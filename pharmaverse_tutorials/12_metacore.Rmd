@@ -1,0 +1,858 @@
+---
+title: "Lesson 12 — {metacore}: The Centralized Spec Object"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+description: >
+  Build and query a metacore spec object — the R equivalent of an Excel
+  specification or Define-XML. Learn the six tables, select_dataset(),
+  and metadata-driven programming principles.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── Mock metacore infrastructure ─────────────────────────────────────────────
+# A metacore object is an R6 container with 6 tibbles.
+# We mock it as an S3 list with a print method and a validator.
+
+metacore <- function(ds_spec, ds_vars, var_spec,
+                     value_spec = tibble(variable = character(), dataset = character(),
+                                         where = character(), code_id = character()),
+                     code_list  = tibble(code_id = character(), name = character(),
+                                         code = character(), decode = character()),
+                     derivations = tibble(derivation_id = character(),
+                                          derivation = character())) {
+  # Validate cross-table consistency
+  missing_datasets <- setdiff(unique(ds_vars$dataset), ds_spec$dataset)
+  if (length(missing_datasets) > 0)
+    stop("ds_vars references datasets not in ds_spec: ",
+         paste(missing_datasets, collapse = ", "))
+
+  missing_vars <- setdiff(unique(ds_vars$variable), var_spec$variable)
+  if (length(missing_vars) > 0)
+    stop("ds_vars references variables not in var_spec: ",
+         paste(missing_vars, collapse = ", "))
+
+  if (nrow(value_spec) > 0) {
+    bad_codes <- setdiff(value_spec$code_id[!is.na(value_spec$code_id)],
+                         unique(code_list$code_id))
+    if (length(bad_codes) > 0)
+      stop("value_spec references code_ids not in code_list: ",
+           paste(bad_codes, collapse = ", "))
+  }
+
+  obj <- list(ds_spec = ds_spec, ds_vars = ds_vars, var_spec = var_spec,
+              value_spec = value_spec, code_list = code_list,
+              derivations = derivations)
+  class(obj) <- c("Metacore", "list")
+  obj
+}
+
+print.Metacore <- function(x, ...) {
+  cat("── Metacore Object ─────────────────────────────────────────\n")
+  cat(sprintf("  ds_spec    : %d dataset(s)  — %s\n",
+              nrow(x$ds_spec), paste(x$ds_spec$dataset, collapse = ", ")))
+  cat(sprintf("  ds_vars    : %d variable-dataset mappings\n", nrow(x$ds_vars)))
+  cat(sprintf("  var_spec   : %d variables\n", nrow(x$var_spec)))
+  cat(sprintf("  value_spec : %d value-level entries\n", nrow(x$value_spec)))
+  cat(sprintf("  code_list  : %d codelist entries\n", nrow(x$code_list)))
+  cat(sprintf("  derivations: %d derivations\n", nrow(x$derivations)))
+  invisible(x)
+}
+
+# DatasetMeta: metacore subset to one dataset
+select_dataset <- function(metacore_obj, dataset) {
+  if (!dataset %in% metacore_obj$ds_spec$dataset)
+    stop("Dataset '", dataset, "' not found in metacore object")
+
+  vars_in_ds   <- metacore_obj$ds_vars |> filter(dataset == !!dataset) |> pull(variable)
+  ds_spec2     <- metacore_obj$ds_spec  |> filter(dataset == !!dataset)
+  ds_vars2     <- metacore_obj$ds_vars  |> filter(dataset == !!dataset)
+  var_spec2    <- metacore_obj$var_spec |> filter(variable %in% vars_in_ds)
+  value_spec2  <- metacore_obj$value_spec  |> filter(dataset == !!dataset | is.na(dataset))
+  code_ids     <- unique(value_spec2$code_id[!is.na(value_spec2$code_id)])
+  code_list2   <- metacore_obj$code_list |> filter(code_id %in% code_ids)
+  derivs2      <- metacore_obj$derivations
+
+  obj <- list(dataset = dataset,
+              ds_spec = ds_spec2, ds_vars = ds_vars2, var_spec = var_spec2,
+              value_spec = value_spec2, code_list = code_list2,
+              derivations = derivs2)
+  class(obj) <- c("DatasetMeta", "Metacore", "list")
+  obj
+}
+
+print.DatasetMeta <- function(x, ...) {
+  cat(sprintf("── DatasetMeta: %s ──────────────────────────────────────\n", x$dataset))
+  cat(sprintf("  Variables  : %d\n", nrow(x$ds_vars)))
+  cat(sprintf("  Codelists  : %d code_ids\n", length(unique(x$code_list$code_id))))
+  cat(sprintf("  Derivations: %d\n", nrow(x$derivations)))
+  invisible(x)
+}
+
+# ── Pre-built example metacore objects ───────────────────────────────────────
+
+# -- Codelists --
+adsl_code_list <- tribble(
+  ~code_id,  ~name,    ~code, ~decode,
+  "SEX_CL",  "SEX",    "M",   "Male",
+  "SEX_CL",  "SEX",    "F",   "Female",
+  "SEX_CL",  "SEX",    "U",   "Unknown",
+  "RACE_CL", "RACE",   "1",   "AMERICAN INDIAN OR ALASKA NATIVE",
+  "RACE_CL", "RACE",   "2",   "ASIAN",
+  "RACE_CL", "RACE",   "3",   "BLACK OR AFRICAN AMERICAN",
+  "RACE_CL", "RACE",   "4",   "NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER",
+  "RACE_CL", "RACE",   "5",   "WHITE",
+  "RACE_CL", "RACE",   "6",   "MULTIPLE",
+  "RACE_CL", "RACE",   "8",   "UNKNOWN",
+  "RACE_CL", "RACE",   "9",   "NOT REPORTED",
+  "ETHNIC_CL","ETHNIC","1",   "HISPANIC OR LATINO",
+  "ETHNIC_CL","ETHNIC","2",   "NOT HISPANIC OR LATINO",
+  "ETHNIC_CL","ETHNIC","3",   "UNKNOWN",
+  "TRT_CL",  "TRT01A", "1",   "XANOMELINE HIGH DOSE",
+  "TRT_CL",  "TRT01A", "2",   "XANOMELINE LOW DOSE",
+  "TRT_CL",  "TRT01A", "3",   "PLACEBO"
+)
+
+# -- var_spec --
+adsl_var_spec <- tribble(
+  ~variable,  ~label,                          ~type,        ~length, ~format,
+  "STUDYID",  "Study Identifier",               "character",  8,       NA,
+  "USUBJID",  "Unique Subject Identifier",      "character",  32,      NA,
+  "SUBJID",   "Subject Identifier for Study",   "character",  8,       NA,
+  "SITEID",   "Study Site Identifier",          "character",  3,       NA,
+  "AGE",      "Age (years)",                    "numeric",    8,       NA,
+  "AGEU",     "Age Units",                      "character",  5,       NA,
+  "AGEGR1",   "Age Group 1",                    "character",  5,       NA,
+  "AGEGR1N",  "Age Group 1 (N)",                "numeric",    8,       NA,
+  "SEX",      "Sex",                            "character",  1,       NA,
+  "SEXN",     "Sex (N)",                        "numeric",    8,       NA,
+  "RACE",     "Race",                           "character",  60,      NA,
+  "RACEN",    "Race (N)",                       "numeric",    8,       NA,
+  "ETHNIC",   "Ethnicity",                      "character",  25,      NA,
+  "TRT01P",   "Planned Treatment for Period 01","character",  40,      NA,
+  "TRT01A",   "Actual Treatment for Period 01", "character",  40,      NA,
+  "TRT01AN",  "Actual Treatment for Period 01 (N)","numeric", 8,       NA,
+  "TRTSDT",   "Date of First Exposure",         "numeric",    8,       "DATE9.",
+  "TRTEDT",   "Date of Last Exposure",          "numeric",    8,       "DATE9.",
+  "TRTDURD",  "Total Treatment Duration (Days)","numeric",    8,       NA,
+  "RANDDT",   "Date of Randomization",          "numeric",    8,       "DATE9.",
+  "EOSDT",    "Date of End of Study",           "numeric",    8,       "DATE9.",
+  "SAFFL",    "Safety Population Flag",         "character",  1,       NA,
+  "ITTFL",    "Intent-To-Treat Population Flag","character",  1,       NA
+)
+
+# -- ds_spec --
+adsl_ds_spec <- tibble(
+  dataset   = c("ADSL", "ADAE"),
+  structure  = c("One record per subject", "One record per subject per adverse event"),
+  label      = c("Subject-Level Analysis Dataset", "Adverse Events Analysis Dataset")
+)
+
+# -- ds_vars --
+adsl_ds_vars <- tibble(
+  dataset   = "ADSL",
+  variable  = adsl_var_spec$variable,
+  order     = seq_along(adsl_var_spec$variable),
+  mandatory = c(TRUE, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, FALSE,
+                TRUE, FALSE, TRUE, FALSE, FALSE, TRUE, TRUE, FALSE,
+                FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE),
+  core      = c("Required", "Required", "Required", "Permissible",
+                "Required", "Permissible", "Permissible", "Permissible",
+                "Required", "Permissible", "Required", "Permissible",
+                "Permissible", "Required", "Required", "Permissible",
+                "Permissible", "Permissible", "Permissible", "Permissible",
+                "Permissible", "Permissible", "Permissible")
+)
+
+# Add a few ADAE rows too (to demonstrate multi-dataset metacore)
+adae_var_spec <- tribble(
+  ~variable, ~label,                        ~type,        ~length, ~format,
+  "STUDYID", "Study Identifier",             "character",  8,       NA,
+  "USUBJID", "Unique Subject Identifier",    "character",  32,      NA,
+  "AETERM",  "Reported Term for AE",         "character",  200,     NA,
+  "AESEV",   "Severity/Intensity",           "character",  5,       NA,
+  "AESEQ",   "Sequence Number",              "numeric",    8,       NA
+)
+
+adae_ds_vars <- tibble(
+  dataset   = "ADAE",
+  variable  = adae_var_spec$variable,
+  order     = 1:5,
+  mandatory = c(TRUE, TRUE, TRUE, FALSE, TRUE),
+  core      = c("Required", "Required", "Required", "Permissible", "Required")
+)
+
+combined_var_spec <- bind_rows(adsl_var_spec,
+  adae_var_spec |> filter(!variable %in% adsl_var_spec$variable))
+
+combined_ds_vars <- bind_rows(adsl_ds_vars, adae_ds_vars)
+
+# -- value_spec --
+adsl_value_spec <- tribble(
+  ~variable, ~dataset, ~where, ~code_id,
+  "SEX",     "ADSL",   NA,     "SEX_CL",
+  "RACE",    "ADSL",   NA,     "RACE_CL",
+  "ETHNIC",  "ADSL",   NA,     "ETHNIC_CL",
+  "TRT01A",  "ADSL",   NA,     "TRT_CL"
+)
+
+# -- derivations --
+adsl_derivations <- tribble(
+  ~derivation_id, ~derivation,
+  "DR_TRTSDT",  "Treatment start date: first dose date from EX (EXDOSE > 0 or placebo)",
+  "DR_TRTEDT",  "Treatment end date: last dose end date from EX",
+  "DR_TRTDURD", "TRTEDT - TRTSDT + 1",
+  "DR_SAFFL",   "Y if subject has at least one EX record with EXDOSE > 0 or placebo",
+  "DR_RACEN",   "Numeric from RACE codelist RACE_CL",
+  "DR_AGEGR1",  "Age group: <18 / 18-64 / >=65"
+)
+
+# Build the full multi-dataset metacore
+md_full <- metacore(
+  ds_spec     = adsl_ds_spec,
+  ds_vars     = combined_ds_vars,
+  var_spec    = combined_var_spec,
+  value_spec  = adsl_value_spec,
+  code_list   = adsl_code_list,
+  derivations = adsl_derivations
+)
+
+# Single-dataset DatasetMeta for ADSL
+md_adsl <- select_dataset(md_full, "ADSL")
+
+# Small mock subject-level dataset (as-if from DM)
+dm_sample <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015", "01-701-1023", "01-702-1042", "01-702-1101"),
+  SUBJID  = c("1015", "1023", "1042", "1101"),
+  SITEID  = c("701", "701", "702", "702"),
+  AGE     = c(63L, 64L, 71L, 56L),
+  AGEU    = "YEARS",
+  SEX     = c("M", "F", "M", "F"),
+  RACE    = c("WHITE", "WHITE", "ASIAN", "WHITE"),
+  ETHNIC  = c("NOT HISPANIC OR LATINO", "NOT HISPANIC OR LATINO",
+              "NOT HISPANIC OR LATINO", "HISPANIC OR LATINO"),
+  ARM     = c("Xanomeline High Dose", "Xanomeline Low Dose",
+              "Placebo", "Xanomeline High Dose"),
+  ACTARM  = c("XANOMELINE HIGH DOSE", "XANOMELINE LOW DOSE",
+              "PLACEBO", "XANOMELINE HIGH DOSE")
+)
+```
+
+## Welcome
+
+This is Lesson 12 — the start of Module 3 — covering **`{metacore}`**: the centralized spec object.
+
+In SAS workflows, the study specification lives in Excel and programmers transcribe it manually into code. When the spec changes, code drifts. `{metacore}` solves this by turning the spec into a **programmable R object** that your code reads from directly.
+
+This lesson covers:
+
+- Why metadata-driven programming matters
+- The six tables that form a metacore object
+- Building a metacore from scratch (and from Excel/Define-XML)
+- Using `select_dataset()` to get a `DatasetMeta` for one dataset
+- Querying the spec for labels, codelists, and derivation logic
+
+All metacore functions are mocked and fully functional — no package installation required.
+
+---
+
+## 1 — The problem with "spec in Excel, code transcribed"
+
+```{r quiz-why-metacore, echo=FALSE}
+quiz(
+  question(
+    "Why is the 'spec lives in Excel, programmers transcribe it' workflow brittle?",
+    answer("Excel is too slow to open"),
+    answer("When the spec changes, all code that hard-codes spec details must be found and updated manually", correct = TRUE),
+    answer("Regulators don't accept Excel-based specs"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "In a metadata-driven pipeline, when the spec changes you:",
+    answer("Update every R script that has a label or codelist"),
+    answer("Update the spec source (Excel/Define-XML), rebuild the metacore object, and re-run — downstream code picks up changes automatically", correct = TRUE),
+    answer("Re-do dual programming from scratch"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 2 — The six tables
+
+A metacore object holds six tibbles. Let's explore them:
+
+```{r explore-tables}
+# Print the object — summary of all six tables
+print(md_full)
+```
+
+```{r explore-ds-spec}
+# Dataset-level info: names, labels, structure
+md_full$ds_spec
+```
+
+```{r explore-ds-vars}
+# Which variables belong to each dataset, in what order, with what flags
+md_full$ds_vars |>
+  filter(dataset == "ADSL") |>
+  arrange(order) |>
+  head(10)
+```
+
+```{r explore-var-spec}
+# Variable-level info: label, type, length — shared across datasets
+md_full$var_spec |>
+  filter(variable %in% c("AGE", "SEX", "RACE", "USUBJID")) |>
+  select(variable, label, type, length)
+```
+
+```{r explore-code-list}
+# Codelist definitions
+md_full$code_list |>
+  filter(code_id == "SEX_CL")
+```
+
+```{r explore-value-spec}
+# Which codelist applies to which variable in which dataset
+md_full$value_spec
+```
+
+```{r explore-derivations}
+# Derivation logic for derived variables
+md_full$derivations
+```
+
+---
+
+## 3 — Querying the spec
+
+Because each table is a plain tibble, you use dplyr to query it:
+
+### Exercise: Find all mandatory variables in ADSL
+
+Use `md_full$ds_vars` to find variables where `dataset == "ADSL"` and `mandatory == TRUE`.
+
+```{r query-mandatory, exercise=TRUE, exercise.lines=10}
+# Find all mandatory ADSL variables
+mandatory_adsl <- md_full$ds_vars |>
+  filter(dataset == ___, mandatory == ___) |>
+  arrange(order) |>
+  pull(variable)
+
+cat("Mandatory ADSL variables:\n")
+cat(paste(mandatory_adsl, collapse = ", "), "\n")
+```
+
+```{r query-mandatory-hint-1}
+# filter(dataset == "ADSL", mandatory == TRUE)
+```
+
+```{r query-mandatory-solution}
+mandatory_adsl <- md_full$ds_vars |>
+  filter(dataset == "ADSL", mandatory == TRUE) |>
+  arrange(order) |>
+  pull(variable)
+
+cat("Mandatory ADSL variables:\n")
+cat(paste(mandatory_adsl, collapse = ", "), "\n")
+```
+
+### Exercise: Get the label for TRTDURD
+
+```{r query-label, exercise=TRUE, exercise.lines=6}
+# Pull the label for TRTDURD from var_spec
+label_trtdurd <- md_full$var_spec |>
+  filter(variable == ___) |>
+  pull(___)
+
+cat("TRTDURD label:", label_trtdurd, "\n")
+```
+
+```{r query-label-hint-1}
+# filter(variable == "TRTDURD") |> pull(label)
+```
+
+```{r query-label-solution}
+label_trtdurd <- md_full$var_spec |>
+  filter(variable == "TRTDURD") |>
+  pull(label)
+
+cat("TRTDURD label:", label_trtdurd, "\n")
+```
+
+### Exercise: Get the full RACE codelist
+
+Find all entries in `code_list` that belong to the `"RACE_CL"` codelist.
+
+```{r query-codelist, exercise=TRUE, exercise.lines=8}
+race_codelist <- md_full$code_list |>
+  filter(code_id == ___) |>
+  select(code, decode) |>
+  arrange(as.integer(code))
+
+race_codelist
+```
+
+```{r query-codelist-hint-1}
+# filter(code_id == "RACE_CL")
+```
+
+```{r query-codelist-solution}
+race_codelist <- md_full$code_list |>
+  filter(code_id == "RACE_CL") |>
+  select(code, decode) |>
+  arrange(as.integer(code))
+
+race_codelist
+```
+
+### Exercise: Look up which codelist applies to TRT01A in ADSL
+
+```{r query-which-codelist, exercise=TRUE, exercise.lines=10}
+# Step 1: find the code_id for TRT01A in value_spec
+trt_code_id <- md_full$value_spec |>
+  filter(variable == ___, dataset == "ADSL") |>
+  pull(___)
+
+cat("code_id for TRT01A:", trt_code_id, "\n")
+
+# Step 2: retrieve the codelist entries
+md_full$code_list |>
+  filter(code_id == trt_code_id)
+```
+
+```{r query-which-codelist-hint-1}
+# filter(variable == "TRT01A", dataset == "ADSL") |> pull(code_id)
+```
+
+```{r query-which-codelist-solution}
+trt_code_id <- md_full$value_spec |>
+  filter(variable == "TRT01A", dataset == "ADSL") |>
+  pull(code_id)
+
+cat("code_id for TRT01A:", trt_code_id, "\n")
+
+md_full$code_list |>
+  filter(code_id == trt_code_id)
+```
+
+---
+
+## 4 — `select_dataset()`: focusing on one dataset
+
+A full-study metacore object holds metadata for every dataset. When building a single ADaM (e.g., ADSL), you need only that dataset's slice. `select_dataset()` produces a `DatasetMeta` — a metacore subclass restricted to one dataset.
+
+```{r select-dataset-demo}
+# Full multi-dataset metacore
+print(md_full)
+
+# Subset to ADSL only
+md_adsl_local <- select_dataset(md_full, "ADSL")
+print(md_adsl_local)
+```
+
+The `DatasetMeta` has the same 6 tables, but filtered — only `ADSL` variables, only the codelists ADSL needs.
+
+```{r select-dataset-compare}
+# Variables in full vs. ADSL-only
+cat("ds_vars in full metacore:  ", nrow(md_full$ds_vars), "\n")
+cat("ds_vars in ADSL DatasetMeta:", nrow(md_adsl$ds_vars), "\n")
+```
+
+### Exercise: Select the ADAE dataset
+
+```{r select-adae, exercise=TRUE, exercise.lines=8}
+# Create a DatasetMeta for ADAE
+md_adae <- select_dataset(md_full, ___)
+
+print(md_adae)
+
+# What are the ADAE variables?
+md_adae$ds_vars |> pull(variable)
+```
+
+```{r select-adae-hint-1}
+# select_dataset(md_full, "ADAE")
+```
+
+```{r select-adae-solution}
+md_adae <- select_dataset(md_full, "ADAE")
+print(md_adae)
+md_adae$ds_vars |> pull(variable)
+```
+
+### Exercise: Confirm that selecting a non-existent dataset errors
+
+```{r select-invalid, exercise=TRUE, exercise.lines=6}
+# What happens when you select a dataset that doesn't exist?
+tryCatch(
+  select_dataset(md_full, "ADVS"),
+  error = function(e) cat("Error caught:", conditionMessage(e), "\n")
+)
+```
+
+---
+
+## 5 — The `mandatory` flag and `core`
+
+```{r quiz-mandatory, echo=FALSE}
+quiz(
+  question(
+    "In metacore, `mandatory = TRUE` means:",
+    answer("The variable is nice to have but optional"),
+    answer("The variable cannot have blank values in the delivered dataset", correct = TRUE),
+    answer("The variable is derived, not collected"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The `core` field can be 'Required', 'Expected', or 'Permissible'. 'Required' means:",
+    answer("The variable is in the SDTMIG and must be present in every submission", correct = TRUE),
+    answer("The variable is recommended but optional"),
+    answer("The variable is sponsor-specific"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "In metacore 0.3.0, `keep` was renamed to `mandatory` because:",
+    answer("'keep' was too long to type"),
+    answer("'mandatory' better aligns with CDISC terminology for required variables", correct = TRUE),
+    answer("The keep flag was removed entirely"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 6 — Building a metacore object from scratch
+
+The constructor `metacore()` validates all six tables on construction. Let's build a minimal one:
+
+```{r build-manual-demo}
+# Step 1: the six tables
+my_ds_spec <- tibble(
+  dataset   = "ADSL",
+  structure  = "One record per subject",
+  label      = "Subject-Level Analysis Dataset"
+)
+
+my_ds_vars <- tibble(
+  dataset   = "ADSL",
+  variable  = c("STUDYID", "USUBJID", "AGE", "SEX"),
+  order     = 1:4,
+  mandatory = c(TRUE, TRUE, TRUE, TRUE),
+  core      = c("Required", "Required", "Required", "Required")
+)
+
+my_var_spec <- tibble(
+  variable = c("STUDYID", "USUBJID", "AGE", "SEX"),
+  label    = c("Study Identifier", "Unique Subject Identifier", "Age (years)", "Sex"),
+  type     = c("character", "character", "numeric", "character"),
+  length   = c(8L, 32L, 8L, 1L),
+  format   = c(NA, NA, NA, NA)
+)
+
+my_value_spec <- tibble(
+  variable = "SEX",
+  dataset  = "ADSL",
+  where    = NA_character_,
+  code_id  = "SEX_CL"
+)
+
+my_code_list <- tribble(
+  ~code_id, ~name, ~code, ~decode,
+  "SEX_CL", "SEX", "M",   "Male",
+  "SEX_CL", "SEX", "F",   "Female",
+  "SEX_CL", "SEX", "U",   "Unknown"
+)
+
+my_derivations <- tibble(
+  derivation_id = "DR_AGE",
+  derivation    = "From DM.AGE, no derivation needed"
+)
+
+# Step 2: construct — validation happens here
+md_manual <- metacore(
+  ds_spec     = my_ds_spec,
+  ds_vars     = my_ds_vars,
+  var_spec    = my_var_spec,
+  value_spec  = my_value_spec,
+  code_list   = my_code_list,
+  derivations = my_derivations
+)
+
+print(md_manual)
+```
+
+### Exercise: Trigger a validation error
+
+Add a variable `"WEIGHT"` to `ds_vars` that doesn't exist in `var_spec`, and observe the error:
+
+```{r build-invalid, exercise=TRUE, exercise.lines=25}
+bad_ds_vars <- tibble(
+  dataset   = "ADSL",
+  variable  = c("STUDYID", "USUBJID", "AGE", "SEX", "WEIGHT"),  # WEIGHT not in var_spec
+  order     = 1:5,
+  mandatory = c(TRUE, TRUE, TRUE, TRUE, FALSE),
+  core      = c("Required", "Required", "Required", "Required", "Permissible")
+)
+
+tryCatch(
+  metacore(
+    ds_spec     = my_ds_spec,
+    ds_vars     = bad_ds_vars,
+    var_spec    = my_var_spec,
+    value_spec  = my_value_spec,
+    code_list   = my_code_list,
+    derivations = my_derivations
+  ),
+  error = function(e) cat("Validation caught:\n", conditionMessage(e), "\n")
+)
+```
+
+---
+
+## 7 — The `DatasetMeta` requirement
+
+```{r quiz-dataset-meta, echo=FALSE}
+quiz(
+  question(
+    "Why do metatools functions require a DatasetMeta (not a full metacore)?",
+    answer("DatasetMeta is faster to compute with"),
+    answer("It prevents ambiguity — when working on ADSL, you don't want code accidentally using ADAE metadata", correct = TRUE),
+    answer("Full metacore objects can't be passed to functions"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "In a typical session, you create one DatasetMeta per dataset because:",
+    answer("You need a separate metacore object for each dataset build, ensuring metadata is scoped correctly", correct = TRUE),
+    answer("select_dataset() modifies the original object"),
+    answer("Full metacore objects can only hold one dataset"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 8 — Reading a derivation from the spec
+
+In production, your code should *implement* the spec's derivation text exactly. The `derivations` table stores the written logic:
+
+```{r read-derivation-demo}
+# What does the spec say about how SAFFL should be derived?
+md_full$derivations |>
+  filter(derivation_id == "DR_SAFFL") |>
+  pull(derivation)
+```
+
+### Exercise: Retrieve the derivation for TRTSDT and TRTDURD
+
+```{r read-derivation-ex, exercise=TRUE, exercise.lines=10}
+# Get derivation text for TRTSDT
+cat("TRTSDT derivation:\n")
+md_full$derivations |>
+  filter(derivation_id == ___) |>
+  pull(derivation) |>
+  cat()
+
+cat("\n\nTRTDURD derivation:\n")
+md_full$derivations |>
+  filter(derivation_id == ___) |>
+  pull(derivation) |>
+  cat()
+```
+
+```{r read-derivation-ex-hint-1}
+# derivation_id == "DR_TRTSDT"
+# derivation_id == "DR_TRTDURD"
+```
+
+```{r read-derivation-ex-solution}
+cat("TRTSDT derivation:\n")
+md_full$derivations |>
+  filter(derivation_id == "DR_TRTSDT") |>
+  pull(derivation) |>
+  cat()
+
+cat("\n\nTRTDURD derivation:\n")
+md_full$derivations |>
+  filter(derivation_id == "DR_TRTDURD") |>
+  pull(derivation) |>
+  cat()
+```
+
+---
+
+## 9 — The pipeline perspective
+
+```{r quiz-pipeline, echo=FALSE}
+quiz(
+  question(
+    "Which package typically consumes the metacore object to perform actual dataset derivations?",
+    answer("{xportr}"),
+    answer("{metatools}", correct = TRUE),
+    answer("{sdtm.oak}"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Where in the pipeline should the metacore object be constructed?",
+    answer("Inside each programmer's derivation script"),
+    answer("In one shared constructor script, saved as .rds, used by all downstream scripts", correct = TRUE),
+    answer("It's created on-the-fly by admiral"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The metacore object is read-only after construction because:",
+    answer("R6 objects can't be modified"),
+    answer("Treating it as immutable ensures the spec is the single source of truth — no accidental in-place edits", correct = TRUE),
+    answer("metatools modifies it and returns a new copy"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 10 — Capstone: Build and interrogate a spec
+
+Build a metacore for a minimal ADVS dataset (Vital Signs) and answer questions about it.
+
+```{r capstone-metacore, exercise=TRUE, exercise.lines=65}
+# ── Build a metacore for ADVS ──────────────────────────────────────────────
+
+advs_ds_spec <- tibble(
+  dataset   = "ADVS",
+  structure  = "One record per subject per parameter per visit",
+  label      = "Vital Signs Analysis Dataset"
+)
+
+advs_ds_vars <- tibble(
+  dataset   = "ADVS",
+  variable  = c("STUDYID", "USUBJID", "PARAMCD", "PARAM",
+                "AVAL", "ADT", "VISIT", "VISITNUM",
+                "ABLFL", "ANL01FL"),
+  order     = 1:10,
+  mandatory = c(TRUE, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE),
+  core      = c("Required", "Required", "Required", "Permissible",
+                "Required", "Permissible", "Permissible", "Permissible",
+                "Permissible", "Permissible")
+)
+
+advs_var_spec <- tribble(
+  ~variable,  ~label,                              ~type,        ~length, ~format,
+  "STUDYID",  "Study Identifier",                  "character",  8,       NA,
+  "USUBJID",  "Unique Subject Identifier",          "character",  32,      NA,
+  "PARAMCD",  "Parameter Code",                    "character",  8,       NA,
+  "PARAM",    "Parameter",                         "character",  40,      NA,
+  "AVAL",     "Analysis Value",                    "numeric",    8,       NA,
+  "ADT",      "Analysis Date",                     "numeric",    8,       "DATE9.",
+  "VISIT",    "Visit Name",                        "character",  200,     NA,
+  "VISITNUM", "Visit Number",                      "numeric",    8,       NA,
+  "ABLFL",    "Baseline Record Flag",              "character",  1,       NA,
+  "ANL01FL",  "Analysis Flag 01",                  "character",  1,       NA
+)
+
+advs_code_list <- tribble(
+  ~code_id,    ~name,     ~code,    ~decode,
+  "PARAMCD_CL","PARAMCD", "SYSBP",  "Systolic Blood Pressure (mmHg)",
+  "PARAMCD_CL","PARAMCD", "DIABP",  "Diastolic Blood Pressure (mmHg)",
+  "PARAMCD_CL","PARAMCD", "PULSE",  "Pulse Rate (beats/min)",
+  "PARAMCD_CL","PARAMCD", "TEMP",   "Temperature (C)",
+  "PARAMCD_CL","PARAMCD", "WEIGHT", "Weight (kg)"
+)
+
+advs_value_spec <- tibble(
+  variable = "PARAMCD", dataset = "ADVS",
+  where = NA_character_, code_id = "PARAMCD_CL"
+)
+
+advs_derivations <- tribble(
+  ~derivation_id, ~derivation,
+  "DR_ADT",  "Analysis date: from VSDTC in SDTM VS domain",
+  "DR_AVAL", "Analysis value: numeric from VSORRES/VSSTRESC"
+)
+
+# Build the metacore
+md_advs <- metacore(
+  ds_spec     = advs_ds_spec,
+  ds_vars     = advs_ds_vars,
+  var_spec    = advs_var_spec,
+  value_spec  = advs_value_spec,
+  code_list   = advs_code_list,
+  derivations = advs_derivations
+)
+
+# ── Questions to answer ────────────────────────────────────────────────────
+
+# Q1: How many mandatory ADVS variables are there?
+n_mandatory <- md_advs$ds_vars |>
+  filter(mandatory == TRUE) |>
+  nrow()
+cat("Mandatory variables:", n_mandatory, "\n")
+
+# Q2: What parameters are defined in the ADVS codelist?
+params <- md_advs$code_list |>
+  filter(code_id == "PARAMCD_CL") |>
+  pull(code)
+cat("Parameters:", paste(params, collapse = ", "), "\n")
+
+# Q3: Select the dataset (produces a DatasetMeta)
+md_advs_single <- select_dataset(md_advs, "ADVS")
+print(md_advs_single)
+```
+
+```{r capstone-metacore-hint-1}
+# This exercise is pre-filled — run it as-is to see the full output.
+# Expected: 3 mandatory variables (STUDYID, USUBJID, PARAMCD, AVAL = 4 TRUE)
+# Parameters: SYSBP, DIABP, PULSE, TEMP, WEIGHT
+```
+
+---
+
+## 11 — Key takeaways
+
+```{r quiz-final-12, echo=FALSE}
+quiz(
+  question(
+    "The six tables in a metacore object are:",
+    answer("ds_spec, ds_vars, var_spec, value_spec, code_list, derivations", correct = TRUE),
+    answer("datasets, variables, codelists, types, labels, origins"),
+    answer("define_xml, study_spec, ct_spec, vlm, derivations, outputs"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "When you call metacore() and a code_id in value_spec doesn't exist in code_list, the constructor:",
+    answer("Silently ignores the missing code_id"),
+    answer("Throws an error immediately, catching the spec inconsistency at load time", correct = TRUE),
+    answer("Returns a warning but continues"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A DatasetMeta is a metacore subclass that:",
+    answer("Has fewer tables than a full metacore"),
+    answer("Is restricted to a single dataset — required by metatools functions", correct = TRUE),
+    answer("Can only be used with admiral"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## What's next
+
+Lesson 13 — **`{metatools}`** — uses the metacore objects we've built here to do real data work: construct base datasets from SDTM sources, derive numeric companion variables from codelists, and run conformance checks that verify your final dataset matches the spec.
+
+The metadata-driven approach pays off fully once you see how `create_var_from_codelist()` uses the RACE codelist from your metacore object to derive RACEN — one line of code, spec-driven, no maintenance when the codelist changes.

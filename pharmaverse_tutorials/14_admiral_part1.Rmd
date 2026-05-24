@@ -1,0 +1,964 @@
+---
+title: "Lesson 14 — {admiral} Part 1: Foundations and Philosophy"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+description: >
+  Admiral's design manifesto, function naming convention, exprs(), date/time
+  helpers, and derive_vars_merged() — the foundation of every ADaM build.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── Mock admiral functions ────────────────────────────────────────────────────
+
+# convert_blanks_to_na: replace "" with NA in all character columns
+convert_blanks_to_na <- function(dataset) {
+  dataset |>
+    mutate(across(where(is.character), ~ if_else(.x == "", NA_character_, .x)))
+}
+
+# ── Date helpers ──────────────────────────────────────────────────────────────
+
+# Impute a partial DTC string
+.impute_dtc <- function(dtc, date_imputation = "first", time_imputation = "first") {
+  sapply(dtc, function(x) {
+    if (is.na(x) || x == "") return(NA_character_)
+    parts <- str_split(x, "T")[[1]]
+    date_part <- parts[1]
+    time_part <- if (length(parts) > 1) parts[2] else NA_character_
+
+    # Pad partial dates
+    segs <- str_split(date_part, "-")[[1]]
+    if (length(segs) == 1) {
+      segs <- c(segs, if (date_imputation == "last") "12" else "01")
+    }
+    if (length(segs) == 2) {
+      last_day <- if (date_imputation == "last") {
+        as.character(lubridate::days_in_month(as.Date(paste0(segs[1], "-", segs[2], "-01"))))
+      } else "01"
+      segs <- c(segs, last_day)
+    }
+    full_date <- paste(segs, collapse = "-")
+
+    if (!is.na(time_part)) {
+      paste0(full_date, "T", time_part)
+    } else {
+      full_date
+    }
+  }, USE.NAMES = FALSE)
+}
+
+.imputation_flag <- function(dtc, imputed_dtc, mode = "date") {
+  sapply(seq_along(dtc), function(i) {
+    if (is.na(dtc[i])) return(NA_character_)
+    orig  <- str_split(dtc[i], "-")[[1]]
+    if (length(orig) == 1) return(if (mode == "date") "Y" else "M")
+    if (length(orig) == 2) return("D")
+    return(NA_character_)
+  }, USE.NAMES = FALSE)
+}
+
+# derive_vars_dt: convert DTC character → numeric Date + imputation flag
+derive_vars_dt <- function(dataset, dtc, new_vars_prefix,
+                            date_imputation = "none",
+                            flag_imputation = "auto") {
+  dtc_nm  <- deparse(substitute(dtc))
+  dt_nm   <- paste0(new_vars_prefix, "DT")
+  dtf_nm  <- paste0(new_vars_prefix, "DTF")
+  raw_dtc <- dataset[[dtc_nm]]
+  imputed <- .impute_dtc(raw_dtc, date_imputation = date_imputation)
+  dataset[[dt_nm]]  <- suppressWarnings(as.numeric(as.Date(imputed)))
+  dataset[[dtf_nm]] <- .imputation_flag(raw_dtc, imputed, "date")
+  dataset
+}
+
+# derive_vars_dtm: convert DTC → numeric POSIXct datetime + flags
+derive_vars_dtm <- function(dataset, dtc, new_vars_prefix,
+                             date_imputation = "none",
+                             time_imputation = "none",
+                             flag_imputation = "auto") {
+  dtc_nm  <- deparse(substitute(dtc))
+  dtm_nm  <- paste0(new_vars_prefix, "DTM")
+  dtf_nm  <- paste0(new_vars_prefix, "DTF")
+  tmf_nm  <- paste0(new_vars_prefix, "TMF")
+  raw_dtc <- dataset[[dtc_nm]]
+
+  ti_str  <- switch(time_imputation, "first" = "00:00:00", "last" = "23:59:59", "00:00:00")
+  imputed <- sapply(raw_dtc, function(x) {
+    if (is.na(x) || x == "") return(NA_character_)
+    if (!str_detect(x, "T")) paste0(x, "T", ti_str) else x
+  }, USE.NAMES = FALSE)
+  imputed <- .impute_dtc(imputed, date_imputation = date_imputation)
+  dataset[[dtm_nm]] <- suppressWarnings(as.numeric(as.POSIXct(str_replace(imputed, "T", " "), tz = "UTC")))
+  dataset[[dtf_nm]] <- .imputation_flag(raw_dtc, imputed, "date")
+  dataset[[tmf_nm]] <- if_else(!str_detect(raw_dtc, "T") & !is.na(raw_dtc),
+                                if (time_imputation == "first") "H" else "H", NA_character_)
+  dataset
+}
+
+# derive_vars_dtm_to_dt: datetime → date (strip time)
+derive_vars_dtm_to_dt <- function(dataset, source_vars) {
+  sv_names <- sapply(source_vars, deparse)
+  for (nm in sv_names) {
+    out_nm <- str_replace(nm, "DTM$", "DT")
+    dataset[[out_nm]] <- trunc(dataset[[nm]] / 86400)  # seconds → days
+  }
+  dataset
+}
+
+# derive_vars_dy: compute study day variables (no Day 0)
+derive_vars_dy <- function(dataset, reference_date, source_vars) {
+  ref_nm  <- deparse(substitute(reference_date))
+  sv_names <- sapply(source_vars, deparse)
+  for (nm in sv_names) {
+    out_nm <- str_replace(nm, "DT$", "DY")
+    ref_days <- dataset[[ref_nm]]
+    src_days <- dataset[[nm]]
+    raw_diff <- src_days - ref_days
+    dataset[[out_nm]] <- case_when(
+      is.na(raw_diff)  ~ NA_real_,
+      raw_diff >= 0    ~ raw_diff + 1,
+      TRUE             ~ raw_diff
+    )
+  }
+  dataset
+}
+
+# exprs: pass through (rlang::exprs is available via dplyr; this is a stub for quiz demos)
+# In real code, exprs() from dplyr/rlang works natively.
+
+# derive_vars_merged: left-join with filter, order, first/last
+derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
+                                order = NULL, filter_add = NULL, mode = NULL,
+                                missing_values = NULL) {
+  by_names <- sapply(by_vars, deparse)
+
+  # Apply filter_add
+  filter_expr <- substitute(filter_add)
+  if (!is.null(filter_expr) && deparse(filter_expr) != "NULL") {
+    dataset_add <- dataset_add |> filter(!!filter_expr)
+  }
+
+  # Order
+  if (!is.null(order)) {
+    ord_names <- sapply(order, deparse)
+    ord_descs <- grepl("^desc\\(", ord_names)
+    ord_clean <- str_replace_all(ord_names, "^desc\\(|\\)$", "")
+    for (i in rev(seq_along(ord_clean))) {
+      if (ord_descs[i]) {
+        dataset_add <- dataset_add |> arrange(desc(.data[[ord_clean[i]]]))
+      } else {
+        dataset_add <- dataset_add |> arrange(.data[[ord_clean[i]]])
+      }
+    }
+  }
+
+  # First/last selection
+  if (!is.null(mode)) {
+    fn <- if (mode == "first") dplyr::slice_head else dplyr::slice_tail
+    dataset_add <- dataset_add |>
+      group_by(across(all_of(by_names))) |>
+      fn(n = 1) |>
+      ungroup()
+  }
+
+  # Rename/select new vars
+  if (!is.null(new_vars)) {
+    nv_names <- sapply(new_vars, deparse)
+    nv_map   <- setNames(names(nv_names), nv_names)  # new_name = old_name
+    keep_cols <- c(by_names, names(nv_map))
+    dataset_add <- dataset_add |>
+      select(any_of(keep_cols)) |>
+      rename(any_of(nv_map))
+    new_col_names <- nv_names
+  } else {
+    new_col_names <- setdiff(names(dataset_add), by_names)
+  }
+
+  dataset |>
+    left_join(
+      dataset_add |> select(any_of(c(by_names, new_col_names))),
+      by = by_names
+    )
+}
+
+# derive_var_extreme_flag: mark first/last record per group
+derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "first") {
+  by_names  <- sapply(by_vars, deparse)
+  ord_names <- sapply(order, deparse)
+  out_nm    <- deparse(substitute(new_var))
+  ord_descs <- grepl("^desc\\(", ord_names)
+  ord_clean <- str_replace_all(ord_names, "^desc\\(|\\)$", "")
+
+  sorted <- dataset
+  for (i in rev(seq_along(ord_clean))) {
+    if (ord_descs[i]) {
+      sorted <- sorted |> arrange(desc(.data[[ord_clean[i]]]))
+    } else {
+      sorted <- sorted |> arrange(.data[[ord_clean[i]]])
+    }
+  }
+
+  flagged <- sorted |>
+    group_by(across(all_of(by_names))) |>
+    mutate(.row_rank = row_number()) |>
+    ungroup() |>
+    mutate(!!out_nm := case_when(
+      (mode == "first" & .row_rank == 1) |
+      (mode == "last"  & .row_rank == max(.row_rank)) ~ "Y",
+      TRUE ~ NA_character_
+    )) |>
+    select(-.row_rank)
+
+  # Merge flag back in original row order
+  dataset |>
+    left_join(flagged |> select(any_of(c(by_names, ord_clean, out_nm))),
+              by = c(by_names, ord_clean))
+}
+
+# derive_var_merged_exist_flag: Y/NA based on existence in another dataset
+derive_var_merged_exist_flag <- function(dataset, dataset_add, by_vars,
+                                          new_var, condition) {
+  by_names <- sapply(by_vars, deparse)
+  out_nm   <- deparse(substitute(new_var))
+  cond_expr <- substitute(condition)
+  flagged  <- dataset_add |>
+    filter(!!cond_expr) |>
+    distinct(across(all_of(by_names))) |>
+    mutate(!!out_nm := "Y")
+  dataset |> left_join(flagged, by = by_names)
+}
+
+# derive_vars_duration: compute duration between two date variables
+derive_vars_duration <- function(dataset, new_var, start_date, end_date,
+                                  out_unit = "days", add_one = TRUE) {
+  out_nm  <- deparse(substitute(new_var))
+  start_nm <- deparse(substitute(start_date))
+  end_nm   <- deparse(substitute(end_date))
+  raw_diff <- dataset[[end_nm]] - dataset[[start_nm]]
+  if (out_unit == "days") {
+    dataset[[out_nm]] <- case_when(
+      is.na(raw_diff) ~ NA_real_,
+      add_one         ~ raw_diff + 1,
+      TRUE            ~ raw_diff
+    )
+  } else if (out_unit == "months") {
+    dataset[[out_nm]] <- round(as.numeric(raw_diff) / 30.4375, 1)
+  }
+  dataset
+}
+
+# derive_var_trtdurd: convenience wrapper for treatment duration
+derive_var_trtdurd <- function(dataset, new_var = TRTDURD,
+                                start_date = TRTSDT, end_date = TRTEDT) {
+  out_nm   <- deparse(substitute(new_var))
+  start_nm <- deparse(substitute(start_date))
+  end_nm   <- deparse(substitute(end_date))
+  dataset[[out_nm]] <- dataset[[end_nm]] - dataset[[start_nm]] + 1
+  dataset
+}
+
+# call_derivation: apply one function multiple times with different variable params
+call_derivation <- function(dataset, derivation, variable_params, ...) {
+  shared_args <- list(...)
+  for (vp in variable_params) {
+    args_i <- c(list(dataset = dataset), vp, shared_args)
+    dataset <- do.call(derivation, args_i)
+  }
+  dataset
+}
+
+# params: helper that just returns its arguments as a named list
+params <- function(...) list(...)
+
+# ── Sample data ───────────────────────────────────────────────────────────────
+
+# SDTM-like datasets with deliberate blanks (to test convert_blanks_to_na)
+dm_raw <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015", "01-701-1023", "01-702-1042", "01-702-1101", "01-703-1211"),
+  AGE     = c(63L, 64L, 71L, 56L, 45L),
+  SEX     = c("M", "F", "M", "F", "M"),
+  RACE    = c("WHITE", "WHITE", "ASIAN", "WHITE", "BLACK OR AFRICAN AMERICAN"),
+  ARM     = c("Xanomeline High Dose", "Xanomeline Low Dose",
+              "Placebo", "Xanomeline High Dose", "Placebo"),
+  ACTARM  = c("XANOMELINE HIGH DOSE", "XANOMELINE LOW DOSE",
+              "PLACEBO", "XANOMELINE HIGH DOSE", "PLACEBO"),
+  RFXSTDTC = c("2014-01-02", "2012-08-05", "2013-07-09", "2013-04-14", "2014-03-22")
+)
+
+ex_raw <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  USUBJID  = c("01-701-1015", "01-701-1015",
+               "01-701-1023", "01-702-1042", "01-702-1101",
+               "01-703-1211", "01-703-1211"),
+  EXTRT    = c("XANOMELINE", "XANOMELINE",
+               "XANOMELINE", "PLACEBO", "XANOMELINE",
+               "PLACEBO", "PLACEBO"),
+  EXDOSE   = c(81, 81, 54, 0, 81, 0, 0),
+  EXSEQ    = c(1L, 2L, 1L, 1L, 1L, 1L, 2L),
+  EXSTDTC  = c("2014-01-02", "2014-02-02",
+               "2012-08-05", "2013-07-09", "2013-04-14",
+               "2014-03-22", "2014-04-22"),
+  EXENDTC  = c("2014-01-31", "2014-02-28",
+               "2012-11-01", "2013-09-15", "2013-06-30",
+               "2014-04-21", "2014-05-21")
+)
+
+# LB for study day derivation example
+lb_raw <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  USUBJID  = c("01-701-1015", "01-701-1015", "01-701-1023"),
+  LBTESTCD = c("ALT", "ALT", "ALT"),
+  LBDTC    = c("2014-01-02", "2014-02-10", "2012-08-05"),
+  LBORRES  = c("28", "35", "22")
+)
+
+# Datasets with blanks (to demo convert_blanks_to_na)
+dm_with_blanks <- dm_raw |>
+  mutate(ARM = if_else(USUBJID == "01-703-1211", "", ARM))
+
+# Pre-processed clean versions
+dm  <- convert_blanks_to_na(dm_raw)
+ex  <- convert_blanks_to_na(ex_raw)
+lb  <- convert_blanks_to_na(lb_raw)
+```
+
+## Welcome
+
+This is Lesson 14 — **`{admiral}` Part 1: Foundations and Philosophy**.
+
+Admiral is the pharmaverse flagship for building ADaM datasets. Before writing a single derivation, you need to internalize two things: the manifesto (admiral is a *toolbox*, not a black box) and the function naming convention (which tells you 80% of what a function does before you read the docs).
+
+This lesson covers:
+
+- The admiral manifesto — why it matters
+- The function prefix convention: `derive_var_*`, `derive_vars_*`, `derive_param_*`, `compute_*`
+- `exprs()` — the expression argument pattern
+- `convert_blanks_to_na()` — why it's always your first call
+- Date/time helpers: `derive_vars_dt()`, `derive_vars_dtm()`, `derive_vars_dy()`
+- `derive_vars_merged()` — the most important function
+- `derive_var_extreme_flag()` and `derive_var_merged_exist_flag()`
+
+All admiral functions are mocked and run without package installation.
+
+---
+
+## 1 — The manifesto
+
+```{r quiz-manifesto, echo=FALSE}
+quiz(
+  question(
+    "The admiral maintainers describe the package as 'a toolbox, not an automation tool'. This means:",
+    answer("You call make_adsl() and admiral builds the dataset for you"),
+    answer("You assemble ADaMs by chaining many small, auditable function calls — no black-box 'make ADSL' functions", correct = TRUE),
+    answer("admiral only handles one ADaM at a time"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Why does the manifesto emphasize 'clear purpose, no multi-purpose functions'?",
+    answer("Regulators require single-purpose functions"),
+    answer("It makes function names predictable and code auditable — each line does exactly one identifiable thing", correct = TRUE),
+    answer("Multi-purpose functions are slower in R"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Admiral's 3-year deprecation cycle (warning → error → removal) exists because:",
+    answer("The development team needs time to update examples"),
+    answer("Studies run for years; a mid-study package update should never break existing code without ample warning time", correct = TRUE),
+    answer("CRAN requires 3-year cycles"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 2 — Function naming convention
+
+```{r quiz-naming, echo=FALSE}
+quiz(
+  question(
+    "derive_vars_dt() (plural 'vars') vs derive_var_trtdurd() (singular 'var') — the difference is:",
+    answer("'vars' functions add multiple related variables at once; 'var' functions add a single variable", correct = TRUE),
+    answer("'vars' is newer than 'var'"),
+    answer("'var' functions are faster"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "derive_param_bmi() belongs to which prefix family?",
+    answer("derive_var_* — adding one variable"),
+    answer("derive_param_* — adding a new parameter row to a BDS dataset", correct = TRUE),
+    answer("compute_* — pure scalar computation"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "compute_age_years() returns:",
+    answer("A dataset with a new AGE column"),
+    answer("A scalar numeric value without modifying a dataset", correct = TRUE),
+    answer("A plot of age distribution"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 3 — `convert_blanks_to_na()`: always your first call
+
+SAS XPT files store missing character values as `""` (empty string), not `NA`. R's `is.na()` returns `FALSE` for empty strings — so downstream derivations silently produce wrong results if you skip this step.
+
+```{r blanks-demo}
+# Demonstrate the problem
+cat("Empty string is.na test:", is.na(""), "\n")
+cat("Proper NA is.na test:    ", is.na(NA), "\n")
+
+# dm_with_blanks has ARM = "" for subject 01-703-1211
+dm_with_blanks |>
+  filter(USUBJID == "01-703-1211") |>
+  select(USUBJID, ARM)
+```
+
+```{r blanks-fix}
+# After convert_blanks_to_na()
+dm_fixed <- convert_blanks_to_na(dm_with_blanks)
+
+dm_fixed |>
+  filter(USUBJID == "01-703-1211") |>
+  select(USUBJID, ARM)
+
+cat("ARM is NA after conversion:", is.na(dm_fixed$ARM[dm_fixed$USUBJID == "01-703-1211"]), "\n")
+```
+
+### Exercise: Convert blanks and verify with is.na
+
+```{r blanks-exercise, exercise=TRUE, exercise.lines=14}
+# Create a dataset with blanks in multiple columns
+test_ds <- tibble(
+  USUBJID = c("S001", "S002", "S003"),
+  ARM     = c("TRT", "", "TRT"),
+  RACE    = c("WHITE", "ASIAN", ""),
+  AGE     = c(45L, NA_integer_, 62L)
+)
+
+# Convert blanks
+test_clean <- convert_blanks_to_na(test_ds)
+
+# Check: how many NAs in ARM before and after?
+cat("NAs in ARM (before):", sum(is.na(test_ds$ARM)), "\n")
+cat("NAs in ARM (after): ", sum(is.na(test_clean$ARM)), "\n")
+cat("NAs in RACE (after):", sum(is.na(test_clean$RACE)), "\n")
+test_clean
+```
+
+---
+
+## 4 — `derive_vars_dt()`: ISO 8601 DTC → numeric Date
+
+The workhorse for converting character SDTM dates to numeric dates suitable for arithmetic.
+
+```{r derive-dt-demo}
+# Pre-process DM to get a numeric date from RFXSTDTC
+dm_dates <- dm |>
+  derive_vars_dt(
+    new_vars_prefix  = "RFXST",
+    dtc              = RFXSTDTC,
+    date_imputation  = "first"
+  )
+
+dm_dates |>
+  select(USUBJID, RFXSTDTC, RFXSTDT, RFXSTDTF) |>
+  mutate(RFXSTDT_human = as.Date(RFXSTDT, origin = "1970-01-01"))
+```
+
+```{r derive-dt-partial}
+# With a partial date — imputation kicks in
+partial_dm <- tibble(
+  USUBJID  = c("S001", "S002"),
+  STARTDTC = c("2014-07", "2014-07-15")   # S001 has no day
+)
+
+partial_dm |>
+  derive_vars_dt(
+    new_vars_prefix = "START",
+    dtc = STARTDTC,
+    date_imputation = "first"
+  ) |>
+  mutate(STARTDT_human = as.Date(STARTDT, origin = "1970-01-01"))
+```
+
+### Exercise: Derive a date with "last" imputation
+
+Impute the same partial date dataset using `date_imputation = "last"`. Subject S001's date should now resolve to the last day of July 2014.
+
+```{r derive-dt-last, exercise=TRUE, exercise.lines=12}
+partial_dm2 <- tibble(
+  USUBJID  = c("S001", "S002"),
+  STARTDTC = c("2014-07", "2014-07-15")
+)
+
+partial_dm2 |>
+  derive_vars_dt(
+    new_vars_prefix = "START",
+    dtc             = STARTDTC,
+    date_imputation = ___
+  ) |>
+  mutate(STARTDT_human = as.Date(STARTDT, origin = "1970-01-01"))
+```
+
+```{r derive-dt-last-hint-1}
+# date_imputation = "last"
+# Expected: S001 → 2014-07-31
+```
+
+```{r derive-dt-last-solution}
+partial_dm2 <- tibble(
+  USUBJID  = c("S001", "S002"),
+  STARTDTC = c("2014-07", "2014-07-15")
+)
+
+partial_dm2 |>
+  derive_vars_dt(
+    new_vars_prefix = "START",
+    dtc             = STARTDTC,
+    date_imputation = "last"
+  ) |>
+  mutate(STARTDT_human = as.Date(STARTDT, origin = "1970-01-01"))
+```
+
+---
+
+## 5 — `derive_vars_dtm()`: DTC → numeric Datetime
+
+For treatment-window calculations you often need datetimes (not just dates), because two records can share a date but have different times of day.
+
+```{r derive-dtm-demo}
+# Pre-process EX with start and end datetimes
+ex_ext <- ex |>
+  derive_vars_dtm(
+    dtc             = EXSTDTC,
+    new_vars_prefix = "EXST",
+    date_imputation = "first",
+    time_imputation = "first"   # impute missing time to 00:00:00
+  ) |>
+  derive_vars_dtm(
+    dtc             = EXENDTC,
+    new_vars_prefix = "EXEN",
+    date_imputation = "last",
+    time_imputation = "last"    # impute missing time to 23:59:59
+  )
+
+ex_ext |>
+  select(USUBJID, EXSTDTC, EXSTDTM, EXSTTMF, EXENDTC, EXENDTM)
+```
+
+```{r dtm-to-dt-demo}
+# Convert datetimes back to dates (strip time component)
+ex_ext2 <- ex_ext |>
+  derive_vars_dtm_to_dt(source_vars = exprs(EXSTDTM, EXENDTM))
+
+ex_ext2 |>
+  select(USUBJID, EXSTDTM, EXSTDT, EXENDTM, EXENDT) |>
+  head(4)
+```
+
+---
+
+## 6 — `derive_vars_dy()`: study day (no Day 0)
+
+CDISC ADaM convention: the day of the reference event is Day 1. The day before is Day -1. There is no Day 0.
+
+```{r study-day-demo}
+# First: derive numeric analysis dates for LB
+lb_dates <- lb |>
+  derive_vars_dt(dtc = LBDTC, new_vars_prefix = "A")
+
+# Then merge TRTSDT onto LB (from dm) and derive ADY
+lb_with_ref <- lb_dates |>
+  left_join(
+    dm |>
+      derive_vars_dt(dtc = RFXSTDTC, new_vars_prefix = "TRTS") |>
+      select(USUBJID, TRTSDT),
+    by = "USUBJID"
+  )
+
+lb_with_day <- lb_with_ref |>
+  derive_vars_dy(
+    reference_date = TRTSDT,
+    source_vars    = exprs(ADT)
+  )
+
+lb_with_day |>
+  mutate(
+    ADT_human    = as.Date(ADT,    origin = "1970-01-01"),
+    TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01")
+  ) |>
+  select(USUBJID, ADT_human, TRTSDT_human, ADY)
+```
+
+### Exercise: Explain the "no Day 0" convention
+
+```{r quiz-study-day, echo=FALSE}
+quiz(
+  question(
+    "A subject's treatment starts on 2014-01-02. An AE occurs on 2014-01-02. What is the study day of the AE?",
+    answer("Day 0"),
+    answer("Day 1 — the reference date itself is always Day 1", correct = TRUE),
+    answer("Day -1"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "An AE occurs one day BEFORE the reference date (2014-01-01, with ref = 2014-01-02). The study day is:",
+    answer("Day 0"),
+    answer("Day -1 — there is no Day 0; the day before Day 1 is Day -1", correct = TRUE),
+    answer("Day -2"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise: Derive study day for an EX dataset
+
+```{r study-day-ex, exercise=TRUE, exercise.lines=18}
+# Add numeric date to EX
+ex_with_dates <- ex |>
+  derive_vars_dt(dtc = EXSTDTC, new_vars_prefix = "A")
+
+# Merge TRTSDT from DM (first exposure date per subject)
+trtsdt_lookup <- dm |>
+  derive_vars_dt(dtc = RFXSTDTC, new_vars_prefix = "TRTS") |>
+  select(USUBJID, TRTSDT)
+
+ex_study_day <- ex_with_dates |>
+  left_join(trtsdt_lookup, by = "USUBJID") |>
+  derive_vars_dy(
+    reference_date = ___,
+    source_vars    = exprs(___)
+  )
+
+ex_study_day |>
+  mutate(ADT_human = as.Date(ADT, origin = "1970-01-01"),
+         TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01")) |>
+  select(USUBJID, EXSTDTC, ADT_human, TRTSDT_human, ADY)
+```
+
+```{r study-day-ex-hint-1}
+# reference_date = TRTSDT
+# source_vars = exprs(ADT)
+```
+
+```{r study-day-ex-solution}
+ex_with_dates <- ex |>
+  derive_vars_dt(dtc = EXSTDTC, new_vars_prefix = "A")
+
+trtsdt_lookup <- dm |>
+  derive_vars_dt(dtc = RFXSTDTC, new_vars_prefix = "TRTS") |>
+  select(USUBJID, TRTSDT)
+
+ex_study_day <- ex_with_dates |>
+  left_join(trtsdt_lookup, by = "USUBJID") |>
+  derive_vars_dy(
+    reference_date = TRTSDT,
+    source_vars    = exprs(ADT)
+  )
+
+ex_study_day |>
+  mutate(ADT_human = as.Date(ADT, origin = "1970-01-01"),
+         TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01")) |>
+  select(USUBJID, EXSTDTC, ADT_human, TRTSDT_human, ADY)
+```
+
+---
+
+## 7 — `derive_vars_merged()`: the most important function
+
+`derive_vars_merged()` is the left-join equivalent with filter, ordering, and first/last selection built in. You'll use it for almost every variable that comes from a non-DM source.
+
+```{r derive-merged-demo}
+# Merge TRTSDT from DM onto a base dataset
+adsl_base <- dm |>
+  mutate(TRT01P = ARM, TRT01A = ACTARM)
+
+ex_dtm <- ex |>
+  derive_vars_dtm(dtc = EXSTDTC, new_vars_prefix = "EXST",
+                  date_imputation = "first", time_imputation = "first") |>
+  derive_vars_dtm(dtc = EXENDTC, new_vars_prefix = "EXEN",
+                  date_imputation = "last",  time_imputation = "last")
+
+# Derive TRTSDTM: first qualifying exposure datetime
+adsl_trt <- adsl_base |>
+  derive_vars_merged(
+    dataset_add = ex_dtm,
+    filter_add  = EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")),
+    new_vars    = exprs(TRTSDTM = EXSTDTM),
+    order       = exprs(EXSTDTM, EXSEQ),
+    mode        = "first",
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_trt |>
+  select(USUBJID, ACTARM, TRTSDTM) |>
+  mutate(TRTSDTM_human = as.POSIXct(TRTSDTM, origin = "1970-01-01", tz = "UTC"))
+```
+
+### Exercise: Derive TRTEDTM (last qualifying exposure end datetime)
+
+Use `mode = "last"` and `EXENDTM` instead of `EXSTDTM`.
+
+```{r derive-merged-end, exercise=TRUE, exercise.lines=18}
+adsl_trte <- adsl_trt |>
+  derive_vars_merged(
+    dataset_add = ex_dtm,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &
+                  !is.na(EXENDTM),
+    new_vars    = exprs(TRTEDTM = ___),
+    order       = exprs(___, EXSEQ),
+    mode        = ___,
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_trte |>
+  select(USUBJID, TRTSDTM, TRTEDTM) |>
+  mutate(
+    TRTS_human = as.POSIXct(TRTSDTM, origin = "1970-01-01", tz = "UTC"),
+    TRTE_human = as.POSIXct(TRTEDTM, origin = "1970-01-01", tz = "UTC")
+  )
+```
+
+```{r derive-merged-end-hint-1}
+# new_vars = exprs(TRTEDTM = EXENDTM)
+# order    = exprs(EXENDTM, EXSEQ)
+# mode     = "last"
+```
+
+```{r derive-merged-end-solution}
+adsl_trte <- adsl_trt |>
+  derive_vars_merged(
+    dataset_add = ex_dtm,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &
+                  !is.na(EXENDTM),
+    new_vars    = exprs(TRTEDTM = EXENDTM),
+    order       = exprs(EXENDTM, EXSEQ),
+    mode        = "last",
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_trte |>
+  select(USUBJID, TRTSDTM, TRTEDTM) |>
+  mutate(
+    TRTS_human = as.POSIXct(TRTSDTM, origin = "1970-01-01", tz = "UTC"),
+    TRTE_human = as.POSIXct(TRTEDTM, origin = "1970-01-01", tz = "UTC")
+  )
+```
+
+---
+
+## 8 — `derive_var_extreme_flag()`: first/last record flags
+
+```{r extreme-flag-demo}
+# Add an analysis date to LB, then flag the baseline (first) record per subject per test
+lb_flagged <- lb |>
+  derive_vars_dt(dtc = LBDTC, new_vars_prefix = "A") |>
+  derive_var_extreme_flag(
+    by_vars  = exprs(STUDYID, USUBJID, LBTESTCD),
+    order    = exprs(ADT),
+    new_var  = ABLFL,
+    mode     = "first"
+  )
+
+lb_flagged |>
+  mutate(ADT_human = as.Date(ADT, origin = "1970-01-01")) |>
+  select(USUBJID, LBTESTCD, ADT_human, ABLFL)
+```
+
+### Exercise: Flag the LAST (most recent) lab record per subject per test
+
+Change `mode` to `"last"` to flag the most recent observation instead.
+
+```{r extreme-flag-last, exercise=TRUE, exercise.lines=14}
+lb_last_flagged <- lb |>
+  derive_vars_dt(dtc = LBDTC, new_vars_prefix = "A") |>
+  derive_var_extreme_flag(
+    by_vars = exprs(STUDYID, USUBJID, LBTESTCD),
+    order   = exprs(ADT),
+    new_var = LAST_FL,
+    mode    = ___
+  )
+
+lb_last_flagged |>
+  mutate(ADT_human = as.Date(ADT, origin = "1970-01-01")) |>
+  select(USUBJID, LBTESTCD, ADT_human, LAST_FL)
+```
+
+```{r extreme-flag-last-hint-1}
+# mode = "last"
+```
+
+```{r extreme-flag-last-solution}
+lb_last_flagged <- lb |>
+  derive_vars_dt(dtc = LBDTC, new_vars_prefix = "A") |>
+  derive_var_extreme_flag(
+    by_vars = exprs(STUDYID, USUBJID, LBTESTCD),
+    order   = exprs(ADT),
+    new_var = LAST_FL,
+    mode    = "last"
+  )
+
+lb_last_flagged |>
+  mutate(ADT_human = as.Date(ADT, origin = "1970-01-01")) |>
+  select(USUBJID, LBTESTCD, ADT_human, LAST_FL)
+```
+
+---
+
+## 9 — `derive_var_merged_exist_flag()`: population flags
+
+Population flags (SAFFL, ITTFL, RANDFL) take the value `"Y"` if a condition is met in another dataset, or `NA` otherwise. Never `"N"` — CDISC ADaM IG specifies this.
+
+```{r exist-flag-demo}
+adsl_for_saffl <- adsl_base |>
+  derive_var_merged_exist_flag(
+    dataset_add = ex,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = SAFFL,
+    condition   = EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))
+  )
+
+adsl_for_saffl |> select(USUBJID, ACTARM, SAFFL)
+```
+
+```{r quiz-flag-convention, echo=FALSE}
+quiz(
+  question(
+    "CDISC ADaM IG specifies that flag variables like SAFFL take values:",
+    answer('"Y" if met, "N" if not'),
+    answer('"Y" if met, NA if not — never use "N"', correct = TRUE),
+    answer("1 if met, 0 if not"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise: Derive ITTFL based on whether RANDDT exists
+
+A subject is in the ITT population if they have a randomization date (RANDDT is not NA). For now, we'll simulate RANDDT from DM:
+
+```{r ittfl-exercise, exercise=TRUE, exercise.lines=16}
+# Create a mock randomization event dataset
+rand_events <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015", "01-701-1023", "01-702-1042", "01-702-1101"),
+  # 01-703-1211 is a screen failure — no randomization
+  RANDDT  = as.Date(c("2014-01-02", "2012-08-05", "2013-07-09", "2013-04-14"))
+)
+
+# Derive ITTFL: "Y" for subjects with a randomization event
+adsl_ittfl <- adsl_base |>
+  derive_var_merged_exist_flag(
+    dataset_add = rand_events,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = ITTFL,
+    condition   = !is.na(___)
+  )
+
+adsl_ittfl |> select(USUBJID, ACTARM, ITTFL)
+```
+
+```{r ittfl-exercise-hint-1}
+# condition = !is.na(RANDDT)
+```
+
+```{r ittfl-exercise-solution}
+rand_events <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015", "01-701-1023", "01-702-1042", "01-702-1101"),
+  RANDDT  = as.Date(c("2014-01-02", "2012-08-05", "2013-07-09", "2013-04-14"))
+)
+
+adsl_ittfl <- adsl_base |>
+  derive_var_merged_exist_flag(
+    dataset_add = rand_events,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = ITTFL,
+    condition   = !is.na(RANDDT)
+  )
+
+adsl_ittfl |> select(USUBJID, ACTARM, ITTFL)
+```
+
+---
+
+## 10 — `call_derivation()`: DRY derivation of multiple variables
+
+When you need to apply the same function multiple times with slightly different arguments, `call_derivation()` keeps the code concise.
+
+```{r call-derivation-demo}
+# Instead of two separate derive_vars_dtm() calls:
+ex_both_dtm <- ex |>
+  call_derivation(
+    derivation = derive_vars_dtm,
+    variable_params = list(
+      params(dtc = EXSTDTC, new_vars_prefix = "EXST"),
+      params(dtc = EXENDTC, new_vars_prefix = "EXEN", time_imputation = "last")
+    ),
+    date_imputation = "first"   # shared arg
+  )
+
+ex_both_dtm |>
+  select(USUBJID, EXSTDTC, EXSTDTM, EXENDTC, EXENDTM) |>
+  head(3)
+```
+
+---
+
+## 11 — Key takeaways
+
+```{r quiz-final-14, echo=FALSE}
+quiz(
+  question(
+    "You need to get 'the most recent non-missing lab date from LB for each subject'. Which function?",
+    answer("derive_vars_merged() with mode = 'last'", correct = TRUE),
+    answer("derive_param_*()",
+           message = "derive_param_* adds new parameter rows, not date columns"),
+    answer("derive_vars_dy()"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A subject's RFXSTDTC is '2014-01'. With date_imputation = 'first', TRTSDT resolves to:",
+    answer("2014-01-01", correct = TRUE),
+    answer("2014-01-31"),
+    answer("NA — partial dates aren't supported"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The exprs() function is used in admiral because:",
+    answer("It's faster than character strings"),
+    answer("It passes variable names as unquoted tidy-evaluation expressions, consistent with dplyr style", correct = TRUE),
+    answer("It encrypts variable names for security"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "derive_vars_merged() vs derive_vars_joined() — when should you prefer the former?",
+    answer("When the filter condition uses only variables from the source dataset", correct = TRUE),
+    answer("When the filter involves comparing dates from both datasets"),
+    answer("Always — derive_vars_joined() is deprecated"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## What's next
+
+Lesson 15 — **`{admiral}` Part 2** — builds a full ADSL end-to-end using everything in this lesson. You'll see treatment dates, treatment duration, disposition dates, cause of death (multi-source), last known alive date, population flags, and age groups — all from the pharmaverse SDTM datasets. Every admiral function you've practiced here gets used in a real derivation context.

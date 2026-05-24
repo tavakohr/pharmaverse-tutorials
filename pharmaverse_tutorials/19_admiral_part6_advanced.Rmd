@@ -1,0 +1,906 @@
+---
+title: "Lesson 19 — admiral Part 6: Advanced Derivation Patterns"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── shared mocks ─────────────────────────────────────────────────────────────
+exprs <- function(...) { dots <- as.list(substitute(list(...)))[-1]; dots }
+params <- function(...) list(...)
+
+.impute_dtc <- function(dtc, date_imputation = "first") {
+  sapply(dtc, function(d) {
+    if (is.na(d)) return(NA_character_)
+    if (nchar(d) == 4) paste0(d, if(date_imputation=="last") "-12-31" else "-01-01")
+    else if (nchar(d) == 7) {
+      if (date_imputation == "last") {
+        yr <- as.integer(substr(d,1,4)); mo <- as.integer(substr(d,6,7))
+        nxt <- if(mo==12) paste0(yr+1,"-01-01") else paste0(yr,"-",sprintf("%02d",mo+1),"-01")
+        as.character(as.Date(nxt)-1)
+      } else paste0(d,"-01")
+    } else d
+  })
+}
+
+convert_blanks_to_na <- function(dataset) {
+  dataset |> mutate(across(where(is.character), ~ifelse(.=="", NA_character_, .)))
+}
+
+derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars=NULL, ...) {
+  by_nm <- sapply(by_vars, deparse)
+  jdf   <- dataset_add
+  if (!is.null(new_vars)) {
+    old <- sapply(new_vars, function(x) { d<-deparse(x); if(grepl("=",d)) trimws(strsplit(d,"=")[[1]][2]) else d })
+    new <- sapply(new_vars, function(x) { d<-deparse(x); if(grepl("=",d)) trimws(strsplit(d,"=")[[1]][1]) else d })
+    keep <- intersect(c(by_nm, old), names(jdf)); jdf <- jdf |> select(all_of(keep))
+    for (i in seq_along(old)) if(old[i]!=new[i] && old[i] %in% names(jdf)) jdf <- rename(jdf, !!new[i] := !!old[i])
+  }
+  left_join(dataset, jdf, by = intersect(by_nm, names(jdf)))
+}
+
+derive_vars_dt <- function(dataset, dtc, new_vars_prefix,
+                            date_imputation="none", highest_imputation="n",
+                            flag_imputation="auto", ...) {
+  dtc_nm <- deparse(substitute(dtc))
+  imp    <- if (date_imputation %in% c("none","") && highest_imputation=="n") "none"
+            else if (date_imputation=="last") "last" else "first"
+  raw    <- if (dtc_nm %in% names(dataset)) dataset[[dtc_nm]] else rep(NA_character_, nrow(dataset))
+  imp_d  <- if (imp=="none") raw else .impute_dtc(raw, imp)
+  dataset[[paste0(new_vars_prefix,"DT")]] <- suppressWarnings(as.numeric(as.Date(imp_d)))
+  dataset
+}
+
+derive_vars_dy <- function(dataset, reference_date, source_vars) {
+  ref <- deparse(substitute(reference_date))
+  for (sv in sapply(source_vars, deparse)) {
+    dy <- sub("DT$","DY",sv)
+    if (sv %in% names(dataset) && ref %in% names(dataset)) {
+      v <- dataset[[sv]]; r <- dataset[[ref]]
+      dataset[[dy]] <- ifelse(is.na(v)|is.na(r), NA_real_,
+        ifelse(v>=r, as.numeric(v-r)+1, as.numeric(v-r)))
+    }
+  }
+  dataset
+}
+
+derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode="first") {
+  new_nm  <- deparse(substitute(new_var))
+  by_nm   <- sapply(by_vars, deparse)
+  ord_nms <- sapply(order, function(x) gsub("desc\\(|\\)","",deparse(x)))
+  desc_fl <- sapply(order, function(x) grepl("^desc\\(",deparse(x)))
+  odf <- dataset
+  for (i in rev(seq_along(ord_nms))) if(ord_nms[i] %in% names(odf))
+    odf <- if(desc_fl[i]) arrange(odf, desc(.data[[ord_nms[i]]])) else arrange(odf, .data[[ord_nms[i]]])
+  byp <- intersect(by_nm, names(odf))
+  if (mode=="first")
+    fl <- odf |> group_by(across(all_of(byp))) |> slice(1) |> ungroup() |>
+          mutate(!!new_nm := "Y") |> select(all_of(c(byp, new_nm)))
+  else
+    fl <- odf |> group_by(across(all_of(byp))) |> slice(n()) |> ungroup() |>
+          mutate(!!new_nm := "Y") |> select(all_of(c(byp, new_nm)))
+  if (new_nm %in% names(dataset)) dataset[[new_nm]] <- NULL
+  left_join(dataset, fl, by = intersect(names(fl), names(dataset)))
+}
+
+restrict_derivation <- function(dataset, derivation, args=list(), filter=NULL) {
+  fe <- substitute(filter)
+  in_rows <- if(!is.null(fe)) tryCatch(which(eval(fe, dataset, parent.frame())), error=function(e) seq_len(nrow(dataset)))
+             else seq_len(nrow(dataset))
+  out_rows <- setdiff(seq_len(nrow(dataset)), in_rows)
+  sub      <- dataset[in_rows,, drop=FALSE]
+  derived  <- tryCatch(do.call(derivation, c(list(dataset=sub), args)), error=function(e) sub)
+  bind_rows(derived, dataset[out_rows,, drop=FALSE])
+}
+
+derivation_slice <- function(filter=NULL, args=list()) list(filter=substitute(filter), args=args)
+
+slice_derivation <- function(dataset, derivation, args=list(), ...) {
+  slices  <- list(...)
+  result  <- dataset
+  covered <- integer(0)
+  for (sl in slices) {
+    fe  <- sl$filter
+    idx <- if(!is.null(fe)) tryCatch(which(eval(fe, result, parent.frame())), error=function(e) integer(0))
+           else seq_len(nrow(result))
+    idx <- setdiff(idx, covered)
+    if (!length(idx)) next
+    merged_args <- modifyList(args, sl$args)
+    sub <- result[idx,, drop=FALSE]
+    drv <- tryCatch(do.call(derivation, c(list(dataset=sub), merged_args)), error=function(e) sub)
+    result[idx, names(drv)] <- drv[seq_len(length(idx)), names(drv)]
+    covered <- c(covered, idx)
+  }
+  result
+}
+
+derive_vars_joined <- function(dataset, dataset_add, by_vars, order,
+                                new_vars=NULL, join_vars=NULL,
+                                filter_join=NULL, mode="first", join_type="all", ...) {
+  by_nm <- sapply(by_vars, deparse)
+  fj    <- substitute(filter_join)
+  mrgd  <- left_join(dataset, dataset_add, by=intersect(by_nm, names(dataset_add)), suffix=c("",".add"))
+  if (!is.null(fj)) mrgd <- tryCatch(filter(mrgd, !!fj), error=function(e) mrgd)
+  if (!is.null(new_vars)) {
+    old <- sapply(new_vars, function(x) { d<-deparse(x); if(grepl("=",d)) trimws(strsplit(d,"=")[[1]][2]) else d })
+    new <- sapply(new_vars, function(x) { d<-deparse(x); if(grepl("=",d)) trimws(strsplit(d,"=")[[1]][1]) else d })
+    for (i in seq_along(old)) if(old[i] %in% names(mrgd)) mrgd <- rename(mrgd, !!new[i] := !!old[i])
+  }
+  ord_nms <- sapply(order, function(x) gsub("desc\\(|\\)","",deparse(x)))
+  desc_fl <- sapply(order, function(x) grepl("^desc\\(",deparse(x)))
+  for (i in rev(seq_along(ord_nms))) if(ord_nms[i] %in% names(mrgd))
+    mrgd <- if(desc_fl[i]) arrange(mrgd, desc(.data[[ord_nms[i]]])) else arrange(mrgd, .data[[ord_nms[i]]])
+  byp <- intersect(by_nm, names(mrgd))
+  mrgd <- if(mode=="first") mrgd |> group_by(across(all_of(byp))) |> slice(1) |> ungroup()
+          else mrgd |> group_by(across(all_of(byp))) |> slice(n()) |> ungroup()
+  new_cols <- if(!is.null(new_vars)) sapply(new_vars, function(x){d<-deparse(x); if(grepl("=",d)) trimws(strsplit(d,"=")[[1]][1]) else d})
+              else setdiff(names(mrgd), c(byp, names(dataset)))
+  extra <- mrgd |> select(all_of(c(byp, intersect(new_cols, names(mrgd)))))
+  for (nm in intersect(new_cols, names(dataset))) dataset[[nm]] <- NULL
+  left_join(dataset, extra, by=byp)
+}
+
+# ── Advanced pattern mocks ────────────────────────────────────────────────────
+create_period_dataset <- function(dataset, new_vars = list()) {
+  # pivot APxxSDT/APxxEDT to long format
+  nms <- names(dataset)
+  sdt_cols <- sort(grep("^AP[0-9]+SDT$", nms, value=TRUE))
+  edt_cols <- sort(grep("^AP[0-9]+EDT$", nms, value=TRUE))
+  if (!length(sdt_cols)) return(dataset)
+  periods <- as.integer(sub("^AP([0-9]+)SDT$","\\1", sdt_cols))
+  rows <- lapply(seq_along(periods), function(i) {
+    p <- periods[i]
+    dataset |>
+      select(any_of(c("STUDYID","USUBJID"))) |>
+      mutate(
+        APERIOD  = p,
+        APERSDT  = dataset[[sdt_cols[i]]],
+        APEREDT  = dataset[[edt_cols[i]]]
+      )
+  })
+  bind_rows(rows) |> filter(!is.na(APERSDT))
+}
+
+derive_expected_records <- function(dataset, dataset_ref, by_vars,
+                                     set_values_to = list()) {
+  by_nm  <- sapply(by_vars, deparse)
+  subj_vars <- intersect(c("STUDYID","USUBJID"), by_nm)
+  param_vars <- setdiff(by_nm, subj_vars)
+  # cartesian of subjects × parameter/visit combos
+  if (length(param_vars) && all(param_vars %in% names(dataset))) {
+    combos <- dataset |>
+      select(all_of(param_vars)) |> distinct()
+  } else {
+    combos <- tibble(.rows = 1)
+  }
+  if (length(subj_vars)) {
+    subj_df <- dataset_ref |> select(all_of(intersect(subj_vars, names(dataset_ref))))
+    full_grid <- cross_join(subj_df, combos)
+  } else {
+    full_grid <- combos
+  }
+  missing <- anti_join(full_grid, dataset, by = intersect(names(full_grid), names(dataset)))
+  for (nm in names(set_values_to)) {
+    val <- tryCatch(eval(set_values_to[[nm]]), error=function(e) as.character(set_values_to[[nm]]))
+    missing[[nm]] <- val
+  }
+  bind_rows(dataset, missing)
+}
+
+derive_locf_records <- function(dataset, dataset_ref = NULL, by_vars, order,
+                                 keep_vars = NULL) {
+  by_nm  <- sapply(by_vars, deparse)
+  ord_nms <- sapply(order, function(x) gsub("desc\\(|\\)","",deparse(x)))
+  kv_nms  <- if (!is.null(keep_vars)) sapply(keep_vars, deparse) else character(0)
+  by_present <- intersect(by_nm, names(dataset))
+  ord_present <- intersect(ord_nms, names(dataset))
+  dataset |>
+    arrange(across(all_of(c(by_present, ord_present)))) |>
+    group_by(across(all_of(by_present))) |>
+    mutate(across(all_of(intersect(kv_nms, names(dataset))),
+                  ~ifelse(is.na(.) & any(!is.na(.)), zoo::na.locf(., na.rm=FALSE), .))) |>
+    ungroup()
+}
+
+derive_extreme_event <- function(dataset, by_vars, events, new_vars, mode="first", order=NULL) {
+  new_nm <- sapply(new_vars, deparse)
+  by_nm  <- sapply(by_vars, deparse)
+  by_p   <- intersect(by_nm, names(dataset))
+  result <- dataset
+  for (nm in new_nm) result[[nm]] <- NA_character_
+  for (ev in events) {
+    fe <- ev$condition
+    idx <- tryCatch(which(eval(fe, result, parent.frame())), error=function(e) integer(0))
+    if (!length(idx)) next
+    for (nm in names(ev$set_values_to)) {
+      val <- tryCatch(eval(ev$set_values_to[[nm]]),
+                      error=function(e) as.character(ev$set_values_to[[nm]]))
+      already_set <- if (!is.null(result[[nm]])) !is.na(result[[nm]]) else rep(FALSE, nrow(result))
+      result[[nm]][idx[!already_set[idx]]] <- val
+    }
+  }
+  result
+}
+
+event <- function(condition, set_values_to) {
+  list(condition=substitute(condition), set_values_to=set_values_to)
+}
+
+# admiral options
+.admiral_opts <- new.env(parent=emptyenv())
+.admiral_opts$subject_keys <- exprs(STUDYID, USUBJID)
+
+get_admiral_option <- function(option) {
+  .admiral_opts[[option]]
+}
+set_admiral_options <- function(...) {
+  opts <- list(...)
+  for (nm in names(opts)) .admiral_opts[[nm]] <- opts[[nm]]
+  invisible(NULL)
+}
+
+# metatools mocks (for metacore integration demo)
+apply_variable_labels <- function(dataset, metacore_obj) {
+  if (!is.null(metacore_obj$var_spec)) {
+    lbl_map <- setNames(metacore_obj$var_spec$label, metacore_obj$var_spec$variable)
+    for (v in intersect(names(lbl_map), names(dataset))) {
+      attr(dataset[[v]], "label") <- lbl_map[v]
+    }
+  }
+  dataset
+}
+
+check_variables <- function(dataset, metacore_obj) {
+  if (!is.null(metacore_obj$ds_vars)) {
+    expected <- metacore_obj$ds_vars$variable
+    missing  <- setdiff(expected, names(dataset))
+    extra    <- setdiff(names(dataset), expected)
+    if (length(missing)) warning("Missing variables: ", paste(missing, collapse=", "))
+    if (length(extra))   message("Extra variables (not in spec): ", paste(extra, collapse=", "))
+  }
+  invisible(NULL)
+}
+
+check_ct_data  <- function(dataset, metacore_obj) invisible(NULL)
+check_unique_keys <- function(dataset, metacore_obj, key_vars=NULL) invisible(NULL)
+build_from_derived <- function(metacore_obj, ds_list, predecessor_only=FALSE, keep=FALSE) {
+  bind_rows(ds_list)
+}
+
+# ── Sample datasets ───────────────────────────────────────────────────────────
+adsl_adv <- tribble(
+  ~STUDYID, ~USUBJID, ~TRTSDT, ~TRTEDT, ~TRT01A,
+  ~AP01SDT, ~AP01EDT, ~AP02SDT, ~AP02EDT, ~SAFFL,
+  "STUDY1","01-001", 19367, 19548, "TrtA",  19367, 19456, 19457, 19548, "Y",
+  "STUDY1","01-002", 19370, 19551, "TrtB",  19370, 19459, 19460, 19551, "Y",
+  "STUDY1","01-003", 19375, 19540, "TrtA",  19375, 19464, 19465, 19540, "Y"
+)
+
+adae_adv <- tribble(
+  ~STUDYID, ~USUBJID, ~AESEQ, ~AETERM,       ~ASTDT,  ~TRTEMFL, ~AESOC,
+  ~AETOXGR, ~AESER, ~TRTSDT,
+  "STUDY1","01-001", 1, "HEADACHE",     19400,  "Y", "Nervous system disorders", 1, "N", 19367,
+  "STUDY1","01-001", 2, "SEVERE RASH",  19480,  "Y", "Skin disorders",           4, "Y", 19367,
+  "STUDY1","01-002", 1, "NAUSEA",       19390,  "Y", "GI disorders",             2, "N", 19370,
+  "STUDY1","01-003", 1, "FATIGUE",      19400,  "Y", "General disorders",        1, "N", 19375
+)
+
+advs_adv <- tribble(
+  ~STUDYID, ~USUBJID, ~PARAMCD, ~AVISIT,  ~AVISITN, ~ADT,  ~AVAL, ~TRTSDT,
+  "STUDY1","01-001","SYSBP","Baseline",  0, 19365, 120, 19367,
+  "STUDY1","01-001","SYSBP","Week 4",    4, 19395, 125, 19367,
+  "STUDY1","01-001","SYSBP","Week 8",    8, 19423,  NA, 19367,
+  "STUDY1","01-002","SYSBP","Baseline",  0, 19368, 145, 19370,
+  "STUDY1","01-002","SYSBP","Week 4",    4, 19398, 138, 19370,
+  "STUDY1","01-002","SYSBP","Week 8",    8, 19426, 141, 19370,
+  "STUDY1","01-003","SYSBP","Baseline",  0, 19373, 132, 19375,
+  "STUDY1","01-003","SYSBP","Week 4",    4, 19403, 129, 19375
+)
+
+mc <- list(
+  ds_vars  = tibble(dataset="ADAE", variable=c("STUDYID","USUBJID","AESEQ","AETERM","ASTDT","TRTEMFL","AESOC","AETOXGR","AESER","TRTSDT","ASEV","AREL")),
+  var_spec = tibble(variable=c("STUDYID","USUBJID","AESEQ","AETERM","ASTDT","TRTEMFL"),
+                    label   =c("Study ID","Unique Subject ID","Seq Num","AE Term","Analysis Start Date","TE Flag"))
+)
+class(mc) <- c("Metacore","list")
+```
+
+## Welcome
+
+This lesson covers **advanced admiral patterns**: period datasets for crossover studies, expected-record insertion, LOCF imputation, `derive_extreme_event()`, `restrict_derivation()` + `slice_derivation()` combinations, metacore integration, custom function authoring, and package-level options.
+
+---
+
+## 1 — Period datasets
+
+```{r period-demo}
+# adsl_adv has AP01SDT, AP01EDT, AP02SDT, AP02EDT
+adsl_adv |> select(USUBJID, AP01SDT, AP01EDT, AP02SDT, AP02EDT)
+```
+
+```{r create-periods-demo}
+# Pivot to long format: one row per (USUBJID × APERIOD)
+adperiods <- create_period_dataset(
+  dataset  = adsl_adv,
+  new_vars = exprs(APERSDT = APxxSDT, APEREDT = APxxEDT)
+)
+
+adperiods
+```
+
+```{r period-ae-demo}
+# Assign APERIOD to each AE based on AE start date falling in period window
+adae_periods <- adae_adv |>
+  derive_vars_joined(
+    dataset_add = adperiods,
+    by_vars     = exprs(USUBJID),
+    order       = exprs(APERSDT),
+    filter_join = ASTDT >= APERSDT & ASTDT <= APEREDT,
+    mode        = "first"
+  )
+
+adae_periods |> select(USUBJID, AETERM, ASTDT, APERIOD, APERSDT, APEREDT)
+```
+
+```{r quiz-periods, echo=FALSE}
+quiz(
+  question(
+    "When would you use `create_period_dataset()`?",
+    answer("Whenever the study has repeated measures"),
+    answer("For crossover or extension studies where each subject passes through multiple distinct treatment periods", correct = TRUE),
+    answer("When ADSL has more than one row per subject"),
+    answer("To expand EX records per dose day"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Why use `derive_vars_joined()` rather than `derive_vars_merged()` to assign APERIOD to events?",
+    answer("derive_vars_joined() is faster"),
+    answer("filter_join can reference ASTDT (from adae) and APERSDT/APEREDT (from adperiods) — both datasets' variables", correct = TRUE),
+    answer("derive_vars_merged() can't handle periods"),
+    answer("derive_vars_joined() handles multiple by_vars"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r period-flag-ex, exercise=TRUE, exercise.lines=18}
+# Exercise: derive AOCCPRFL = first treatment-emergent AE per (USUBJID × APERIOD)
+# using restrict_derivation + derive_var_extreme_flag on adae_periods
+
+adae_pfl <- adae_periods |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, ___),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCPRFL,
+      mode    = "first"
+    ),
+    filter = TRTEMFL == "Y" & !is.na(APERIOD)
+  )
+
+adae_pfl |> filter(!is.na(AOCCPRFL)) |>
+  select(USUBJID, AETERM, APERIOD, AOCCPRFL)
+```
+
+```{r period-flag-ex-hint-1}
+# by_vars needs to group by both USUBJID and APERIOD → exprs(STUDYID, USUBJID, APERIOD)
+```
+
+```{r period-flag-ex-solution}
+adae_pfl <- adae_periods |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, APERIOD),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCPRFL,
+      mode    = "first"
+    ),
+    filter = TRTEMFL == "Y" & !is.na(APERIOD)
+  )
+
+adae_pfl |> filter(!is.na(AOCCPRFL)) |>
+  select(USUBJID, AETERM, APERIOD, AOCCPRFL)
+```
+
+---
+
+## 2 — Expected records: derive_expected_records()
+
+```{r expected-demo}
+# advs_adv has a missing Week 8 row for 01-003
+advs_adv |> select(USUBJID, PARAMCD, AVISIT, AVISITN, AVAL)
+```
+
+```{r insert-expected-demo}
+# Insert expected-but-missing rows for each (USUBJID × PARAMCD × AVISIT)
+ref_pop <- adsl_adv |> filter(SAFFL == "Y") |> select(STUDYID, USUBJID)
+
+advs_exp <- advs_adv |>
+  derive_expected_records(
+    dataset_ref   = ref_pop,
+    by_vars       = exprs(STUDYID, USUBJID, PARAMCD, AVISITN, AVISIT),
+    set_values_to = exprs(DTYPE = "EXPECTED")
+  )
+
+advs_exp |>
+  filter(PARAMCD == "SYSBP") |>
+  select(USUBJID, AVISIT, AVISITN, AVAL, DTYPE) |>
+  arrange(USUBJID, AVISITN)
+```
+
+```{r quiz-expected, echo=FALSE}
+quiz(
+  question(
+    "What does `derive_expected_records()` do that simply filtering can't?",
+    answer("It removes rows with missing AVAL"),
+    answer("It inserts placeholder rows for expected (subject × visit × parameter) combinations that are absent from the data", correct = TRUE),
+    answer("It merges ADSL variables"),
+    answer("It computes AVAL from adjacent visits"),
+    allow_retry = TRUE
+  ),
+  question(
+    "DTYPE = 'EXPECTED' on an inserted row allows downstream analyses to:",
+    answer("Exclude the row automatically"),
+    answer("Include or exclude the row depending on SAP rules — it serves as a distinguishing flag", correct = TRUE),
+    answer("Compute LOCF for that row"),
+    answer("Flag a data quality issue"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r expected-ex, exercise=TRUE, exercise.lines=16}
+# Exercise: count how many EXPECTED rows were inserted (DTYPE == "EXPECTED")
+# compared to the total rows in advs_exp
+
+ref_pop <- adsl_adv |> filter(SAFFL == "Y") |> select(STUDYID, USUBJID)
+
+advs_exp2 <- advs_adv |>
+  derive_expected_records(
+    dataset_ref   = ref_pop,
+    by_vars       = exprs(STUDYID, USUBJID, PARAMCD, AVISITN, AVISIT),
+    set_values_to = exprs(DTYPE = "EXPECTED")
+  )
+
+list(
+  total_rows    = nrow(advs_exp2),
+  expected_rows = sum(advs_exp2$DTYPE == "EXPECTED", na.rm = TRUE),
+  original_rows = nrow(advs_adv)
+)
+```
+
+```{r expected-ex-hint-1}
+# No changes needed — just run it to see the counts
+```
+
+```{r expected-ex-solution}
+ref_pop <- adsl_adv |> filter(SAFFL == "Y") |> select(STUDYID, USUBJID)
+
+advs_exp2 <- advs_adv |>
+  derive_expected_records(
+    dataset_ref   = ref_pop,
+    by_vars       = exprs(STUDYID, USUBJID, PARAMCD, AVISITN, AVISIT),
+    set_values_to = exprs(DTYPE = "EXPECTED")
+  )
+
+list(
+  total_rows    = nrow(advs_exp2),
+  expected_rows = sum(advs_exp2$DTYPE == "EXPECTED", na.rm = TRUE),
+  original_rows = nrow(advs_adv)
+)
+```
+
+---
+
+## 3 — LOCF imputation
+
+```{r locf-demo}
+# advs_adv has NA AVAL at Week 8 for 01-001
+advs_adv |> select(USUBJID, AVISITN, AVAL)
+```
+
+```{r locf-run-demo}
+# LOCF: carry last non-NA AVAL forward for each (USUBJID × PARAMCD)
+# Note: requires zoo package (installed) — mock uses simpler logic for exercises
+advs_locf <- advs_adv |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    AVAL_LOCF = ifelse(is.na(AVAL),
+                       dplyr::lag(AVAL[!is.na(AVAL)], default=NA),
+                       AVAL),
+    DTYPE     = ifelse(is.na(AVAL) & !is.na(lag(AVAL)), "LOCF", DTYPE %||% NA_character_)
+  ) |>
+  ungroup()
+
+advs_locf |>
+  filter(USUBJID == "01-001") |>
+  select(USUBJID, AVISIT, AVAL, AVAL_LOCF, DTYPE)
+```
+
+```{r quiz-locf, echo=FALSE}
+quiz(
+  question(
+    "DTYPE = 'LOCF' on an imputed row allows downstream analyses to:",
+    answer("Remove the row"),
+    answer("Include it in primary analysis and exclude it in sensitivity, or vice versa — the flag makes it distinguishable", correct = TRUE),
+    answer("Automatically compute CHG from BASE"),
+    answer("Flag a regulatory issue"),
+    allow_retry = TRUE
+  ),
+  question(
+    "LOCF is considered:",
+    answer("The gold-standard imputation method"),
+    answer("A simple imputation method — older protocols use it; modern guidance prefers more sophisticated approaches", correct = TRUE),
+    answer("Mandatory per CDISC"),
+    answer("Equivalent to multiple imputation"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 4 — derive_extreme_event(): priority-based worst-event
+
+```{r extreme-event-demo}
+# Flag the worst AE per subject using priority-ordered conditions
+# Grade 5 > Grade 4 > Serious
+
+adae_worst <- adae_adv |>
+  derive_extreme_event(
+    by_vars  = exprs(STUDYID, USUBJID),
+    events   = list(
+      event(
+        condition     = AETOXGR >= 4,
+        set_values_to = exprs(AOWORSEN = "SEVERE")
+      ),
+      event(
+        condition     = AESER == "Y",
+        set_values_to = exprs(AOWORSEN = "SERIOUS")
+      ),
+      event(
+        condition     = AETOXGR >= 2,
+        set_values_to = exprs(AOWORSEN = "MODERATE")
+      )
+    ),
+    new_vars = exprs(AOWORSEN),
+    mode     = "first",
+    order    = exprs(ASTDT)
+  )
+
+adae_worst |> select(USUBJID, AETERM, AETOXGR, AESER, AOWORSEN)
+```
+
+```{r quiz-extreme-event, echo=FALSE}
+quiz(
+  question(
+    "How does `derive_extreme_event()` differ from `derive_var_extreme_flag()`?",
+    answer("derive_extreme_event() creates new rows"),
+    answer("derive_extreme_event() applies priority-ordered condition checks rather than simply sorting to find first/last", correct = TRUE),
+    answer("derive_var_extreme_flag() cannot handle multiple parameters"),
+    answer("They are identical"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r extreme-event-ex, exercise=TRUE, exercise.lines=22}
+# Exercise: use derive_extreme_event to create WORSTCAT:
+# priority 1: AETOXGR >= 3 → "HIGH GRADE"
+# priority 2: AESER == "Y" → "SERIOUS"
+# priority 3: AETOXGR >= 1 → "ANY GRADE"
+
+adae_wc <- adae_adv |>
+  derive_extreme_event(
+    by_vars  = exprs(STUDYID, USUBJID),
+    events   = list(
+      event(condition = ___ >= 3,   set_values_to = exprs(WORSTCAT = "HIGH GRADE")),
+      event(condition = ___ == "Y", set_values_to = exprs(WORSTCAT = "SERIOUS")),
+      event(condition = ___ >= 1,   set_values_to = exprs(WORSTCAT = "ANY GRADE"))
+    ),
+    new_vars = exprs(WORSTCAT),
+    mode     = "first",
+    order    = exprs(ASTDT)
+  )
+
+adae_wc |> select(USUBJID, AETERM, AETOXGR, AESER, WORSTCAT)
+```
+
+```{r extreme-event-ex-hint-1}
+# condition arguments: AETOXGR >= 3, AESER == "Y", AETOXGR >= 1
+```
+
+```{r extreme-event-ex-solution}
+adae_wc <- adae_adv |>
+  derive_extreme_event(
+    by_vars  = exprs(STUDYID, USUBJID),
+    events   = list(
+      event(condition = AETOXGR >= 3,   set_values_to = exprs(WORSTCAT = "HIGH GRADE")),
+      event(condition = AESER == "Y",   set_values_to = exprs(WORSTCAT = "SERIOUS")),
+      event(condition = AETOXGR >= 1,   set_values_to = exprs(WORSTCAT = "ANY GRADE"))
+    ),
+    new_vars = exprs(WORSTCAT),
+    mode     = "first",
+    order    = exprs(ASTDT)
+  )
+
+adae_wc |> select(USUBJID, AETERM, AETOXGR, AESER, WORSTCAT)
+```
+
+---
+
+## 5 — slice_derivation + restrict_derivation combined
+
+```{r combined-demo}
+# Different ABLFL baseline rules per parameter family
+# Slice 1: SYSBP — last pre-treatment row, ordered by ADT
+# (height would use a different rule, shown conceptually)
+advs_bl <- advs_adv |>
+  slice_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      new_var = ABLFL,
+      mode    = "last"
+    ),
+    derivation_slice(
+      filter = PARAMCD == "SYSBP" & !is.na(AVAL) & ADT <= TRTSDT,
+      args   = params(order = exprs(ADT, AVISITN))
+    )
+  )
+
+advs_bl |> select(USUBJID, PARAMCD, AVISIT, AVAL, ABLFL)
+```
+
+```{r quiz-combined, echo=FALSE}
+quiz(
+  question(
+    "Why would you use `slice_derivation()` with multiple slices over calling `restrict_derivation()` twice?",
+    answer("slice_derivation() is always faster"),
+    answer("slice_derivation() ensures each row is processed by at most one slice — no double derivation, and each slice can have different arguments", correct = TRUE),
+    answer("slice_derivation() doesn't require a filter"),
+    answer("restrict_derivation() cannot take mode arguments"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 6 — Admiral options and metacore integration
+
+```{r admiral-options-demo}
+# Get the default subject keys
+get_admiral_option("subject_keys")
+```
+
+```{r set-options-demo}
+# Override subject keys for this project
+set_admiral_options(subject_keys = exprs(STUDYID, USUBJID))
+
+# Now use it
+by_subj <- get_admiral_option("subject_keys")
+by_subj
+```
+
+```{r metacore-integration-demo}
+# Pattern: metacore + admiral + metatools together
+# mc is a simplified Metacore object pre-built in setup
+
+# Step 1: build base from derived datasets
+adae_base <- build_from_derived(mc, ds_list = list("ae" = adae_adv),
+                                 predecessor_only = FALSE)
+
+# Step 2: admiral pipeline
+adae_integrated <- adae_base |>
+  mutate(ASEV = AETOXGR, AREL = AESER)
+
+# Step 3: apply spec labels and check conformance
+adae_labeled <- adae_integrated |>
+  apply_variable_labels(mc)
+
+# Step 4: check conformance (warnings for missing/extra vars)
+check_variables(adae_labeled, mc)
+
+cat("Integration pattern complete. Columns:", paste(names(adae_labeled), collapse=", "))
+```
+
+```{r quiz-metacore, echo=FALSE}
+quiz(
+  question(
+    "What does `set_admiral_options(subject_keys = ...)` accomplish project-wide?",
+    answer("Renames STUDYID everywhere"),
+    answer("Sets a default so all admiral functions use the configured identifier columns — no need to pass by_vars manually every time", correct = TRUE),
+    answer("Creates new variables STUDYID and USUBJID"),
+    answer("Merges ADSL into every derivation"),
+    allow_retry = TRUE
+  ),
+  question(
+    "In the metacore + metatools + admiral architecture, which package is the derivation engine?",
+    answer("metacore"),
+    answer("metatools"),
+    answer("admiral", correct = TRUE),
+    answer("xportr"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 7 — Custom extension functions
+
+```{r custom-function-demo}
+# Writing sponsor-specific helpers in admiral style
+# Convention: derive_var_* for single new variable; derive_vars_* for multiple
+
+derive_var_serafl <- function(dataset,
+                               by_vars,
+                               filter,
+                               new_var,
+                               mode = "first") {
+  # Mock of an assert check (in real code, use admiraldev::assert_data_frame)
+  stopifnot(is.data.frame(dataset))
+  new_nm <- deparse(substitute(new_var))
+  fe     <- substitute(filter)
+
+  dataset |>
+    restrict_derivation(
+      derivation = derive_var_extreme_flag,
+      args = params(
+        by_vars = by_vars,
+        order   = exprs(ASTDT, AESEQ),
+        new_var = !!as.name(new_nm),
+        mode    = mode
+      ),
+      filter = !!fe
+    )
+}
+
+# Use the custom function
+adae_adv |>
+  derive_var_serafl(
+    by_vars = exprs(STUDYID, USUBJID),
+    filter  = AESER == "Y" & TRTEMFL == "Y",
+    new_var = SERAFL
+  ) |>
+  filter(!is.na(SERAFL)) |>
+  select(USUBJID, AETERM, AESER, SERAFL)
+```
+
+```{r custom-function-ex, exercise=TRUE, exercise.lines=24}
+# Exercise: write a custom function `derive_var_rel3fl` that flags the first
+# treatment-emergent AE with AETOXGR >= 3 per subject as "Y".
+# It should accept: dataset, by_vars, new_var
+# and internally call restrict_derivation + derive_var_extreme_flag
+
+derive_var_rel3fl <- function(dataset, by_vars, new_var) {
+  new_nm <- deparse(substitute(new_var))
+  dataset |>
+    restrict_derivation(
+      derivation = derive_var_extreme_flag,
+      args = params(
+        by_vars = by_vars,
+        order   = exprs(ASTDT, AESEQ),
+        new_var = !!as.name(new_nm),
+        mode    = "first"
+      ),
+      filter = TRTEMFL == "Y" & AETOXGR >= ___
+    )
+}
+
+adae_adv |>
+  derive_var_rel3fl(
+    by_vars = exprs(STUDYID, USUBJID),
+    new_var = G3FL
+  ) |>
+  filter(!is.na(G3FL)) |>
+  select(USUBJID, AETERM, AETOXGR, G3FL)
+```
+
+```{r custom-function-ex-hint-1}
+# filter uses AETOXGR >= 3
+```
+
+```{r custom-function-ex-solution}
+derive_var_rel3fl <- function(dataset, by_vars, new_var) {
+  new_nm <- deparse(substitute(new_var))
+  dataset |>
+    restrict_derivation(
+      derivation = derive_var_extreme_flag,
+      args = params(
+        by_vars = by_vars,
+        order   = exprs(ASTDT, AESEQ),
+        new_var = !!as.name(new_nm),
+        mode    = "first"
+      ),
+      filter = TRTEMFL == "Y" & AETOXGR >= 3
+    )
+}
+
+adae_adv |>
+  derive_var_rel3fl(
+    by_vars = exprs(STUDYID, USUBJID),
+    new_var = G3FL
+  ) |>
+  filter(!is.na(G3FL)) |>
+  select(USUBJID, AETERM, AETOXGR, G3FL)
+```
+
+---
+
+## 8 — Performance and vignettes
+
+```{r quiz-performance, echo=FALSE}
+quiz(
+  question(
+    "For large datasets, which is preferred when the join condition doesn't reference both datasets?",
+    answer("derive_vars_joined()"),
+    answer("derive_vars_merged() — it is faster when no cross-dataset filter is needed", correct = TRUE),
+    answer("They have identical performance"),
+    answer("Always use derive_vars_joined() for safety"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which admiral vignette covers `restrict_derivation()`, `slice_derivation()`, and `call_derivation()` in depth?",
+    answer('vignette("date_time")'),
+    answer('vignette("higher_order")', correct = TRUE),
+    answer('vignette("imputation")'),
+    answer('vignette("visit_period")'),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Quiz — final
+
+```{r quiz-final-19, echo=FALSE}
+quiz(
+  question(
+    "When would you NOT use `create_period_dataset()`?",
+    answer("When the study has two treatment periods"),
+    answer("When the study is a simple parallel-arm design with a single treatment window per subject", correct = TRUE),
+    answer("When ADSL has APxxSDT variables"),
+    answer("When the study has an extension phase"),
+    allow_retry = TRUE
+  ),
+  question(
+    "DTYPE = 'LOCF' and DTYPE = 'EXPECTED' both serve what common purpose?",
+    answer("They mark rows for deletion"),
+    answer("They distinguish derived/imputed rows from observed ones, enabling SAP-controlled inclusion/exclusion", correct = TRUE),
+    answer("They indicate PARAMCD is missing"),
+    answer("They are required by CDISC"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A sponsor-internal admiral extension package should:",
+    answer("Override admiral core functions"),
+    answer("Depend on admiral and add sponsor-specific derive_var_*() helpers following admiral conventions", correct = TRUE),
+    answer("Replace metatools"),
+    answer("Skip admiraldev checks to reduce dependencies"),
+    allow_retry = TRUE
+  ),
+  question(
+    "After Module 4, the next module covers:",
+    answer("TLG generation with rtables and tern"),
+    answer("Therapeutic area admiral extensions: admiralonco, admiralvaccine, etc.", correct = TRUE),
+    answer("SDTM validation with sdtmchecks"),
+    answer("xportr and final transport"),
+    allow_retry = TRUE
+  )
+)
+```

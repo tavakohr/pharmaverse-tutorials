@@ -1,0 +1,1077 @@
+---
+title: "Lesson 09 — {sdtm.oak} Part 2: Building SDTM Domains End-to-End"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+    ace_theme: tomorrow
+runtime: shiny_prerendered
+description: >
+  Build a complete VS (Findings) domain and AE (Events) domain from raw data using
+  the sdtm.oak algorithm pipeline. Apply derive_seq, derive_study_day, and derive_blfl.
+  Handle multiple raw sources and compare output to pharmaversesdtm.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tibble)
+library(lubridate)
+library(stringr)
+library(rlang)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 90)
+
+# ════════════════════════════════════════════════════════════════════════════
+# MOCK sdtm.oak FUNCTIONS  (same core as Lesson 08, extended here)
+# Replace with library(sdtm.oak) when the package is installed.
+# ════════════════════════════════════════════════════════════════════════════
+
+oak_id_vars <- function() c("oak_id", "raw_source", "patient_number")
+
+generate_oak_id_vars <- function(raw_dat, pat_var, raw_src) {
+  raw_dat |>
+    mutate(
+      oak_id         = row_number(),
+      raw_source     = raw_src,
+      patient_number = .data[[pat_var]]
+    )
+}
+
+assign_no_ct <- function(raw_dat, raw_var, tgt_var, id_vars = oak_id_vars()) {
+  raw_dat |>
+    select(any_of(c(id_vars, raw_var))) |>
+    rename(!!sym(tgt_var) := !!sym(raw_var))
+}
+
+hardcode_no_ct <- function(raw_dat, raw_var, tgt_var, tgt_val, id_vars = oak_id_vars()) {
+  raw_dat |>
+    filter(!is.na(.data[[raw_var]])) |>
+    select(any_of(id_vars)) |>
+    mutate(!!sym(tgt_var) := tgt_val)
+}
+
+assign_ct <- function(raw_dat, raw_var, tgt_var, ct_spec, ct_clst, id_vars = oak_id_vars()) {
+  lookup <- ct_spec |> filter(codelist_code == ct_clst) |>
+    select(collected_value, term_value) |> distinct()
+  unmapped <- setdiff(na.omit(unique(pull(raw_dat, !!sym(raw_var)))), lookup$collected_value)
+  if (length(unmapped)) message("assign_ct: unmapped in '", raw_var, "': ", paste(unmapped, collapse=", "))
+  raw_dat |>
+    select(any_of(c(id_vars, raw_var))) |>
+    left_join(lookup, by = setNames("collected_value", raw_var)) |>
+    select(-any_of(raw_var)) |>
+    rename(!!sym(tgt_var) := term_value)
+}
+
+hardcode_ct <- function(raw_dat, raw_var, tgt_var, tgt_val, ct_spec, ct_clst, id_vars = oak_id_vars()) {
+  valid <- ct_spec |> filter(codelist_code == ct_clst) |> pull(term_value) |> unique()
+  if (!tgt_val %in% valid) warning("hardcode_ct: '", tgt_val, "' not in codelist ", ct_clst)
+  hardcode_no_ct(raw_dat, raw_var, tgt_var, tgt_val, id_vars)
+}
+
+condition_add <- function(raw_dat, condition) {
+  cond <- enquo(condition)
+  raw_dat |> mutate(.oak_condition = !!cond)
+}
+
+apply_condition <- function(conditioned_dat) {
+  conditioned_dat |> filter(.oak_condition) |> select(-.oak_condition)
+}
+
+# ── NEW in Lesson 09 ──────────────────────────────────────────────────────
+
+# derive_seq: assign a 1-based row sequence number per USUBJID
+derive_seq <- function(data, tgt_var, rec_vars = "USUBJID") {
+  data |>
+    arrange(across(all_of(rec_vars))) |>
+    group_by(USUBJID) |>
+    mutate(!!sym(tgt_var) := row_number()) |>
+    ungroup()
+}
+
+# derive_study_day: compute --DY with no-Day-0 convention
+# CDISC rule: days >= 0 from ref → day+1; days < 0 → unchanged (negative)
+derive_study_day <- function(data, dm_domain, tgdt, refdt, study_day_var) {
+  ref_dates <- dm_domain |> select(USUBJID, all_of(refdt))
+  data |>
+    left_join(ref_dates, by = "USUBJID") |>
+    mutate(
+      .tgt_d  = ymd(.data[[tgdt]]),
+      .ref_d  = ymd(.data[[refdt]]),
+      !!sym(study_day_var) := case_when(
+        is.na(.tgt_d) | is.na(.ref_d) ~ NA_real_,
+        as.numeric(.tgt_d - .ref_d) >= 0 ~ as.numeric(.tgt_d - .ref_d) + 1,
+        TRUE ~ as.numeric(.tgt_d - .ref_d)
+      )
+    ) |>
+    select(-all_of(refdt), -.tgt_d, -.ref_d)
+}
+
+# derive_blfl: flag the last pre-dose observation per USUBJID × VSTESTCD
+derive_blfl <- function(data, dm_domain, tgt_var, ref_var,
+                        baseline_visits = NULL, date_var = "VSDTC", test_var = "VSTESTCD") {
+  ref_dates <- dm_domain |> select(USUBJID, all_of(ref_var))
+  data |>
+    left_join(ref_dates, by = "USUBJID") |>
+    mutate(
+      .ref_d  = ymd(.data[[ref_var]]),
+      .obs_d  = ymd(.data[[date_var]]),
+      .is_bl  = !is.na(.obs_d) & .obs_d <= .ref_d &
+                (is.null(baseline_visits) | .data[["VISIT"]] %in% baseline_visits)
+    ) |>
+    group_by(USUBJID, across(any_of(test_var))) |>
+    mutate(
+      !!sym(tgt_var) := if_else(
+        .is_bl & .obs_d == suppressWarnings(max(.obs_d[.is_bl], na.rm = TRUE)),
+        "Y", NA_character_
+      )
+    ) |>
+    ungroup() |>
+    select(-all_of(ref_var), -.ref_d, -.obs_d, -.is_bl)
+}
+
+# ── Shared datasets ──────────────────────────────────────────────────────────
+
+vs_raw <- tribble(
+  ~STUDYID,     ~PATNUM, ~SITEID, ~VISIT,       ~VISDAT,       ~VISTM,  ~SYS_BP, ~DIA_BP, ~PULSE,
+  "TEST_STUDY",    1015,  "701",  "SCREENING",  "10-JUL-2020", "09:00",    128,      82,     72,
+  "TEST_STUDY",    1015,  "701",  "WEEK 4",     "07-AUG-2020", "10:15",    132,      84,     74,
+  "TEST_STUDY",    1015,  "701",  "WEEK 8",     "04-SEP-2020", "09:45",    126,      80,     70,
+  "TEST_STUDY",    1023,  "701",  "SCREENING",  "11-JUL-2020", "08:30",    145,      90,     80,
+  "TEST_STUDY",    1023,  "701",  "WEEK 4",     "08-AUG-2020", "11:00",    138,      88,     78,
+  "TEST_STUDY",    1034,  "702",  "SCREENING",  "12-JUL-2020", "14:00",    120,      76,     65,
+  "TEST_STUDY",    1034,  "702",  "WEEK 4",     "09-AUG-2020", "09:30",     NA,      NA,     68
+)
+
+ae_raw <- tribble(
+  ~STUDYID,     ~PATNUM, ~SITEID, ~AETERM,                      ~AESTDT,       ~AEENDT,       ~AESEV,      ~AESER, ~AEOUT,
+  "TEST_STUDY",    1015,  "701",  "HEADACHE",                   "2020-07-20",  "2020-07-22",  "MILD",      "N",    "RECOVERED/RESOLVED",
+  "TEST_STUDY",    1015,  "701",  "NAUSEA",                     "2020-08-05",  "2020-08-08",  "MODERATE",  "N",    "RECOVERED/RESOLVED",
+  "TEST_STUDY",    1023,  "701",  "DIZZINESS",                  "2020-07-22",  NA,            "MILD",      "N",    "NOT RECOVERED/NOT RESOLVED",
+  "TEST_STUDY",    1034,  "702",  "FALL",                       "2020-07-28",  "2020-07-28",  "SEVERE",    "Y",    "RECOVERED/RESOLVED",
+  "TEST_STUDY",    1034,  "702",  "HEADACHE",                   "2020-08-15",  "2020-08-17",  "MILD",      "N",    "RECOVERED/RESOLVED"
+)
+
+# SAE supplement raw (separate raw source for multi-source exercise)
+sae_raw <- tribble(
+  ~STUDYID,     ~PATNUM, ~SITEID, ~AETERM,   ~AESTDT,       ~AEENDT,       ~AESEV,   ~AESER,
+  "TEST_STUDY",    1034,  "702",  "FALL",    "2020-07-28",  "2020-07-28",  "SEVERE", "Y"
+)
+
+# DM reference dataset (provides first-dose date for study-day calculation)
+dm_ref <- tribble(
+  ~USUBJID,               ~RFXSTDTC,     ~RFSTDTC,
+  "TEST_STUDY-701-1015",  "2020-07-15",  "2020-07-15",
+  "TEST_STUDY-701-1023",  "2020-07-16",  "2020-07-16",
+  "TEST_STUDY-702-1034",  "2020-07-17",  "2020-07-17"
+)
+
+# SDTM AE "canonical" output (mirrors pharmaversesdtm::ae structure)
+ae_sdtm_ref <- tribble(
+  ~STUDYID,       ~DOMAIN, ~USUBJID,               ~AESEQ, ~AETERM,     ~AESTDTC,      ~AEENDTC,      ~AESEV,      ~AESER, ~AEOUT,
+  "TEST_STUDY",   "AE",    "TEST_STUDY-701-1015",    1,     "HEADACHE",  "2020-07-20",  "2020-07-22",  "MILD",      "N",    "RECOVERED/RESOLVED",
+  "TEST_STUDY",   "AE",    "TEST_STUDY-701-1015",    2,     "NAUSEA",    "2020-08-05",  "2020-08-08",  "MODERATE",  "N",    "RECOVERED/RESOLVED",
+  "TEST_STUDY",   "AE",    "TEST_STUDY-701-1023",    1,     "DIZZINESS", "2020-07-22",  NA,            "MILD",      "N",    "NOT RECOVERED/NOT RESOLVED",
+  "TEST_STUDY",   "AE",    "TEST_STUDY-702-1034",    1,     "FALL",      "2020-07-28",  "2020-07-28",  "SEVERE",    "Y",    "RECOVERED/RESOLVED",
+  "TEST_STUDY",   "AE",    "TEST_STUDY-702-1034",    2,     "HEADACHE",  "2020-08-15",  "2020-08-17",  "MILD",      "N",    "RECOVERED/RESOLVED"
+)
+
+# CT spec
+study_ct <- tribble(
+  ~codelist_code, ~codelist_name,  ~term_code, ~term_value,                   ~collected_value,
+  "C66741",       "VS Test Code",  "SYSBP",    "SYSBP",                       "SYSBP",
+  "C66741",       "VS Test Code",  "DIABP",    "DIABP",                       "DIABP",
+  "C66741",       "VS Test Code",  "PULSE",    "PULSE",                       "PULSE",
+  "C67153",       "VS Test Name",  "SYSBP",    "Systolic Blood Pressure",     "Systolic Blood Pressure",
+  "C67153",       "VS Test Name",  "DIABP",    "Diastolic Blood Pressure",    "Diastolic Blood Pressure",
+  "C67153",       "VS Test Name",  "PULSE",    "Pulse Rate",                  "Pulse Rate",
+  "C66770",       "VS Unit",       "mmHg",     "mmHg",                        "mmHg",
+  "C66770",       "VS Unit",       "bpm",      "beats/min",                   "beats/min",
+  "C66742",       "AE Severity",   "MILD",     "MILD",                        "MILD",
+  "C66742",       "AE Severity",   "MODERATE", "MODERATE",                    "MODERATE",
+  "C66742",       "AE Severity",   "SEVERE",   "SEVERE",                      "SEVERE",
+  "NY",           "No Yes",        "N",        "N",                           "N",
+  "NY",           "No Yes",        "Y",        "Y",                           "Y",
+  "C66768",       "AE Outcome",    "RECO",     "RECOVERED/RESOLVED",          "RECOVERED/RESOLVED",
+  "C66768",       "AE Outcome",    "NREC",     "NOT RECOVERED/NOT RESOLVED",  "NOT RECOVERED/NOT RESOLVED"
+)
+```
+
+## Overview
+
+### From algorithms to full domains
+
+In Lesson 08 you learned the individual algorithm functions. This lesson puts them together to build **complete SDTM domains** from raw data. You'll work through two domain types:
+
+| Class | Domain | Raw → SDTM pattern |
+|---|---|---|
+| **Findings** | VS (Vital Signs) | Wide raw row → **many** SDTM rows (one per parameter) |
+| **Events** | AE (Adverse Events) | One raw row → **one** SDTM row |
+
+The standard build order for any domain:
+
+```
+1. generate_oak_id_vars()       attach row-tracing identifiers
+2. Topic block(s)               map TESTCD/TERM/TRT + qualifiers
+3. bind_rows()                  combine topic blocks (Findings only)
+4. mutate()                     STUDYID, DOMAIN, USUBJID
+5. derive_seq()                 --SEQ sequence number
+6. derive_study_day()           --DY from reference date
+7. derive_blfl()                --BLFL baseline flag (Findings)
+8. select() / relocate()        SDTM column order
+```
+
+---
+
+```{r quiz-classes, echo=FALSE}
+quiz(
+  caption = "SDTM observation classes",
+  question(
+    "Vital Signs (VS) is a Findings domain. Which structural fact distinguishes Findings from Events?",
+    answer("Findings have more variables than Events"),
+    answer("Findings use a topic variable (--TESTCD) meaning one raw wide row becomes multiple long SDTM rows", correct = TRUE),
+    answer("Findings only contain numeric data; Events contain text"),
+    answer("Findings domains start with 'F'; Events domains start with 'E'"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which set correctly lists the four SDTM observation classes?",
+    answer("Findings, Events, Interventions, Findings About", correct = TRUE),
+    answer("Findings, Events, Demographics, Special Purpose"),
+    answer("Findings, AE, EX, CM"),
+    answer("BDS, ADSL, ADAE, ADLB"),
+    allow_retry = TRUE
+  ),
+  question(
+    "For an Interventions domain like EX (Exposure), the topic variable is:",
+    answer("EXTESTCD"),
+    answer("EXTERM"),
+    answer("EXTRT — the treatment name", correct = TRUE),
+    answer("EXOBJ"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Part 1 — Building VS (Findings) {.tabset}
+
+## 1  Prepare raw data
+
+### Step 1 of 8: attach OAK identifiers
+
+Always the first step before any algorithm call.
+
+```{r vs-setup, exercise=TRUE, exercise.lines=8}
+vs_id <- generate_oak_id_vars(
+  raw_dat = vs_raw,
+  pat_var = "PATNUM",
+  raw_src = "vs_raw"
+)
+
+vs_id |> select(oak_id, raw_source, patient_number, VISIT, SYS_BP, DIA_BP, PULSE)
+```
+
+---
+
+## 2  Build the SYSBP topic block
+
+### Steps 2–3 for one parameter
+
+For each parameter we need four SDTM columns:
+
+| Column | Source | Function |
+|---|---|---|
+| `VSTESTCD` | fixed `"SYSBP"` | `hardcode_ct()` |
+| `VSTEST` | fixed `"Systolic Blood Pressure"` | `hardcode_ct()` |
+| `VSORRES` | raw `SYS_BP` | `assign_no_ct()` |
+| `VSORRESU` | fixed `"mmHg"` | `hardcode_no_ct()` |
+
+Each function call returns a small tibble with `oak_id_vars()` + the one new column. Join them on `oak_id_vars()`.
+
+```{r sysbp-block, exercise=TRUE, exercise.lines=30}
+vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+
+# Only rows where SYS_BP was recorded
+vs_sysbp_rows <- vs_id |> filter(!is.na(SYS_BP))
+
+# Four columns — four calls
+sysbp_testcd  <- hardcode_ct(vs_sysbp_rows, "SYS_BP", "VSTESTCD",
+                              "SYSBP", study_ct, "C66741")
+sysbp_test    <- hardcode_ct(vs_sysbp_rows, "SYS_BP", "VSTEST",
+                              "Systolic Blood Pressure", study_ct, "C67153")
+sysbp_orres   <- assign_no_ct(vs_sysbp_rows, "SYS_BP", "VSORRES")
+sysbp_orresu  <- hardcode_no_ct(vs_sysbp_rows, "SYS_BP", "VSORRESU", "mmHg")
+
+# Join all on oak_id_vars()
+vs_sysbp <- sysbp_testcd |>
+  left_join(sysbp_test,   by = oak_id_vars()) |>
+  left_join(sysbp_orres,  by = oak_id_vars()) |>
+  left_join(sysbp_orresu, by = oak_id_vars())
+
+vs_sysbp
+```
+
+```{r sysbp-block-hint-1}
+# Note: vs_sysbp_rows is pre-filtered to non-NA SYS_BP rows
+# hardcode_no_ct and hardcode_ct: raw_var identifies the row population,
+#   the tgt_val is what gets written into the SDTM column
+# All four narrow tibbles share oak_id_vars() → join them cleanly
+```
+
+---
+
+## 3  Build the DIABP and PULSE topic blocks
+
+### Exercise — write the DIABP block yourself
+
+Following exactly the same pattern as SYSBP, build the DIABP topic block:
+
+- `VSTESTCD` = `"DIABP"` (codelist `C66741`)
+- `VSTEST` = `"Diastolic Blood Pressure"` (codelist `C67153`)
+- `VSORRES` from raw `DIA_BP`
+- `VSORRESU` = `"mmHg"` (no CT needed)
+
+```{r diabp-block, exercise=TRUE, exercise.lines=25}
+vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+vs_diabp_rows <- vs_id |> filter(!is.na(DIA_BP))
+
+diabp_testcd  <- hardcode_ct(vs_diabp_rows, "DIA_BP", "VSTESTCD",
+                              "___", study_ct, "C66741")
+diabp_test    <- hardcode_ct(vs_diabp_rows, "DIA_BP", "VSTEST",
+                              "___", study_ct, "C67153")
+diabp_orres   <- assign_no_ct(vs_diabp_rows, "___", "VSORRES")
+diabp_orresu  <- hardcode_no_ct(vs_diabp_rows, "DIA_BP", "VSORRESU", "___")
+
+vs_diabp <- diabp_testcd |>
+  left_join(diabp_test,   by = oak_id_vars()) |>
+  left_join(diabp_orres,  by = oak_id_vars()) |>
+  left_join(diabp_orresu, by = oak_id_vars())
+
+vs_diabp
+```
+
+```{r diabp-block-hint-1}
+# "DIABP" for VSTESTCD tgt_val
+# "Diastolic Blood Pressure" for VSTEST tgt_val
+# raw_var = "DIA_BP" for assign_no_ct (the raw column with the reading)
+# "mmHg" for VSORRESU
+```
+
+```{r diabp-block-solution}
+vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+vs_diabp_rows <- vs_id |> filter(!is.na(DIA_BP))
+
+diabp_testcd  <- hardcode_ct(vs_diabp_rows, "DIA_BP", "VSTESTCD", "DIABP", study_ct, "C66741")
+diabp_test    <- hardcode_ct(vs_diabp_rows, "DIA_BP", "VSTEST", "Diastolic Blood Pressure", study_ct, "C67153")
+diabp_orres   <- assign_no_ct(vs_diabp_rows, "DIA_BP", "VSORRES")
+diabp_orresu  <- hardcode_no_ct(vs_diabp_rows, "DIA_BP", "VSORRESU", "mmHg")
+
+vs_diabp <- diabp_testcd |>
+  left_join(diabp_test,   by = oak_id_vars()) |>
+  left_join(diabp_orres,  by = oak_id_vars()) |>
+  left_join(diabp_orresu, by = oak_id_vars())
+
+vs_diabp
+```
+
+### Exercise — write the PULSE block with less scaffolding
+
+Pulse rate: `VSTESTCD = "PULSE"`, `VSTEST = "Pulse Rate"`, `VSORRES` from `PULSE`, `VSORRESU = "beats/min"` (codelist `C66770` for units).
+
+```{r pulse-block, exercise=TRUE, exercise.lines=20}
+vs_id   <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+vs_pulse_rows <- vs_id |> filter(!is.na(PULSE))
+
+# Build pulse_testcd, pulse_test, pulse_orres, pulse_orresu
+# then join them into vs_pulse
+
+vs_pulse <- ___
+
+vs_pulse
+```
+
+```{r pulse-block-hint-1}
+# pulse_testcd  <- hardcode_ct(vs_pulse_rows, "PULSE", "VSTESTCD", "PULSE", study_ct, "C66741")
+# pulse_test    <- hardcode_ct(vs_pulse_rows, "PULSE", "VSTEST", "Pulse Rate", study_ct, "C67153")
+# pulse_orres   <- assign_no_ct(vs_pulse_rows, "PULSE", "VSORRES")
+# pulse_orresu  <- hardcode_no_ct(vs_pulse_rows, "PULSE", "VSORRESU", "beats/min")
+```
+
+```{r pulse-block-solution}
+vs_id         <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+vs_pulse_rows <- vs_id |> filter(!is.na(PULSE))
+
+pulse_testcd  <- hardcode_ct(vs_pulse_rows, "PULSE", "VSTESTCD", "PULSE",     study_ct, "C66741")
+pulse_test    <- hardcode_ct(vs_pulse_rows, "PULSE", "VSTEST",   "Pulse Rate",study_ct, "C67153")
+pulse_orres   <- assign_no_ct(vs_pulse_rows, "PULSE", "VSORRES")
+pulse_orresu  <- hardcode_no_ct(vs_pulse_rows, "PULSE", "VSORRESU", "beats/min")
+
+vs_pulse <- pulse_testcd |>
+  left_join(pulse_test,   by = oak_id_vars()) |>
+  left_join(pulse_orres,  by = oak_id_vars()) |>
+  left_join(pulse_orresu, by = oak_id_vars())
+
+vs_pulse
+```
+
+---
+
+## 4  bind_rows — the implicit transpose
+
+### Step 3 of 8: combine topic blocks
+
+`bind_rows()` stacks the three topic blocks into one long-format dataset — one row per parameter per visit. This is the **Findings transpose**: wide raw → long SDTM.
+
+```{r vs-bind-rows, exercise=TRUE, exercise.lines=35}
+# Rebuild all three blocks (condensed)
+vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+
+build_block <- function(rows, raw_col, testcd, test, unit, unit_clst) {
+  tc <- hardcode_ct(rows, raw_col, "VSTESTCD", testcd, study_ct, "C66741")
+  tt <- hardcode_ct(rows, raw_col, "VSTEST",   test,   study_ct, "C67153")
+  or <- assign_no_ct(rows, raw_col, "VSORRES")
+  ou <- hardcode_no_ct(rows, raw_col, "VSORRESU", unit)
+  tc |> left_join(tt, by = oak_id_vars()) |>
+       left_join(or, by = oak_id_vars()) |>
+       left_join(ou, by = oak_id_vars())
+}
+
+vs_sysbp <- build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP",
+                         "SYSBP", "Systolic Blood Pressure", "mmHg", "C66770")
+vs_diabp  <- build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP",
+                         "DIABP", "Diastolic Blood Pressure","mmHg", "C66770")
+vs_pulse  <- build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE",
+                         "PULSE", "Pulse Rate", "beats/min", "C66770")
+
+# Bind them
+vs <- bind_rows(vs_sysbp, vs_diabp, vs_pulse)
+
+# How many rows? (should be sum of non-NA measurements across all three params)
+nrow(vs)
+vs |> count(VSTESTCD)
+```
+
+```{r vs-bind-rows-hint-1}
+# bind_rows() stacks data frames with the same columns
+# Rows for SYS_BP NA visits are already excluded (we filtered before building)
+# count(VSTESTCD) confirms the row distribution across parameters
+```
+
+---
+
+## 5  Domain-wide keys
+
+### Step 4 of 8: STUDYID, DOMAIN, USUBJID
+
+Use plain `dplyr::mutate()` for values that apply to every row regardless of topic.
+
+```{r vs-domain-keys, exercise=TRUE, exercise.lines=20}
+# Rebuild vs (condensed)
+vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+build_block <- function(rows, rc, tc, tt, u) {
+  hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
+    left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
+    left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                    by = oak_id_vars())
+}
+vs <- bind_rows(
+  build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP", "SYSBP", "Systolic Blood Pressure", "mmHg"),
+  build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP", "DIABP", "Diastolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE",  "PULSE", "Pulse Rate", "beats/min")
+)
+
+# Add domain-wide keys
+vs <- vs |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "___",
+    USUBJID = paste("TEST_STUDY", patient_number, sep = "___")
+  )
+
+vs |> select(STUDYID, DOMAIN, USUBJID, VSTESTCD, VSORRES) |> head(8)
+```
+
+```{r vs-domain-keys-hint-1}
+# DOMAIN = "VS"
+# sep = "-"  →  USUBJID = paste("TEST_STUDY", patient_number, sep = "-")
+```
+
+```{r vs-domain-keys-solution}
+vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+build_block <- function(rows, rc, tc, tt, u) {
+  hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
+    left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
+    left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                    by = oak_id_vars())
+}
+vs <- bind_rows(
+  build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP", "SYSBP", "Systolic Blood Pressure", "mmHg"),
+  build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP", "DIABP", "Diastolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE",  "PULSE", "Pulse Rate", "beats/min")
+)
+vs <- vs |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "VS",
+    USUBJID = paste("TEST_STUDY", patient_number, sep = "-")
+  )
+vs |> select(STUDYID, DOMAIN, USUBJID, VSTESTCD, VSORRES) |> head(8)
+```
+
+---
+
+## 6  derive_seq() — sequence number
+
+### Step 5 of 8: assign VSSEQ
+
+`derive_seq()` assigns a 1-based row number within each subject. The `rec_vars` argument determines the uniqueness key — typically `c("USUBJID", "VSTESTCD", "VISIT")`.
+
+```{r vs-seq, exercise=TRUE, exercise.lines=25}
+vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+build_block <- function(rows, rc, tc, tt, u) {
+  hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
+    left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
+    left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                    by = oak_id_vars()) |>
+    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT), by = oak_id_vars())
+}
+vs <- bind_rows(
+  build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP", "SYSBP", "Systolic Blood Pressure", "mmHg"),
+  build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP", "DIABP", "Diastolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE",  "PULSE", "Pulse Rate", "beats/min")
+) |>
+  mutate(STUDYID = "TEST_STUDY", DOMAIN = "VS",
+         USUBJID = paste("TEST_STUDY", patient_number, sep = "-"))
+
+# Add VSSEQ
+vs <- derive_seq(vs, tgt_var = "___", rec_vars = c("USUBJID", "VSTESTCD", "VISIT"))
+
+vs |> select(USUBJID, VSTESTCD, VISIT, VSSEQ, VSORRES)
+```
+
+```{r vs-seq-hint-1}
+# tgt_var = "VSSEQ"
+# derive_seq() numbers rows 1, 2, 3 ... within each USUBJID
+```
+
+```{r vs-seq-solution}
+vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+build_block <- function(rows, rc, tc, tt, u) {
+  hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
+    left_join(hardcode_ct(rows, rc, "VSTEST", tt, study_ct, "C67153"), by = oak_id_vars()) |>
+    left_join(assign_no_ct(rows, rc, "VSORRES"),  by = oak_id_vars()) |>
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u), by = oak_id_vars()) |>
+    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT), by = oak_id_vars())
+}
+vs <- bind_rows(
+  build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP","SYSBP","Systolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP","DIABP","Diastolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE", "PULSE","Pulse Rate","beats/min")
+) |>
+  mutate(STUDYID="TEST_STUDY", DOMAIN="VS",
+         USUBJID=paste("TEST_STUDY", patient_number, sep="-"))
+
+vs <- derive_seq(vs, tgt_var = "VSSEQ", rec_vars = c("USUBJID", "VSTESTCD", "VISIT"))
+vs |> select(USUBJID, VSTESTCD, VISIT, VSSEQ, VSORRES)
+```
+
+---
+
+## 7  derive_study_day() — VSDY
+
+### Step 6 of 8: days from first dose
+
+`derive_study_day()` computes days from a reference date (first dose, `RFXSTDTC` in DM) to the observation date, applying the **no-Day-0 convention**: the reference day itself is Day 1; days before it are negative.
+
+```{r vs-study-day, exercise=TRUE, exercise.lines=22}
+# Add VSDTC from raw VISDAT (simplified parse for tutorial)
+vs_with_dtc <- vs |>   # using vs built in Exercise 6 — re-run below if needed
+  left_join(vs_raw |>
+              mutate(USUBJID = paste("TEST_STUDY", SITEID, PATNUM, sep="-"),
+                     VSDTC = as.character(dmy(VISDAT))) |>
+              select(USUBJID, VISIT, VSDTC),
+            by = c("USUBJID", "VISIT"))
+
+# Derive VSDY using dm_ref for reference dates
+vs_with_dy <- derive_study_day(
+  data        = vs_with_dtc,
+  dm_domain   = dm_ref,
+  tgdt        = "VSDTC",
+  refdt       = "___",          # first-dose date column in dm_ref
+  study_day_var = "VSDY"
+)
+
+vs_with_dy |> select(USUBJID, VSTESTCD, VISIT, VSDTC, VSDY)
+```
+
+```{r vs-study-day-hint-1}
+# refdt = "RFXSTDTC"  (the first-dose date column in dm_ref)
+# SCREENING rows should be negative VSDY (before first dose on 2020-07-15)
+# WEEK 4 rows should be positive VSDY
+```
+
+```{r vs-study-day-solution}
+vs_with_dtc <- vs |>
+  left_join(vs_raw |>
+              mutate(USUBJID = paste("TEST_STUDY", SITEID, PATNUM, sep="-"),
+                     VSDTC = as.character(dmy(VISDAT))) |>
+              select(USUBJID, VISIT, VSDTC),
+            by = c("USUBJID", "VISIT"))
+
+vs_with_dy <- derive_study_day(
+  data          = vs_with_dtc,
+  dm_domain     = dm_ref,
+  tgdt          = "VSDTC",
+  refdt         = "RFXSTDTC",
+  study_day_var = "VSDY"
+)
+vs_with_dy |> select(USUBJID, VSTESTCD, VISIT, VSDTC, VSDY)
+```
+
+```{r quiz-study-day, echo=FALSE}
+quiz(
+  caption = "Study day convention",
+  question(
+    "Under the CDISC no-Day-0 convention, if a subject's first dose is 2020-07-15 and an observation is on 2020-07-15 (same day), VSDY is:",
+    answer("0"),
+    answer("1 — the reference day itself is Day 1", correct = TRUE),
+    answer("-1"),
+    answer("NA — Day 0 is undefined"),
+    allow_retry = TRUE
+  ),
+  question(
+    "An observation on 2020-07-14 (one day before first dose on 2020-07-15) produces VSDY =",
+    answer("0"),
+    answer("-1 — one day before Day 1", correct = TRUE),
+    answer("1"),
+    answer("-2"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 8  derive_blfl() — baseline flag
+
+### Step 7 of 8: VSBLFL
+
+`derive_blfl()` flags the **last pre-dose observation** per subject per test as `"Y"`. It checks:
+- The observation date ≤ first dose date (`RFXSTDTC`)
+- The visit is in a list of qualifying baseline visits
+- Among qualifying rows, the chronologically last one gets `"Y"`
+
+```{r vs-blfl, exercise=TRUE, exercise.lines=18}
+vs_blfl <- derive_blfl(
+  data             = vs_with_dy,
+  dm_domain        = dm_ref,
+  tgt_var          = "VSBLFL",
+  ref_var          = "RFXSTDTC",
+  baseline_visits  = c("SCREENING"),
+  date_var         = "VSDTC",
+  test_var         = "VSTESTCD"
+)
+
+vs_blfl |>
+  select(USUBJID, VSTESTCD, VISIT, VSDTC, VSDY, VSBLFL) |>
+  arrange(USUBJID, VSTESTCD, VISIT)
+```
+
+```{r vs-blfl-hint-1}
+# Only SCREENING visits (before first dose) should get VSBLFL = "Y"
+# WEEK 4 and WEEK 8 visits (after first dose) should be NA
+```
+
+---
+
+## 9  VS Capstone — full pipeline in one block
+
+### Exercise — build the entire VS domain end-to-end
+
+This exercise brings together all 8 steps. Fill in the blanks to complete the pipeline.
+
+```{r vs-capstone, exercise=TRUE, exercise.lines=55}
+# ── Step 1: OAK IDs ──────────────────────────────────────────────────────────
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "___", raw_src = "vs_raw")
+
+# ── Step 2–3: Topic blocks + bind_rows ───────────────────────────────────────
+build_block <- function(rows, rc, tc, tt, u) {
+  hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
+    left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
+    left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                    by = oak_id_vars()) |>
+    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT, VISDAT),      by = oak_id_vars())
+}
+
+vs <- bind_rows(
+  build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP","SYSBP","Systolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP","DIABP","Diastolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE", "PULSE","Pulse Rate","beats/min")
+)
+
+# ── Step 4: Domain-wide keys ─────────────────────────────────────────────────
+vs <- vs |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "VS",
+    USUBJID = paste("TEST_STUDY", patient_number, sep = "-"),
+    VSDTC   = as.character(dmy(VISDAT))
+  ) |>
+  select(-VISDAT)
+
+# ── Step 5: --SEQ ────────────────────────────────────────────────────────────
+vs <- derive_seq(vs, tgt_var = "VSSEQ",
+                 rec_vars = c("USUBJID", "___", "VISIT"))
+
+# ── Step 6: --DY ─────────────────────────────────────────────────────────────
+vs <- derive_study_day(vs, dm_ref, tgdt = "VSDTC",
+                       refdt = "RFXSTDTC", study_day_var = "VSDY")
+
+# ── Step 7: --BLFL ───────────────────────────────────────────────────────────
+vs <- derive_blfl(vs, dm_ref, tgt_var = "VSBLFL",
+                  ref_var = "RFXSTDTC", baseline_visits = c("SCREENING"))
+
+# ── Step 8: Column order ─────────────────────────────────────────────────────
+vs_final <- vs |>
+  select(STUDYID, DOMAIN, USUBJID, VSSEQ,
+         VSTESTCD, VSTEST, VSORRES, VSORRESU,
+         VISIT, VSDTC, VSDY, VSBLFL)
+
+vs_final
+```
+
+```{r vs-capstone-hint-1}
+# Step 1: pat_var = "PATNUM"
+# Step 5: rec_vars = c("USUBJID", "VSTESTCD", "VISIT")
+```
+
+```{r vs-capstone-solution}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+build_block <- function(rows, rc, tc, tt, u) {
+  hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
+    left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
+    left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                    by = oak_id_vars()) |>
+    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT, VISDAT),      by = oak_id_vars())
+}
+vs <- bind_rows(
+  build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP","SYSBP","Systolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP","DIABP","Diastolic Blood Pressure","mmHg"),
+  build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE", "PULSE","Pulse Rate","beats/min")
+) |>
+  mutate(STUDYID="TEST_STUDY", DOMAIN="VS",
+         USUBJID=paste("TEST_STUDY", patient_number, sep="-"),
+         VSDTC=as.character(dmy(VISDAT))) |>
+  select(-VISDAT)
+
+vs <- derive_seq(vs, "VSSEQ", c("USUBJID","VSTESTCD","VISIT"))
+vs <- derive_study_day(vs, dm_ref, "VSDTC", "RFXSTDTC", "VSDY")
+vs <- derive_blfl(vs, dm_ref, "VSBLFL", "RFXSTDTC", c("SCREENING"))
+
+vs |> select(STUDYID, DOMAIN, USUBJID, VSSEQ, VSTESTCD, VSTEST, VSORRES, VSORRESU, VISIT, VSDTC, VSDY, VSBLFL)
+```
+
+---
+
+## Part 2 — Building AE (Events)
+
+## 10  Events are simpler — one raw row → one SDTM row
+
+### No topic blocks needed
+
+Because there's no transposition, AE is a straight pipeline:
+
+```
+attach OAK IDs
+→ assign/hardcode each SDTM column
+→ mutate domain keys
+→ derive_seq → derive_study_day
+```
+
+### Exercise 10a — map AE columns
+
+Attach OAK IDs to `ae_raw`, then map these columns:
+
+| SDTM column | Source | Function |
+|---|---|---|
+| `AETERM` | raw `AETERM` | `assign_no_ct()` |
+| `AESEV` | raw `AESEV`, CT `C66742` | `assign_ct()` |
+| `AESER` | raw `AESER`, CT `NY` | `assign_ct()` |
+| `AESTDTC` | raw `AESTDT` (rename) | `assign_no_ct()` |
+| `AEENDTC` | raw `AEENDT` (rename) | `assign_no_ct()` |
+
+```{r ae-map-cols, exercise=TRUE, exercise.lines=30}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_term    <- assign_no_ct(ae_id, "AETERM",  "AETERM")
+ae_sev     <- assign_ct(ae_id,   "AESEV",   "AESEV",   study_ct, "C66742")
+ae_ser     <- assign_ct(ae_id,   "AESER",   "AESER",   study_ct, "NY")
+ae_stdt    <- assign_no_ct(ae_id, "AESTDT", "AESTDTC")
+ae_endt    <- assign_no_ct(ae_id, "AEENDT", "AEENDTC")
+ae_out     <- assign_ct(ae_id,   "___",     "AEOUT",   study_ct, "C66768")
+
+# Join all
+ae <- ae_term |>
+  left_join(ae_sev,  by = oak_id_vars()) |>
+  left_join(ae_ser,  by = oak_id_vars()) |>
+  left_join(ae_stdt, by = oak_id_vars()) |>
+  left_join(ae_endt, by = oak_id_vars()) |>
+  left_join(ae_out,  by = oak_id_vars())
+
+ae
+```
+
+```{r ae-map-cols-hint-1}
+# ae_out: raw_var = "AEOUT", tgt_var = "AEOUT", ct_clst = "C66768"
+```
+
+```{r ae-map-cols-solution}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_term <- assign_no_ct(ae_id, "AETERM", "AETERM")
+ae_sev  <- assign_ct(ae_id,   "AESEV",  "AESEV",  study_ct, "C66742")
+ae_ser  <- assign_ct(ae_id,   "AESER",  "AESER",  study_ct, "NY")
+ae_stdt <- assign_no_ct(ae_id, "AESTDT","AESTDTC")
+ae_endt <- assign_no_ct(ae_id, "AEENDT","AEENDTC")
+ae_out  <- assign_ct(ae_id,   "AEOUT", "AEOUT",   study_ct, "C66768")
+
+ae <- ae_term |>
+  left_join(ae_sev,  by = oak_id_vars()) |>
+  left_join(ae_ser,  by = oak_id_vars()) |>
+  left_join(ae_stdt, by = oak_id_vars()) |>
+  left_join(ae_endt, by = oak_id_vars()) |>
+  left_join(ae_out,  by = oak_id_vars())
+ae
+```
+
+### Exercise 10b — domain keys, AESEQ, and AESTDY
+
+Add `STUDYID`, `DOMAIN`, `USUBJID`, `AESEQ`, and `AESTDY` to the AE domain.
+
+```{r ae-keys-seq, exercise=TRUE, exercise.lines=20}
+ae_full <- ae |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "AE",
+    USUBJID = paste("TEST_STUDY", patient_number, sep = "-")
+  ) |>
+  derive_seq(tgt_var = "AESEQ",
+             rec_vars = c("USUBJID", "AETERM", "AESTDTC")) |>
+  derive_study_day(
+    dm_domain     = dm_ref,
+    tgdt          = "AESTDTC",
+    refdt         = "___",
+    study_day_var = "AESTDY"
+  )
+
+ae_full |>
+  select(STUDYID, DOMAIN, USUBJID, AESEQ, AETERM, AESTDTC, AESTDY, AESEV, AESER)
+```
+
+```{r ae-keys-seq-hint-1}
+# refdt = "RFSTDTC"  (reference start date in dm_ref)
+```
+
+```{r ae-keys-seq-solution}
+ae_full <- ae |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "AE",
+    USUBJID = paste("TEST_STUDY", patient_number, sep = "-")
+  ) |>
+  derive_seq(tgt_var = "AESEQ",
+             rec_vars = c("USUBJID", "AETERM", "AESTDTC")) |>
+  derive_study_day(
+    dm_domain     = dm_ref,
+    tgdt          = "AESTDTC",
+    refdt         = "RFSTDTC",
+    study_day_var = "AESTDY"
+  )
+ae_full |>
+  select(STUDYID, DOMAIN, USUBJID, AESEQ, AETERM, AESTDTC, AESTDY, AESEV, AESER)
+```
+
+---
+
+## 11  Multiple raw sources → one domain
+
+### Pattern: process each source independently, then bind_rows
+
+Some studies collect AEs on a main CRF and serious AEs on a separate SAE CRF. Each source gets its own `generate_oak_id_vars()` with a different `raw_src` label.
+
+```{r multi-source, exercise=TRUE, exercise.lines=28}
+# Source 1: main AE
+ae_main_id <- generate_oak_id_vars(ae_raw,  "PATNUM", raw_src = "ae_main")
+# Source 2: SAE supplement
+sae_id     <- generate_oak_id_vars(sae_raw, "PATNUM", raw_src = "ae_sae")
+
+# Build each source (AETERM only for brevity)
+ae_from_main <- assign_no_ct(ae_main_id, "AETERM", "AETERM") |>
+  mutate(USUBJID = paste("TEST_STUDY", ae_main_id$SITEID, ae_main_id$PATNUM, sep="-"))
+
+ae_from_sae  <- assign_no_ct(sae_id,    "AETERM", "AETERM") |>
+  mutate(USUBJID = paste("TEST_STUDY", sae_id$SITEID, sae_id$PATNUM, sep="-"))
+
+# Combine — raw_source tells us which CRF each row came from
+ae_combined <- bind_rows(ae_from_main, ae_from_sae)
+
+ae_combined |>
+  select(raw_source, patient_number, USUBJID, AETERM) |>
+  arrange(USUBJID)
+```
+
+```{r multi-source-hint-1}
+# raw_source distinguishes "ae_main" from "ae_sae" rows
+# After bind_rows(), derive_seq() would renumber AESEQ across both sources together
+# The SAE row for PATNUM 1034 appears twice: once from ae_main, once from ae_sae
+# In production you'd deduplicate before deriving AESEQ
+```
+
+---
+
+## 12  Comparing to pharmaversesdtm
+
+### Validate your output against the canonical SDTM
+
+```{r vs-canonical-compare, exercise=TRUE, exercise.lines=20}
+# ae_full is our derived AE; ae_sdtm_ref mirrors pharmaversesdtm::ae
+my_cols      <- names(ae_full)
+canonical_cols <- names(ae_sdtm_ref)
+
+cat("In canonical but NOT in our output (still to derive):\n")
+print(setdiff(canonical_cols, my_cols))
+
+cat("\nIn our output but NOT in canonical (OAK-internal columns):\n")
+print(setdiff(my_cols, canonical_cols))
+
+# Row count match?
+cat("\nOur rows:", nrow(ae_full), "  Canonical rows:", nrow(ae_sdtm_ref), "\n")
+
+# AESEQ and AETERM values match?
+inner_join(
+  ae_full      |> select(USUBJID, AESEQ, AETERM),
+  ae_sdtm_ref  |> select(USUBJID, AESEQ, AETERM),
+  by = c("USUBJID", "AESEQ"),
+  suffix = c("_ours", "_canonical")
+) |>
+  mutate(MATCH = AETERM_ours == AETERM_canonical)
+```
+
+```{r vs-canonical-compare-hint-1}
+# Columns in canonical not in ours: likely AEDECOD, AEBODSYS, AESOC (need MedDRA)
+# OAK-internal cols in ours: oak_id, raw_source, patient_number
+# Row counts and AETERM/AESEQ should align perfectly
+```
+
+---
+
+## 13  Common Gotchas
+
+```{r quiz-gotchas, echo=FALSE}
+quiz(
+  caption = "Common pitfalls",
+  question(
+    "You forget id_vars = oak_id_vars() on the second call in a topic block. What likely happens?",
+    answer("The function errors with 'argument id_vars missing'"),
+    answer("The merge uses the default id_vars and may produce a many-to-many join or misaligned rows", correct = TRUE),
+    answer("The second column is simply added as a new column with no join"),
+    answer("Nothing — id_vars is optional and has no effect"),
+    allow_retry = TRUE
+  ),
+  question(
+    "In a Findings domain hardcode call like hardcode_ct(vs_raw, 'SYS_BP', 'VSTESTCD', 'SYSBP', ...), using raw_var = 'patient_number' instead of 'SYS_BP' would cause:",
+    answer("A CT validation error because patient_number is not in the codelist"),
+    answer("An SDTM row to be created for EVERY raw row, even visits where SYS_BP was not recorded", correct = TRUE),
+    answer("No change — raw_var is ignored for hardcode calls"),
+    answer("The VSTESTCD column to be filled with patient numbers"),
+    allow_retry = TRUE
+  ),
+  question(
+    "After assign_datetime() some VSDTC rows are NA. The correct next step is:",
+    answer("Filter out the NA rows and continue"),
+    answer("Re-run with na.rm = TRUE"),
+    answer("Call problems() to see which rows failed parsing and fix the raw_fmt specification", correct = TRUE),
+    answer("Hardcode NA dates to '9999-12-31'"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Two AE raw datasets (ae_main and sae_raw) are processed separately. Both use generate_oak_id_vars with different raw_src values. After bind_rows, why might the same AE event appear twice?",
+    answer("bind_rows always deduplicates by AETERM"),
+    answer("Because the same serious AE is recorded on both the main CRF and the SAE CRF — deduplication must be applied before derive_seq", correct = TRUE),
+    answer("derive_seq will automatically remove duplicates"),
+    answer("Different raw_src values prevent duplicates from appearing"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 14  Self-check Quiz
+
+```{r final-quiz-09, echo=FALSE}
+quiz(
+  caption = "Lesson 09 — self-check",
+
+  question(
+    "Why does a Findings domain like VS need a 'topic block + bind_rows' pattern?",
+    answer("CDISC requires it for all non-DM domains"),
+    answer("Raw VS data is wide (one row per visit with multiple BP columns); SDTM VS is long (one row per measurement), so the wide columns must be individually processed and stacked", correct = TRUE),
+    answer("bind_rows is needed to attach multiple OAK identifier sets"),
+    answer("Each topic block maps a different subject"),
+    allow_retry = TRUE
+  ),
+  question(
+    "In derive_seq(), rec_vars = c('USUBJID', 'VSTESTCD', 'VISIT') means the sequence number resets to 1 when:",
+    answer("Any column in rec_vars changes — i.e. for each unique USUBJID (regardless of test or visit)"),
+    answer("USUBJID changes — a new subject always starts at 1"),
+    answer("Within each USUBJID, rows are numbered 1, 2, 3 … sorted by the rec_vars combination", correct = TRUE),
+    answer("VSTESTCD changes"),
+    allow_retry = TRUE
+  ),
+  question(
+    "An AE starts on 2020-07-14 and the reference start date (RFSTDTC) is 2020-07-16. AESTDY =",
+    answer("-1"),
+    answer("-2 — two days before Day 1", correct = TRUE),
+    answer("1"),
+    answer("0"),
+    allow_retry = TRUE
+  ),
+  question(
+    "AEDECOD and AEBODSYS are absent from your OAK AE pipeline. Why?",
+    answer("They are optional SDTM variables not required for submissions"),
+    answer("They come from external MedDRA medical coding — not from the raw CRF data or OAK mapping", correct = TRUE),
+    answer("They are derived by derive_seq() in a later step"),
+    answer("sdtm.oak does not support Events domains yet"),
+    allow_retry = TRUE
+  ),
+  question(
+    "The raw_source column set by generate_oak_id_vars() is most useful when:",
+    answer("Validating CT spec conformance"),
+    answer("Two raw datasets feed one SDTM domain — raw_source identifies which CRF each row came from for provenance and QC", correct = TRUE),
+    answer("Computing study day"),
+    answer("Deriving USUBJID from PATNUM"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Key Takeaways
+
+1. **Four SDTM classes**: Findings (wide→long, topic blocks), Events (one-to-one), Interventions (one-to-one), Findings About (rare).
+2. **Findings pipeline = topic blocks + bind_rows**: each raw measurement column becomes a separate block of rows, then all blocks are stacked.
+3. **Events pipeline** is simpler: assign/hardcode each SDTM column, then domain keys, `derive_seq()`, `derive_study_day()`.
+4. **`derive_seq()`** assigns a 1-based row number within USUBJID — the choice of `rec_vars` determines uniqueness.
+5. **`derive_study_day()`** implements the CDISC no-Day-0 convention: reference day = Day 1, days before = negative.
+6. **`derive_blfl()`** flags the last pre-dose observation per subject per test — encodes the full CDISC baseline rule.
+7. **Multiple raw sources** → process independently, `bind_rows()`, deduplicate before `derive_seq()`. The `raw_source` column tracks provenance.
+8. **Validate against `pharmaversesdtm`** using `setdiff(names(...))` and `inner_join()` comparisons.
+
+**Next** → Lesson 10: `{sdtm.oak}` Part 3 — SUPP-- domains and RELREC
+(`rmarkdown::run("10_sdtm_oak_part3.Rmd")`)

@@ -1,0 +1,1074 @@
+---
+title: "Lesson 08 — {sdtm.oak} Part 1: Concepts and Architecture"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+    ace_theme: tomorrow
+runtime: shiny_prerendered
+description: >
+  Understand why sdtm.oak exists, learn all six core algorithm functions, master the
+  oak_id_vars threading concept, read and apply a CT spec, and use condition_add for
+  conditional mapping — all with runnable exercises built on mock implementations that
+  mirror the real package behaviour.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tibble)
+library(lubridate)
+library(stringr)
+library(rlang)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 60)
+
+# ════════════════════════════════════════════════════════════════════════════
+# MOCK sdtm.oak IMPLEMENTATIONS
+# These reproduce the core behaviour of the real sdtm.oak functions so every
+# exercise runs without the package installed.  The real functions add
+# additional validation, logging, and metadata-driven features not shown here.
+# Once you install sdtm.oak, replace these with library(sdtm.oak).
+# ════════════════════════════════════════════════════════════════════════════
+
+oak_id_vars <- function() c("oak_id", "raw_source", "patient_number")
+
+generate_oak_id_vars <- function(raw_dat, pat_var, raw_src) {
+  raw_dat |>
+    mutate(
+      oak_id         = row_number(),
+      raw_source     = raw_src,
+      patient_number = .data[[pat_var]]
+    )
+}
+
+assign_no_ct <- function(raw_dat, raw_var, tgt_var,
+                         id_vars = oak_id_vars(), tgt_dat = NULL) {
+  result <- raw_dat |>
+    select(any_of(c(id_vars, raw_var))) |>
+    rename(!!sym(tgt_var) := !!sym(raw_var))
+  if (!is.null(tgt_dat)) {
+    left_join(tgt_dat, result, by = intersect(id_vars, names(tgt_dat)))
+  } else {
+    result
+  }
+}
+
+hardcode_no_ct <- function(raw_dat, raw_var, tgt_var, tgt_val,
+                           id_vars = oak_id_vars()) {
+  raw_dat |>
+    filter(!is.na(.data[[raw_var]])) |>
+    select(any_of(c(id_vars, raw_var))) |>
+    mutate(!!sym(tgt_var) := tgt_val) |>
+    select(-any_of(raw_var))
+}
+
+assign_ct <- function(raw_dat, raw_var, tgt_var, ct_spec, ct_clst,
+                      id_vars = oak_id_vars()) {
+  lookup <- ct_spec |>
+    filter(codelist_code == ct_clst) |>
+    select(collected_value, term_value) |>
+    distinct()
+  unmapped <- raw_dat |>
+    pull(!!sym(raw_var)) |>
+    unique() |>
+    setdiff(lookup$collected_value) |>
+    na.omit()
+  if (length(unmapped) > 0)
+    message("assign_ct: unmapped value(s) in '", raw_var, "': ",
+            paste(unmapped, collapse = ", "))
+  raw_dat |>
+    select(any_of(c(id_vars, raw_var))) |>
+    left_join(lookup, by = setNames("collected_value", raw_var)) |>
+    select(-any_of(raw_var)) |>
+    rename(!!sym(tgt_var) := term_value)
+}
+
+hardcode_ct <- function(raw_dat, raw_var, tgt_var, tgt_val,
+                        ct_spec, ct_clst, id_vars = oak_id_vars()) {
+  valid_vals <- ct_spec |>
+    filter(codelist_code == ct_clst) |>
+    pull(term_value) |>
+    unique()
+  if (!tgt_val %in% valid_vals)
+    warning("hardcode_ct: '", tgt_val, "' not in codelist ", ct_clst)
+  hardcode_no_ct(raw_dat, raw_var, tgt_var, tgt_val, id_vars)
+}
+
+condition_add <- function(raw_dat, condition) {
+  cond <- enquo(condition)
+  raw_dat |> mutate(.oak_condition = !!cond)
+}
+
+# Apply a conditioned dataset — strips the flag and filters to active rows
+apply_condition <- function(conditioned_dat) {
+  conditioned_dat |>
+    filter(.oak_condition) |>
+    select(-.oak_condition)
+}
+
+# ── Shared raw datasets ──────────────────────────────────────────────────────
+
+vs_raw <- tribble(
+  ~STUDYID,     ~PATNUM, ~SITEID, ~VISIT,       ~VISDAT,       ~VISTM,  ~SYS_BP, ~DIA_BP, ~PULSE, ~SUBPOS,
+  "TEST_STUDY",    1015,  "701",  "SCREENING",  "15-JUL-2020", "09:00",    128,      82,     72,  "Sitting",
+  "TEST_STUDY",    1015,  "701",  "WEEK 4",     "12-AUG-2020", "10:15",    132,      84,     74,  "sitting",
+  "TEST_STUDY",    1015,  "701",  "WEEK 8",     "09-SEP-2020", "09:45",    126,      80,     70,  "SITTING",
+  "TEST_STUDY",    1023,  "701",  "SCREENING",  "16-JUL-2020", "08:30",    145,      90,     80,  "Sitting",
+  "TEST_STUDY",    1023,  "701",  "WEEK 4",     "13-AUG-2020", "11:00",    138,      88,     78,  "sit",
+  "TEST_STUDY",    1034,  "702",  "SCREENING",  "17-JUL-2020", "14:00",    120,      76,     65,  "SITTING",
+  "TEST_STUDY",    1034,  "702",  "WEEK 4",     "14-AUG-2020", "09:30",    NA,       NA,     68,  NA
+)
+
+ae_raw <- tribble(
+  ~STUDYID,     ~PATNUM, ~SITEID, ~AETERM,                      ~AESTDT,       ~AESEV,      ~AESER,
+  "TEST_STUDY",    1015,  "701",  "HEADACHE",                   "2020-07-20",  "MILD",      "N",
+  "TEST_STUDY",    1015,  "701",  "NAUSEA",                     "2020-08-05",  "MODERATE",  "N",
+  "TEST_STUDY",    1023,  "701",  "DIZZINESS",                  "2020-07-22",  "MILD",      "N",
+  "TEST_STUDY",    1034,  "702",  "FALL",                       "2020-07-28",  "SEVERE",    "Y",
+  "TEST_STUDY",    1034,  "702",  "HEADACHE",                   "2020-08-15",  "mild",      "N"  # dirty CT
+)
+
+cm_raw <- tribble(
+  ~STUDYID,     ~PATNUM, ~SITEID, ~IT.CMTRT,     ~IT.CMTRTOTH,    ~CMDOSE, ~CMDOSU,
+  "TEST_STUDY",    1015,  "701",  "IBUPROFEN",    NA,              400,     "mg",
+  "TEST_STUDY",    1015,  "701",  "OTHER",        "HERBAL TEA",    NA,      NA,
+  "TEST_STUDY",    1023,  "701",  "PARACETAMOL",  NA,              500,     "mg",
+  "TEST_STUDY",    1034,  "702",  NA,             "VITAMIN D",     1000,    "IU"
+)
+
+# Controlled terminology spec
+study_ct <- tribble(
+  ~codelist_code, ~codelist_name,  ~term_code, ~term_value,            ~collected_value,
+  "C66741",       "VS Test Code",  "SYSBP",    "SYSBP",                "SYSBP",
+  "C66741",       "VS Test Code",  "DIABP",    "DIABP",                "DIABP",
+  "C66741",       "VS Test Code",  "PULSE",    "PULSE",                "PULSE",
+  "C67153",       "VS Test Name",  "SYSBP",    "Systolic Blood Pressure", "Systolic Blood Pressure",
+  "C67153",       "VS Test Name",  "DIABP",    "Diastolic Blood Pressure","Diastolic Blood Pressure",
+  "C67153",       "VS Test Name",  "PULSE",    "Pulse Rate",           "Pulse Rate",
+  "C66770",       "VS Unit",       "mmHg",     "mmHg",                 "mmHg",
+  "C66770",       "VS Unit",       "beats/min","beats/min",            "beats/min",
+  "C71148",       "Position",      "SITTING",  "SITTING",              "Sitting",
+  "C71148",       "Position",      "SITTING",  "SITTING",              "sitting",
+  "C71148",       "Position",      "SITTING",  "SITTING",              "sit",
+  "C71148",       "Position",      "SITTING",  "SITTING",              "SITTING",
+  "C71148",       "Position",      "STANDING", "STANDING",             "Standing",
+  "C71148",       "Position",      "SUPINE",   "SUPINE",               "Supine",
+  "C66742",       "AE Severity",   "MILD",     "MILD",                 "MILD",
+  "C66742",       "AE Severity",   "MILD",     "MILD",                 "mild",
+  "C66742",       "AE Severity",   "MODERATE", "MODERATE",             "MODERATE",
+  "C66742",       "AE Severity",   "SEVERE",   "SEVERE",               "SEVERE"
+)
+```
+
+## Overview
+
+### Why a special package for SDTM mapping?
+
+You could build SDTM datasets with nothing but `dplyr` — as you did manually in Lesson 07. So why does pharmaverse maintain `{sdtm.oak}`?
+
+The answer is **standardisation through algorithms**. Roche's analysis of their internal SDTM work found that ~80% of 13,000+ SDTM variable mappings across 6 therapeutic areas could be expressed as instances of just **22 reusable algorithm patterns**. Each one is now a function. The benefits:
+
+| Benefit | What it means in practice |
+|---|---|
+| **Consistency** | Every "hardcode with CT check" uses the same function — no ad-hoc dplyr |
+| **Validation** | Validate `assign_ct()` once; every use of it inherits that validation |
+| **Metadata-readiness** | Algorithm + arguments can live in a spec spreadsheet → path to automation |
+
+`sdtm.oak` is co-developed by Roche, Pfizer, GSK, Vertex, and Merck, sponsored by **CDISC COSA** (Open Source Alliance). It is in the 0.x lifecycle — stable enough for production use, with new domains added each release.
+
+> **About this tutorial's code.** The exercises use *mock implementations* of the sdtm.oak
+> functions that reproduce their core behaviour. This means every exercise runs without the
+> package installed. Real function calls look identical — just add `library(sdtm.oak)` and
+> remove the mock block. Where the real function adds extra validation or features, a
+> callout box notes the difference.
+
+---
+
+```{r quiz-why-oak, echo=FALSE}
+quiz(
+  caption = "Why sdtm.oak?",
+  question(
+    "The core insight behind sdtm.oak is that SDTM mapping patterns are:",
+    answer("Unique to every domain and cannot be generalised"),
+    answer("Highly repetitive — ~80% of mappings reduce to a small set of algorithm patterns", correct = TRUE),
+    answer("Best expressed as SAS macros"),
+    answer("Fully automatable without any code"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which organisation sponsors the collaborative development of sdtm.oak?",
+    answer("FDA"),
+    answer("PHUSE"),
+    answer("CDISC COSA (Open Source Alliance)", correct = TRUE),
+    answer("ICH"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 1  The Algorithm Catalog
+
+### Six core algorithms — one function per pattern
+
+| Algorithm | Function | When to use |
+|---|---|---|
+| **assign_no_ct** | `assign_no_ct()` | Copy a raw variable → SDTM variable, no CT validation |
+| **assign_ct** | `assign_ct()` | Copy a raw variable → SDTM variable, recode against CT |
+| **hardcode_no_ct** | `hardcode_no_ct()` | Set SDTM variable to a fixed string, no CT check |
+| **hardcode_ct** | `hardcode_ct()` | Set SDTM variable to a fixed string, validated against CT |
+| **assign_datetime** | `assign_datetime()` | Parse date/time column(s) → ISO 8601 `--DTC` variable |
+| **condition_add** | `condition_add()` | Apply subsequent mappings only when a condition is TRUE |
+
+Plus essential utility functions:
+
+| Function | Purpose |
+|---|---|
+| `generate_oak_id_vars()` | Attach row-tracing identifiers to a raw dataset |
+| `oak_id_vars()` | Return the names of the three identifier columns |
+| `derive_seq()` | Derive `--SEQ` (within-subject sequence number) |
+| `derive_study_day()` | Calculate `--DY` from ISO 8601 dates |
+| `read_ct_spec()` | Load a CT spec from a CSV file |
+
+```{r quiz-catalog, echo=FALSE}
+quiz(
+  caption = "Algorithm matching",
+  question(
+    "DOMAIN = 'AE' (same value for every row, no CT needed). Which function?",
+    answer("assign_no_ct()"),
+    answer("assign_ct()"),
+    answer("hardcode_no_ct()", correct = TRUE),
+    answer("assign_datetime()"),
+    allow_retry = TRUE
+  ),
+  question(
+    "AESEV mapped from raw IT.AESEV — must be MILD, MODERATE, or SEVERE. Which function?",
+    answer("assign_no_ct() — just copy the value"),
+    answer("assign_ct() — copy and validate/recode against the severity codelist", correct = TRUE),
+    answer("hardcode_ct() — it's a fixed value"),
+    answer("condition_add() — only map when AESEV is not blank"),
+    allow_retry = TRUE
+  ),
+  question(
+    "VSTESTCD = 'SYSBP' for all rows sourced from the SYS_BP raw column, validated against the VS Test Code codelist. Which function?",
+    answer("assign_ct()"),
+    answer("hardcode_no_ct()"),
+    answer("hardcode_ct() — it's a fixed value that must pass CT validation", correct = TRUE),
+    answer("assign_datetime()"),
+    allow_retry = TRUE
+  ),
+  question(
+    "VSDTC must be built from separate raw columns VISDAT ('15-JUL-2020') and VISTM ('09:00'). Which function?",
+    answer("assign_no_ct() with two raw_var arguments"),
+    answer("assign_datetime() — it combines and reformats to ISO 8601", correct = TRUE),
+    answer("hardcode_no_ct() with a paste() in tgt_val"),
+    answer("condition_add()"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 2  generate_oak_id_vars() — attach row-tracing identifiers
+
+### Concept
+
+Before any algorithm can run, every raw row needs three identity columns that track it throughout the mapping chain:
+
+| Column | Content | Purpose |
+|---|---|---|
+| `oak_id` | 1, 2, 3, … | Unique row identifier within the raw source |
+| `raw_source` | e.g. `"vs_raw"` | Labels which raw dataset this row came from |
+| `patient_number` | copy of `PATNUM` | Subject identifier carried forward |
+
+Together these are `oak_id_vars()`. Every algorithm function accepts `id_vars = oak_id_vars()` so it can merge derived values back onto the correct rows.
+
+```r
+# Real sdtm.oak:
+library(sdtm.oak)
+vs_raw <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+oak_id_vars()   # c("oak_id", "raw_source", "patient_number")
+```
+
+### Exercise 2a — attach OAK identifiers to vs_raw
+
+Run `generate_oak_id_vars()` on `vs_raw`. Inspect the result and confirm the three new columns.
+
+```{r gen-oak-id, exercise=TRUE, exercise.lines=8}
+vs_id <- generate_oak_id_vars(
+  raw_dat = vs_raw,
+  pat_var = "___",    # the raw patient ID column
+  raw_src = "___"     # label for this source
+)
+
+vs_id |> select(oak_id, raw_source, patient_number, VISIT, SYS_BP)
+```
+
+```{r gen-oak-id-hint-1}
+# pat_var = "PATNUM"  (the column holding the patient number)
+# raw_src = "vs_raw"  (any descriptive label you choose)
+```
+
+```{r gen-oak-id-solution}
+vs_id <- generate_oak_id_vars(
+  raw_dat = vs_raw,
+  pat_var = "PATNUM",
+  raw_src = "vs_raw"
+)
+vs_id |> select(oak_id, raw_source, patient_number, VISIT, SYS_BP)
+```
+
+### Exercise 2b — inspect oak_id_vars()
+
+Call `oak_id_vars()` and confirm the three column names it returns. Then check they all exist in `vs_id`.
+
+```{r oak-id-vars, exercise=TRUE, exercise.lines=8}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+# The three identifier column names
+id_cols <- oak_id_vars()
+id_cols
+
+# Verify they are all present in vs_id
+all(id_cols %in% names(vs_id))
+```
+
+```{r quiz-oak-id, echo=FALSE}
+quiz(
+  caption = "oak_id_vars check",
+  question(
+    "Why does sdtm.oak keep ALL rows (including those with NA raw values) rather than filtering them out early?",
+    answer("To save memory — filtering is slower than keeping all rows"),
+    answer("So every raw row remains traceable through the full algorithm chain and can be audited", correct = TRUE),
+    answer("Because NA rows may still receive hardcoded DOMAIN values"),
+    answer("The algorithms automatically skip NA rows anyway"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 3  assign_no_ct() — direct copy, no CT
+
+### Concept
+
+The simplest algorithm: copy a raw variable into an SDTM variable with no controlled terminology validation.
+
+```r
+# Real sdtm.oak syntax:
+cm_trt <- assign_no_ct(
+  raw_dat = cm_raw,
+  raw_var = "IT.CMTRT",    # raw column
+  tgt_var = "CMTRT",       # SDTM target column
+  id_vars = oak_id_vars()
+)
+```
+
+**Priority chaining** — a key feature: if two `assign_no_ct()` calls write to the same `tgt_var`, the second call fills only the rows that are still `NA` from the first. This gives you a clean "try this source first, fall back to that source" pattern:
+
+```r
+# Fill CMTRT from IT.CMTRT; for rows where that's NA, fill from IT.CMTRTOTH
+cm_trt <- cm_raw |>
+  assign_no_ct(raw_var = "IT.CMTRT",    tgt_var = "CMTRT") |>
+  assign_no_ct(raw_var = "IT.CMTRTOTH", tgt_var = "CMTRT")
+```
+
+### Exercise 3a — basic assign_no_ct
+
+Map `AETERM` from `ae_raw` (first attach OAK IDs). Show the result with id columns and `AETERM`.
+
+```{r assign-no-ct-basic, exercise=TRUE, exercise.lines=10}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_term <- assign_no_ct(
+  raw_dat = ae_id,
+  raw_var = "___",
+  tgt_var = "___",
+  id_vars = oak_id_vars()
+)
+
+ae_term
+```
+
+```{r assign-no-ct-basic-hint-1}
+# raw_var = "AETERM"  (the raw column)
+# tgt_var = "AETERM"  (SDTM target — same name here, just a direct copy)
+```
+
+```{r assign-no-ct-basic-solution}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_term <- assign_no_ct(
+  raw_dat = ae_id,
+  raw_var = "AETERM",
+  tgt_var = "AETERM",
+  id_vars = oak_id_vars()
+)
+
+ae_term
+```
+
+### Exercise 3b — priority chaining
+
+`cm_raw` has two treatment columns: `IT.CMTRT` (the primary treatment name) and `IT.CMTRTOTH` ("Other, specify" free text). Use priority chaining to fill `CMTRT` from the primary column first, then fall back to the "Other" column for rows where the primary was NA or `"OTHER"`.
+
+First attach OAK IDs, then chain two `assign_no_ct()` calls.
+
+```{r assign-no-ct-chain, exercise=TRUE, exercise.lines=14}
+cm_id <- generate_oak_id_vars(cm_raw, pat_var = "PATNUM", raw_src = "cm_raw")
+
+# Replace "OTHER" with NA so the second source can fill it
+cm_id <- cm_id |>
+  mutate(IT.CMTRT = if_else(IT.CMTRT == "OTHER", NA_character_, IT.CMTRT))
+
+cm_trt <- cm_id |>
+  assign_no_ct(raw_var = "IT.CMTRT",    tgt_var = "CMTRT", id_vars = oak_id_vars()) |>
+  # Now merge the second source (IT.CMTRTOTH fills remaining NAs)
+  left_join(
+    cm_id |> assign_no_ct(raw_var = "IT.CMTRTOTH", tgt_var = "CMTRT_OTH",
+                           id_vars = oak_id_vars()),
+    by = oak_id_vars()
+  ) |>
+  mutate(CMTRT = coalesce(CMTRT, CMTRT_OTH)) |>
+  select(-CMTRT_OTH)
+
+cm_trt |> select(patient_number, CMTRT)
+```
+
+```{r assign-no-ct-chain-hint-1}
+# coalesce(CMTRT, CMTRT_OTH) fills NA positions in CMTRT with the "Other" value
+# In real sdtm.oak, the second assign_no_ct() call handles this automatically
+# because it only fills NAs in the existing tgt_dat
+```
+
+---
+
+## 4  assign_ct() — copy with controlled terminology recoding
+
+### Concept
+
+When the SDTM variable is subject to a CT codelist, `assign_ct()` both maps the value **and** recodes it from whatever the raw data says to the standardised CDISC term.
+
+```r
+# Real sdtm.oak syntax:
+vs_pos <- assign_ct(
+  raw_dat = vs_raw,
+  raw_var = "SUBPOS",         # raw: "Sitting", "sitting", "sit"
+  tgt_var = "VSPOS",          # SDTM: must be "SITTING"
+  ct_spec = study_ct,
+  ct_clst = "C71148",         # Position codelist
+  id_vars = oak_id_vars()
+)
+```
+
+The CT spec maps `"Sitting"` → `"SITTING"`, `"sitting"` → `"SITTING"`, `"sit"` → `"SITTING"`. If a raw value is not in the spec, the function **alerts you** — it never silently passes non-conformant values through.
+
+### Exercise 4a — inspect the CT spec
+
+Examine `study_ct`. Find all collected values that map to `"SITTING"` under codelist `C71148`. This is how OAK handles raw data inconsistency.
+
+```{r inspect-ct-spec, exercise=TRUE, exercise.lines=8}
+study_ct |>
+  filter(codelist_code == "___") |>
+  select(codelist_code, collected_value, term_value)
+```
+
+```{r inspect-ct-spec-hint-1}
+# codelist_code == "C71148" (Position codelist)
+```
+
+```{r inspect-ct-spec-solution}
+study_ct |>
+  filter(codelist_code == "C71148") |>
+  select(codelist_code, collected_value, term_value)
+```
+
+### Exercise 4b — apply assign_ct to VSPOS
+
+Map `SUBPOS` from `vs_raw` to SDTM `VSPOS`, recoding all variants of "sitting" to the standard `"SITTING"`.
+
+```{r assign-ct-vspos, exercise=TRUE, exercise.lines=10}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vspos <- assign_ct(
+  raw_dat = vs_id,
+  raw_var = "___",        # raw column with dirty values
+  tgt_var = "___",        # SDTM target variable
+  ct_spec = study_ct,
+  ct_clst = "___",        # Position codelist
+  id_vars = oak_id_vars()
+)
+
+vspos
+```
+
+```{r assign-ct-vspos-hint-1}
+# raw_var = "SUBPOS"
+# tgt_var = "VSPOS"
+# ct_clst = "C71148"
+```
+
+```{r assign-ct-vspos-solution}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vspos <- assign_ct(
+  raw_dat = vs_id,
+  raw_var = "SUBPOS",
+  tgt_var = "VSPOS",
+  ct_spec = study_ct,
+  ct_clst = "C71148",
+  id_vars = oak_id_vars()
+)
+
+vspos
+```
+
+### Exercise 4c — catch an unmapped value
+
+`ae_raw$AESEV` has one row with the value `"mild"` (lowercase). Map it using `assign_ct()` with the AE Severity codelist (`C66742`). Notice whether the mock alerts you about the unmapped value or silently passes it.
+
+```{r assign-ct-catch, exercise=TRUE, exercise.lines=10}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+aesev <- assign_ct(
+  raw_dat = ae_id,
+  raw_var = "AESEV",
+  tgt_var = "AESEV",
+  ct_spec = study_ct,
+  ct_clst = "C66742",
+  id_vars = oak_id_vars()
+)
+
+aesev   # Which row has NA in AESEV?
+```
+
+```{r assign-ct-catch-hint-1}
+# "mild" (lowercase) maps to "MILD" in our CT spec — it SHOULD be handled.
+# Check study_ct for C66742 to see if "mild" is listed as a collected_value.
+# If it IS missing from the spec, that row gets NA and you see the alert.
+```
+
+```{r quiz-assign-ct, echo=FALSE}
+quiz(
+  caption = "assign_ct check",
+  question(
+    "What happens in assign_ct() when a raw value is not found in the CT spec?",
+    answer("The function silently passes the original raw value through"),
+    answer("The function errors and stops the pipeline"),
+    answer("The target variable gets NA for that row and the function alerts the user", correct = TRUE),
+    answer("The function substitutes the closest matching term automatically"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 5  hardcode_no_ct() and hardcode_ct()
+
+### Concept
+
+When the SDTM value is **fixed** (not pulled from raw data), use a hardcode function:
+
+```r
+# No CT check needed (DOMAIN is always "AE" — that's obvious)
+ae_domain <- hardcode_no_ct(
+  raw_dat = ae_raw,
+  raw_var = "AETERM",    # identifies which rows are "active"
+  tgt_var = "DOMAIN",
+  tgt_val = "AE",
+  id_vars = oak_id_vars()
+)
+
+# CT check needed (VSTESTCD must be in the VS Test Code codelist)
+vs_testcd <- hardcode_ct(
+  raw_dat = vs_raw,
+  raw_var = "SYS_BP",
+  tgt_var = "VSTESTCD",
+  tgt_val = "SYSBP",
+  ct_spec = study_ct,
+  ct_clst = "C66741",
+  id_vars = oak_id_vars()
+)
+```
+
+> **Why use `raw_var` at all in a hardcode call?**
+> It identifies the *row population* — the rows that exist for this variable.
+> In a Findings domain, each topic variable (SYSBP, DIABP, PULSE) comes from a
+> different raw column. `raw_var = "SYS_BP"` means "create one SDTM row for
+> each non-NA row in SYS_BP."
+
+### Exercise 5a — hardcode DOMAIN
+
+Attach OAK IDs to `ae_raw`, then hardcode `DOMAIN = "AE"` for every row where `AETERM` is not missing.
+
+```{r hardcode-no-ct, exercise=TRUE, exercise.lines=10}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_domain <- hardcode_no_ct(
+  raw_dat = ae_id,
+  raw_var = "___",     # the topic variable (identifies active rows)
+  tgt_var = "___",
+  tgt_val = "___",
+  id_vars = oak_id_vars()
+)
+
+ae_domain
+```
+
+```{r hardcode-no-ct-hint-1}
+# raw_var = "AETERM"  (rows with non-NA AETERM are active)
+# tgt_var = "DOMAIN", tgt_val = "AE"
+```
+
+```{r hardcode-no-ct-solution}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_domain <- hardcode_no_ct(
+  raw_dat = ae_id,
+  raw_var = "AETERM",
+  tgt_var = "DOMAIN",
+  tgt_val = "AE",
+  id_vars = oak_id_vars()
+)
+
+ae_domain
+```
+
+### Exercise 5b — hardcode_ct with validation
+
+Hardcode `VSTESTCD = "SYSBP"` for rows sourced from `SYS_BP`, validated against codelist `C66741`. Then try setting `tgt_val = "INVALIDCODE"` — does the mock warn you?
+
+```{r hardcode-ct-ex, exercise=TRUE, exercise.lines=18}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+# Valid hardcode
+vs_sysbp_code <- hardcode_ct(
+  raw_dat = vs_id,
+  raw_var = "SYS_BP",
+  tgt_var = "VSTESTCD",
+  tgt_val = "___",
+  ct_spec = study_ct,
+  ct_clst = "C66741",
+  id_vars = oak_id_vars()
+)
+
+vs_sysbp_code
+
+# Now try an invalid value — watch for the warning message
+hardcode_ct(vs_id, "SYS_BP", "VSTESTCD", "INVALIDCODE", study_ct, "C66741")
+```
+
+```{r hardcode-ct-ex-hint-1}
+# tgt_val = "SYSBP"  (a valid entry in the C66741 codelist)
+# "INVALIDCODE" is not in the spec → the function warns you
+```
+
+```{r hardcode-ct-ex-solution}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vs_sysbp_code <- hardcode_ct(
+  raw_dat = vs_id,
+  raw_var  = "SYS_BP",
+  tgt_var  = "VSTESTCD",
+  tgt_val  = "SYSBP",
+  ct_spec  = study_ct,
+  ct_clst  = "C66741",
+  id_vars  = oak_id_vars()
+)
+
+vs_sysbp_code
+hardcode_ct(vs_id, "SYS_BP", "VSTESTCD", "INVALIDCODE", study_ct, "C66741")
+```
+
+---
+
+## 6  assign_datetime() — ISO 8601 from raw date/time columns
+
+### Concept
+
+SDTM `--DTC` variables must be ISO 8601 strings (`YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`). Raw data may provide dates in a variety of formats, sometimes with a separate time column.
+
+```r
+# Real sdtm.oak syntax:
+vs_dtc <- assign_datetime(
+  raw_dat = vs_raw,
+  raw_var = c("VISDAT", "VISTM"),           # date col, time col
+  tgt_var = "VSDTC",
+  raw_fmt = c(list(c("d-m-y", "dd-mmm-yyyy")), "H:M"),
+  id_vars = oak_id_vars()
+)
+```
+
+The function:
+- Accepts a **list of input formats** per component (handles `"15-JUL-2020"` and `"15-07-2020"` in the same column)
+- Combines date + time into `"2020-07-15T09:00"`
+- Returns partial ISO 8601 when time is missing: `"2020-07-15"`
+- Exposes parse failures via `problems()` — **never silently drops bad rows**
+
+### Exercise 6 — manual ISO 8601 construction (mirroring assign_datetime logic)
+
+The mock in this tutorial doesn't implement `assign_datetime()` (date parsing is complex). Instead, practice the underlying logic manually using `lubridate`. Parse `VISDAT` from `"dd-mmm-yyyy"` format and combine with `VISTM` into an ISO 8601 datetime string.
+
+```{r datetime-manual, exercise=TRUE, exercise.lines=14}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vs_id |>
+  mutate(
+    # Parse the "15-JUL-2020" format (day-month abbreviation-year)
+    VISDAT_D  = dmy(VISDAT),
+    # Combine with time to produce ISO 8601 datetime string
+    VSDTC     = if_else(
+      !is.na(VISTM),
+      paste0(as.character(VISDAT_D), "T", VISTM, ":00"),
+      as.character(VISDAT_D)
+    )
+  ) |>
+  select(patient_number, VISIT, VISDAT, VISTM, VSDTC)
+```
+
+```{r datetime-manual-hint-1}
+# dmy() parses day-month-year format ("15-JUL-2020")
+# paste0(date, "T", time, ":00") builds "2020-07-15T09:00:00"
+# This is exactly what assign_datetime() automates with format detection
+```
+
+```{r quiz-datetime, echo=FALSE}
+quiz(
+  caption = "assign_datetime check",
+  question(
+    "When assign_datetime() cannot parse a date value, it:",
+    answer("Silently substitutes today's date"),
+    answer("Errors and stops the entire pipeline"),
+    answer("Returns NA for that row and records the failure in problems() for review", correct = TRUE),
+    answer("Attempts the next format in the format list indefinitely"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A raw VS record has a date ('15-JUL-2020') but no time. assign_datetime() will produce:",
+    answer("An error because ISO 8601 requires a time component"),
+    answer("'2020-07-15T00:00:00' (midnight default)"),
+    answer("'2020-07-15' — a valid partial ISO 8601 date string", correct = TRUE),
+    answer("NA because the datetime is incomplete"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 7  condition_add() — conditional mapping
+
+### Concept
+
+`condition_add()` creates a **conditioned data frame** — a tibble tagged with a logical column `.oak_condition` that marks which rows are "active" for the next algorithm call. The critical design choice: rows are **tagged, not filtered** — all rows remain present for traceability.
+
+```r
+# Real sdtm.oak syntax:
+vs_orres_conditional <- vs_raw |>
+  condition_add(SYS_BP != "" & !is.na(SYS_BP)) |>
+  assign_no_ct(raw_var = "SYS_BP", tgt_var = "VSORRES", id_vars = oak_id_vars())
+```
+
+The condition is consumed by the next algorithm — only the active rows receive the mapped value. Inactive rows get `NA`.
+
+This is OAK's answer to SAS's `IF condition THEN` in a DATA step.
+
+### Exercise 7a — inspect a conditioned data frame
+
+Apply `condition_add()` to flag only rows where `SYS_BP` is not NA. Print the result and observe the `.oak_condition` column.
+
+```{r condition-inspect, exercise=TRUE, exercise.lines=8}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vs_cond <- condition_add(vs_id, !is.na(SYS_BP))
+
+vs_cond |> select(oak_id, patient_number, VISIT, SYS_BP, .oak_condition)
+```
+
+```{r condition-inspect-hint-1}
+# .oak_condition is TRUE when SYS_BP is not NA, FALSE when it is
+# Row 7 (PATNUM 1034, WEEK 4) has SYS_BP = NA → .oak_condition = FALSE
+```
+
+### Exercise 7b — conditional assign_no_ct
+
+Map `SYS_BP` to `VSORRES` **only** for rows where `SYS_BP` is not NA. Use `condition_add()` then `apply_condition()` (a helper in this tutorial that strips the flag and keeps active rows).
+
+```{r condition-map, exercise=TRUE, exercise.lines=12}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vs_orres <- vs_id |>
+  condition_add(!is.na(___)) |>
+  apply_condition() |>           # keep only active rows (real sdtm.oak handles this internally)
+  assign_no_ct(
+    raw_var = "SYS_BP",
+    tgt_var = "VSORRES",
+    id_vars = oak_id_vars()
+  )
+
+vs_orres   # should have 6 rows — row with NA SYS_BP is excluded
+```
+
+```{r condition-map-hint-1}
+# condition_add(!is.na(SYS_BP))
+# apply_condition() is a tutorial helper — in real sdtm.oak, the subsequent
+# algorithm call handles the conditioned data frame automatically
+```
+
+```{r condition-map-solution}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vs_orres <- vs_id |>
+  condition_add(!is.na(SYS_BP)) |>
+  apply_condition() |>
+  assign_no_ct(
+    raw_var = "SYS_BP",
+    tgt_var = "VSORRES",
+    id_vars = oak_id_vars()
+  )
+
+vs_orres
+```
+
+```{r quiz-condition-add, echo=FALSE}
+quiz(
+  caption = "condition_add check",
+  question(
+    "Why does condition_add() tag rows rather than filter them out?",
+    answer("Filtering is slower in R"),
+    answer("So all raw rows remain in the dataset and every row can be traced and audited back to its source", correct = TRUE),
+    answer("Because the condition may change later in the pipeline"),
+    answer("Filtering breaks the oak_id sequence"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 8  The CT spec in detail
+
+### Spec format
+
+A CT spec is a plain data frame (usually read from a CSV) with these key columns:
+
+| Column | Description |
+|---|---|
+| `codelist_code` | NCI code for the codelist (e.g. `"C66742"`) |
+| `codelist_name` | Human-readable name (e.g. `"AE Severity"`) |
+| `term_code` | CDISC submission value code |
+| `term_value` | The standard CDISC term string to write into SDTM |
+| `collected_value` | Raw value(s) that map to this term (many rows per term) |
+
+Multiple `collected_value` rows for the same `term_value` is how OAK handles dirty raw data — one standard output, many acceptable raw inputs.
+
+```r
+# Real sdtm.oak:
+study_ct <- read_ct_spec("path/to/study_ct.csv")
+# Or use the built-in example:
+study_ct <- read_ct_spec_example("ct-01-cm")
+```
+
+### Exercise 8a — explore the full CT spec
+
+Inspect `study_ct`. How many distinct codelists are present? For codelist `C66742`, how many raw collected values map to `"MILD"`?
+
+```{r ct-spec-explore, exercise=TRUE, exercise.lines=12}
+# Number of distinct codelists
+study_ct |> distinct(codelist_code, codelist_name)
+
+# How many raw values map to MILD in C66742?
+study_ct |>
+  filter(codelist_code == "C66742", term_value == "MILD") |>
+  select(collected_value, term_value)
+```
+
+### Exercise 8b — add a new entry to the CT spec
+
+The spec for `C71148` (Position) is missing the raw value `"standing"` (lowercase). Add it as a mapping to `"STANDING"`. Use `bind_rows()`.
+
+```{r ct-spec-extend, exercise=TRUE, exercise.lines=12}
+new_entry <- tibble(
+  codelist_code = "C71148",
+  codelist_name = "Position",
+  term_code     = "STANDING",
+  term_value    = "___",
+  collected_value = "___"
+)
+
+study_ct_extended <- bind_rows(study_ct, new_entry)
+
+# Verify the new entry
+study_ct_extended |>
+  filter(codelist_code == "C71148") |>
+  select(collected_value, term_value)
+```
+
+```{r ct-spec-extend-hint-1}
+# term_value    = "STANDING"
+# collected_value = "standing"
+```
+
+```{r ct-spec-extend-solution}
+new_entry <- tibble(
+  codelist_code   = "C71148",
+  codelist_name   = "Position",
+  term_code       = "STANDING",
+  term_value      = "STANDING",
+  collected_value = "standing"
+)
+
+study_ct_extended <- bind_rows(study_ct, new_entry)
+
+study_ct_extended |>
+  filter(codelist_code == "C71148") |>
+  select(collected_value, term_value)
+```
+
+---
+
+## 9  The OAK Pipeline Pattern — putting it all together
+
+### Shape of a complete topic variable
+
+A typical OAK pipeline for one **topic variable** (e.g., SYSBP) chains:
+
+1. `hardcode_ct()` → `VSTESTCD = "SYSBP"` (what was measured)
+2. `hardcode_ct()` → `VSTEST = "Systolic Blood Pressure"` (long label)
+3. `assign_no_ct()` → `VSORRES = SYS_BP` (the collected value)
+4. `hardcode_no_ct()` → `VSORRESU = "mmHg"` (units)
+5. `assign_ct()` → `VSPOS` from `SUBPOS` (position, with CT recode)
+
+Then you repeat for DIABP and PULSE, `bind_rows()` all three, and add domain-wide columns (STUDYID, USUBJID, VSSEQ, VSDTC).
+
+### Exercise 9 — build the SYSBP topic variable
+
+Chain all five steps above for SYSBP. Use the mock functions and `study_ct`. The result should be a tibble with one row per measurement of systolic BP.
+
+```{r oak-sysbp-pipeline, exercise=TRUE, exercise.lines=35}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+# Focus on rows where SYS_BP was recorded
+vs_sysbp <- vs_id |>
+  condition_add(!is.na(SYS_BP)) |>
+  apply_condition()
+
+# Step 1: VSTESTCD = "SYSBP"
+step1 <- hardcode_ct(vs_sysbp, "SYS_BP", "VSTESTCD", "SYSBP",
+                     study_ct, "C66741", oak_id_vars())
+
+# Step 2: VSTEST = "Systolic Blood Pressure"
+step2 <- hardcode_ct(vs_sysbp, "SYS_BP", "VSTEST",
+                     "Systolic Blood Pressure",
+                     study_ct, "C67153", oak_id_vars())
+
+# Step 3: VSORRES = SYS_BP (the actual reading)
+step3 <- assign_no_ct(vs_sysbp, "SYS_BP", "VSORRES", oak_id_vars())
+
+# Step 4: VSORRESU = "mmHg"
+step4 <- hardcode_no_ct(vs_sysbp, "SYS_BP", "VSORRESU", "mmHg", oak_id_vars())
+
+# Step 5: VSPOS from SUBPOS (recode with CT)
+step5 <- assign_ct(vs_sysbp, "SUBPOS", "VSPOS", study_ct, "C71148", oak_id_vars())
+
+# Join all steps on oak_id_vars()
+vs_sysbp_full <- step1 |>
+  left_join(step2, by = oak_id_vars()) |>
+  left_join(step3, by = oak_id_vars()) |>
+  left_join(step4, by = oak_id_vars()) |>
+  left_join(step5, by = oak_id_vars())
+
+vs_sysbp_full |> select(patient_number, VSTESTCD, VSTEST, VSORRES, VSORRESU, VSPOS)
+```
+
+```{r oak-sysbp-pipeline-hint-1}
+# Each step() returns a tibble with oak_id_vars() + the derived SDTM column.
+# left_join by oak_id_vars() aligns them all correctly.
+# In real sdtm.oak, a single chained pipeline with tgt_dat= argument handles this.
+```
+
+---
+
+## 10  Self-check Quiz
+
+```{r final-quiz-08, echo=FALSE}
+quiz(
+  caption = "Lesson 08 — self-check",
+
+  question(
+    "What are the three columns that make up oak_id_vars()?",
+    answer("oak_id, PATNUM, STUDYID"),
+    answer("oak_id, raw_source, patient_number", correct = TRUE),
+    answer("row_id, dataset_name, subject_id"),
+    answer("oak_id, raw_source, USUBJID"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "You need to map AESER from raw IT.AESER — values must be Y or N per CDISC CT. Which function?",
+    answer("assign_no_ct() — just copy the value"),
+    answer("hardcode_ct() — it's always Y or N"),
+    answer("assign_ct() — copy the value and validate/recode against the Y/N codelist", correct = TRUE),
+    answer("condition_add() — only map when IT.AESER is not blank"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "What does priority chaining with two assign_no_ct() calls to the same tgt_var achieve?",
+    answer("The second call overwrites all values set by the first"),
+    answer("It causes an error because a target variable can only be mapped once"),
+    answer("The second call fills only the rows that are still NA after the first — a fallback pattern", correct = TRUE),
+    answer("Both calls run independently and you choose which result to keep"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "In a Findings domain (e.g., VS), the raw_var argument in hardcode_ct() identifies:",
+    answer("The codelist to validate against"),
+    answer("The raw column whose non-NA rows define which SDTM rows to create for this topic variable", correct = TRUE),
+    answer("The variable that will be recoded using the CT spec"),
+    answer("The date column for the observation"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "Which statement about condition_add() is TRUE?",
+    answer("It permanently removes rows that don't meet the condition"),
+    answer("It creates a conditioned data frame — all rows remain but only active rows receive the next mapping", correct = TRUE),
+    answer("It is equivalent to dplyr::filter()"),
+    answer("It must be paired with condition_remove() to work"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "A CT spec row has collected_value = 'sitting' and term_value = 'SITTING'. This means:",
+    answer("The raw data must always contain exactly 'SITTING'"),
+    answer("When assign_ct() encounters 'sitting' in the raw data, it writes 'SITTING' to the SDTM variable", correct = TRUE),
+    answer("Both 'sitting' and 'SITTING' are valid SDTM outputs"),
+    answer("The spec entry is invalid — collected and term values must match exactly"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Key Takeaways
+
+1. **`sdtm.oak` turns SDTM mapping into 6 reusable algorithm functions** — eliminating ad-hoc dplyr that looks different every time.
+2. **`generate_oak_id_vars()`** is always the first step — it attaches `oak_id`, `raw_source`, and `patient_number` so every row is traceable through the chain.
+3. **Four mapping patterns** → four function pairs: copy (assign_no_ct / assign_ct), hardcode (hardcode_no_ct / hardcode_ct).
+4. **`assign_ct()` and `hardcode_ct()`** validate against a CT spec — unmapped values produce NAs with alerts, never silent data quality issues.
+5. **`assign_datetime()`** handles raw date/time → ISO 8601, with multi-format support and a `problems()` audit trail.
+6. **`condition_add()`** tags rows for conditional mapping without losing any rows — essential for traceability.
+7. **One topic variable = one chain of algorithm calls**, joined by `oak_id_vars()`. Repeat per topic, then `bind_rows()`.
+
+**Next** → Lesson 09: `{sdtm.oak}` Part 2 — building the VS and AE domains end-to-end
+(`rmarkdown::run("09_sdtm_oak_part2.Rmd")`)

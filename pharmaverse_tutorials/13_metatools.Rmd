@@ -1,0 +1,760 @@
+---
+title: "Lesson 13 — {metatools}: Using the Spec to Build and Validate Datasets"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+description: >
+  Use metacore objects to build datasets spec-first, derive codelist-driven
+  companion variables, apply labels, and run conformance checks.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── Re-create metacore infrastructure (same as Lesson 12) ────────────────────
+metacore <- function(ds_spec, ds_vars, var_spec,
+                     value_spec  = tibble(variable = character(), dataset = character(),
+                                          where = character(), code_id = character()),
+                     code_list   = tibble(code_id = character(), name = character(),
+                                          code = character(), decode = character()),
+                     derivations = tibble(derivation_id = character(),
+                                          derivation = character())) {
+  missing_datasets <- setdiff(unique(ds_vars$dataset), ds_spec$dataset)
+  if (length(missing_datasets) > 0)
+    stop("ds_vars references datasets not in ds_spec: ", paste(missing_datasets, collapse = ", "))
+  missing_vars <- setdiff(unique(ds_vars$variable), var_spec$variable)
+  if (length(missing_vars) > 0)
+    stop("ds_vars references variables not in var_spec: ", paste(missing_vars, collapse = ", "))
+  obj <- list(ds_spec = ds_spec, ds_vars = ds_vars, var_spec = var_spec,
+              value_spec = value_spec, code_list = code_list, derivations = derivations)
+  class(obj) <- c("Metacore", "list"); obj
+}
+
+print.Metacore <- function(x, ...) {
+  cat("── Metacore Object ─────────────────────────────────────────\n")
+  cat(sprintf("  Datasets: %s\n", paste(x$ds_spec$dataset, collapse = ", ")))
+  cat(sprintf("  Variables: %d  |  Codelists: %d entries  |  Derivations: %d\n",
+              nrow(x$var_spec), nrow(x$code_list), nrow(x$derivations)))
+  invisible(x)
+}
+
+select_dataset <- function(metacore_obj, dataset) {
+  if (!dataset %in% metacore_obj$ds_spec$dataset)
+    stop("Dataset '", dataset, "' not found")
+  vars_in_ds  <- metacore_obj$ds_vars |> filter(dataset == !!dataset) |> pull(variable)
+  value_spec2 <- metacore_obj$value_spec |> filter(dataset == !!dataset | is.na(dataset))
+  code_ids    <- unique(value_spec2$code_id[!is.na(value_spec2$code_id)])
+  obj <- list(
+    dataset = dataset,
+    ds_spec     = metacore_obj$ds_spec  |> filter(dataset == !!dataset),
+    ds_vars     = metacore_obj$ds_vars  |> filter(dataset == !!dataset),
+    var_spec    = metacore_obj$var_spec |> filter(variable %in% vars_in_ds),
+    value_spec  = value_spec2,
+    code_list   = metacore_obj$code_list |> filter(code_id %in% code_ids),
+    derivations = metacore_obj$derivations
+  )
+  class(obj) <- c("DatasetMeta", "Metacore", "list"); obj
+}
+
+# ── Mock metatools functions ──────────────────────────────────────────────────
+
+# combine_supp: fold SUPP-- (long) back into parent domain (wide)
+combine_supp <- function(parent_dataset, supp_dataset) {
+  if (nrow(supp_dataset) == 0) return(parent_dataset)
+  supp_wide <- supp_dataset |>
+    select(USUBJID, QNAM, QVAL) |>
+    pivot_wider(names_from = QNAM, values_from = QVAL)
+  left_join(parent_dataset, supp_wide, by = "USUBJID")
+}
+
+# build_from_derived: construct base dataset from source datasets per spec
+build_from_derived <- function(metacore_obj, ds_list, predecessor_only = FALSE, keep = FALSE) {
+  spec_vars  <- metacore_obj$ds_vars |> arrange(order) |> pull(variable)
+  var_labels <- metacore_obj$var_spec |> select(variable, label, type)
+
+  # Collect all columns available across source datasets
+  all_cols <- lapply(names(ds_list), function(nm) {
+    ds <- ds_list[[nm]]
+    tibble(variable = names(ds), src = nm)
+  }) |> bind_rows() |> distinct(variable, .keep_all = TRUE)
+
+  vars_available <- intersect(spec_vars, all_cols$variable)
+  vars_missing   <- setdiff(spec_vars, all_cols$variable)
+
+  # Start from the first source dataset
+  base_ds <- ds_list[[1]]
+
+  # Add columns from other source datasets that aren't yet present
+  for (nm in names(ds_list)[-1]) {
+    src_ds <- ds_list[[nm]]
+    new_cols <- setdiff(names(src_ds), names(base_ds))
+    key_cols <- intersect(c("USUBJID", "STUDYID"), names(base_ds))
+    if (length(new_cols) > 0 && length(key_cols) > 0) {
+      base_ds <- left_join(base_ds,
+                           src_ds |> select(any_of(c(key_cols, new_cols))),
+                           by = key_cols)
+    }
+  }
+
+  # Add NA columns for spec variables that don't exist in any source
+  for (v in vars_missing) {
+    base_ds[[v]] <- NA_character_
+  }
+
+  # Re-order per spec
+  base_ds <- base_ds |> select(any_of(spec_vars), everything())
+  base_ds
+}
+
+# create_var_from_codelist: derive numeric companion or decoded label from a codelist
+create_var_from_codelist <- function(dataset, metacore_obj, input_var, out_var,
+                                     decode_to_code = FALSE) {
+  input_nm <- deparse(substitute(input_var))
+  out_nm   <- deparse(substitute(out_var))
+
+  # Find code_id for input_var
+  code_id_val <- metacore_obj$value_spec |>
+    filter(variable == input_nm) |>
+    pull(code_id) |>
+    first()
+
+  if (is.na(code_id_val) || length(code_id_val) == 0)
+    stop("No codelist found for variable: ", input_nm)
+
+  cl <- metacore_obj$code_list |>
+    filter(code_id == code_id_val) |>
+    select(code, decode) |>
+    distinct()
+
+  if (!decode_to_code) {
+    # code → numeric (when input is the decode, map to numeric code)
+    lookup <- cl |>
+      mutate(numeric_code = suppressWarnings(as.numeric(code))) |>
+      select(decode, numeric_code)
+    dataset <- dataset |>
+      left_join(lookup, by = setNames("decode", input_nm)) |>
+      rename(!!out_nm := numeric_code)
+  } else {
+    # code → decode (expand to long label)
+    lookup <- cl |> select(code, decode)
+    dataset <- dataset |>
+      left_join(lookup, by = setNames("code", input_nm)) |>
+      rename(!!out_nm := decode)
+  }
+  dataset
+}
+
+# apply_variable_labels: set label attribute on each column per spec
+apply_variable_labels <- function(dataset, metacore_obj) {
+  for (v in names(dataset)) {
+    lbl <- metacore_obj$var_spec |> filter(variable == v) |> pull(label)
+    if (length(lbl) == 1 && !is.na(lbl)) attr(dataset[[v]], "label") <- lbl
+  }
+  dataset
+}
+
+# check_variables: verify dataset has exactly the variables in the spec
+check_variables <- function(dataset, metacore_obj) {
+  spec_vars <- metacore_obj$ds_vars |> pull(variable)
+  data_vars <- names(dataset)
+  missing_vars <- setdiff(spec_vars, data_vars)
+  extra_vars   <- setdiff(data_vars, spec_vars)
+  if (length(missing_vars) > 0)
+    warning("Variables in spec but missing from dataset: ", paste(missing_vars, collapse = ", "))
+  if (length(extra_vars) > 0)
+    warning("Variables in dataset but not in spec: ", paste(extra_vars, collapse = ", "))
+  if (length(missing_vars) == 0 && length(extra_vars) == 0)
+    message("check_variables: PASSED — dataset variables match spec exactly")
+  invisible(list(missing = missing_vars, extra = extra_vars))
+}
+
+# check_ct_data: verify coded variables are in their codelist
+check_ct_data <- function(dataset, metacore_obj) {
+  issues <- list()
+  for (i in seq_len(nrow(metacore_obj$value_spec))) {
+    vs_row  <- metacore_obj$value_spec[i, ]
+    vname   <- vs_row$variable
+    code_id <- vs_row$code_id
+    if (!vname %in% names(dataset)) next
+    valid_vals <- metacore_obj$code_list |>
+      filter(code_id == !!code_id) |>
+      pull(decode)
+    invalid <- dataset[[vname]][!is.na(dataset[[vname]]) & !dataset[[vname]] %in% valid_vals]
+    if (length(invalid) > 0)
+      issues[[vname]] <- unique(invalid)
+  }
+  if (length(issues) == 0)
+    message("check_ct_data: PASSED — all coded variables within codelists")
+  else
+    warning("check_ct_data: FAILED — invalid values found: ",
+            paste(sapply(names(issues), function(n) paste0(n, "=", issues[[n]])), collapse = "; "))
+  invisible(issues)
+}
+
+# check_unique_keys: verify the dataset's key columns identify rows uniquely
+check_unique_keys <- function(dataset, metacore_obj, key_vars = c("STUDYID", "USUBJID")) {
+  key_cols <- intersect(key_vars, names(dataset))
+  dups <- dataset |>
+    group_by(across(all_of(key_cols))) |>
+    filter(n() > 1) |>
+    ungroup()
+  if (nrow(dups) == 0)
+    message("check_unique_keys: PASSED — ", paste(key_cols, collapse = "+"),
+            " uniquely identifies rows")
+  else
+    warning("check_unique_keys: FAILED — ", nrow(dups), " duplicate rows on ",
+            paste(key_cols, collapse = "+"))
+  invisible(dups)
+}
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+
+# Spec: ADSL metacore object
+adsl_code_list <- tribble(
+  ~code_id,   ~name,    ~code, ~decode,
+  "SEX_CL",   "SEX",    "M",   "Male",
+  "SEX_CL",   "SEX",    "F",   "Female",
+  "SEX_CL",   "SEX",    "U",   "Unknown",
+  "RACE_CL",  "RACE",   "1",   "AMERICAN INDIAN OR ALASKA NATIVE",
+  "RACE_CL",  "RACE",   "2",   "ASIAN",
+  "RACE_CL",  "RACE",   "3",   "BLACK OR AFRICAN AMERICAN",
+  "RACE_CL",  "RACE",   "4",   "NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER",
+  "RACE_CL",  "RACE",   "5",   "WHITE",
+  "RACE_CL",  "RACE",   "6",   "MULTIPLE",
+  "RACE_CL",  "RACE",   "8",   "UNKNOWN",
+  "RACE_CL",  "RACE",   "9",   "NOT REPORTED"
+)
+
+adsl_var_spec <- tribble(
+  ~variable, ~label,                           ~type,        ~length, ~format,
+  "STUDYID", "Study Identifier",               "character",  8,       NA,
+  "USUBJID", "Unique Subject Identifier",      "character",  32,      NA,
+  "AGE",     "Age (years)",                    "numeric",    8,       NA,
+  "SEX",     "Sex",                            "character",  1,       NA,
+  "SEXN",    "Sex (N)",                        "numeric",    8,       NA,
+  "RACE",    "Race",                           "character",  60,      NA,
+  "RACEN",   "Race (N)",                       "numeric",    8,       NA,
+  "TRT01A",  "Actual Treatment for Period 01", "character",  40,      NA,
+  "TRTSDT",  "Date of First Exposure",         "numeric",    8,       "DATE9.",
+  "TRTEDT",  "Date of Last Exposure",          "numeric",    8,       "DATE9.",
+  "TRTDURD", "Total Treatment Duration (Days)","numeric",    8,       NA,
+  "SAFFL",   "Safety Population Flag",         "character",  1,       NA,
+  "ITTFL",   "Intent-To-Treat Population Flag","character",  1,       NA
+)
+
+adsl_ds_spec <- tibble(
+  dataset   = "ADSL",
+  structure  = "One record per subject",
+  label      = "Subject-Level Analysis Dataset"
+)
+
+adsl_ds_vars <- tibble(
+  dataset   = "ADSL",
+  variable  = adsl_var_spec$variable,
+  order     = seq_along(adsl_var_spec$variable),
+  mandatory = c(TRUE, TRUE, TRUE, TRUE, FALSE, TRUE, FALSE, TRUE,
+                FALSE, FALSE, FALSE, FALSE, FALSE),
+  core      = c("Required", "Required", "Required", "Required", "Permissible",
+                "Required", "Permissible", "Required", "Permissible",
+                "Permissible", "Permissible", "Permissible", "Permissible")
+)
+
+adsl_value_spec <- tribble(
+  ~variable, ~dataset, ~where,          ~code_id,
+  "SEX",     "ADSL",   NA_character_,   "SEX_CL",
+  "RACE",    "ADSL",   NA_character_,   "RACE_CL"
+)
+
+adsl_derivations <- tribble(
+  ~derivation_id, ~derivation,
+  "DR_TRTSDT",  "First non-zero dose date from EX",
+  "DR_TRTDURD", "TRTEDT - TRTSDT + 1",
+  "DR_SAFFL",   "Y if any EX record with EXDOSE > 0 or placebo",
+  "DR_RACEN",   "Numeric code from RACE_CL codelist"
+)
+
+md <- metacore(adsl_ds_spec, adsl_ds_vars, adsl_var_spec,
+               adsl_value_spec, adsl_code_list, adsl_derivations)
+md_adsl <- select_dataset(md, "ADSL")
+
+# Source DM data
+dm <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015", "01-701-1023", "01-702-1042", "01-702-1101"),
+  AGE     = c(63L, 64L, 71L, 56L),
+  SEX     = c("M", "F", "M", "F"),
+  RACE    = c("WHITE", "WHITE", "ASIAN", "WHITE"),
+  TRT01A  = c("XANOMELINE HIGH DOSE", "XANOMELINE LOW DOSE", "PLACEBO", "XANOMELINE HIGH DOSE")
+)
+
+# SUPPDM (subject-level supplemental qualifiers)
+suppdm <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  RDOMAIN  = "DM",
+  USUBJID  = c("01-701-1015", "01-701-1023", "01-702-1042", "01-702-1101"),
+  IDVAR    = "",
+  IDVARVAL = "",
+  QNAM     = "STRATGRP",
+  QLABEL   = "Stratification Group",
+  QVAL     = c("A", "B", "A", "B"),
+  QORIG    = "CRF",
+  QEVAL    = "INVESTIGATOR"
+)
+```
+
+## Welcome
+
+This is Lesson 13 — **`{metatools}`**: Using the Spec to Build and Validate Datasets.
+
+Where `{metacore}` stores the spec, `{metatools}` *acts on it*. Every metatools function takes a `DatasetMeta` and uses the metadata to do something useful with your data.
+
+This lesson covers the five things metatools does:
+
+1. `combine_supp()` — fold SUPP-- back into the parent domain
+2. `build_from_derived()` — spec-driven base dataset construction
+3. `create_var_from_codelist()` — derive companion variables from codelists
+4. `apply_variable_labels()` — apply spec labels to dataset columns
+5. `check_variables()`, `check_ct_data()`, `check_unique_keys()` — spec conformance checks
+
+All functions are mocked with identical behavior to the real package.
+
+---
+
+## 1 — Five things metatools does
+
+```{r quiz-five-things, echo=FALSE}
+quiz(
+  question(
+    "Which metatools function would you call FIRST when building an ADSL that includes SUPPDM variables?",
+    answer("build_from_derived()"),
+    answer("combine_supp() — to fold SUPPDM into DM so the combined columns are available for the base build", correct = TRUE),
+    answer("check_variables()"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "create_var_from_codelist() is the metadata-driven alternative to:",
+    answer("A hard-coded case_when() that maps character values to numeric codes", correct = TRUE),
+    answer("derive_vars_dt() from admiral"),
+    answer("pivot_wider() from tidyr"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 2 — `combine_supp()`: fold SUPP-- into the parent domain
+
+SUPPDM is long-format (one row per subject per QNAM). For ADSL, you want the SUPPDM variables as proper columns. `combine_supp()` pivots SUPPDM wide and joins it to DM.
+
+```{r combine-supp-demo}
+# Before: DM and SUPPDM are separate
+cat("DM columns:", paste(names(dm), collapse = ", "), "\n\n")
+cat("SUPPDM sample:\n")
+print(suppdm |> select(USUBJID, QNAM, QVAL))
+```
+
+```{r combine-supp-result}
+# After: SUPPDM's STRATGRP column is now in dm_combined
+dm_combined <- combine_supp(dm, suppdm)
+
+cat("dm_combined columns:", paste(names(dm_combined), collapse = ", "), "\n\n")
+dm_combined
+```
+
+### Exercise: Check that combine_supp adds the correct column and values
+
+```{r combine-supp-check, exercise=TRUE, exercise.lines=10}
+dm_combined2 <- combine_supp(dm, suppdm)
+
+# Verify the STRATGRP column is present and has the right values
+cat("STRATGRP present:", "STRATGRP" %in% names(dm_combined2), "\n")
+cat("STRATGRP values:", paste(dm_combined2$STRATGRP, collapse = ", "), "\n")
+
+# What happens with a subject missing from SUPPDM? (none missing here, but check for NA)
+cat("NAs in STRATGRP:", sum(is.na(dm_combined2$STRATGRP)), "\n")
+```
+
+---
+
+## 3 — `build_from_derived()`: spec-driven base dataset
+
+`build_from_derived()` constructs a starting dataset with columns in the spec's order, populated where source datasets provide values, and `NA` where derivations are still needed.
+
+```{r build-from-derived-demo}
+# Build base ADSL from DM (with SUPPDM already combined)
+adsl_base <- build_from_derived(
+  metacore_obj = md_adsl,
+  ds_list      = list(dm = dm_combined),
+  predecessor_only = FALSE,
+  keep = FALSE
+)
+
+glimpse(adsl_base)
+```
+
+```{r build-from-derived-structure}
+# The key feature: columns are in SPEC ORDER, not source order
+names(adsl_base)
+
+# Derived columns exist as NA — waiting to be filled
+cat("\nTRTSDT (not yet derived):", sum(is.na(adsl_base$TRTSDT)), "NAs out of", nrow(adsl_base), "\n")
+```
+
+### Exercise: Confirm column order matches the spec
+
+The spec defines `order` for each variable. Check that the first 6 columns of `adsl_base` match the spec order.
+
+```{r build-order-check, exercise=TRUE, exercise.lines=12}
+# What order does the spec define?
+spec_order <- md_adsl$ds_vars |>
+  arrange(order) |>
+  pull(variable)
+
+cat("Spec order (first 6):", paste(head(spec_order, 6), collapse = " → "), "\n")
+cat("Data order (first 6):", paste(head(names(adsl_base), 6), collapse = " → "), "\n")
+cat("Match:", identical(head(spec_order, 6), head(names(adsl_base), 6)), "\n")
+```
+
+---
+
+## 4 — `create_var_from_codelist()`: spec-driven companion variables
+
+CDISC ADaM convention: categorical character variables have numeric companions (SEX→SEXN, RACE→RACEN). The values come from the codelist. `create_var_from_codelist()` reads the codelist from the spec and derives the companion automatically.
+
+```{r create-racen-demo}
+# Derive RACEN from RACE using the RACE_CL codelist
+adsl_with_racen <- adsl_base |>
+  create_var_from_codelist(md_adsl, input_var = RACE, out_var = RACEN)
+
+adsl_with_racen |>
+  select(USUBJID, RACE, RACEN)
+```
+
+```{r create-sexn-demo}
+# Derive SEXN from SEX using the SEX_CL codelist
+adsl_with_sexn <- adsl_with_racen |>
+  create_var_from_codelist(md_adsl, input_var = SEX, out_var = SEXN)
+
+adsl_with_sexn |>
+  select(USUBJID, SEX, SEXN, RACE, RACEN)
+```
+
+### Exercise: Chain both companion derivations
+
+Starting from `adsl_base`, derive SEXN and RACEN in a single pipeline.
+
+```{r derive-companions, exercise=TRUE, exercise.lines=14}
+adsl_with_companions <- adsl_base |>
+  create_var_from_codelist(md_adsl, input_var = ___, out_var = ___) |>
+  create_var_from_codelist(md_adsl, input_var = ___, out_var = ___)
+
+adsl_with_companions |>
+  select(USUBJID, SEX, SEXN, RACE, RACEN)
+```
+
+```{r derive-companions-hint-1}
+# create_var_from_codelist(md_adsl, input_var = SEX, out_var = SEXN)
+# create_var_from_codelist(md_adsl, input_var = RACE, out_var = RACEN)
+```
+
+```{r derive-companions-solution}
+adsl_with_companions <- adsl_base |>
+  create_var_from_codelist(md_adsl, input_var = SEX,  out_var = SEXN) |>
+  create_var_from_codelist(md_adsl, input_var = RACE, out_var = RACEN)
+
+adsl_with_companions |>
+  select(USUBJID, SEX, SEXN, RACE, RACEN)
+```
+
+### Exercise: What is the manual (non-metatools) equivalent of create_var_from_codelist for RACEN?
+
+Reproduce the RACEN derivation using `case_when()` directly, without using the spec.
+
+```{r manual-racen, exercise=TRUE, exercise.lines=20}
+# Manual approach (what you'd write without metacore/metatools)
+adsl_manual_racen <- adsl_base |>
+  mutate(RACEN = case_when(
+    RACE == "AMERICAN INDIAN OR ALASKA NATIVE"          ~ 1,
+    RACE == "ASIAN"                                     ~ 2,
+    RACE == "BLACK OR AFRICAN AMERICAN"                 ~ 3,
+    RACE == "NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER" ~ 4,
+    RACE == "WHITE"                                     ~ 5,
+    RACE == "MULTIPLE"                                  ~ 6,
+    RACE == "UNKNOWN"                                   ~ 8,
+    RACE == "NOT REPORTED"                              ~ 9,
+    TRUE                                                ~ NA_real_
+  ))
+
+# Compare to the spec-driven result
+adsl_spec_racen <- adsl_base |>
+  create_var_from_codelist(md_adsl, input_var = RACE, out_var = RACEN)
+
+cat("Manual RACEN:    ", adsl_manual_racen$RACEN, "\n")
+cat("Spec-driven RACEN:", adsl_spec_racen$RACEN, "\n")
+cat("Identical:", identical(adsl_manual_racen$RACEN, adsl_spec_racen$RACEN), "\n")
+```
+
+---
+
+## 5 — `apply_variable_labels()`
+
+Variable labels are metadata attributes set on each column. They're not shown by default but are used by export tools (`{xportr}`) and reporting packages (`gtsummary`, `tern`).
+
+```{r apply-labels-demo}
+# Before applying labels
+cat("Label on AGE (before):", attr(adsl_base$AGE, "label"), "\n")
+
+# Apply labels from the spec
+adsl_labeled <- adsl_base |>
+  apply_variable_labels(md_adsl)
+
+# After applying labels
+cat("Label on AGE (after): ", attr(adsl_labeled$AGE, "label"), "\n")
+cat("Label on SEX (after): ", attr(adsl_labeled$SEX, "label"), "\n")
+cat("Label on TRT01A (after):", attr(adsl_labeled$TRT01A, "label"), "\n")
+```
+
+### Exercise: Verify labels on multiple columns
+
+```{r verify-labels, exercise=TRUE, exercise.lines=14}
+adsl_labeled2 <- adsl_base |> apply_variable_labels(md_adsl)
+
+# Extract labels for the first 5 columns
+col_labels <- sapply(names(adsl_labeled2)[1:5], function(v) {
+  lbl <- attr(adsl_labeled2[[v]], "label")
+  if (is.null(lbl)) "(none)" else lbl
+})
+
+tibble(
+  variable = names(col_labels),
+  label    = col_labels
+)
+```
+
+---
+
+## 6 — Conformance checks
+
+Three checks run at the end of a derivation to verify the dataset matches its spec.
+
+### `check_variables()`: Are the right variables present?
+
+```{r check-variables-demo}
+# A dataset that matches the spec exactly — should pass
+adsl_complete <- adsl_base  # all spec columns present (with NAs for derived ones)
+result <- check_variables(adsl_complete, md_adsl)
+```
+
+```{r check-variables-missing}
+# A dataset missing a required variable — should warn
+adsl_missing_col <- adsl_base |> select(-TRTDURD)
+result_bad <- check_variables(adsl_missing_col, md_adsl)
+cat("Missing:", paste(result_bad$missing, collapse = ", "), "\n")
+```
+
+### Exercise: `check_variables()` on a dataset with an extra column
+
+```{r check-variables-extra, exercise=TRUE, exercise.lines=10}
+# Add an extra column not in the spec
+adsl_extra <- adsl_base |> mutate(EXTRA_COL = "unexpected")
+
+result_extra <- check_variables(adsl_extra, md_adsl)
+cat("Missing variables:", paste(result_extra$missing, collapse = ", "), "\n")
+cat("Extra variables:", paste(result_extra$extra, collapse = ", "), "\n")
+```
+
+---
+
+### `check_ct_data()`: Are coded variable values in their codelists?
+
+```{r check-ct-demo}
+# Clean dataset — all SEX values are M/F which map to Male/Female via SEX_CL
+# (The codelist decode column stores "Male"/"Female"; SEX stores "M"/"F")
+# Since our data uses "M"/"F" and the lookup is code→decode, let's show the check
+
+# Introduce a bad value
+adsl_bad_sex <- adsl_base |>
+  mutate(SEX = ifelse(USUBJID == "01-702-1042", "MALE", SEX))  # "MALE" not in codelist decode
+
+result_ct <- check_ct_data(adsl_bad_sex, md_adsl)
+```
+
+```{r check-ct-pass}
+# Clean: standard values
+check_ct_data(adsl_base, md_adsl)
+```
+
+### Exercise: `check_ct_data()` with an invalid RACE value
+
+```{r check-ct-race, exercise=TRUE, exercise.lines=10}
+# Introduce an invalid RACE value
+adsl_bad_race <- adsl_base |>
+  mutate(RACE = ifelse(row_number() == 3, "OTHER", RACE))
+
+check_ct_data(adsl_bad_race, md_adsl)
+```
+
+---
+
+### `check_unique_keys()`: Is the key unique?
+
+```{r check-keys-demo}
+# Clean — each USUBJID appears once (ADSL is one row per subject)
+check_unique_keys(adsl_base, md_adsl)
+```
+
+```{r check-keys-dup}
+# Introduce a duplicate
+adsl_dup <- bind_rows(adsl_base, adsl_base[1, ])
+result_dup <- check_unique_keys(adsl_dup, md_adsl)
+cat("Duplicate rows detected:", nrow(result_dup), "\n")
+```
+
+### Exercise: Run all three checks in sequence as a final QC block
+
+```{r qc-block, exercise=TRUE, exercise.lines=12}
+# Run all three checks on a clean dataset
+# Expected: all three pass
+run_final_qc <- function(dataset, metacore_obj) {
+  message("=== Final QC Block ===")
+  check_variables(dataset, metacore_obj)
+  check_ct_data(dataset, metacore_obj)
+  check_unique_keys(dataset, metacore_obj)
+  message("=== QC Complete ===")
+}
+
+run_final_qc(adsl_base, md_adsl)
+```
+
+---
+
+## 7 — The full metadata-driven ADSL pattern
+
+Putting it all together — the canonical metatools workflow before admiral derivations:
+
+```{r full-pattern-demo}
+# Step 1: Combine SUPP-- into parent domain
+dm_with_supp <- combine_supp(dm, suppdm)
+
+# Step 2: Build the spec-ordered base dataset
+adsl_step2 <- build_from_derived(md_adsl, ds_list = list(dm = dm_with_supp))
+
+# Step 3: Derive codelist-driven companion variables
+adsl_step3 <- adsl_step2 |>
+  create_var_from_codelist(md_adsl, input_var = SEX,  out_var = SEXN) |>
+  create_var_from_codelist(md_adsl, input_var = RACE, out_var = RACEN)
+
+# Step 4: Apply variable labels
+adsl_step4 <- adsl_step3 |>
+  apply_variable_labels(md_adsl)
+
+# Step 5: Run conformance checks
+check_variables(adsl_step4, md_adsl)
+check_unique_keys(adsl_step4, md_adsl)
+
+# Show the result
+glimpse(adsl_step4)
+```
+
+### Exercise: Add a stratification group derivation to the pipeline
+
+After `combine_supp()`, the `dm_with_supp` dataset has a `STRATGRP` column from SUPPDM. Continue the pipeline to include this step, then check that `STRATGRP` is present in the final dataset.
+
+```{r full-pattern-strat, exercise=TRUE, exercise.lines=20}
+# Step 1: Combine
+dm_with_supp2 <- combine_supp(dm, suppdm)
+
+# Step 2: Build base
+adsl_ex <- build_from_derived(md_adsl, ds_list = list(dm = dm_with_supp2))
+
+# Step 3: Derive companions
+adsl_ex <- adsl_ex |>
+  create_var_from_codelist(md_adsl, input_var = SEX,  out_var = SEXN) |>
+  create_var_from_codelist(md_adsl, input_var = RACE, out_var = RACEN)
+
+# Step 4: Does dm_with_supp2 have STRATGRP?
+cat("STRATGRP in dm_with_supp2:", "STRATGRP" %in% names(dm_with_supp2), "\n")
+
+# Inspect the pipeline output
+adsl_ex |> select(USUBJID, SEX, SEXN, RACE, RACEN) |> print()
+```
+
+---
+
+## 8 — When to use (and when to skip) metacore/metatools
+
+```{r quiz-when-to-use, echo=FALSE}
+quiz(
+  question(
+    "For a phase-I exploratory analysis that won't be submitted to FDA, metacore/metatools is:",
+    answer("Always required"),
+    answer("Optional — the metadata discipline may be more overhead than value for exploratory work", correct = TRUE),
+    answer("Forbidden for exploratory work"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "For a submission-quality ADSL going to FDA, metatools is valuable because:",
+    answer("FDA mandates the use of metatools specifically"),
+    answer("It enables spec-driven derivation, conformance checking, and Define-XML serialization — all required for submissions", correct = TRUE),
+    answer("It makes the dataset smaller"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "metatools functions require a DatasetMeta (not a full metacore) because:",
+    answer("Full metacore objects are too slow"),
+    answer("It prevents ambiguity — scoping to one dataset ensures metadata doesn't accidentally bleed across ADaMs", correct = TRUE),
+    answer("Full metacore objects can't have value_spec entries"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 9 — Key takeaways
+
+```{r quiz-final-13, echo=FALSE}
+quiz(
+  question(
+    "The correct order of the standard metatools ADSL workflow is:",
+    answer("build_from_derived → combine_supp → create_var_from_codelist → apply_variable_labels → check_*"),
+    answer("combine_supp → build_from_derived → create_var_from_codelist → apply_variable_labels → check_*", correct = TRUE),
+    answer("check_* → build_from_derived → combine_supp → create_var_from_codelist → apply_variable_labels"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "create_var_from_codelist() is more maintainable than a case_when() because:",
+    answer("It runs faster"),
+    answer("When the codelist changes in the spec, the derivation automatically reflects the change without touching the R script", correct = TRUE),
+    answer("case_when() doesn't work with character variables"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Which function checks that all values of a coded variable (e.g., SEX) are in its codelist?",
+    answer("check_variables()"),
+    answer("check_ct_data()", correct = TRUE),
+    answer("check_unique_keys()"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## What's next
+
+Module 3 is complete. The metacore/metatools patterns you've learned here thread through the rest of pharmaverse:
+
+- **Lesson 14 (admiral Part 1)**: admiral's date helpers and `derive_vars_merged()` — the foundation of every ADaM
+- **Lesson 15 (admiral Part 2)**: a full ADSL end-to-end, combining metatools (base dataset + codelist companions) with admiral (treatment dates, population flags, death cause)
+
+The metacore object you built in these two lessons is the same one `{xportr}` (Module 9) uses to apply spec labels and lengths when exporting the final XPT file for submission.

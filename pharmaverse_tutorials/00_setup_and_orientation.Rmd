@@ -1,0 +1,256 @@
+---
+title: "Pharmaverse Learning System — Module 0: Setup & Orientation"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Set up your pharmaverse environment and get oriented with the clinical data
+  pipeline: raw data → SDTM → ADaM → TLF.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120)
+```
+
+## Welcome to Pharmaverse
+
+### What is pharmaverse?
+
+**Pharmaverse** is a curated set of open-source R packages developed collaboratively
+by the pharmaceutical industry for clinical reporting. Together they cover the
+complete clinical data submission pipeline required by the FDA and other regulators.
+
+```
+Raw EDC Data
+     │
+     ▼  [sdtm.oak]
+  SDTM Datasets  (.xpt)
+     │
+     ▼  [admiral]
+  ADaM Datasets  (.xpt)
+     │
+     ▼  [tfrmt / rtables / gt]
+  Tables, Listings & Figures  (TLF)
+     │
+     ▼
+  eCTD Submission Package
+```
+
+The four modules in this tutorial track that pipeline:
+
+| Module | Package(s) | Topic |
+|--------|-----------|-------|
+| 0 (this) | — | Ecosystem orientation & setup |
+| 1 | `admiral` | Building ADaM datasets |
+| 2 | `sdtm.oak`, `xportr` | SDTM mapping & xpt export |
+| 3 | `tfrmt`, `rtables`, `gt` | Clinical tables & figures |
+| Capstone | all | End-to-end mini-submission |
+
+---
+
+## Installation
+
+### Installing pharmaverse packages
+
+Run this once in your **R console** (not inside a learnr block) before starting the tutorials:
+
+```r
+# Install all pharmaverse packages used in this course
+install.packages(c(
+  "learnr",       # interactive tutorials
+  "admiral",      # ADaM construction
+  "admiraldev",   # admiral developer utilities
+  "xportr",       # SAS transport file export
+  "sdtm.oak",     # SDTM mapping
+  "tfrmt",        # table formatting
+  "rtables",      # clinical tables
+  "gt",           # grammar of tables
+  "dplyr",        # data manipulation
+  "lubridate",    # date handling
+  "stringr",      # string manipulation
+  "tidyr",        # data reshaping
+  "ggplot2"       # figures
+))
+```
+
+> **Tip:** If `sdtm.oak` isn't on CRAN yet, install from GitHub:
+> `remotes::install_github("pharmaverse/sdtm.oak")`
+
+---
+
+## The CDISC Data Standards
+
+### Why do we need ADaM and SDTM?
+
+The FDA requires clinical trial data submissions to follow **CDISC** standards:
+
+- **SDTM** (Study Data Tabulation Model) — raw-ish collected data, organized into
+  domain-specific datasets (DM, AE, EX, LB, VS, etc.)
+- **ADaM** (Analysis Data Model) — analysis-ready datasets derived from SDTM,
+  designed for statistical analysis and direct traceability back to SDTM
+
+```{r quiz-cdisc, echo=FALSE}
+quiz(
+  caption = "Quick check — CDISC basics",
+  question("SDTM datasets are best described as:",
+    answer("Analysis-ready datasets with derived variables"),
+    answer("Collected trial data organized by clinical domain", correct = TRUE),
+    answer("Tables and figures for the clinical study report"),
+    answer("R package names"),
+    allow_retry = TRUE
+  ),
+  question("Which statement about ADaM is TRUE?",
+    answer("ADaM datasets must be traceable back to SDTM or raw data", correct = TRUE),
+    answer("ADaM replaces SDTM — you only need one"),
+    answer("ADaM datasets use the same variable names as SDTM"),
+    answer("ADaM is only used for safety analyses"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Key CDISC Domains
+
+### SDTM domains you'll encounter most
+
+| Domain | Full Name | Contains |
+|--------|-----------|----------|
+| DM | Demographics | One row per subject, baseline characteristics |
+| AE | Adverse Events | Safety data — all reported adverse events |
+| EX | Exposure | Drug dosing records |
+| LB | Laboratory | Lab test results over time |
+| VS | Vital Signs | BP, HR, weight, height, etc. |
+| CM | Concomitant Medications | Other meds taken during trial |
+| MH | Medical History | Pre-existing conditions |
+
+### ADaM datasets you'll encounter most
+
+| Dataset | Full Name | Contains |
+|---------|-----------|----------|
+| ADSL | Subject Level | One row per subject — baseline, treatment, flags |
+| ADAE | Adverse Events | Safety analysis dataset |
+| ADLBC | Laboratory (BDS) | Longitudinal lab with derived flags |
+| ADVS | Vital Signs (BDS) | Longitudinal vitals with change-from-baseline |
+| ADTTE | Time to Event | Survival/time-to-event analysis dataset |
+
+---
+
+## R Basics Review
+
+### dplyr — the foundation
+
+Admiral and the pharmaverse stack rely heavily on `dplyr`. Let's warm up.
+
+```{r dplyr-warmup, exercise=TRUE, exercise.lines=20}
+library(dplyr)
+
+# A tiny fake SDTM DM domain
+dm <- tibble::tribble(
+  ~USUBJID,       ~AGE, ~SEX, ~RACE,       ~ARM,
+  "STUDY-001-001",  45,  "M", "WHITE",     "Drug A",
+  "STUDY-001-002",  52,  "F", "BLACK",     "Placebo",
+  "STUDY-001-003",  38,  "M", "ASIAN",     "Drug A",
+  "STUDY-001-004",  61,  "F", "WHITE",     "Drug A",
+  "STUDY-001-005",  29,  "M", "HISPANIC",  "Placebo"
+)
+
+# Your turn: filter to Drug A subjects and arrange by AGE descending
+dm |>
+  filter(ARM == "Drug A") |>
+  arrange(desc(AGE))
+```
+
+```{r dplyr-warmup-hint}
+# Use filter() with == and arrange() with desc()
+# dm |> filter(ARM == "Drug A") |> arrange(desc(AGE))
+```
+
+### mutate and case_when
+
+One of the most important patterns in admiral is deriving new variables with `mutate()`
+and conditional logic with `case_when()`.
+
+```{r mutate-exercise, exercise=TRUE, exercise.lines=25}
+library(dplyr)
+
+dm <- tibble::tribble(
+  ~USUBJID,       ~AGE, ~SEX, ~ARM,
+  "001",  45,  "M", "Drug A",
+  "002",  52,  "F", "Placebo",
+  "003",  38,  "M", "Drug A",
+  "004",  70,  "F", "Drug A",
+  "005",  29,  "M", "Placebo"
+)
+
+# Task: add a column AGEGR1 with age groups:
+#   "<40" for age < 40
+#   "40-65" for age 40 to 65
+#   ">=65" for age >= 65
+dm |>
+  mutate(
+    AGEGR1 = case_when(
+      AGE < 40        ~ "<40",
+      AGE >= 40 & AGE < 65 ~ "40-65",
+      AGE >= 65       ~ ">=65"
+    )
+  )
+```
+
+```{r mutate-exercise-solution}
+library(dplyr)
+dm <- tibble::tribble(
+  ~USUBJID, ~AGE, ~SEX, ~ARM,
+  "001", 45, "M", "Drug A",
+  "002", 52, "F", "Placebo",
+  "003", 38, "M", "Drug A",
+  "004", 70, "F", "Drug A",
+  "005", 29, "M", "Placebo"
+)
+dm |>
+  mutate(
+    AGEGR1 = case_when(
+      AGE < 40             ~ "<40",
+      AGE >= 40 & AGE < 65 ~ "40-65",
+      AGE >= 65            ~ ">=65"
+    )
+  )
+```
+
+---
+
+## Environment Check
+
+```{r env-check, exercise=TRUE, exercise.lines=15}
+# Run this to confirm your pharmaverse packages are installed
+pkgs <- c("admiral", "xportr", "tfrmt", "rtables", "gt",
+          "dplyr", "lubridate", "stringr")
+
+status <- sapply(pkgs, function(p) {
+  if (requireNamespace(p, quietly = TRUE)) "✓ installed" else "✗ MISSING"
+})
+
+data.frame(Package = names(status), Status = status, row.names = NULL)
+```
+
+---
+
+## You're Ready!
+
+You now understand the pharmaverse ecosystem and have a working environment.
+
+**Next steps:**
+
+- 📦 **Module 1** → `01_admiral_adam.Rmd` — Build ADSL and ADAE with admiral
+- 📦 **Module 2** → `02_sdtm_xportr.Rmd` — Map raw data to SDTM and export .xpt files
+- 📦 **Module 3** → `03_tlf_generation.Rmd` — Create clinical tables with tfrmt & rtables
+- 🏆 **Capstone** → `04_capstone_project.Rmd` — Full end-to-end mini-submission
+
+Open the next module in RStudio with `rmarkdown::run("01_admiral_adam.Rmd")`.

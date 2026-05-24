@@ -1,0 +1,982 @@
+---
+title: "Lesson 15 — {admiral} Part 2: Building ADSL End-to-End"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+description: >
+  Build a production-grade ADSL step by step: treatment dates, durations,
+  disposition dates, death cause, population flags, and age groups.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── Mock admiral functions (same as Lesson 14 + new ones) ────────────────────
+
+convert_blanks_to_na <- function(dataset) {
+  dataset |>
+    mutate(across(where(is.character), ~ if_else(.x == "", NA_character_, .x)))
+}
+
+.impute_dtc <- function(dtc, date_imputation = "first") {
+  sapply(dtc, function(x) {
+    if (is.na(x) || x == "") return(NA_character_)
+    segs <- str_split(str_split(x, "T")[[1]][1], "-")[[1]]
+    if (length(segs) == 1) segs <- c(segs, if (date_imputation == "last") "12" else "01")
+    if (length(segs) == 2) {
+      d <- if (date_imputation == "last")
+        as.character(days_in_month(as.Date(paste0(segs[1], "-", segs[2], "-01")))) else "01"
+      segs <- c(segs, d)
+    }
+    paste(segs, collapse = "-")
+  }, USE.NAMES = FALSE)
+}
+
+derive_vars_dt <- function(dataset, dtc, new_vars_prefix,
+                            date_imputation = "none", flag_imputation = "auto") {
+  dtc_nm <- deparse(substitute(dtc))
+  dt_nm  <- paste0(new_vars_prefix, "DT")
+  dtf_nm <- paste0(new_vars_prefix, "DTF")
+  raw    <- dataset[[dtc_nm]]
+  imp    <- .impute_dtc(raw, date_imputation)
+  dataset[[dt_nm]]  <- suppressWarnings(as.numeric(as.Date(imp)))
+  dataset[[dtf_nm]] <- sapply(raw, function(x) {
+    if (is.na(x)) return(NA_character_)
+    n <- length(str_split(x, "-")[[1]])
+    if (n == 1) "Y" else if (n == 2) "D" else NA_character_
+  }, USE.NAMES = FALSE)
+  dataset
+}
+
+derive_vars_dtm <- function(dataset, dtc, new_vars_prefix,
+                             date_imputation = "none", time_imputation = "none",
+                             flag_imputation = "auto") {
+  dtc_nm <- deparse(substitute(dtc))
+  dtm_nm <- paste0(new_vars_prefix, "DTM")
+  dtf_nm <- paste0(new_vars_prefix, "DTF")
+  tmf_nm <- paste0(new_vars_prefix, "TMF")
+  raw    <- dataset[[dtc_nm]]
+  ti_str <- switch(time_imputation, "first" = "00:00:00", "last" = "23:59:59", "00:00:00")
+  imp    <- sapply(raw, function(x) {
+    if (is.na(x) || x == "") return(NA_character_)
+    x2 <- if (!str_detect(x, "T")) paste0(x, "T", ti_str) else x
+    dp <- .impute_dtc(str_split(x2, "T")[[1]][1], date_imputation)
+    tp <- str_split(x2, "T")[[1]][2]
+    paste0(dp, "T", tp)
+  }, USE.NAMES = FALSE)
+  dataset[[dtm_nm]] <- suppressWarnings(
+    as.numeric(as.POSIXct(str_replace(imp, "T", " "), tz = "UTC")))
+  dataset[[dtf_nm]] <- sapply(raw, function(x) {
+    if (is.na(x)) NA_character_ else if (length(str_split(x, "-")[[1]]) < 3) "D" else NA_character_
+  }, USE.NAMES = FALSE)
+  dataset[[tmf_nm]] <- if_else(!str_detect(raw, "T") & !is.na(raw),
+                                if (time_imputation == "first") "H" else "H", NA_character_)
+  dataset
+}
+
+derive_vars_dtm_to_dt <- function(dataset, source_vars) {
+  for (nm in sapply(source_vars, deparse)) {
+    dataset[[str_replace(nm, "DTM$", "DT")]] <- trunc(dataset[[nm]] / 86400)
+  }
+  dataset
+}
+
+derive_vars_dy <- function(dataset, reference_date, source_vars) {
+  ref_nm <- deparse(substitute(reference_date))
+  for (nm in sapply(source_vars, deparse)) {
+    d <- dataset[[nm]] - dataset[[ref_nm]]
+    dataset[[str_replace(nm, "DT$", "DY")]] <- case_when(
+      is.na(d) ~ NA_real_, d >= 0 ~ d + 1, TRUE ~ d)
+  }
+  dataset
+}
+
+derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
+                                order = NULL, filter_add = NULL, mode = NULL,
+                                missing_values = NULL) {
+  by_nm <- sapply(by_vars, deparse)
+  fe    <- substitute(filter_add)
+  if (!is.null(fe) && deparse(fe) != "NULL")
+    dataset_add <- dataset_add |> filter(!!fe)
+  if (!is.null(order)) {
+    ord_nm  <- sapply(order, deparse)
+    ord_desc <- grepl("^desc\\(", ord_nm)
+    ord_cl   <- str_replace_all(ord_nm, "^desc\\(|\\)$", "")
+    for (i in rev(seq_along(ord_cl)))
+      dataset_add <- if (ord_desc[i]) dataset_add |> arrange(desc(.data[[ord_cl[i]]]))
+                     else dataset_add |> arrange(.data[[ord_cl[i]]])
+  }
+  if (!is.null(mode)) {
+    fn <- if (mode == "first") dplyr::slice_head else dplyr::slice_tail
+    dataset_add <- dataset_add |> group_by(across(all_of(by_nm))) |> fn(n = 1) |> ungroup()
+  }
+  if (!is.null(new_vars)) {
+    nv_nm  <- sapply(new_vars, deparse)
+    nv_map <- setNames(names(nv_nm), nv_nm)
+    dataset_add <- dataset_add |>
+      select(any_of(c(by_nm, names(nv_map)))) |>
+      rename(any_of(nv_map))
+  }
+  keep <- setdiff(names(dataset_add), names(dataset)[names(dataset) != by_nm])
+  dataset |> left_join(dataset_add |> select(any_of(c(by_nm, sapply(new_vars, deparse)))), by = by_nm)
+}
+
+derive_var_trtdurd <- function(dataset, new_var = TRTDURD,
+                                start_date = TRTSDT, end_date = TRTEDT) {
+  out <- deparse(substitute(new_var))
+  s   <- deparse(substitute(start_date))
+  e   <- deparse(substitute(end_date))
+  dataset[[out]] <- dataset[[e]] - dataset[[s]] + 1
+  dataset
+}
+
+derive_vars_duration <- function(dataset, new_var, start_date, end_date,
+                                  out_unit = "days", add_one = TRUE) {
+  out <- deparse(substitute(new_var))
+  s   <- deparse(substitute(start_date))
+  e   <- deparse(substitute(end_date))
+  d   <- dataset[[e]] - dataset[[s]]
+  dataset[[out]] <- case_when(
+    is.na(d) ~ NA_real_,
+    out_unit == "months" ~ round(as.numeric(d) / 30.4375, 1),
+    add_one  ~ d + 1,
+    TRUE     ~ d
+  )
+  dataset
+}
+
+derive_var_merged_exist_flag <- function(dataset, dataset_add, by_vars, new_var, condition) {
+  by_nm <- sapply(by_vars, deparse)
+  out   <- deparse(substitute(new_var))
+  ce    <- substitute(condition)
+  flagged <- dataset_add |> filter(!!ce) |> distinct(across(all_of(by_nm))) |>
+    mutate(!!out := "Y")
+  dataset |> left_join(flagged, by = by_nm)
+}
+
+# event_source: describe one possible source of an event for derive_vars_extreme_event
+event_source <- function(dataset_name, filter = NULL, date, set_values_to) {
+  list(
+    dataset_name   = dataset_name,
+    filter         = substitute(filter),
+    date           = substitute(date),
+    set_values_to  = set_values_to
+  )
+}
+
+# derive_vars_extreme_event: find first/last event across multiple sources
+derive_vars_extreme_event <- function(dataset, by_vars, events, order, mode,
+                                       source_datasets, new_vars) {
+  by_nm <- sapply(by_vars, deparse)
+
+  event_rows <- lapply(events, function(ev) {
+    src <- source_datasets[[ev$dataset_name]]
+    # Apply filter
+    if (!is.null(ev$filter) && deparse(ev$filter) != "NULL")
+      src <- src |> filter(!!ev$filter)
+    if (nrow(src) == 0) return(NULL)
+    # Evaluate date expression
+    src <- src |> mutate(.EVENT_DATE = !!ev$date)
+    # Apply set_values_to
+    nv_names <- sapply(ev$set_values_to, deparse)
+    for (i in seq_along(nv_names)) {
+      out_nm  <- names(nv_names)[i]
+      src_col <- nv_names[i]
+      src[[out_nm]] <- tryCatch(src[[src_col]], error = function(e) src[[src_col]])
+    }
+    src |> select(any_of(c(by_nm, ".EVENT_DATE", names(nv_names))))
+  }) |> bind_rows()
+
+  if (nrow(event_rows) == 0) {
+    for (nm in names(sapply(new_vars, deparse))) dataset[[nm]] <- NA_character_
+    return(dataset)
+  }
+
+  # Sort by date
+  ord_nm  <- sapply(order, deparse)
+  if (mode == "first")
+    event_rows <- event_rows |> arrange(across(all_of(intersect(ord_nm, names(event_rows)))))
+  else
+    event_rows <- event_rows |> arrange(desc(across(all_of(intersect(ord_nm, names(event_rows))))))
+
+  # Take first/last per subject
+  fn <- if (mode == "first") dplyr::slice_head else dplyr::slice_tail
+  best <- event_rows |>
+    group_by(across(all_of(by_nm))) |>
+    fn(n = 1) |>
+    ungroup() |>
+    select(-any_of(".EVENT_DATE"))
+
+  dataset |> left_join(best, by = by_nm)
+}
+
+convert_dtc_to_dt <- function(dtc) {
+  suppressWarnings(as.numeric(as.Date(.impute_dtc(dtc, "first"))))
+}
+
+# ── Source SDTM datasets ──────────────────────────────────────────────────────
+
+dm <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  DOMAIN   = "DM",
+  USUBJID  = c("01-701-1015", "01-701-1023", "01-702-1042", "01-702-1101", "01-703-1211"),
+  SUBJID   = c("1015", "1023", "1042", "1101", "1211"),
+  SITEID   = c("701", "701", "702", "702", "703"),
+  AGE      = c(63L, 64L, 71L, 56L, 45L),
+  AGEU     = "YEARS",
+  SEX      = c("M", "F", "M", "F", "M"),
+  RACE     = c("WHITE", "WHITE", "ASIAN", "WHITE", "BLACK OR AFRICAN AMERICAN"),
+  ETHNIC   = c("NOT HISPANIC OR LATINO", "NOT HISPANIC OR LATINO",
+               "NOT HISPANIC OR LATINO", "HISPANIC OR LATINO", "NOT HISPANIC OR LATINO"),
+  ARM      = c("Xanomeline High Dose", "Xanomeline Low Dose",
+               "Placebo", "Xanomeline High Dose", "Placebo"),
+  ACTARM   = c("XANOMELINE HIGH DOSE", "XANOMELINE LOW DOSE",
+               "PLACEBO", "XANOMELINE HIGH DOSE", "PLACEBO"),
+  RFXSTDTC = c("2014-01-02", "2012-08-05", "2013-07-09", "2013-04-14", "2014-03-22"),
+  RFXENDTC = c("2014-06-15", "2012-12-22", "2013-12-15", "2013-10-30", "2014-09-01"),
+  DTHDTC   = c(NA, NA, NA, NA, NA)
+) |> convert_blanks_to_na()
+
+ex <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  DOMAIN   = "EX",
+  USUBJID  = c("01-701-1015", "01-701-1015",
+               "01-701-1023", "01-702-1042",
+               "01-702-1101", "01-703-1211"),
+  EXTRT    = c("XANOMELINE", "XANOMELINE",
+               "XANOMELINE", "PLACEBO",
+               "XANOMELINE", "PLACEBO"),
+  EXDOSE   = c(81, 81, 54, 0, 81, 0),
+  EXSEQ    = c(1L, 2L, 1L, 1L, 1L, 1L),
+  EXSTDTC  = c("2014-01-02", "2014-02-02",
+               "2012-08-05", "2013-07-09",
+               "2013-04-14", "2014-03-22"),
+  EXENDTC  = c("2014-01-31", "2014-06-15",
+               "2012-12-22", "2013-12-15",
+               "2013-10-30", "2014-09-01")
+) |> convert_blanks_to_na()
+
+ds <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  DOMAIN   = "DS",
+  USUBJID  = c("01-701-1015", "01-701-1015",
+               "01-701-1023", "01-702-1042",
+               "01-702-1101", "01-703-1211"),
+  DSSEQ    = c(1L, 2L, 1L, 1L, 1L, 1L),
+  DSCAT    = c("PROTOCOL MILESTONE", "DISPOSITION EVENT",
+               "DISPOSITION EVENT", "DISPOSITION EVENT",
+               "PROTOCOL MILESTONE", "DISPOSITION EVENT"),
+  DSDECOD  = c("RANDOMIZED", "COMPLETED",
+               "COMPLETED", "ADVERSE EVENT",
+               "RANDOMIZED", "COMPLETED"),
+  DSTERM   = c("RANDOMIZED", "COMPLETED STUDY",
+               "COMPLETED STUDY", "DISCONTINUED DUE TO AE",
+               "RANDOMIZED", "COMPLETED STUDY"),
+  DSSTDTC  = c("2014-01-02", "2014-06-15",
+               "2012-12-22", "2013-09-15",
+               "2013-04-14", "2014-09-01")
+) |> convert_blanks_to_na()
+
+ae <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  DOMAIN   = "AE",
+  USUBJID  = c("01-701-1015", "01-702-1042", "01-702-1042"),
+  AESEQ    = c(1L, 1L, 2L),
+  AETERM   = c("HEADACHE", "DIZZINESS", "RASH"),
+  AEDECOD  = c("Headache", "Dizziness", "Rash"),
+  AESTDTC  = c("2014-03-15", "2013-08-10", "2013-09-01"),
+  AEOUT    = c("RECOVERED/RESOLVED", "RECOVERED/RESOLVED", "RECOVERING/RESOLVING"),
+  AEDTHDTC = c(NA, NA, NA)
+) |> convert_blanks_to_na()
+
+lb <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  DOMAIN   = "LB",
+  USUBJID  = c("01-701-1015", "01-701-1015", "01-701-1023", "01-702-1042"),
+  LBTESTCD = c("ALT", "ALT", "ALT", "ALT"),
+  LBDTC    = c("2014-01-02", "2014-04-01", "2012-08-05", "2013-07-09"),
+  LBORRES  = c("28", "35", "22", "41")
+) |> convert_blanks_to_na()
+```
+
+## Welcome
+
+This is Lesson 15 — **`{admiral}` Part 2: Building ADSL End-to-End**.
+
+An ADSL has one row per subject and holds everything true about that subject: demographics, treatment dates, durations, population flags, and outcomes. It's built first — every other ADaM references it.
+
+This lesson walks through a complete ADSL build using admiral, step by step:
+
+1. Base dataset from DM
+2. Treatment start/end datetimes → dates → duration
+3. Disposition dates (randomization, end of study)
+4. Cause of death and last known alive date (multi-source)
+5. Population flags (SAFFL, ITTFL, RANDFL)
+6. Age groups (AGEGR1, AGEGR1N)
+
+---
+
+## 1 — What's in an ADSL?
+
+```{r quiz-adsl-overview, echo=FALSE}
+quiz(
+  question(
+    "ADSL has one row per:",
+    answer("Subject per visit"),
+    answer("Subject", correct = TRUE),
+    answer("Subject per parameter"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Why is ADSL typically the first ADaM you build?",
+    answer("It's the smallest and easiest"),
+    answer("Every other ADaM joins to ADSL for subject-level metadata like treatment dates and population flags", correct = TRUE),
+    answer("Regulators require it first"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "TRTSDTM vs TRTSDT — the difference is:",
+    answer("TRTSDTM is a datetime (with time component); TRTSDT is a date-only version", correct = TRUE),
+    answer("They are identical — both store dates"),
+    answer("TRTSDT comes from DS; TRTSDTM comes from EX"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 2 — Setup and base dataset
+
+```{r adsl-base-setup}
+# Step 0: All SDTM already loaded and blanks converted (see setup)
+# Step 1: Create base ADSL from DM
+adsl <- dm |>
+  mutate(
+    TRT01P = ARM,
+    TRT01A = ACTARM
+  )
+
+glimpse(adsl)
+```
+
+---
+
+## 3 — Pre-process EX and DS
+
+Before merging, derive datetime variables on the source datasets.
+
+```{r preprocess-ex}
+# EX: add start and end datetimes
+ex_ext <- ex |>
+  derive_vars_dtm(
+    dtc             = EXSTDTC,
+    new_vars_prefix = "EXST",
+    date_imputation = "first",
+    time_imputation = "first"
+  ) |>
+  derive_vars_dtm(
+    dtc             = EXENDTC,
+    new_vars_prefix = "EXEN",
+    date_imputation = "last",
+    time_imputation = "last"
+  )
+
+ex_ext |>
+  select(USUBJID, EXSTDTC, EXSTDTM, EXENDTC, EXENDTM) |>
+  mutate(
+    EXST_human = as.POSIXct(EXSTDTM, origin = "1970-01-01", tz = "UTC"),
+    EXEN_human = as.POSIXct(EXENDTM, origin = "1970-01-01", tz = "UTC")
+  )
+```
+
+```{r preprocess-ds}
+# DS: add date variable from DSSTDTC
+ds_ext <- ds |>
+  derive_vars_dt(
+    dtc             = DSSTDTC,
+    new_vars_prefix = "DSST",
+    date_imputation = "first"
+  )
+
+ds_ext |>
+  select(USUBJID, DSCAT, DSDECOD, DSSTDTC, DSSTDT) |>
+  mutate(DSSTDT_human = as.Date(DSSTDT, origin = "1970-01-01"))
+```
+
+---
+
+## 4 — Treatment start and end datetimes
+
+The standard EX filter: `(EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))` — counts active doses AND zero-dose placebo records.
+
+```{r derive-trt-dates}
+# Derive TRTSDTM (first qualifying dose) and TRTEDTM (last qualifying dose end)
+adsl <- adsl |>
+  derive_vars_merged(
+    dataset_add = ex_ext,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &
+                  !is.na(EXSTDTM),
+    new_vars    = exprs(TRTSDTM = EXSTDTM, TRTSTMF = EXSTTMF),
+    order       = exprs(EXSTDTM, EXSEQ),
+    mode        = "first",
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  derive_vars_merged(
+    dataset_add = ex_ext,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &
+                  !is.na(EXENDTM),
+    new_vars    = exprs(TRTEDTM = EXENDTM, TRTETMF = EXENTMF),
+    order       = exprs(EXENDTM, EXSEQ),
+    mode        = "last",
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl |>
+  select(USUBJID, ACTARM, TRTSDTM, TRTEDTM) |>
+  mutate(
+    TRTS_human = as.POSIXct(TRTSDTM, origin = "1970-01-01", tz = "UTC"),
+    TRTE_human = as.POSIXct(TRTEDTM, origin = "1970-01-01", tz = "UTC")
+  )
+```
+
+### Exercise: Convert datetimes to dates and compute treatment duration
+
+```{r trt-dates-to-dt, exercise=TRUE, exercise.lines=20}
+# Step 1: convert TRTSDTM/TRTEDTM → TRTSDT/TRTEDT
+adsl_dates <- adsl |>
+  derive_vars_dtm_to_dt(source_vars = exprs(TRTSDTM, TRTEDTM))
+
+# Step 2: derive TRTDURD = TRTEDT - TRTSDT + 1
+adsl_dur <- adsl_dates |>
+  derive_var_trtdurd()
+
+adsl_dur |>
+  select(USUBJID, ACTARM, TRTSDT, TRTEDT, TRTDURD) |>
+  mutate(
+    TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01"),
+    TRTEDT_human = as.Date(TRTEDT, origin = "1970-01-01")
+  )
+```
+
+---
+
+## 5 — Disposition dates
+
+Both RANDDT and EOSDT come from DS with different DSDECOD filters:
+
+```{r derive-disp-dates}
+adsl <- adsl |>
+  # Randomization date
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "PROTOCOL MILESTONE" & DSDECOD == "RANDOMIZED",
+    new_vars    = exprs(RANDDT = DSSTDT),
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  # End of study date
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(EOSDT = DSSTDT),
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl |>
+  select(USUBJID, RANDDT, EOSDT) |>
+  mutate(
+    RANDDT_human = as.Date(RANDDT, origin = "1970-01-01"),
+    EOSDT_human  = as.Date(EOSDT,  origin = "1970-01-01")
+  )
+```
+
+### Exercise: Derive the discontinuation reason (DCSREAS)
+
+Merge the DS term for "DISPOSITION EVENT" records onto ADSL as `DCSREAS`.
+
+```{r derive-dcsreas, exercise=TRUE, exercise.lines=15}
+adsl_dcsreas <- adsl |>
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == ___ & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(DCSREAS = ___),
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_dcsreas |>
+  select(USUBJID, ACTARM, DCSREAS)
+```
+
+```{r derive-dcsreas-hint-1}
+# filter_add = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE"
+# new_vars = exprs(DCSREAS = DSTERM)
+```
+
+```{r derive-dcsreas-solution}
+adsl_dcsreas <- adsl |>
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(DCSREAS = DSTERM),
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_dcsreas |>
+  select(USUBJID, ACTARM, DCSREAS)
+```
+
+---
+
+## 6 — Cause of death: multi-source derivation
+
+DTHCAUS can come from DS (death recorded as a disposition event) OR from AE (fatal adverse event). `derive_vars_extreme_event()` handles multi-source lookups elegantly.
+
+```{r death-source-demo}
+# Source 1: DS records for death
+src_ds_death <- event_source(
+  dataset_name = "ds",
+  filter       = DSDECOD == "DEATH",
+  date         = DSSTDT,
+  set_values_to = exprs(
+    DTHCAUS = DSTERM,
+    DTHDT   = DSSTDT
+  )
+)
+
+# Source 2: AE records with fatal outcome
+src_ae_death <- event_source(
+  dataset_name = "ae",
+  filter       = AEOUT == "FATAL",
+  date         = convert_dtc_to_dt(AEDTHDTC),
+  set_values_to = exprs(
+    DTHCAUS = AEDECOD,
+    DTHDT   = convert_dtc_to_dt(AEDTHDTC)
+  )
+)
+
+# Derive DTHCAUS and DTHDT from whichever source has the event
+adsl <- adsl |>
+  derive_vars_extreme_event(
+    by_vars         = exprs(STUDYID, USUBJID),
+    events          = list(src_ds_death, src_ae_death),
+    order           = exprs(DTHDT),
+    mode            = "first",
+    source_datasets = list(ds = ds_ext, ae = ae),
+    new_vars        = exprs(DTHCAUS, DTHDT)
+  )
+
+adsl |>
+  select(USUBJID, DTHCAUS, DTHDT) |>
+  mutate(DTHDT_human = as.Date(DTHDT, origin = "1970-01-01"))
+```
+
+### Exercise: Verify no subjects have a death event in our sample data
+
+Our sample `ds` has no `DSDECOD == "DEATH"` and `ae` has no `AEOUT == "FATAL"`. Confirm DTHCAUS is NA for all subjects.
+
+```{r death-check, exercise=TRUE, exercise.lines=8}
+# How many subjects have a non-NA DTHCAUS?
+n_deaths <- adsl |>
+  filter(!is.na(___)) |>
+  nrow()
+
+cat("Subjects with DTHCAUS:", n_deaths, "\n")
+cat("Expected: 0 — no deaths in sample data\n")
+```
+
+```{r death-check-hint-1}
+# filter(!is.na(DTHCAUS))
+```
+
+```{r death-check-solution}
+n_deaths <- adsl |>
+  filter(!is.na(DTHCAUS)) |>
+  nrow()
+
+cat("Subjects with DTHCAUS:", n_deaths, "\n")
+cat("Expected: 0 — no deaths in sample data\n")
+```
+
+---
+
+## 7 — Last known alive date (LSTALVDT)
+
+LSTALVDT is the latest date we have *any* evidence the subject was alive. It comes from multiple sources — we take the maximum (latest) across all of them.
+
+```{r lstalvdt-demo}
+# Source 1: latest AE start date (subject was alive when the AE started)
+src_ae_alive <- event_source(
+  dataset_name = "ae",
+  filter       = !is.na(AESTDTC),
+  date         = convert_dtc_to_dt(AESTDTC),
+  set_values_to = exprs(LSTALVDT = convert_dtc_to_dt(AESTDTC))
+)
+
+# Source 2: latest lab collection date
+src_lb_alive <- event_source(
+  dataset_name = "lb",
+  filter       = !is.na(LBDTC),
+  date         = convert_dtc_to_dt(LBDTC),
+  set_values_to = exprs(LSTALVDT = convert_dtc_to_dt(LBDTC))
+)
+
+adsl <- adsl |>
+  derive_vars_extreme_event(
+    by_vars         = exprs(STUDYID, USUBJID),
+    events          = list(src_ae_alive, src_lb_alive),
+    order           = exprs(LSTALVDT),
+    mode            = "last",    # latest date across all sources
+    source_datasets = list(ae = ae, lb = lb),
+    new_vars        = exprs(LSTALVDT)
+  )
+
+adsl |>
+  select(USUBJID, LSTALVDT) |>
+  mutate(LSTALVDT_human = as.Date(LSTALVDT, origin = "1970-01-01"))
+```
+
+```{r quiz-lstalvdt, echo=FALSE}
+quiz(
+  question(
+    "For LSTALVDT you use mode = 'last' because:",
+    answer("You want the most recent date at which the subject was confirmed alive", correct = TRUE),
+    answer("You want the earliest date"),
+    answer("Both first and last produce the same result"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 8 — Treatment duration
+
+```{r trt-duration}
+# TRTSDT and TRTEDT are now available — derive TRTDURD
+adsl <- adsl |>
+  derive_vars_dtm_to_dt(source_vars = exprs(TRTSDTM, TRTEDTM)) |>
+  derive_var_trtdurd()
+
+adsl |>
+  select(USUBJID, TRTSDT, TRTEDT, TRTDURD) |>
+  mutate(
+    TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01"),
+    TRTEDT_human = as.Date(TRTEDT, origin = "1970-01-01")
+  )
+```
+
+### Exercise: Derive TRTDURM (treatment duration in months)
+
+Use `derive_vars_duration()` with `out_unit = "months"`.
+
+```{r trt-duration-months, exercise=TRUE, exercise.lines=12}
+adsl_with_months <- adsl |>
+  derive_vars_duration(
+    new_var    = TRTDURM,
+    start_date = TRTSDT,
+    end_date   = TRTEDT,
+    out_unit   = ___,
+    add_one    = FALSE
+  )
+
+adsl_with_months |>
+  select(USUBJID, TRTDURD, TRTDURM)
+```
+
+```{r trt-duration-months-hint-1}
+# out_unit = "months"
+```
+
+```{r trt-duration-months-solution}
+adsl_with_months <- adsl |>
+  derive_vars_duration(
+    new_var    = TRTDURM,
+    start_date = TRTSDT,
+    end_date   = TRTEDT,
+    out_unit   = "months",
+    add_one    = FALSE
+  )
+
+adsl_with_months |>
+  select(USUBJID, TRTDURD, TRTDURM)
+```
+
+---
+
+## 9 — Population flags
+
+### SAFFL: Safety population
+
+A subject is in the safety population if they received at least one dose (positive dose OR placebo).
+
+```{r saffl-demo}
+adsl <- adsl |>
+  derive_var_merged_exist_flag(
+    dataset_add = ex,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = SAFFL,
+    condition   = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))
+  )
+
+adsl |> select(USUBJID, ACTARM, SAFFL)
+```
+
+### ITTFL and RANDFL: Intent-to-treat and randomized populations
+
+These are derived from RANDDT — a subject is in ITT if they were randomized.
+
+```{r ittfl-demo}
+adsl <- adsl |>
+  mutate(
+    ITTFL  = if_else(!is.na(RANDDT), "Y", NA_character_),
+    RANDFL = if_else(!is.na(RANDDT), "Y", NA_character_)
+  )
+
+adsl |> select(USUBJID, SAFFL, ITTFL, RANDFL)
+```
+
+```{r quiz-flag-values, echo=FALSE}
+quiz(
+  question(
+    "Why do population flags use 'Y' or NA, not 'Y' or 'N'?",
+    answer("CDISC ADaM IG specifies 'Y'/NA — a blank means 'not in population'; 'N' is redundant and not standard", correct = TRUE),
+    answer("'N' is a reserved value in R"),
+    answer("It saves storage space"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise: Derive COMPLFL (completion flag)
+
+A subject is a completer if their DCSREAS is `"COMPLETED STUDY"`. Derive `COMPLFL` using a direct `mutate()`.
+
+```{r complfl-exercise, exercise=TRUE, exercise.lines=10}
+# First, get DCSREAS onto adsl (derive it from ds)
+adsl_with_dcsreas <- adsl |>
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(DCSREAS = DSTERM),
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  mutate(COMPLFL = if_else(DCSREAS == ___, "Y", NA_character_))
+
+adsl_with_dcsreas |>
+  select(USUBJID, ACTARM, DCSREAS, COMPLFL)
+```
+
+```{r complfl-exercise-hint-1}
+# if_else(DCSREAS == "COMPLETED STUDY", "Y", NA_character_)
+```
+
+```{r complfl-exercise-solution}
+adsl_with_dcsreas <- adsl |>
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(DCSREAS = DSTERM),
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  mutate(COMPLFL = if_else(DCSREAS == "COMPLETED STUDY", "Y", NA_character_))
+
+adsl_with_dcsreas |>
+  select(USUBJID, ACTARM, DCSREAS, COMPLFL)
+```
+
+---
+
+## 10 — Age groups
+
+AGEGR1 (character) and AGEGR1N (numeric companion) are the standard age categorization:
+
+```{r age-groups-demo}
+adsl <- adsl |>
+  mutate(
+    AGEGR1  = case_when(
+      AGE < 18             ~ "<18",
+      between(AGE, 18, 64) ~ "18-64",
+      AGE >= 65            ~ ">=65"
+    ),
+    AGEGR1N = case_when(
+      AGE < 18             ~ 1,
+      between(AGE, 18, 64) ~ 2,
+      AGE >= 65            ~ 3
+    )
+  )
+
+adsl |>
+  select(USUBJID, AGE, AGEGR1, AGEGR1N)
+```
+
+### Exercise: Add a finer age categorization (AGEGR2)
+
+Create `AGEGR2` with categories: `<40`, `40-54`, `55-64`, `>=65`.
+
+```{r agegr2-exercise, exercise=TRUE, exercise.lines=14}
+adsl_agegr2 <- adsl |>
+  mutate(
+    AGEGR2 = case_when(
+      AGE < 40             ~ "<40",
+      between(AGE, 40, 54) ~ "40-54",
+      between(AGE, 55, 64) ~ "55-64",
+      AGE >= 65            ~ ">=65"
+    )
+  )
+
+adsl_agegr2 |>
+  select(USUBJID, AGE, AGEGR1, AGEGR2)
+```
+
+---
+
+## 11 — Putting it all together: the complete ADSL build
+
+Here is the full ADSL derivation script, condensed. Run it to see the complete dataset.
+
+```{r adsl-full-build, exercise=TRUE, exercise.lines=80}
+# ── Pre-process source datasets ───────────────────────────────────────────────
+ex_ext_full <- ex |>
+  derive_vars_dtm(dtc = EXSTDTC, new_vars_prefix = "EXST",
+                  date_imputation = "first", time_imputation = "first") |>
+  derive_vars_dtm(dtc = EXENDTC, new_vars_prefix = "EXEN",
+                  date_imputation = "last",  time_imputation = "last")
+
+ds_ext_full <- ds |>
+  derive_vars_dt(dtc = DSSTDTC, new_vars_prefix = "DSST", date_imputation = "first")
+
+# ── Build ADSL ────────────────────────────────────────────────────────────────
+adsl_full <- dm |>
+  mutate(TRT01P = ARM, TRT01A = ACTARM) |>
+
+  # 1. Treatment datetimes
+  derive_vars_merged(
+    dataset_add = ex_ext_full,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) & !is.na(EXSTDTM),
+    new_vars    = exprs(TRTSDTM = EXSTDTM), order = exprs(EXSTDTM, EXSEQ),
+    mode = "first", by_vars = exprs(STUDYID, USUBJID)) |>
+  derive_vars_merged(
+    dataset_add = ex_ext_full,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) & !is.na(EXENDTM),
+    new_vars    = exprs(TRTEDTM = EXENDTM), order = exprs(EXENDTM, EXSEQ),
+    mode = "last", by_vars = exprs(STUDYID, USUBJID)) |>
+
+  # 2. Convert to dates + duration
+  derive_vars_dtm_to_dt(source_vars = exprs(TRTSDTM, TRTEDTM)) |>
+  derive_var_trtdurd() |>
+
+  # 3. Disposition dates
+  derive_vars_merged(
+    dataset_add = ds_ext_full,
+    filter_add  = DSCAT == "PROTOCOL MILESTONE" & DSDECOD == "RANDOMIZED",
+    new_vars    = exprs(RANDDT = DSSTDT), by_vars = exprs(STUDYID, USUBJID)) |>
+  derive_vars_merged(
+    dataset_add = ds_ext_full,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(EOSDT = DSSTDT, DCSREAS = DSTERM),
+    by_vars = exprs(STUDYID, USUBJID)) |>
+
+  # 4. Population flags
+  derive_var_merged_exist_flag(
+    dataset_add = ex, by_vars = exprs(STUDYID, USUBJID), new_var = SAFFL,
+    condition   = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))) |>
+  mutate(ITTFL  = if_else(!is.na(RANDDT), "Y", NA_character_),
+         RANDFL = if_else(!is.na(RANDDT), "Y", NA_character_),
+         COMPLFL = if_else(DCSREAS == "COMPLETED STUDY", "Y", NA_character_)) |>
+
+  # 5. Age groups
+  mutate(
+    AGEGR1  = case_when(AGE < 18 ~ "<18", between(AGE, 18, 64) ~ "18-64", AGE >= 65 ~ ">=65"),
+    AGEGR1N = case_when(AGE < 18 ~ 1,     between(AGE, 18, 64) ~ 2,       AGE >= 65 ~ 3)
+  )
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+cat("ADSL rows (one per subject):", nrow(adsl_full), "\n")
+cat("ADSL columns:", ncol(adsl_full), "\n\n")
+
+adsl_full |>
+  select(USUBJID, ACTARM, TRTSDT, TRTEDT, TRTDURD,
+         SAFFL, ITTFL, RANDFL, COMPLFL, AGEGR1, AGEGR1N) |>
+  mutate(
+    TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01"),
+    TRTEDT_human = as.Date(TRTEDT, origin = "1970-01-01")
+  ) |>
+  select(-TRTSDT, -TRTEDT) |>
+  print()
+```
+
+---
+
+## 12 — Validation strategy
+
+```{r quiz-validation, echo=FALSE}
+quiz(
+  question(
+    "The standard validation approach for submission-quality ADSL is:",
+    answer("One programmer writes it and a reviewer checks the code"),
+    answer("Two programmers independently build the ADSL; outputs are compared with {diffdf}; discrepancies are resolved", correct = TRUE),
+    answer("Run check_variables() from metatools — that's sufficient"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The add_one = FALSE convention in derive_vars_duration() applies to:",
+    answer("TRTDURD — treatment duration in days"),
+    answer("Elapsed-time variables like LDDTHELD, where you count calendar gap without an endpoint adjustment", correct = TRUE),
+    answer("All duration variables"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The filter (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, 'PLACEBO'))) ensures:",
+    answer("Only active doses count"),
+    answer("Active doses AND zero-dose placebo records both count as exposure", correct = TRUE),
+    answer("Missing doses are excluded"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 13 — Key takeaways
+
+```{r quiz-final-15, echo=FALSE}
+quiz(
+  question(
+    "The standard admiral pattern for most ADSL variables from EX is:",
+    answer("derive_vars_dtm() on EX → derive_vars_merged() with filter/order/mode onto ADSL", correct = TRUE),
+    answer("derive_param_*() to add EX parameters"),
+    answer("Manually mutate() with left_join()"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "derive_vars_extreme_event() is used for DTHCAUS and LSTALVDT because:",
+    answer("These variables can come from multiple different source datasets, and you need the first/last across all of them", correct = TRUE),
+    answer("derive_vars_merged() can't handle date variables"),
+    answer("It's faster than derive_vars_merged() for large datasets"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "After this lesson, what are the three most common admiral functions you'll use in any ADSL build?",
+    answer("derive_vars_dt/dtm(), derive_vars_merged(), derive_var_merged_exist_flag()", correct = TRUE),
+    answer("derive_param_*(), derive_vars_dy(), compute_*()"),
+    answer("combine_supp(), build_from_derived(), check_variables()"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## What's next
+
+Lesson 16 — **`{admiral}` Part 3** — covers BDS (Basic Data Structure) ADaMs: ADLB, ADVS, ADEG. These are long-format datasets with one row per subject per parameter per visit. The derivation patterns reuse `derive_vars_merged()`, `derive_var_extreme_flag()`, and the date helpers — but now applied to analysis-value reshaping and baseline flagging across many parameters.
+
+After Lesson 16: OCCDS (ADAE, ADCM) in Lesson 17, time-to-event (ADTTE) in Lesson 18, and advanced admiral patterns in Lesson 19.

@@ -1,0 +1,889 @@
+---
+title: "Lesson 17 — admiral Part 4: OCCDS Datasets (ADAE, ADCM)"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(lubridate)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── shared mocks (from prior lessons) ────────────────────────────────────────
+exprs <- function(...) {
+  dots <- as.list(substitute(list(...)))[-1]
+  dots
+}
+
+convert_blanks_to_na <- function(dataset) {
+  dataset |> mutate(across(where(is.character), ~ifelse(. == "", NA_character_, .)))
+}
+
+.impute_dtc <- function(dtc, date_imputation = "first") {
+  sapply(dtc, function(d) {
+    if (is.na(d)) return(NA_character_)
+    if (nchar(d) == 4) {
+      paste0(d, if (date_imputation == "last") "-12-31" else "-01-01")
+    } else if (nchar(d) == 7) {
+      if (date_imputation == "last") {
+        yr <- as.integer(substr(d, 1, 4)); mo <- as.integer(substr(d, 6, 7))
+        nxt <- if (mo == 12) paste0(yr+1,"-01-01") else paste0(yr,"-",sprintf("%02d",mo+1),"-01")
+        as.character(as.Date(nxt) - 1)
+      } else paste0(d, "-01")
+    } else d
+  })
+}
+
+convert_dtc_to_dt <- function(dtc, date_imputation = "first") {
+  suppressWarnings(as.numeric(as.Date(.impute_dtc(dtc, date_imputation))))
+}
+
+derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
+                                order = NULL, filter_add = NULL, mode = NULL, ...) {
+  by_nm   <- sapply(by_vars, deparse)
+  join_df <- dataset_add
+  if (!is.null(filter_add)) {
+    fe <- substitute(filter_add)
+    join_df <- tryCatch(filter(join_df, !!fe), error = function(e) join_df)
+  }
+  if (!is.null(new_vars)) {
+    old_nms <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d, "=")[[1]][2]) else d
+    })
+    new_nms <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d, "=")[[1]][1]) else d
+    })
+    keep <- intersect(c(by_nm, old_nms), names(join_df))
+    join_df <- join_df |> select(all_of(keep))
+    for (i in seq_along(old_nms)) {
+      if (old_nms[i] != new_nms[i] && old_nms[i] %in% names(join_df))
+        join_df <- join_df |> rename(!!new_nms[i] := !!old_nms[i])
+    }
+  }
+  by_present <- intersect(by_nm, names(join_df))
+  left_join(dataset, join_df, by = by_present)
+}
+
+derive_vars_dt <- function(dataset, dtc, new_vars_prefix,
+                            date_imputation = "none", highest_imputation = "n",
+                            flag_imputation = "auto", ...) {
+  dtc_nm  <- deparse(substitute(dtc))
+  imp_rule <- if (date_imputation %in% c("none","") && highest_imputation == "n") "none"
+              else if (date_imputation == "last") "last" else "first"
+  raw     <- if (dtc_nm %in% names(dataset)) dataset[[dtc_nm]] else rep(NA_character_, nrow(dataset))
+  imputed <- if (imp_rule == "none") raw else .impute_dtc(raw, imp_rule)
+  dataset[[paste0(new_vars_prefix, "DT")]] <- suppressWarnings(as.numeric(as.Date(imputed)))
+  if (flag_imputation != "none") {
+    dataset[[paste0(new_vars_prefix, "DTF")]] <- case_when(
+      is.na(raw)                       ~ NA_character_,
+      nchar(raw) <= 4 & !is.na(imputed) ~ "Y",
+      nchar(raw) <= 7 & !is.na(imputed) ~ "M",
+      TRUE                              ~ NA_character_
+    )
+  }
+  dataset
+}
+
+derive_vars_dtm <- function(dataset, dtc, new_vars_prefix,
+                             date_imputation = "first", time_imputation = "first",
+                             highest_imputation = "n", ...) {
+  dtc_nm  <- deparse(substitute(dtc))
+  raw     <- if (dtc_nm %in% names(dataset)) dataset[[dtc_nm]] else rep(NA_character_, nrow(dataset))
+  imputed <- .impute_dtc(raw, date_imputation)
+  suffix  <- if (time_imputation == "last") "T23:59:59" else "T00:00:00"
+  dataset[[paste0(new_vars_prefix, "DTM")]] <- suppressWarnings(
+    as.numeric(as.POSIXct(paste0(imputed, suffix), tz = "UTC"))
+  )
+  dataset
+}
+
+derive_vars_dy <- function(dataset, reference_date, source_vars) {
+  ref_nm  <- deparse(substitute(reference_date))
+  src_nms <- sapply(source_vars, deparse)
+  for (sv in src_nms) {
+    dy_nm <- sub("DT$", "DY", sv)
+    if (sv %in% names(dataset) && ref_nm %in% names(dataset)) {
+      v <- dataset[[sv]]; r <- dataset[[ref_nm]]
+      dataset[[dy_nm]] <- ifelse(is.na(v) | is.na(r), NA_real_,
+        ifelse(v >= r, as.numeric(v - r) + 1, as.numeric(v - r)))
+    }
+  }
+  dataset
+}
+
+derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "first") {
+  new_nm  <- deparse(substitute(new_var))
+  by_nm   <- sapply(by_vars, deparse)
+  ord_nms <- sapply(order, function(x) { d <- deparse(x); gsub("desc\\(|\\)","",d) })
+  desc_fl <- sapply(order, function(x) grepl("^desc\\(", deparse(x)))
+  ord_df  <- dataset
+  for (i in rev(seq_along(ord_nms))) {
+    if (ord_nms[i] %in% names(ord_df))
+      ord_df <- if (desc_fl[i]) arrange(ord_df, desc(.data[[ord_nms[i]]]))
+                else arrange(ord_df, .data[[ord_nms[i]]])
+  }
+  by_present <- intersect(by_nm, names(ord_df))
+  if (mode == "first")
+    flagged <- ord_df |> group_by(across(all_of(by_present))) |>
+      slice(1) |> ungroup() |> mutate(!!new_nm := "Y") |>
+      select(all_of(c(by_present, ord_nms[ord_nms %in% names(ord_df)][1], new_nm)))
+  else
+    flagged <- ord_df |> group_by(across(all_of(by_present))) |>
+      slice(n()) |> ungroup() |> mutate(!!new_nm := "Y") |>
+      select(all_of(c(by_present, ord_nms[ord_nms %in% names(ord_df)][1], new_nm)))
+  if (new_nm %in% names(dataset)) dataset[[new_nm]] <- NULL
+  left_join(dataset, flagged, by = intersect(names(flagged), names(dataset)))
+}
+
+restrict_derivation <- function(dataset, derivation, args = list(), filter = NULL) {
+  fe <- substitute(filter)
+  in_rows <- if (!is.null(fe)) {
+    tryCatch(which(eval(fe, dataset, parent.frame())), error = function(e) seq_len(nrow(dataset)))
+  } else seq_len(nrow(dataset))
+  out_rows <- setdiff(seq_len(nrow(dataset)), in_rows)
+  sub_data  <- dataset[in_rows, , drop = FALSE]
+  all_args  <- c(list(dataset = sub_data), args)
+  derived   <- tryCatch(do.call(derivation, all_args), error = function(e) sub_data)
+  bind_rows(derived, dataset[out_rows, , drop = FALSE])
+}
+
+params <- function(...) list(...)
+
+# ── OCCDS-specific mocks ─────────────────────────────────────────────────────
+derive_var_trtemfl <- function(dataset, start_date, end_date = NULL,
+                                trt_start_date, trt_end_date,
+                                end_window = 0,
+                                initial_intensity = NULL,
+                                intensity = NULL, ...) {
+  sd_nm  <- deparse(substitute(start_date))
+  ed_nm  <- if (!is.null(substitute(end_date))) deparse(substitute(end_date)) else NULL
+  ts_nm  <- deparse(substitute(trt_start_date))
+  te_nm  <- deparse(substitute(trt_end_date))
+  ii_nm  <- if (!is.null(substitute(initial_intensity))) deparse(substitute(initial_intensity)) else NULL
+  in_nm  <- if (!is.null(substitute(intensity)))         deparse(substitute(intensity))         else NULL
+  dataset |> mutate(
+    TRTEMFL = case_when(
+      is.na(.data[[sd_nm]]) | is.na(.data[[ts_nm]]) ~ NA_character_,
+      .data[[sd_nm]] >= .data[[ts_nm]] &
+        .data[[sd_nm]] <= (.data[[te_nm]] + end_window) ~ "Y",
+      TRUE ~ NA_character_
+    )
+  )
+}
+
+derive_var_ontrtfl <- function(dataset, start_date, end_date = NULL,
+                                ref_start_date, ref_end_date,
+                                ref_end_window = 0, ...) {
+  sd_nm <- deparse(substitute(start_date))
+  rs_nm <- deparse(substitute(ref_start_date))
+  re_nm <- deparse(substitute(ref_end_date))
+  dataset |> mutate(
+    ONTRTFL = case_when(
+      is.na(.data[[sd_nm]]) | is.na(.data[[rs_nm]]) ~ NA_character_,
+      .data[[sd_nm]] >= .data[[rs_nm]] &
+        .data[[sd_nm]] <= (.data[[re_nm]] + ref_end_window) ~ "Y",
+      TRUE ~ NA_character_
+    )
+  )
+}
+
+derive_var_obs_number <- function(dataset, new_var, by_vars, order,
+                                   check_type = "warning") {
+  new_nm  <- deparse(substitute(new_var))
+  by_nm   <- sapply(by_vars, deparse)
+  ord_nms <- sapply(order, function(x) { d <- deparse(x); gsub("desc\\(|\\)","",d) })
+  desc_fl <- sapply(order, function(x) grepl("^desc\\(", deparse(x)))
+  ord_df  <- dataset
+  for (i in rev(seq_along(ord_nms))) {
+    if (ord_nms[i] %in% names(ord_df))
+      ord_df <- if (desc_fl[i]) arrange(ord_df, desc(.data[[ord_nms[i]]]))
+                else arrange(ord_df, .data[[ord_nms[i]]])
+  }
+  by_present <- intersect(by_nm, names(ord_df))
+  ord_df |> group_by(across(all_of(by_present))) |>
+    mutate(!!new_nm := row_number()) |> ungroup()
+}
+
+derive_vars_joined <- function(dataset, dataset_add, by_vars, order,
+                                new_vars = NULL, join_vars = NULL,
+                                filter_join = NULL, mode = "first",
+                                join_type = "all", ...) {
+  by_nm  <- sapply(by_vars, deparse)
+  fj_sub <- substitute(filter_join)
+  merged <- left_join(dataset, dataset_add, by = intersect(by_nm, names(dataset_add)),
+                      suffix = c("", ".add"))
+  if (!is.null(fj_sub)) {
+    merged <- tryCatch(filter(merged, !!fj_sub), error = function(e) merged)
+  }
+  if (!is.null(new_vars)) {
+    old_nms <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=",d)) trimws(strsplit(d,"=")[[1]][2]) else d
+    })
+    new_nms <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=",d)) trimws(strsplit(d,"=")[[1]][1]) else d
+    })
+    for (i in seq_along(old_nms)) {
+      if (old_nms[i] %in% names(merged))
+        merged <- rename(merged, !!new_nms[i] := !!old_nms[i])
+    }
+    keep_extra <- new_nms
+  } else {
+    keep_extra <- setdiff(names(dataset_add), c(by_nm, names(dataset)))
+  }
+  ord_nms <- sapply(order, function(x) { d <- deparse(x); gsub("desc\\(|\\)","",d) })
+  desc_fl <- sapply(order, function(x) grepl("^desc\\(", deparse(x)))
+  for (i in rev(seq_along(ord_nms))) {
+    if (ord_nms[i] %in% names(merged))
+      merged <- if (desc_fl[i]) arrange(merged, desc(.data[[ord_nms[i]]]))
+                else arrange(merged, .data[[ord_nms[i]]])
+  }
+  by_present <- intersect(by_nm, names(merged))
+  if (mode == "first")
+    merged <- merged |> group_by(across(all_of(by_present))) |> slice(1) |> ungroup()
+  else
+    merged <- merged |> group_by(across(all_of(by_present))) |> slice(n()) |> ungroup()
+  keep_cols <- intersect(keep_extra, names(merged))
+  extra <- merged |> select(all_of(c(by_present, keep_cols)))
+  if (any(keep_cols %in% names(dataset))) {
+    for (nm in keep_cols[keep_cols %in% names(dataset)]) dataset[[nm]] <- NULL
+  }
+  left_join(dataset, extra, by = by_present)
+}
+
+derive_vars_query <- function(dataset, dataset_queries) {
+  prefixes <- unique(dataset_queries$PREFIX)
+  for (px in prefixes) {
+    grp_rows <- dataset_queries |> filter(PREFIX == px)
+    grp_name <- grp_rows$GRPNAME[1]
+    terms    <- grp_rows$TERM_NAME
+    dataset <- dataset |> mutate(
+      !!paste0(px, "NAM") := case_when(
+        toupper(AEDECOD) %in% toupper(terms) ~ grp_name,
+        TRUE ~ NA_character_
+      )
+    )
+  }
+  dataset
+}
+
+create_single_dose_dataset <- function(dataset, dose_freq, start_date,
+                                        end_date, keep_source_vars = NULL) {
+  sf_nm <- deparse(substitute(dose_freq))
+  sd_nm <- deparse(substitute(start_date))
+  ed_nm <- deparse(substitute(end_date))
+  result <- vector("list", nrow(dataset))
+  for (i in seq_len(nrow(dataset))) {
+    row  <- dataset[i, , drop = FALSE]
+    freq <- row[[sf_nm]]
+    sd   <- row[[sd_nm]]; ed <- row[[ed_nm]]
+    if (is.na(sd) || is.na(ed)) { result[[i]] <- row; next }
+    sd_d <- as.Date(sd, origin = "1970-01-01")
+    ed_d <- as.Date(ed, origin = "1970-01-01")
+    if (grepl("^(QD|QD1|ONCE DAILY)$", toupper(freq %||% ""))) {
+      dates <- seq(sd_d, ed_d, by = "day")
+      row_rep <- row[rep(1, length(dates)), ]
+      row_rep[[sd_nm]] <- as.numeric(dates)
+      result[[i]] <- row_rep
+    } else {
+      result[[i]] <- row
+    }
+  }
+  bind_rows(result)
+}
+
+# fallback for %||%
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ── Sample datasets ───────────────────────────────────────────────────────────
+adsl_occ <- tribble(
+  ~STUDYID,        ~USUBJID, ~TRTSDT, ~TRTEDT, ~TRT01A,    ~TRT01P,    ~AGE, ~SEX, ~RACE, ~SAFFL,
+  "CDISCPILOT01", "01-001",  19367,   19548,   "Xanomeli", "Xanomeli",  52, "F", "WHITE",    "Y",
+  "CDISCPILOT01", "01-002",  19370,   19551,   "Placebo",  "Placebo",   61, "M", "WHITE",    "Y",
+  "CDISCPILOT01", "01-003",  19375,   19540,   "Xanomeli", "Xanomeli",  47, "F", "BLACK",    "Y"
+)
+
+ae <- tribble(
+  ~STUDYID,        ~USUBJID,  ~AESEQ, ~AETERM,            ~AEDECOD,           ~AESOC,
+  ~AESTDTC,     ~AEENDTC,     ~AESEV,    ~AEREL,       ~AESER, ~AETOXGR,
+  "CDISCPILOT01","01-001", 1, "HEADACHE",         "Headache",          "Nervous system disorders",
+  "2024-01-20", "2024-01-22", "MILD",    "UNLIKELY",   "N",    1,
+  "CDISCPILOT01","01-001", 2, "NAUSEA",           "Nausea",            "Gastrointestinal disorders",
+  "2024-02-01", "2024-02-05", "MODERATE","POSSIBLE",   "N",    2,
+  "CDISCPILOT01","01-002", 1, "DIZZINESS",        "Dizziness",         "Nervous system disorders",
+  "2024-01-25", "2024-01-28", "MILD",    "UNLIKELY",   "N",    1,
+  "CDISCPILOT01","01-002", 2, "ANAPHYLACTIC SHOCK","Anaphylactic shock","Immune system disorders",
+  "2024-02-10", NA,           "SEVERE",  "PROBABLE",   "Y",    3,
+  "CDISCPILOT01","01-003", 1, "RASH",             "Rash",              "Skin disorders",
+  "2024-01-30", "2024-02-03", "MILD",    "POSSIBLE",   "N",    1
+)
+
+ex_occ <- tribble(
+  ~STUDYID,        ~USUBJID,  ~EXSEQ, ~EXTRT,      ~EXDOSE, ~EXDOSFRQ, ~EXSTDTC,      ~EXENDTC,
+  "CDISCPILOT01", "01-001",   1,      "XANOMELI",   54,     "QD",      "2024-01-15",  "2024-02-15",
+  "CDISCPILOT01", "01-002",   1,      "PLACEBO",     0,     "QD",      "2024-01-18",  "2024-02-18",
+  "CDISCPILOT01", "01-003",   1,      "XANOMELI",   54,     "QD",      "2024-01-23",  "2024-02-20"
+) |> mutate(
+  EXSTDT = as.numeric(as.Date(EXSTDTC)),
+  EXENDT = as.numeric(as.Date(EXENDTC))
+)
+
+queries_df <- tribble(
+  ~PREFIX, ~GRPNAME,                    ~SCOPE,   ~SCOPEN, ~TERM_NAME,
+  "SMQ01", "Hypersensitivity (SMQ)",   "NARROW", 2,       "ANAPHYLACTIC SHOCK",
+  "SMQ01", "Hypersensitivity (SMQ)",   "NARROW", 2,       "RASH",
+  "CQ02",  "GI Disorders (Customized)", NA,      NA,      "NAUSEA",
+  "CQ02",  "GI Disorders (Customized)", NA,      NA,      "VOMITING"
+)
+```
+
+## Welcome
+
+This lesson covers **OCCDS (Occurrence Data Structure)** ADaMs — ADAE (Adverse Events) and ADCM (Concomitant Medications). You'll build a complete ADAE step by step, learning the treatment-emergent flag, occurrence flags, MedDRA queries, and last-dose linkage.
+
+---
+
+## 1 — OCCDS at a glance
+
+```{r occds-shape-demo}
+# OCCDS = one row per event (AE, CM, MH, DV)
+# No PARAMCD — events are heterogeneous
+ae |> select(USUBJID, AESEQ, AEDECOD, AESOC, AESTDTC, AEENDTC, AESEV, AESER)
+```
+
+```{r quiz-occds-shape, echo=FALSE}
+quiz(
+  question(
+    "Which ADaM uses the OCCDS structure?",
+    answer("ADVS"),
+    answer("ADLB"),
+    answer("ADAE", correct = TRUE),
+    answer("ADTTE"),
+    allow_retry = TRUE
+  ),
+  question(
+    "OCCDS rows represent:",
+    answer("One measurement per visit"),
+    answer("One time-to-event per subject"),
+    answer("One event or occurrence per subject record", correct = TRUE),
+    answer("One parameter per study"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 2 — Merge ADSL and derive analysis dates
+
+```{r adae-dates-demo}
+adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P, AGE, SEX, RACE, SAFFL)
+
+adae <- ae |>
+  derive_vars_merged(
+    dataset_add = adsl_occ,
+    new_vars    = adsl_vars,
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  # Start date: partial imputed to first
+  derive_vars_dt(
+    new_vars_prefix  = "AST",
+    dtc              = AESTDTC,
+    highest_imputation = "M",
+    date_imputation  = "first",
+    flag_imputation  = "auto"
+  ) |>
+  # End date: partial imputed to last (conservative)
+  derive_vars_dt(
+    new_vars_prefix  = "AEN",
+    dtc              = AEENDTC,
+    highest_imputation = "M",
+    date_imputation  = "last"
+  ) |>
+  derive_vars_dy(
+    reference_date = TRTSDT,
+    source_vars    = exprs(ASTDT, AENDT)
+  )
+
+adae |> select(USUBJID, AETERM, AESTDTC, ASTDT, AENDT, ASTDY) |> head(4)
+```
+
+```{r quiz-imputation, echo=FALSE}
+quiz(
+  question(
+    "Why is `date_imputation = 'last'` appropriate for end dates?",
+    answer("It makes AVAL larger"),
+    answer("A partial end date like '2024-07' means the AE continued through the month — imputing to the last day is the conservative choice", correct = TRUE),
+    answer("Admiral requires last for end dates"),
+    answer("It matches start date imputation"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r dates-ex, exercise=TRUE, exercise.lines=18}
+# Exercise: starting from ae, merge adsl_occ and derive ASTDT / AENDT
+# then compute ASTDY = days from TRTSDT to ASTDT (with +1 convention)
+# Confirm the ASTDY for subject 01-001's first AE
+
+adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P, AGE, SEX, SAFFL)
+
+adae_tmp <- ae |>
+  derive_vars_merged(dataset_add = adsl_occ, new_vars = adsl_vars,
+                     by_vars = exprs(STUDYID, USUBJID)) |>
+  derive_vars_dt(new_vars_prefix = "AST", dtc = AESTDTC,
+                 highest_imputation = "M", date_imputation = "first") |>
+  derive_vars_dt(new_vars_prefix = "AEN", dtc = AEENDTC,
+                 highest_imputation = "M", date_imputation = "last") |>
+  derive_vars_dy(reference_date = TRTSDT, source_vars = exprs(ASTDT, AENDT))
+
+adae_tmp |> filter(USUBJID == "01-001") |>
+  select(USUBJID, AETERM, ASTDTC = AESTDTC, ASTDT, ASTDY)
+```
+
+```{r dates-ex-hint-1}
+# derive_vars_dy reads TRTSDT and ASTDT automatically when you pass source_vars = exprs(ASTDT)
+```
+
+```{r dates-ex-solution}
+adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P, AGE, SEX, SAFFL)
+
+adae_tmp <- ae |>
+  derive_vars_merged(dataset_add = adsl_occ, new_vars = adsl_vars,
+                     by_vars = exprs(STUDYID, USUBJID)) |>
+  derive_vars_dt(new_vars_prefix = "AST", dtc = AESTDTC,
+                 highest_imputation = "M", date_imputation = "first") |>
+  derive_vars_dt(new_vars_prefix = "AEN", dtc = AEENDTC,
+                 highest_imputation = "M", date_imputation = "last") |>
+  derive_vars_dy(reference_date = TRTSDT, source_vars = exprs(ASTDT, AENDT))
+
+adae_tmp |> filter(USUBJID == "01-001") |>
+  select(USUBJID, AETERM, ASTDTC = AESTDTC, ASTDT, ASTDY)
+```
+
+---
+
+## 3 — Severity mapping
+
+```{r severity-demo}
+adae <- adae |>
+  mutate(
+    ASEV  = AESEV,
+    AREL  = AEREL,
+    ASEVN = case_when(
+      ASEV == "MILD"     ~ 1,
+      ASEV == "MODERATE" ~ 2,
+      ASEV == "SEVERE"   ~ 3,
+      TRUE               ~ NA_real_
+    )
+  )
+
+adae |> select(USUBJID, AETERM, ASEV, ASEVN, AREL)
+```
+
+---
+
+## 4 — Treatment-emergent flag: TRTEMFL
+
+TRTEMFL = "Y" for AEs that started **on or after** first dose and on or before last dose + end_window.
+
+```{r trtemfl-demo}
+adae <- adae |>
+  derive_var_trtemfl(
+    start_date      = ASTDT,
+    end_date        = AENDT,
+    trt_start_date  = TRTSDT,
+    trt_end_date    = TRTEDT,
+    end_window      = 30
+  )
+
+adae |> select(USUBJID, AETERM, ASTDT, TRTSDT, TRTEDT, TRTEMFL)
+```
+
+```{r quiz-trtemfl, echo=FALSE}
+quiz(
+  question(
+    "An AE that started before TRTSDT but worsened during treatment: what is TRTEMFL?",
+    answer("NA"),
+    answer("N"),
+    answer("Y — when intensity (grade) arguments are supplied and worsening is detected", correct = TRUE),
+    answer("Always NA without the intensity arguments"),
+    allow_retry = TRUE
+  ),
+  question(
+    "`end_window = 30` means:",
+    answer("The AE must end within 30 days"),
+    answer("AEs starting up to 30 days after TRTEDT are still counted as treatment-emergent", correct = TRUE),
+    answer("The window is 30 weeks"),
+    answer("Only the first 30 AEs are flagged"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r trtemfl-ex, exercise=TRUE, exercise.lines=16}
+# Exercise: apply derive_var_trtemfl with end_window = 0 (strict)
+# How many AEs get TRTEMFL = "Y" vs end_window = 30?
+
+adae_strict <- adae |>
+  derive_var_trtemfl(
+    start_date     = ASTDT,
+    end_date       = AENDT,
+    trt_start_date = TRTSDT,
+    trt_end_date   = TRTEDT,
+    end_window     = ___
+  )
+
+# Compare counts
+list(
+  strict_30  = sum(adae$TRTEMFL == "Y", na.rm = TRUE),
+  strict_0   = sum(adae_strict$TRTEMFL == "Y", na.rm = TRUE)
+)
+```
+
+```{r trtemfl-ex-hint-1}
+# end_window = 0
+```
+
+```{r trtemfl-ex-solution}
+adae_strict <- adae |>
+  derive_var_trtemfl(
+    start_date     = ASTDT,
+    end_date       = AENDT,
+    trt_start_date = TRTSDT,
+    trt_end_date   = TRTEDT,
+    end_window     = 0
+  )
+
+list(
+  strict_30 = sum(adae$TRTEMFL == "Y", na.rm = TRUE),
+  strict_0  = sum(adae_strict$TRTEMFL == "Y", na.rm = TRUE)
+)
+```
+
+---
+
+## 5 — Occurrence flags: AOCCFL and AOCCSFL
+
+```{r occ-flags-demo}
+# AOCCFL: first treatment-emergent AE per subject
+adae <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCFL,
+      mode    = "first"
+    ),
+    filter = TRTEMFL == "Y"
+  )
+
+# AOCCSFL: first treatment-emergent AE per subject per SOC
+adae <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, AESOC),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCSFL,
+      mode    = "first"
+    ),
+    filter = TRTEMFL == "Y"
+  )
+
+adae |> select(USUBJID, AETERM, AESOC, TRTEMFL, AOCCFL, AOCCSFL) |> arrange(USUBJID, ASTDT)
+```
+
+```{r quiz-occ-flags, echo=FALSE}
+quiz(
+  question(
+    "AOCCFL = 'Y' should equal the number of subjects with at least one treatment-emergent AE. True or false?",
+    answer("True", correct = TRUE),
+    answer("False — AOCCFL can be 'Y' on multiple rows per subject"),
+    allow_retry = TRUE
+  ),
+  question(
+    "AOCCSFL by-group differs from AOCCFL by-group by:",
+    answer("AOCCSFL also groups by AESOC (system organ class)", correct = TRUE),
+    answer("AOCCSFL uses AETOXGR"),
+    answer("AOCCSFL is the last AE, not the first"),
+    answer("They are identical"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r aocc02fl-ex, exercise=TRUE, exercise.lines=18}
+# Exercise: derive AOCC02FL = first treatment-emergent AE with AETOXGR >= 2 per subject
+
+adae_02 <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCC02FL,
+      mode    = "first"
+    ),
+    filter = ___ & ___
+  )
+
+adae_02 |> filter(!is.na(AOCC02FL)) |>
+  select(USUBJID, AETERM, AETOXGR, AOCC02FL)
+```
+
+```{r aocc02fl-ex-hint-1}
+# filter = TRTEMFL == "Y" & AETOXGR >= 2
+```
+
+```{r aocc02fl-ex-solution}
+adae_02 <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCC02FL,
+      mode    = "first"
+    ),
+    filter = TRTEMFL == "Y" & AETOXGR >= 2
+  )
+
+adae_02 |> filter(!is.na(AOCC02FL)) |>
+  select(USUBJID, AETERM, AETOXGR, AOCC02FL)
+```
+
+---
+
+## 6 — MedDRA queries: derive_vars_query()
+
+```{r queries-demo}
+# queries_df has PREFIX, GRPNAME, TERM_NAME for SMQ01 and CQ02
+adae <- adae |>
+  derive_vars_query(dataset_queries = queries_df)
+
+adae |> select(USUBJID, AEDECOD, SMQ01NAM, CQ02NAM) |> head(6)
+```
+
+```{r quiz-queries, echo=FALSE}
+quiz(
+  question(
+    "What variables does `derive_vars_query()` add to ADAE?",
+    answer("MEDDRACD and MEDDRANM"),
+    answer("SMQ01NAM, SMQ01CD, CQ02NAM, etc. — named from the PREFIX column of the queries dataset", correct = TRUE),
+    answer("AETERM and AEDECOD synonyms"),
+    answer("New parameter rows"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 7 — Last dose linkage: derive_vars_joined()
+
+```{r last-dose-demo}
+# For each AE, attach the most recent prior dose date
+adae <- adae |>
+  derive_vars_joined(
+    dataset_add = ex_occ |> filter(EXDOSE > 0),
+    by_vars     = exprs(USUBJID),
+    order       = exprs(EXSTDT),
+    new_vars    = exprs(LDOSEDT = EXSTDT, LDOSEDOSE = EXDOSE),
+    join_vars   = exprs(EXSTDT),
+    filter_join = ASTDT >= EXSTDT,
+    mode        = "last"
+  )
+
+adae |> select(USUBJID, AETERM, ASTDT, LDOSEDT, LDOSEDOSE) |> head(4)
+```
+
+```{r quiz-joined, echo=FALSE}
+quiz(
+  question(
+    "Why use `derive_vars_joined()` instead of `derive_vars_merged()` for last-dose linkage?",
+    answer("derive_vars_joined() is faster"),
+    answer("derive_vars_joined() supports filter conditions that reference both datasets' variables (ASTDT >= EXSTDT)", correct = TRUE),
+    answer("derive_vars_merged() cannot rename variables"),
+    answer("They are equivalent for this use case"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r joined-ex, exercise=TRUE, exercise.lines=16}
+# Exercise: for each AE, find the FIRST dose that started ON OR AFTER the AE start date
+# (i.e., dose started after AE — a different temporal relationship)
+# Store the date as NEXTDOSEDT
+
+adae_nd <- adae |>
+  derive_vars_joined(
+    dataset_add = ex_occ |> filter(EXDOSE > 0),
+    by_vars     = exprs(USUBJID),
+    order       = exprs(EXSTDT),
+    new_vars    = exprs(NEXTDOSEDT = EXSTDT),
+    join_vars   = exprs(EXSTDT),
+    filter_join = ___ <= EXSTDT,   # AE start <= dose start
+    mode        = "first"
+  )
+
+adae_nd |> select(USUBJID, AETERM, ASTDT, NEXTDOSEDT) |> head(4)
+```
+
+```{r joined-ex-hint-1}
+# filter_join = ASTDT <= EXSTDT
+```
+
+```{r joined-ex-solution}
+adae_nd <- adae |>
+  derive_vars_joined(
+    dataset_add = ex_occ |> filter(EXDOSE > 0),
+    by_vars     = exprs(USUBJID),
+    order       = exprs(EXSTDT),
+    new_vars    = exprs(NEXTDOSEDT = EXSTDT),
+    join_vars   = exprs(EXSTDT),
+    filter_join = ASTDT <= EXSTDT,
+    mode        = "first"
+  )
+
+adae_nd |> select(USUBJID, AETERM, ASTDT, NEXTDOSEDT) |> head(4)
+```
+
+---
+
+## 8 — ASEQ and create_single_dose_dataset
+
+```{r aseq-demo}
+adae <- adae |>
+  derive_var_obs_number(
+    new_var  = ASEQ,
+    by_vars  = exprs(STUDYID, USUBJID),
+    order    = exprs(ASTDT, AESEQ),
+    check_type = "warning"
+  )
+
+adae |> select(USUBJID, AETERM, ASTDT, AESEQ, ASEQ) |> arrange(USUBJID, ASEQ)
+```
+
+```{r single-dose-demo}
+# Expand QD dosing to one row per day
+ex_single <- ex_occ |>
+  create_single_dose_dataset(
+    dose_freq        = EXDOSFRQ,
+    start_date       = EXSTDT,
+    end_date         = EXENDT,
+    keep_source_vars = exprs(USUBJID, EXSTDT, EXENDT, EXDOSFRQ, EXDOSE)
+  )
+
+# Compare row counts
+cat("Original EX rows:", nrow(ex_occ), "\n")
+cat("Expanded rows:   ", nrow(ex_single), "\n")
+```
+
+```{r quiz-aseq-single, echo=FALSE}
+quiz(
+  question(
+    "What does `create_single_dose_dataset()` do?",
+    answer("Aggregates multiple doses per day into one"),
+    answer("Expands summary EX records (e.g., QD from Day 1 to Day 15) to one row per dose date", correct = TRUE),
+    answer("Creates a new ADaM dataset"),
+    answer("Derives the number of doses"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 9 — Complete ADAE pipeline
+
+```{r capstone-adae, exercise=TRUE, exercise.lines=60}
+# Build ADAE from ae + adsl_occ + ex_occ in one clean pipe
+# Steps: merge ADSL → dates → severity → TRTEMFL → AOCCFL → AOCCSFL → MedDRA queries → ASEQ
+
+adsl_v <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P, AGE, SEX, RACE, SAFFL)
+
+adae_full <- ae |>
+  derive_vars_merged(dataset_add = adsl_occ, new_vars = adsl_v,
+                     by_vars = exprs(STUDYID, USUBJID)) |>
+  derive_vars_dt(new_vars_prefix = "AST", dtc = AESTDTC,
+                 highest_imputation = "M", date_imputation = "first") |>
+  derive_vars_dt(new_vars_prefix = "AEN", dtc = AEENDTC,
+                 highest_imputation = "M", date_imputation = "last") |>
+  derive_vars_dy(reference_date = TRTSDT, source_vars = exprs(ASTDT, AENDT)) |>
+  mutate(
+    ASEV  = AESEV, AREL = AEREL,
+    ASEVN = case_when(ASEV == "MILD" ~ 1, ASEV == "MODERATE" ~ 2, ASEV == "SEVERE" ~ 3,
+                      TRUE ~ NA_real_)
+  ) |>
+  derive_var_trtemfl(start_date = ASTDT, end_date = AENDT,
+                     trt_start_date = TRTSDT, trt_end_date = TRTEDT, end_window = 30) |>
+  derive_var_ontrtfl(start_date = ASTDT, ref_start_date = TRTSDT,
+                     ref_end_date = TRTEDT, ref_end_window = 30) |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(by_vars = exprs(STUDYID, USUBJID),
+                  order = exprs(ASTDT, AESEQ), new_var = AOCCFL, mode = "first"),
+    filter = TRTEMFL == "Y"
+  ) |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(by_vars = exprs(STUDYID, USUBJID, AESOC),
+                  order = exprs(ASTDT, AESEQ), new_var = AOCCSFL, mode = "first"),
+    filter = TRTEMFL == "Y"
+  ) |>
+  derive_vars_query(dataset_queries = queries_df) |>
+  derive_var_obs_number(new_var = ASEQ, by_vars = exprs(STUDYID, USUBJID),
+                        order = exprs(ASTDT, AESEQ))
+
+adae_full |>
+  select(USUBJID, AETERM, TRTEMFL, AOCCFL, AOCCSFL, SMQ01NAM, ASEQ) |>
+  arrange(USUBJID, ASEQ)
+```
+
+---
+
+## Quiz — final
+
+```{r quiz-final-17, echo=FALSE}
+quiz(
+  question(
+    "What does TRTEMFL stand for, and what does 'Y' mean?",
+    answer("Treatment Exposure Flag; subject received treatment"),
+    answer("Treatment-Emergent Flag; the AE was new or worsened during the treatment window", correct = TRUE),
+    answer("Time-resolved event flag"),
+    answer("Tolerability flag"),
+    allow_retry = TRUE
+  ),
+  question(
+    "ADCM differs from ADAE mainly in:",
+    answer("It uses OCCDS structure like ADAE, but maps ATC codes from WHODrug instead of MedDRA terms", correct = TRUE),
+    answer("ADCM has PARAMCD; ADAE does not"),
+    answer("ADCM has no treatment-emergent flag"),
+    answer("ADCM uses BDS structure"),
+    allow_retry = TRUE
+  ),
+  question(
+    "The function for ATC class hierarchy derivation in ADCM is:",
+    answer("derive_vars_query()"),
+    answer("derive_vars_transposed()"),
+    answer("derive_vars_atc()", correct = TRUE),
+    answer("create_single_dose_dataset()"),
+    allow_retry = TRUE
+  ),
+  question(
+    "ASEQ provides:",
+    answer("The sequence number of AE records per subject", correct = TRUE),
+    answer("The severity sequence"),
+    answer("The chronological position of TRTEMFL"),
+    answer("A link to ADTTE"),
+    allow_retry = TRUE
+  )
+)
+```

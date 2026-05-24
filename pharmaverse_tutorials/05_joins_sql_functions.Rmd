@@ -1,0 +1,1194 @@
+---
+title: "Lesson 05 — R Primer for SAS Programmers, Part 3: Joins, SQL, and Functions"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+    ace_theme: tomorrow
+runtime: shiny_prerendered
+description: >
+  Translate PROC SQL and DATA step MERGE into dplyr joins. Diagnose fanout and key
+  mismatches. Write reusable R functions using default args, curly-curly, and dot-dot-dot.
+  Replace SAS macro loops with purrr::map().
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(tidyr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 60)
+
+# ── Shared datasets ──────────────────────────────────────────────────────────
+
+adsl <- tribble(
+  ~USUBJID,       ~AGE, ~SEX, ~RACE,      ~SAFFL, ~EFFFL, ~TRT01A,
+  "CDIS-001-001",   63,  "F", "WHITE",    "Y",    "Y",    "Xanomeline High Dose",
+  "CDIS-001-002",   52,  "M", "WHITE",    "Y",    "Y",    "Placebo",
+  "CDIS-001-003",   70,  "F", "BLACK",    "Y",    "N",    "Xanomeline Low Dose",
+  "CDIS-001-004",   45,  "M", "ASIAN",    "Y",    "Y",    "Xanomeline High Dose",
+  "CDIS-001-005",   67,  "F", "WHITE",    "Y",    "Y",    "Placebo",
+  "CDIS-001-006",   38,  "M", "HISPANIC", "N",    "N",    "Xanomeline Low Dose",
+  "CDIS-001-007",   74,  "F", "WHITE",    "Y",    "Y",    "Xanomeline High Dose",
+  "CDIS-001-008",   58,  "M", "WHITE",    "Y",    "Y",    "Placebo"
+)
+
+adae <- tribble(
+  ~USUBJID,       ~AEDECOD,                   ~AESEV,     ~AESEVN, ~AESER, ~AESTDTC,
+  "CDIS-001-001", "HEADACHE",                 "MILD",     1,       "N",    "2014-01-05",
+  "CDIS-001-001", "NAUSEA",                   "MODERATE", 2,       "N",    "2014-02-10",
+  "CDIS-001-003", "DIZZINESS",                "MILD",     1,       "N",    "2014-01-20",
+  "CDIS-001-004", "VOMITING",                 "SEVERE",   3,       "Y",    "2014-03-01",
+  "CDIS-001-004", "HEADACHE",                 "MILD",     1,       "N",    "2014-01-15",
+  "CDIS-001-005", "FATIGUE",                  "MILD",     1,       "N",    "2014-02-22",
+  "CDIS-001-007", "APPLICATION SITE PRURITUS","MODERATE", 2,       "N",    "2014-01-30",
+  "CDIS-001-009", "NAUSEA",                   "MODERATE", 2,       "N",    "2014-02-08"  # orphan!
+)
+
+adlb <- tribble(
+  ~USUBJID,       ~PARAMCD, ~AVISIT,    ~AVISITN, ~AVAL, ~ATOXGR,
+  "CDIS-001-001", "HGB",    "BASELINE",  0,        13.2,  0,
+  "CDIS-001-001", "HGB",    "WEEK 4",    4,        12.1,  1,
+  "CDIS-001-001", "ALT",    "BASELINE",  0,        22.0,  0,
+  "CDIS-001-001", "ALT",    "WEEK 4",    4,        28.0,  1,
+  "CDIS-001-002", "HGB",    "BASELINE",  0,        14.5,  0,
+  "CDIS-001-002", "HGB",    "WEEK 4",    4,        13.9,  0,
+  "CDIS-001-002", "ALT",    "BASELINE",  0,        35.0,  0,
+  "CDIS-001-002", "ALT",    "WEEK 4",    4,        42.0,  1,
+  "CDIS-001-003", "HGB",    "BASELINE",  0,        11.8,  1,
+  "CDIS-001-003", "HGB",    "WEEK 4",    4,        11.2,  1,
+  "CDIS-001-004", "ALT",    "BASELINE",  0,        18.0,  0,
+  "CDIS-001-004", "ALT",    "WEEK 4",    4,        20.0,  0
+)
+
+# Dataset with a different key column name (for join_by exercise)
+ae_renamed <- adae |> rename(SUBJECT_ID = USUBJID)
+
+# Dataset with a whitespace key mismatch (for diagnostics exercise)
+adsl_dirty <- adsl |>
+  mutate(USUBJID = if_else(USUBJID == "CDIS-001-002",
+                           paste0(USUBJID, " "),   # trailing space
+                           USUBJID))
+```
+
+## Overview
+
+### Joins and functions — the backbone of clinical R
+
+Almost every ADaM dataset is built by joining SDTM domains — AE ← DM, LB ← DM, EX ← DM. Almost every table starts by joining an analysis dataset to ADSL for population flags. And every reusable derivation pattern gets wrapped in a function.
+
+This lesson covers:
+
+- All **six dplyr join verbs** and their SAS equivalents
+- Diagnosing the two most common join bugs: **many-to-many fanout** and **key mismatches**
+- A brief look at **dbplyr** for database-backed dplyr queries
+- Writing **R functions** with default arguments, `{{ }}`, and `...`
+- Why **R functions are strictly better than SAS macros**
+- **`purrr::map()`** as a replacement for SAS macro loops
+
+> All datasets (`adsl`, `adae`, `adlb`) are pre-loaded in this tutorial.
+> Note: `adae` intentionally contains `CDIS-001-009` — a subject **not** in `adsl` —
+> to let you practice orphan detection.
+
+---
+
+```{r quiz-overview-05, echo=FALSE}
+quiz(
+  caption = "Before we begin",
+  question("Which dplyr verb is most equivalent to a SAS PROC SQL LEFT JOIN?",
+    answer("inner_join()"),
+    answer("left_join()", correct = TRUE),
+    answer("semi_join()"),
+    answer("full_join()"),
+    allow_retry = TRUE
+  ),
+  question("R functions differ from SAS macros most fundamentally because:",
+    answer("R functions run faster"),
+    answer("R functions are first-class values — they can be passed, returned, and stored like any object", correct = TRUE),
+    answer("SAS macros don't support default arguments"),
+    answer("R functions don't need to be declared before use"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 1  left_join() — keep everything from the left
+
+### Concept
+
+`left_join` is what you reach for ~80% of the time. Every row of the left dataset is preserved; unmatched rows get `NA` for the right-side columns.
+
+```r
+adae |>
+  left_join(
+    adsl |> select(USUBJID, TRT01A, SAFFL),
+    by = "USUBJID"
+  )
+```
+
+SAS equivalent:
+```sas
+proc sql;
+  create table adae_with_trt as
+  select a.*, b.trt01a, b.saffl
+  from adae a
+  left join (select usubjid, trt01a, saffl from adsl) b
+  on a.usubjid = b.usubjid;
+quit;
+```
+
+### Exercise 1a — attach treatment to AE records
+
+Join `TRT01A` and `SAFFL` from `adsl` onto `adae`. Select `USUBJID`, `AEDECOD`, `AESEV`, `TRT01A`, and `SAFFL` in the output.
+
+```{r left-join-basic, exercise=TRUE, exercise.lines=10}
+adae |>
+  left_join(
+    adsl |> select(___, ___, ___),
+    by = "___"
+  ) |>
+  select(USUBJID, AEDECOD, AESEV, TRT01A, SAFFL)
+```
+
+```{r left-join-basic-hint-1}
+# adsl |> select(USUBJID, TRT01A, SAFFL)
+# by = "USUBJID"
+```
+
+```{r left-join-basic-solution}
+adae |>
+  left_join(
+    adsl |> select(USUBJID, TRT01A, SAFFL),
+    by = "USUBJID"
+  ) |>
+  select(USUBJID, AEDECOD, AESEV, TRT01A, SAFFL)
+```
+
+### Exercise 1b — spot the orphan
+
+Notice that `CDIS-001-009` appears in `adae` but **not** in `adsl`. After a `left_join`, what value will `TRT01A` have for that subject? Run the code and check.
+
+```{r left-join-orphan, exercise=TRUE, exercise.lines=8}
+adae |>
+  left_join(adsl |> select(USUBJID, TRT01A), by = "USUBJID") |>
+  filter(is.na(TRT01A)) |>
+  select(USUBJID, AEDECOD, TRT01A)
+```
+
+```{r left-join-orphan-hint-1}
+# Just run it — the NA row exposes the orphan subject
+```
+
+---
+
+## 2  inner_join() — keep only matches
+
+### Concept
+
+`inner_join` drops rows that don't match in **either** dataset. It's useful when you genuinely want to restrict to subjects present in both tables — but `semi_join` (next section) is often cleaner for population filtering.
+
+```r
+adae |>
+  inner_join(
+    adsl |> filter(SAFFL == "Y") |> select(USUBJID, TRT01A),
+    by = "USUBJID"
+  )
+```
+
+### Exercise 2 — restrict to safety population
+
+Use `inner_join` to keep only AE records for subjects where `SAFFL == "Y"`. How many rows are dropped compared to the original `adae`?
+
+```{r inner-join-ex, exercise=TRUE, exercise.lines=12}
+# Original row count
+nrow(adae)
+
+# After inner_join to safety population
+adae_safety <- adae |>
+  inner_join(
+    adsl |> filter(SAFFL == "___") |> select(USUBJID, TRT01A),
+    by = "USUBJID"
+  )
+
+nrow(adae_safety)
+adae_safety
+```
+
+```{r inner-join-ex-hint-1}
+# filter(SAFFL == "Y")
+```
+
+```{r inner-join-ex-solution}
+nrow(adae)
+
+adae_safety <- adae |>
+  inner_join(
+    adsl |> filter(SAFFL == "Y") |> select(USUBJID, TRT01A),
+    by = "USUBJID"
+  )
+
+nrow(adae_safety)
+adae_safety
+```
+
+---
+
+## 3  semi_join() and anti_join() — filtering joins
+
+### Concept
+
+These two are **filtering joins** — they never add columns from the right side.
+
+| Verb | Keeps rows from left where... |
+|---|---|
+| `semi_join(x, y)` | Key **exists** in y |
+| `anti_join(x, y)` | Key does **not** exist in y |
+
+`semi_join` is often cleaner than `inner_join` for population filtering because it doesn't risk adding duplicate columns or fanout from the right side.
+
+`anti_join` is your **QC tool** — use it to find orphans, unmatched records, and data gaps.
+
+### Exercise 3a — semi_join for population filter
+
+Use `semi_join` to keep only AE records for subjects in the safety population. Compare the result to Exercise 2 — same rows, but notice **no `TRT01A` column is added**.
+
+```{r semi-join-ex, exercise=TRUE, exercise.lines=8}
+adae |>
+  semi_join(
+    adsl |> filter(SAFFL == "Y"),
+    by = "___"
+  )
+```
+
+```{r semi-join-ex-hint-1}
+# by = "USUBJID"
+# Note: no TRT01A column is added — semi_join is a filter only
+```
+
+```{r semi-join-ex-solution}
+adae |>
+  semi_join(
+    adsl |> filter(SAFFL == "Y"),
+    by = "USUBJID"
+  )
+```
+
+### Exercise 3b — anti_join for orphan detection
+
+Use `anti_join` to find AE records whose `USUBJID` does **not** appear in `adsl`. This is how you QC for orphan records.
+
+```{r anti-join-ex, exercise=TRUE, exercise.lines=7}
+adae |>
+  anti_join(adsl, by = "___") |>
+  select(USUBJID, AEDECOD, AESEV)
+```
+
+```{r anti-join-ex-hint-1}
+# by = "USUBJID"
+# This should return the CDIS-001-009 row
+```
+
+```{r anti-join-ex-solution}
+adae |>
+  anti_join(adsl, by = "USUBJID") |>
+  select(USUBJID, AEDECOD, AESEV)
+```
+
+### Exercise 3c — anti_join in reverse: subjects with no AEs
+
+Use `anti_join` in the opposite direction: starting from `adsl`, find subjects in the **safety population** who have **no AE records** at all.
+
+```{r anti-join-reverse, exercise=TRUE, exercise.lines=8}
+adsl |>
+  filter(SAFFL == "Y") |>
+  anti_join(___, by = "USUBJID") |>
+  select(USUBJID, TRT01A, AGE)
+```
+
+```{r anti-join-reverse-hint-1}
+# anti_join(adae, by = "USUBJID")
+# Start from adsl (safety pop), find who is NOT in adae
+```
+
+```{r anti-join-reverse-solution}
+adsl |>
+  filter(SAFFL == "Y") |>
+  anti_join(adae, by = "USUBJID") |>
+  select(USUBJID, TRT01A, AGE)
+```
+
+```{r quiz-joins, echo=FALSE}
+quiz(
+  caption = "Join verbs check",
+  question(
+    "You want to keep all AE rows for safety-pop subjects but DON'T want to add any ADSL columns. Which verb is cleanest?",
+    answer("left_join()"),
+    answer("inner_join()"),
+    answer("semi_join()", correct = TRUE),
+    answer("full_join()"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What does anti_join(adae, adsl, by = 'USUBJID') return?",
+    answer("All subjects in adsl not in adae"),
+    answer("All AE rows for subjects who also appear in adsl"),
+    answer("All AE rows for subjects who do NOT appear in adsl", correct = TRUE),
+    answer("All rows from both datasets that don't match"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 4  full_join() — keep everything from both sides
+
+### Concept
+
+`full_join` keeps every row from both datasets. Rows that don't match on either side get `NA` for the other side's columns. It's most useful for **reconciliation tasks** — finding what's in one dataset but missing from the other.
+
+```r
+adsl |>
+  full_join(adae, by = "USUBJID")
+```
+
+### Exercise 4 — reconciliation
+
+Use `full_join` to combine `adsl` and a small subset of `adae`. Then filter for rows where `AGE` is `NA` (came from adae but not adsl) or `AEDECOD` is `NA` (came from adsl but not adae). What does this reveal?
+
+```{r full-join-ex, exercise=TRUE, exercise.lines=14}
+adsl_mini <- adsl |> select(USUBJID, AGE, TRT01A)
+adae_mini <- adae |> select(USUBJID, AEDECOD, AESEV)
+
+reconciled <- adsl_mini |>
+  full_join(adae_mini, by = "USUBJID")
+
+# Rows in adae with no matching adsl row (AGE will be NA)
+reconciled |> filter(is.na(AGE))
+```
+
+```{r full-join-ex-hint-1}
+# Rows where AGE is NA came from adae only — no matching USUBJID in adsl
+# Rows where AEDECOD is NA came from adsl only — subjects with no AEs
+```
+
+---
+
+## 5  Joining on differently-named columns
+
+### Concept
+
+When key columns have different names in each dataset, use the named vector `by = c("left_col" = "right_col")` or the modern `join_by()` syntax:
+
+```r
+# Named vector style (older but widely used)
+left_join(adsl, ae_renamed, by = c("USUBJID" = "SUBJECT_ID"))
+
+# join_by() style (dplyr 1.1+, preferred)
+left_join(adsl, ae_renamed, by = join_by(USUBJID == SUBJECT_ID))
+```
+
+`join_by()` also unlocks **inequality joins** — for example, joining AE records to a dosing window:
+```r
+adae |>
+  left_join(adcm, by = join_by(USUBJID, ASTDT >= CMSTDT, ASTDT <= CMENDT))
+```
+
+### Exercise 5 — join on differently-named key
+
+The dataset `ae_renamed` is a copy of `adae` where `USUBJID` has been renamed to `SUBJECT_ID`. Join it to `adsl` using the correct `by` syntax. Select `USUBJID`, `AEDECOD`, and `TRT01A`.
+
+```{r diff-key-join, exercise=TRUE, exercise.lines=10}
+# ae_renamed has SUBJECT_ID instead of USUBJID
+# peek at the column names:
+names(ae_renamed)
+
+adsl |>
+  left_join(ae_renamed, by = join_by(___ == ___)) |>
+  select(USUBJID, AEDECOD, TRT01A) |>
+  filter(!is.na(AEDECOD))
+```
+
+```{r diff-key-join-hint-1}
+# join_by(USUBJID == SUBJECT_ID)
+# Left side = adsl column name, right side = ae_renamed column name
+```
+
+```{r diff-key-join-solution}
+names(ae_renamed)
+
+adsl |>
+  left_join(ae_renamed, by = join_by(USUBJID == SUBJECT_ID)) |>
+  select(USUBJID, AEDECOD, TRT01A) |>
+  filter(!is.na(AEDECOD))
+```
+
+---
+
+## 6  The most dangerous join bug: many-to-many fanout
+
+### Concept
+
+Fanout occurs when you join two datasets that each have **multiple rows per key**. The result is the Cartesian product per key — rows explode silently.
+
+```
+df_a:   3 rows for subject X  (visit-level)
+df_b:   5 rows for subject X  (lab-level)
+join result:  15 rows for subject X  ← BUG!
+```
+
+dplyr 1.1+ warns you with:
+```
+Warning: Detected an unexpected many-to-many relationship between `x` and `y`.
+```
+
+Assert your expectations explicitly using the `relationship` argument:
+
+```r
+adae |>
+  left_join(adsl, by = "USUBJID", relationship = "many-to-one")
+# Errors if any USUBJID appears more than once in adsl
+```
+
+### Exercise 6a — witness the fanout
+
+Join `adlb` (multiple rows per subject) to a version of `adae` (also multiple rows per subject) **without a visit key**. Check how many rows you get vs. expected.
+
+```{r fanout-ex, exercise=TRUE, exercise.lines=12}
+# Original row counts
+nrow(adlb)    # multiple rows per subject
+nrow(adae)    # multiple rows per subject
+
+# Join only on USUBJID — watch the row explosion
+fanout_result <- adlb |>
+  left_join(adae |> select(USUBJID, AEDECOD), by = "USUBJID")
+
+nrow(fanout_result)
+
+# Compare: how many rows did you expect vs. what you got?
+fanout_result |> filter(USUBJID == "CDIS-001-001")
+```
+
+```{r fanout-ex-hint-1}
+# For CDIS-001-001: adlb has 4 rows, adae has 2 rows
+# The join produces 4 × 2 = 8 rows for that subject — fanout!
+```
+
+### Exercise 6b — assert the relationship
+
+Now join `adae` to `adsl` and explicitly tell dplyr you expect a many-to-one relationship (many AE rows per subject, one ADSL row per subject). If `adsl` had duplicate USUBJIDs, this would raise an error.
+
+```{r relationship-ex, exercise=TRUE, exercise.lines=8}
+adae |>
+  left_join(
+    adsl |> select(USUBJID, TRT01A),
+    by = "USUBJID",
+    relationship = "___"
+  ) |>
+  select(USUBJID, AEDECOD, TRT01A)
+```
+
+```{r relationship-ex-hint-1}
+# relationship = "many-to-one"
+# adae has many rows per USUBJID; adsl has exactly one
+```
+
+```{r relationship-ex-solution}
+adae |>
+  left_join(
+    adsl |> select(USUBJID, TRT01A),
+    by = "USUBJID",
+    relationship = "many-to-one"
+  ) |>
+  select(USUBJID, AEDECOD, TRT01A)
+```
+
+---
+
+## 7  Diagnosing key mismatches
+
+### Concept
+
+If a `left_join` produces unexpected `NA` columns, the keys aren't matching. The four most common causes are whitespace, type mismatch, case, and leading-zero differences.
+
+Quick diagnostic toolkit:
+```r
+# Which keys are in adae but missing from adsl?
+adae |> anti_join(adsl, by = "USUBJID") |> distinct(USUBJID)
+
+# Check types
+class(adae$USUBJID); class(adsl$USUBJID)
+
+# Whitespace check
+adae$USUBJID |> trimws() |> unique()
+```
+
+### Exercise 7 — find the whitespace mismatch
+
+`adsl_dirty` is a version of `adsl` where `CDIS-001-002` has a trailing space added to its `USUBJID`. Use `anti_join` to expose the mismatch, then fix it with `trimws()` and confirm the join works.
+
+```{r key-mismatch-ex, exercise=TRUE, exercise.lines=20}
+# Step 1: how many adae rows fail to match adsl_dirty?
+adae |>
+  anti_join(adsl_dirty, by = "USUBJID") |>
+  select(USUBJID, AEDECOD)
+
+# Step 2: fix the dirty key and re-check
+adsl_clean <- adsl_dirty |>
+  mutate(USUBJID = trimws(___))
+
+adae |>
+  anti_join(adsl_clean, by = "USUBJID") |>
+  select(USUBJID, AEDECOD)
+# Now only the genuine orphan (CDIS-001-009) remains
+```
+
+```{r key-mismatch-ex-hint-1}
+# trimws(USUBJID) strips leading and trailing whitespace
+# After cleaning, anti_join should only show CDIS-001-009
+```
+
+```{r key-mismatch-ex-solution}
+adae |>
+  anti_join(adsl_dirty, by = "USUBJID") |>
+  select(USUBJID, AEDECOD)
+
+adsl_clean <- adsl_dirty |>
+  mutate(USUBJID = trimws(USUBJID))
+
+adae |>
+  anti_join(adsl_clean, by = "USUBJID") |>
+  select(USUBJID, AEDECOD)
+```
+
+---
+
+## 8  dbplyr — dplyr against a database
+
+### Concept (no exercise — database not available here)
+
+`{dbplyr}` lets you write **the same dplyr code** against a database table. It translates your dplyr verbs to SQL behind the scenes and runs the computation on the server. You only pull data into R when you call `collect()`.
+
+```r
+library(DBI); library(dbplyr)
+
+con     <- dbConnect(odbc::odbc(), "ClinicalDB")
+ae_db   <- tbl(con, "AE_SDTM")          # reference, no data pulled yet
+
+result <- ae_db |>
+  filter(AESER == "Y") |>
+  group_by(USUBJID) |>
+  summarise(n_serious_ae = n()) |>
+  collect()                              # now data enters R
+```
+
+The key insight: **you can prototype dplyr against a small in-memory tibble**, then point the same code at a 100-million-row database table — the heavy lifting stays on the server.
+
+```{r quiz-dbplyr, echo=FALSE}
+quiz(
+  caption = "dbplyr check",
+  question(
+    "In a dbplyr workflow, when does data actually transfer from the database into R?",
+    answer("When you write the tbl() reference"),
+    answer("When you call filter() or group_by()"),
+    answer("When you call collect()", correct = TRUE),
+    answer("When you assign the result to a variable"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What is the main advantage of dbplyr over writing raw SQL for database queries?",
+    answer("dbplyr queries are always faster than SQL"),
+    answer("You can write the same dplyr code you use for in-memory tibbles — no SQL needed", correct = TRUE),
+    answer("dbplyr doesn't require a database connection"),
+    answer("dbplyr automatically creates indexes"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 9  Writing your own R functions
+
+### Concept
+
+R's `function` keyword is the analog of SAS's `%macro`. Key differences:
+
+- No `length`/`format` declarations needed — types are dynamic
+- The **last evaluated expression** is the return value (`return()` is optional)
+- Functions are **first-class objects** — pass them as arguments, store in lists, return from other functions
+- Arguments are real R objects, not text substitutions
+
+```r
+# SAS:
+# %macro add(x, y); %let result = %eval(&x + &y); &result %mend;
+
+# R:
+add <- function(x, y) {
+  x + y           # last expression is automatically returned
+}
+add(3, 4)         # 7
+```
+
+### Exercise 9a — write your first function
+
+Write a function `flag_elderly` that takes a data frame and a minimum age (default `65`), and adds a column `ELDERLY` that is `"Y"` when `AGE >= min_age`, else `"N"`. Test it on `adsl`.
+
+```{r func-basic, exercise=TRUE, exercise.lines=15}
+flag_elderly <- function(data, min_age = ___) {
+  data |>
+    mutate(
+      ELDERLY = if_else(AGE >= ___, "Y", "N")
+    )
+}
+
+# Test with default (65)
+flag_elderly(adsl) |> select(USUBJID, AGE, ELDERLY)
+```
+
+```{r func-basic-hint-1}
+# function(data, min_age = 65)
+# if_else(AGE >= min_age, "Y", "N")
+```
+
+```{r func-basic-solution}
+flag_elderly <- function(data, min_age = 65) {
+  data |>
+    mutate(
+      ELDERLY = if_else(AGE >= min_age, "Y", "N")
+    )
+}
+
+flag_elderly(adsl) |> select(USUBJID, AGE, ELDERLY)
+```
+
+### Exercise 9b — override the default
+
+Call `flag_elderly()` with `min_age = 70` instead of the default. Which subjects are now flagged?
+
+```{r func-default-override, exercise=TRUE, exercise.lines=8}
+flag_elderly <- function(data, min_age = 65) {
+  data |>
+    mutate(ELDERLY = if_else(AGE >= min_age, "Y", "N"))
+}
+
+flag_elderly(adsl, min_age = ___) |>
+  select(USUBJID, AGE, ELDERLY)
+```
+
+```{r func-default-override-solution}
+flag_elderly <- function(data, min_age = 65) {
+  data |>
+    mutate(ELDERLY = if_else(AGE >= min_age, "Y", "N"))
+}
+
+flag_elderly(adsl, min_age = 70) |>
+  select(USUBJID, AGE, ELDERLY)
+```
+
+---
+
+## 10  Functions with {{ }} — dplyr-aware arguments
+
+### Concept
+
+When you want to pass a **column name** (without quotes) into a dplyr-aware function, use `{{ }}` ("curly-curly"). It tells dplyr to evaluate the argument as a column name rather than a regular R variable.
+
+```r
+summarise_by <- function(data, group_col, ...) {
+  data |>
+    group_by({{ group_col }}) |>
+    summarise(n = n(), ...)
+}
+
+summarise_by(adsl, TRT01A, mean_age = mean(AGE, na.rm = TRUE))
+```
+
+For passing column names as **strings**, use `.data[[col]]`:
+```r
+summarise_by_str <- function(data, group_col = "TRT01A") {
+  data |>
+    group_by(.data[[group_col]]) |>
+    summarise(n = n())
+}
+```
+
+### Exercise 10a — write a {{ }} function
+
+Write a function `group_count` that takes a data frame and a grouping column (without quotes), and returns a count per group. Test it with `TRT01A` and then with `SEX`.
+
+```{r curlycurly-ex, exercise=TRUE, exercise.lines=15}
+group_count <- function(data, group_col) {
+  data |>
+    group_by({{ ___ }}) |>
+    summarise(n = n(), .groups = "drop")
+}
+
+# By treatment
+group_count(adsl, TRT01A)
+
+# By sex
+group_count(adsl, ___)
+```
+
+```{r curlycurly-ex-hint-1}
+# group_by({{ group_col }})
+# group_count(adsl, SEX)
+```
+
+```{r curlycurly-ex-solution}
+group_count <- function(data, group_col) {
+  data |>
+    group_by({{ group_col }}) |>
+    summarise(n = n(), .groups = "drop")
+}
+
+group_count(adsl, TRT01A)
+group_count(adsl, SEX)
+```
+
+### Exercise 10b — dot-dot-dot (...) for extra stats
+
+Extend `group_count` to accept `...` and pass those extra expressions to `summarise()`, so callers can add arbitrary summary statistics.
+
+```{r dots-ex, exercise=TRUE, exercise.lines=15}
+group_summary <- function(data, group_col, ...) {
+  data |>
+    group_by({{ group_col }}) |>
+    summarise(n = n(), ..., .groups = "drop")
+}
+
+# Call with extra stats
+group_summary(
+  adsl,
+  TRT01A,
+  mean_age    = mean(AGE, na.rm = TRUE),
+  median_age  = median(AGE, na.rm = TRUE)
+)
+```
+
+```{r dots-ex-hint-1}
+# The ... in the function signature captures extra named expressions
+# They are forwarded to summarise() via ... in the function body
+```
+
+```{r dots-ex-solution}
+group_summary <- function(data, group_col, ...) {
+  data |>
+    group_by({{ group_col }}) |>
+    summarise(n = n(), ..., .groups = "drop")
+}
+
+group_summary(
+  adsl,
+  TRT01A,
+  mean_age   = mean(AGE, na.rm = TRUE),
+  median_age = median(AGE, na.rm = TRUE)
+)
+```
+
+---
+
+## 11  Anonymous functions — \(x) syntax
+
+### Concept
+
+Anonymous functions are functions defined inline, without a name. R 4.1+ introduced the clean `\(x)` shorthand:
+
+```r
+# All equivalent:
+function(x) mean(x, na.rm = TRUE)    # long form
+\(x) mean(x, na.rm = TRUE)           # short form (R 4.1+)
+~ mean(.x, na.rm = TRUE)             # purrr/tidyverse formula style
+```
+
+The `\(x)` form is the modern preference — pure base R, reads clearly.
+
+```r
+# Use inside across()
+adsl |>
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+```
+
+### Exercise 11a — anonymous function with across
+
+Use `across()` with an anonymous function `\(x)` to compute the **median** of every numeric column in `adsl`, grouped by `TRT01A`.
+
+```{r anon-func-ex, exercise=TRUE, exercise.lines=8}
+adsl |>
+  group_by(TRT01A) |>
+  summarise(
+    across(where(is.numeric), \(x) ___),
+    .groups = "drop"
+  )
+```
+
+```{r anon-func-ex-hint-1}
+# \(x) median(x, na.rm = TRUE)
+```
+
+```{r anon-func-ex-solution}
+adsl |>
+  group_by(TRT01A) |>
+  summarise(
+    across(where(is.numeric), \(x) median(x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+### Exercise 11b — tilde formula style
+
+Repeat the same using the `~` formula syntax (common in older pharmaverse code). Notice `~` uses `.x` instead of `x`.
+
+```{r tilde-func-ex, exercise=TRUE, exercise.lines=8}
+adsl |>
+  group_by(TRT01A) |>
+  summarise(
+    across(where(is.numeric), ~ median(___, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+```{r tilde-func-ex-hint-1}
+# ~ median(.x, na.rm = TRUE)
+```
+
+```{r tilde-func-ex-solution}
+adsl |>
+  group_by(TRT01A) |>
+  summarise(
+    across(where(is.numeric), ~ median(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+---
+
+## 12  purrr::map() — iteration without macro loops
+
+### Concept
+
+SAS uses macro `%do` loops to repeat an operation. In R, you **map** a function over a vector instead:
+
+```r
+# SAS macro loop equivalent
+# %do i = 1 %to 4; ... AVISITN = &i. ... %end;
+
+# R with map_dfr (returns a single data frame, rows bound)
+library(purrr)
+
+visits <- c(0, 4)
+results <- map_dfr(visits, \(v) {
+  adlb |>
+    filter(AVISITN == v) |>
+    summarise(visit = v, mean_aval = mean(AVAL, na.rm = TRUE))
+})
+```
+
+`map()` variants:
+
+| Function | Returns |
+|---|---|
+| `map()` | A list |
+| `map_dbl()` | A numeric vector |
+| `map_chr()` | A character vector |
+| `map_lgl()` | A logical vector |
+| `map_dfr()` | A data frame (rows bound) |
+
+### Exercise 12a — map over visit numbers
+
+Use `map_dfr()` to compute the mean `AVAL` per parameter (`PARAMCD`) for each visit number in `adlb`. The visit numbers are `c(0, 4)`.
+
+```{r map-ex, exercise=TRUE, exercise.lines=12}
+library(purrr)
+
+visits <- c(0, 4)
+
+map_dfr(visits, \(v) {
+  adlb |>
+    filter(AVISITN == ___) |>
+    group_by(PARAMCD) |>
+    summarise(
+      visit    = v,
+      mean_val = mean(AVAL, na.rm = TRUE),
+      .groups  = "drop"
+    )
+})
+```
+
+```{r map-ex-hint-1}
+# filter(AVISITN == v) — v comes from the map iteration
+```
+
+```{r map-ex-solution}
+library(purrr)
+
+visits <- c(0, 4)
+
+map_dfr(visits, \(v) {
+  adlb |>
+    filter(AVISITN == v) |>
+    group_by(PARAMCD) |>
+    summarise(
+      visit    = v,
+      mean_val = mean(AVAL, na.rm = TRUE),
+      .groups  = "drop"
+    )
+})
+```
+
+### Exercise 12b — map over treatment arms
+
+Use `map_dfr()` to compute the number of subjects and AEs **per treatment arm**. Iterate over the unique values of `TRT01A`.
+
+```{r map-trt, exercise=TRUE, exercise.lines=15}
+library(purrr)
+
+trt_arms <- unique(adsl$TRT01A)
+
+map_dfr(trt_arms, \(arm) {
+  n_subj <- adsl |>
+    filter(TRT01A == ___) |>
+    nrow()
+
+  n_ae <- adae |>
+    left_join(adsl |> select(USUBJID, TRT01A), by = "USUBJID") |>
+    filter(TRT01A == ___) |>
+    nrow()
+
+  tibble(treatment = arm, n_subjects = n_subj, n_aes = n_ae)
+})
+```
+
+```{r map-trt-hint-1}
+# filter(TRT01A == arm) — arm is the loop variable
+```
+
+```{r map-trt-solution}
+library(purrr)
+
+trt_arms <- unique(adsl$TRT01A)
+
+map_dfr(trt_arms, \(arm) {
+  n_subj <- adsl |>
+    filter(TRT01A == arm) |>
+    nrow()
+
+  n_ae <- adae |>
+    left_join(adsl |> select(USUBJID, TRT01A), by = "USUBJID") |>
+    filter(TRT01A == arm) |>
+    nrow()
+
+  tibble(treatment = arm, n_subjects = n_subj, n_aes = n_ae)
+})
+```
+
+---
+
+## 13  Putting it all together — a derivation function
+
+### The task
+
+Build a function `derive_subject_summary()` that takes `adsl`, `adae`, and `adlb`, and returns one row per subject in the safety population with:
+
+- `USUBJID`, `TRT01A`, `AGE`, `SEX`
+- `n_ae` — total number of AEs per subject (0 if none)
+- `n_ser_ae` — number of serious AEs (`AESER == "Y"`)
+- `hgb_min` — minimum haemoglobin (`PARAMCD == "HGB"`)
+
+### Exercise 13 — build the function
+
+```{r derive-func-ex, exercise=TRUE, exercise.lines=40}
+derive_subject_summary <- function(adsl, adae, adlb) {
+
+  # Step 1: count AEs per subject
+  ae_counts <- adae |>
+    group_by(___) |>
+    summarise(
+      n_ae     = n(),
+      n_ser_ae = sum(AESER == "Y", na.rm = TRUE),
+      .groups  = "drop"
+    )
+
+  # Step 2: minimum HGB per subject
+  hgb_worst <- adlb |>
+    filter(PARAMCD == "___") |>
+    group_by(USUBJID) |>
+    summarise(
+      hgb_min = min(AVAL, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Step 3: join to adsl (safety pop) and fill NA AE counts with 0
+  adsl |>
+    filter(SAFFL == "Y") |>
+    left_join(ae_counts, by = "USUBJID") |>
+    left_join(hgb_worst, by = "USUBJID") |>
+    mutate(
+      n_ae     = replace_na(n_ae,     0),
+      n_ser_ae = replace_na(n_ser_ae, 0)
+    ) |>
+    select(USUBJID, TRT01A, AGE, SEX, n_ae, n_ser_ae, hgb_min)
+}
+
+# Run it
+derive_subject_summary(adsl, adae, adlb)
+```
+
+```{r derive-func-ex-hint-1}
+# Step 1: group_by(USUBJID)
+# Step 2: filter(PARAMCD == "HGB")
+# Steps 3: left_join twice, then replace_na for missing counts
+```
+
+```{r derive-func-ex-solution}
+derive_subject_summary <- function(adsl, adae, adlb) {
+
+  ae_counts <- adae |>
+    group_by(USUBJID) |>
+    summarise(
+      n_ae     = n(),
+      n_ser_ae = sum(AESER == "Y", na.rm = TRUE),
+      .groups  = "drop"
+    )
+
+  hgb_worst <- adlb |>
+    filter(PARAMCD == "HGB") |>
+    group_by(USUBJID) |>
+    summarise(
+      hgb_min = min(AVAL, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  adsl |>
+    filter(SAFFL == "Y") |>
+    left_join(ae_counts, by = "USUBJID") |>
+    left_join(hgb_worst, by = "USUBJID") |>
+    mutate(
+      n_ae     = replace_na(n_ae,     0),
+      n_ser_ae = replace_na(n_ser_ae, 0)
+    ) |>
+    select(USUBJID, TRT01A, AGE, SEX, n_ae, n_ser_ae, hgb_min)
+}
+
+derive_subject_summary(adsl, adae, adlb)
+```
+
+---
+
+## 14  Self-check Quiz
+
+```{r final-quiz-05, echo=FALSE}
+quiz(
+  caption = "Lesson 05 — self-check",
+
+  question(
+    "Translate: `select a.*, b.trt01a from adae a left join adsl b on a.usubjid = b.usubjid where b.saffl = 'Y'`",
+    answer("adae |> inner_join(adsl |> filter(SAFFL=='Y') |> select(USUBJID, TRT01A), by='USUBJID')"),
+    answer("adae |> left_join(adsl |> filter(SAFFL=='Y') |> select(USUBJID, TRT01A), by='USUBJID')", correct = TRUE),
+    answer("adsl |> filter(SAFFL=='Y') |> left_join(adae, by='USUBJID')"),
+    answer("adae |> semi_join(adsl |> filter(SAFFL=='Y'), by='USUBJID')"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "In dplyr, how do you find subjects in adsl (safety pop) who have NO AE records?",
+    answer("adsl |> filter(SAFFL=='Y') |> inner_join(adae, by='USUBJID')"),
+    answer("adsl |> filter(SAFFL=='Y') |> anti_join(adae, by='USUBJID')", correct = TRUE),
+    answer("adae |> anti_join(adsl, by='USUBJID')"),
+    answer("adsl |> filter(SAFFL=='Y') |> full_join(adae, by='USUBJID') |> filter(is.na(AEDECOD))"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "What does `\\(x) x + 1` mean in R?",
+    answer("A regex that matches x followed by + and 1"),
+    answer("An anonymous function that takes x and returns x + 1", correct = TRUE),
+    answer("A purrr formula shorthand — equivalent to ~ .x + 1 but different syntax"),
+    answer("A lambda only usable inside purrr::map()"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "What is the key purpose of {{ }} (curly-curly) in a dplyr-aware function?",
+    answer("It makes the function run faster by pre-evaluating the column"),
+    answer("It passes a column name (without quotes) through to dplyr verbs inside the function", correct = TRUE),
+    answer("It is required whenever using group_by() inside a function"),
+    answer("It converts a string argument to a column reference"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "What is the difference between purrr::map() and purrr::map_dfr()?",
+    answer("map() is faster; map_dfr() is type-safe"),
+    answer("map() returns a list; map_dfr() returns a data frame with rows bound together", correct = TRUE),
+    answer("map_dfr() only works with data frames as input"),
+    answer("There is no difference — map_dfr() is deprecated"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "The 'many-to-many fanout' join bug occurs when:",
+    answer("You forget to include na.rm = TRUE in a summarise"),
+    answer("Both the left and right datasets have multiple rows per key, producing a Cartesian product per key", correct = TRUE),
+    answer("You join on a column that contains NA values"),
+    answer("The key column has different types in each dataset"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 15  SAS → dplyr Joins & Functions Cheat Sheet
+
+### Joins
+
+| SAS pattern | dplyr equivalent |
+|---|---|
+| `PROC SQL LEFT JOIN` | `left_join(x, y, by = "key")` |
+| `PROC SQL INNER JOIN` | `inner_join(x, y, by = "key")` |
+| `PROC SQL FULL JOIN` | `full_join(x, y, by = "key")` |
+| `DATA step MERGE … IF IN(1)` | `left_join()` |
+| "Keep X rows where key in Y" | `semi_join(x, y, by = "key")` |
+| "Keep X rows where key NOT in Y" | `anti_join(x, y, by = "key")` |
+| `ON a.col = b.other_col` | `by = join_by(col == other_col)` |
+| PROC SQL pass-through | `dbplyr::tbl()` + `collect()` |
+| Post-join row explosion QC | `relationship = "many-to-one"` |
+
+### Functions
+
+| SAS macro pattern | R function equivalent |
+|---|---|
+| `%macro foo(var)` | `foo <- function(var) { ... }` |
+| `&var.` substitution | Just `var` (it's a real variable) |
+| `%let x = 5;` | `x <- 5` |
+| `%if cond %then; %else;` | `if (cond) ... else ...` |
+| `%do i = 1 %to 10;` | `for (i in 1:10)` or `map(1:10, ...)` |
+| Return a dataset | `return(my_df)` or last expression |
+| Pass column name to inner verb | `{{ col }}` (curly-curly) |
+| Pass column name as string | `.data[[col]]` |
+| Extra flexible arguments | `...` (dot-dot-dot) |
+| Anonymous one-off function | `\(x) expression` (R 4.1+) |
+
+---
+
+## Key Takeaways
+
+1. **Six join verbs** — `left_join` (80%), `semi_join`/`anti_join` (QC), `inner_join`, `full_join`
+2. **`anti_join` is your QC friend** — find orphan records and missing matches in seconds
+3. **Many-to-many fanout** is the most dangerous silent join bug — assert expectations with `relationship = "..."`
+4. **`join_by()`** is the modern syntax for joins on differently-named or inequality columns
+5. **R functions are first-class** — pass, return, and compose them freely unlike SAS macros
+6. **`{{ }}`** passes unquoted column names into dplyr verbs inside functions
+7. **`\(x)`** is the modern anonymous function shorthand — use it inside `across()` and `map()`
+8. **`purrr::map_dfr()`** replaces SAS `%do` loops with clean, composable iteration
+
+**Next** → Lesson 06: tidyr reshaping, pivot_longer/pivot_wider, lubridate dates
+(`rmarkdown::run("06_tidyr_lubridate.Rmd")`)

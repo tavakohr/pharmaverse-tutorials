@@ -1,0 +1,2554 @@
+---
+title: "Lesson 04 — R Primer for SAS Programmers, Part 2: The DATA Step in dplyr"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Comprehensive translation of SAS DATA step patterns into dplyr: filter, select,
+  mutate, case_when, summarise, group_by, distinct/count, string operations,
+  rowwise, FIRST./LAST. logic, lag/lead, cumulative functions, across(), and
+  two clinical capstone projects.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.blanks = TRUE)
+
+# ── ADSL — 254 subjects (CDISC CDISCPILOT01) ─────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+
+# HEIGHTBL / WEIGHTBL / BMIBL are present in pharmaverseadam >= 0.1.1.
+# For older builds or versions where they are absent, synthesise clinically
+# plausible values (Alzheimer's trial demographics, set.seed for reproducibility).
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014)          # CDISC pilot study year
+  n  <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F",
+               round(rnorm(n, 161, 7)),
+               round(rnorm(n, 174, 8)))
+  wt <- ifelse(adsl_raw$SEX == "F",
+               round(rnorm(n, 68, 12), 1),
+               round(rnorm(n, 82, 14), 1))
+  adsl_raw <- adsl_raw |>
+    mutate(HEIGHTBL = ht,
+           WEIGHTBL = wt,
+           BMIBL    = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw,
+                     BMIBL = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    # In the CDISC pilot all randomised subjects are also ITT
+    ITTFL  = SAFFL,
+    # Obesity (BMI >= 30) used as a diabetes-risk proxy flag for exercises
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N")
+  )
+
+# ── ADAE — treatment-emergent adverse events ─────────────────────────────────
+# pharmaverseadam stores treatment as TRTA; rename to TRT01A for consistency
+adae_raw <- pharmaverseadam::adae
+
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw)) {
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+} else if (!"TRT01A" %in% names(adae_raw)) {
+  adae_raw <- left_join(adae_raw,
+                        select(adsl, USUBJID, TRT01A),
+                        by = "USUBJID")
+}
+
+adae <- adae_raw |>
+  mutate(
+    # Numeric severity: MILD = 1, MODERATE = 2, SEVERE = 3
+    AESEVN = case_when(
+      AESEV == "MILD"     ~ 1L,
+      AESEV == "MODERATE" ~ 2L,
+      AESEV == "SEVERE"   ~ 3L,
+      TRUE                ~ NA_integer_
+    )
+  )
+
+# ── ADLB — lab results ────────────────────────────────────────────────────────
+adlb <- pharmaverseadam::adlb
+
+# ATOXGR and BTOXGR are stored as character in pharmaverseadam; convert to
+# integer so numeric comparisons (>, lag, cummax) behave correctly.
+# Values: 0 = no toxicity, 1-4 = NCI CTCAE grades; negative = below-normal range.
+if (is.character(adlb$ATOXGR)) {
+  adlb <- mutate(adlb,
+                 ATOXGR = as.integer(ATOXGR),
+                 BTOXGR = as.integer(BTOXGR))
+}
+
+# admiral routinely appends derived summary rows to BDS datasets:
+#   DTYPE = "MINIMUM", "MAXIMUM", "LOCF", "WOCF", etc.
+#   These have sentinel AVISITN values (9997, 9998, ...) and are NOT real visits.
+#   Keeping them in longitudinal analyses (lag, lead, worsening flags) produces
+#   spurious comparisons — e.g. "POST-BASELINE MAXIMUM" vs. the last real visit.
+#   Always exclude them before any visit-sequence work.
+if ("DTYPE" %in% names(adlb)) {
+  adlb <- filter(adlb, is.na(DTYPE))
+}
+
+# Add TRTSDT from ADSL if not already present
+if (!"TRTSDT" %in% names(adlb)) {
+  adlb <- left_join(adlb,
+                    select(adsl, USUBJID, TRTSDT),
+                    by = "USUBJID")
+}
+
+# ── ADVS — vital signs ───────────────────────────────────────────────────────
+advs <- pharmaverseadam::advs
+```
+
+## Overview
+
+### Why dplyr matters for pharmaverse
+
+`{dplyr}` is the workhorse of clinical data manipulation in R — a hard dependency of every major pharmaverse package. You'll write more dplyr code in a typical clinical R script than all pharmaverse packages combined.
+
+The motivation: dplyr provides **five small verbs** that cover almost everything you did in the SAS DATA step, plus powerful higher-order tools that SAS requires entire PROCs for.
+
+| dplyr verb | SAS equivalent | What it does |
+|---|---|---|
+| `filter()` | `where` / subsetting `if` | Keep rows meeting a condition |
+| `select()` | `keep` / `drop` | Keep, drop, or reorder columns |
+| `mutate()` | Assignment statements | Add or modify columns |
+| `summarise()` | `proc means`, `proc summary` | Reduce rows to summary statistics |
+| `arrange()` | `proc sort` | Reorder rows |
+
+Combined with `group_by()` (the BY statement) and `|>`, these five verbs — plus a dozen supporting functions — handle every clinical data manipulation pattern you'll encounter.
+
+**Datasets pre-loaded in this lesson — real data from the CDISC CDISCPILOT01 study via `pharmaverseadam`:**
+
+- `adsl` — 254 subjects across 3 treatment arms (Placebo / Xanomeline Low Dose / Xanomeline High Dose)
+- `adae` — 1,200+ treatment-emergent AE records spanning 20+ MedDRA system organ classes
+- `adlb` — thousands of lab observations: ALT, CREAT, WBC, glucose, and more across screening and on-study visits, with NCI CTCAE toxicity grades
+- `advs` — vital signs records: systolic BP, diastolic BP, pulse, weight, and height across multiple visits
+
+These are the same datasets used in admiral, tfrmt, and rtables tutorials throughout this course.
+
+---
+
+```{r quiz-overview, echo=FALSE}
+quiz(
+  caption = "Before we begin",
+  question("Which dplyr verb is equivalent to SAS PROC SORT?",
+    answer("mutate()"),
+    answer("filter()"),
+    answer("arrange()", correct = TRUE),
+    answer("summarise()"),
+    allow_retry = TRUE
+  ),
+  question("What SAS concept does group_by() most closely replace?",
+    answer("The LENGTH statement"),
+    answer("The BY statement in PROC/DATA step", correct = TRUE),
+    answer("PROC FORMAT"),
+    answer("The ARRAY statement"),
+    allow_retry = TRUE
+  ),
+  question("In R, what does NA propagation mean in practice?",
+    answer("NA values are silently removed"),
+    answer("NA values are treated as 0"),
+    answer("Any arithmetic or comparison involving NA returns NA, unlike SAS which often ignores missing", correct = TRUE),
+    answer("NA causes an error"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 1 — filter() — the WHERE clause
+
+### Concept
+
+`filter()` keeps rows that match a condition. Multiple conditions separated by commas are treated as AND; use `|` for OR.
+
+```r
+adsl |> filter(SAFFL == "Y", AGE >= 65)                          # AND: comma = &
+adsl |> filter(SAFFL == "Y" | DTHFL == "Y")                      # OR
+adsl |> filter(TRT01A %in% c("Placebo", "Xanomeline Low Dose"))  # IN list
+adsl |> filter(!(TRT01A %in% c("Xanomeline High Dose")))         # NOT IN — wrap with !()
+adsl |> filter(!is.na(WEIGHTBL))                                  # not missing
+adsl |> filter(grepl("HIGH", TRT01A))                            # pattern match
+adsl |> filter(WEIGHTBL / (HEIGHTBL / 100)^2 > 30)              # filter on computed expr
+```
+
+**`%in%` negation** — to exclude values from a list, wrap the whole `%in%` expression in `!()`:
+
+```r
+# SAS:  where trt not in ("Placebo")
+# R:    filter(!(TRT01A %in% c("Placebo")))
+```
+
+**`grepl()` in filter** — returns TRUE when the pattern is found anywhere in the string:
+
+```r
+filter(grepl("Xanomeline", TRT01A))          # matches "Xanomeline Low Dose" AND "High Dose"
+filter(grepl("xanomeline", TRT01A, ignore.case = TRUE))  # case-insensitive
+```
+
+### Exercise 1a — safety population, elderly or female, on Xanomeline
+
+Filter `adsl` to subjects who satisfy **all three** conditions:
+
+1. Safety population (`SAFFL == "Y"`)
+2. Elderly (age ≥ 65) **or** female
+3. Randomised to **any** Xanomeline dose — use `grepl()`
+
+Then count results by `TRT01A` and `SEX`.
+
+```{r filter-basic, exercise=TRUE, exercise.lines=9}
+adsl |>
+  filter(
+    SAFFL == "Y",
+    ___ | ___,
+    grepl(___, TRT01A)
+  ) |>
+  count(TRT01A, SEX)
+```
+
+```{r filter-basic-hint-1}
+# Condition 2: AGE >= 65 | SEX == "F"
+# Condition 3: grepl("Xanomeline", TRT01A)
+```
+
+```{r filter-basic-solution}
+adsl |>
+  filter(
+    SAFFL == "Y",
+    AGE >= 65 | SEX == "F",
+    grepl("Xanomeline", TRT01A)
+  ) |>
+  count(TRT01A, SEX)
+```
+
+### Exercise 1b — NOT IN list
+
+Filter `adsl` to subjects who are **not** on Xanomeline High Dose. Use `!` + `%in%`.
+
+```{r filter-notin, exercise=TRUE, exercise.lines=5}
+adsl |>
+  filter(!(TRT01A %in% c(___))) |>
+  select(USUBJID, TRT01A)
+```
+
+```{r filter-notin-hint-1}
+# !(TRT01A %in% c("Xanomeline High Dose"))
+```
+
+```{r filter-notin-solution}
+adsl |>
+  filter(!(TRT01A %in% c("Xanomeline High Dose"))) |>
+  select(USUBJID, TRT01A)
+```
+
+### Exercise 1c — pattern match with grepl()
+
+Filter `adsl` to subjects whose treatment contains the word `"Xanomeline"` (either dose). Use `grepl()`.
+
+```{r filter-grepl, exercise=TRUE, exercise.lines=5}
+adsl |>
+  filter(grepl(___, TRT01A)) |>
+  count(TRT01A)
+```
+
+```{r filter-grepl-hint-1}
+# grepl("Xanomeline", TRT01A)
+```
+
+```{r filter-grepl-solution}
+adsl |>
+  filter(grepl("Xanomeline", TRT01A)) |>
+  count(TRT01A)
+```
+
+### Exercise 1d — complex multi-condition filter
+
+Find subjects who:
+- Are in the safety population AND the ITT population
+- Are female OR aged 70+
+- Have a non-missing WEIGHTBL
+
+```{r filter-complex, exercise=TRUE, exercise.lines=9}
+adsl |>
+  filter(
+    SAFFL == "Y" & ITTFL == "Y",
+    ___ | ___,
+    ___
+  ) |>
+  select(USUBJID, AGE, SEX, SAFFL, ITTFL, WEIGHTBL)
+```
+
+```{r filter-complex-hint-1}
+# SEX == "F" | AGE >= 70
+# !is.na(WEIGHTBL)
+```
+
+```{r filter-complex-solution}
+adsl |>
+  filter(
+    SAFFL == "Y" & ITTFL == "Y",
+    SEX == "F" | AGE >= 70,
+    !is.na(WEIGHTBL)
+  ) |>
+  select(USUBJID, AGE, SEX, SAFFL, ITTFL, WEIGHTBL)
+```
+
+### Exercise 1e — filter on computed expression (no pre-step)
+
+Filter `adsl` directly to subjects whose **BMI** (WEIGHTBL / (HEIGHTBL/100)^2) is **above 30** — without creating a BMI column first.
+
+```{r filter-expr, exercise=TRUE, exercise.lines=6}
+adsl |>
+  filter(___ > 30) |>
+  select(USUBJID, HEIGHTBL, WEIGHTBL)
+```
+
+```{r filter-expr-hint-1}
+# WEIGHTBL / (HEIGHTBL / 100)^2 > 30
+```
+
+```{r filter-expr-solution}
+adsl |>
+  filter(WEIGHTBL / (HEIGHTBL / 100)^2 > 30) |>
+  select(USUBJID, HEIGHTBL, WEIGHTBL)
+```
+
+### Exercise 1f — serious AEs that are still ongoing (AEENDTC is NA)
+
+Filter `adae` to rows where the AE is **serious** AND still **ongoing** (end date is missing).
+
+```{r filter-ongoing-sae, exercise=TRUE, exercise.lines=6}
+adae |>
+  filter(___ == "Y", ___) |>
+  select(USUBJID, AEDECOD, AESTDTC, AEENDTC, AESER)
+```
+
+```{r filter-ongoing-sae-hint-1}
+# AESER == "Y", is.na(AEENDTC)
+```
+
+```{r filter-ongoing-sae-solution}
+adae |>
+  filter(AESER == "Y", is.na(AEENDTC)) |>
+  select(USUBJID, AEDECOD, AESTDTC, AEENDTC, AESER)
+```
+
+---
+
+## 2 — select() — KEEP, DROP, reorder
+
+### Concept
+
+```r
+adsl |> select(USUBJID, AGE, SEX)              # keep specific columns
+adsl |> select(-STUDYID, -SITEID)              # drop with minus; -c(STUDYID, SITEID) also works
+adsl |> select(USUBJID, TRT01A, everything())  # promote columns to front, keep the rest
+adsl |> select(ends_with("FL"))                # tidyselect helper
+adsl |> select(where(is.numeric))              # predicate helper — all numeric columns
+adsl |> relocate(TRT01A, .before = AGE)        # move column position (.before or .after)
+```
+
+**Rename while selecting** — put `NEW_NAME = OLD_NAME` inside `select()`. This keeps only the listed columns and renames in one step (more concise than `select()` + `rename()`):
+
+```r
+adsl |> select(SUBJECT_ID = USUBJID,   # rename USUBJID → SUBJECT_ID
+               TREATMENT  = TRT01A,    # rename TRT01A  → TREATMENT
+               AGE, SEX)               # keep as-is
+```
+
+| Helper | Selects columns that... |
+|---|---|
+| `starts_with("TRT")` | start with "TRT" |
+| `ends_with("FL")` | end with "FL" |
+| `contains("BL")` | contain "BL" anywhere |
+| `matches("^A[EV]")` | match a regex |
+| `where(is.numeric)` | satisfy a predicate function |
+
+### Exercise 2a — key demographic columns
+
+Select `USUBJID`, `AGE`, `SEX`, `RACE`, and `TRT01A` from `adsl`. No hints needed — straightforward practice.
+
+```{r select-demo-cols, exercise=TRUE, exercise.lines=4}
+adsl |>
+  select(___)
+```
+
+```{r select-demo-cols-solution}
+adsl |>
+  select(USUBJID, AGE, SEX, RACE, TRT01A)
+```
+
+### Exercise 2b — all flag columns + USUBJID
+
+Select `USUBJID` and all flag columns (those ending in `"FL"`) using a tidyselect helper.
+
+```{r select-flags, exercise=TRUE, exercise.lines=4}
+adsl |>
+  select(USUBJID, ___)
+```
+
+```{r select-flags-hint-1}
+# ends_with("FL")
+```
+
+```{r select-flags-solution}
+adsl |>
+  select(USUBJID, ends_with("FL"))
+```
+
+### Exercise 2c — numeric columns only
+
+Select only columns that are numeric from `adsl`. Use `where(is.numeric)`.
+
+```{r select-numeric, exercise=TRUE, exercise.lines=5}
+adsl |>
+  select(USUBJID, where(___)) |>
+  names()
+```
+
+```{r select-numeric-hint-1}
+# where(is.numeric)
+```
+
+```{r select-numeric-solution}
+adsl |>
+  select(USUBJID, where(is.numeric)) |>
+  names()
+```
+
+### Exercise 2d — rename while selecting
+
+In one `select()` call, keep `USUBJID` (rename to `SUBJECT_ID`), `TRT01A` (rename to `TREATMENT`), `AGE`, and `SEX`.
+
+```{r select-rename-select, exercise=TRUE, exercise.lines=6}
+adsl |>
+  select(
+    SUBJECT_ID = ___,
+    TREATMENT  = ___,
+    AGE,
+    SEX
+  )
+```
+
+```{r select-rename-select-hint-1}
+# SUBJECT_ID = USUBJID, TREATMENT = TRT01A
+```
+
+```{r select-rename-select-solution}
+adsl |>
+  select(
+    SUBJECT_ID = USUBJID,
+    TREATMENT  = TRT01A,
+    AGE,
+    SEX
+  )
+```
+
+### Exercise 2e — promote columns with relocate()
+
+In `adsl`, move `TRT01A` to be the **first column** after `USUBJID`, pushing everything else right.
+
+```{r select-relocate, exercise=TRUE, exercise.lines=6}
+adsl |>
+  relocate(TRT01A, .after = ___) |>
+  names() |>
+  head(4)
+```
+
+```{r select-relocate-hint-1}
+# .after = USUBJID
+```
+
+```{r select-relocate-solution}
+adsl |>
+  relocate(TRT01A, .after = USUBJID) |>
+  names() |>
+  head(4)
+```
+
+### Exercise 2f — drop multiple columns, keep the rest
+
+Drop `STUDYID`, `SITEID`, `RFSTDTC`, and `RFENDTC` from `adsl` using the minus notation. (A common real-world pattern: strip study-level admin columns before passing data to a reporting macro.)
+
+```{r select-drop-multi, exercise=TRUE, exercise.lines=5}
+adsl |>
+  select(-___, -___, -___, -___) |>
+  names()
+```
+
+```{r select-drop-multi-solution}
+adsl |>
+  select(-STUDYID, -SITEID, -RFSTDTC, -RFENDTC) |>
+  names()
+```
+
+---
+
+## 3 — mutate() — assignment statements
+
+### Concept
+
+`mutate()` adds or modifies columns. You can reference columns just created in the same call.
+
+```r
+adsl |>
+  mutate(
+    BMI        = WEIGHTBL / (HEIGHTBL / 100)^2,
+    BMI_ROUND  = round(BMI, 1),         # uses BMI from same call
+    USUBJID_UC = toupper(USUBJID)
+  )
+```
+
+**`if_else()` — binary condition (base R):** Use `if_else()` (dplyr) instead of base `ifelse()` because it enforces that both branches return the **same type**, catching type mismatches at run time. This matters in clinical code where a silent type coercion could corrupt a flag.
+
+```r
+# Syntax: if_else(condition, value_if_TRUE, value_if_FALSE, missing = value_if_NA)
+adsl |> mutate(ELDERLY = if_else(AGE >= 65, "Y", "N"))
+adsl |> mutate(ONPBO   = if_else(TRT01A == "Placebo", "Y", NA_character_))
+#                                                           ↑ type-safe NA
+```
+
+**Type-safe NAs** — when you need to produce `NA` in a typed context, use the appropriate constant:
+
+| Type | Constant |
+|---|---|
+| character | `NA_character_` |
+| numeric (double) | `NA_real_` |
+| integer | `NA_integer_` |
+| Date | `as.Date(NA)` |
+
+**`as.Date()` — convert strings to Date:** ADaM date columns like `TRTSDT` are stored as `Date` objects. When a date arrives as a character string (ISO 8601), coerce it first:
+
+```r
+as.Date("2014-01-15")          # "2014-01-15" → Date
+as.Date("15JAN2014", "%d%b%Y") # SAS-style date string
+as.Date(ADT)                   # if ADT is already Date, returns unchanged (safe no-op)
+```
+
+Date arithmetic works directly: `as.Date("2014-03-01") - as.Date("2014-01-15")` returns `45` days.
+
+**String helpers in `mutate()`** — full coverage is in Section 9, but the three most common ones appear in exercises here:
+
+```r
+paste0(SITEID, "-", USUBJID)            # concatenate strings (no separator argument)
+substr(USUBJID, 4, 6)                   # extract characters at positions 4–6 (1-based)
+nchar(USUBJID)                          # number of characters in string
+toupper(RACE)                           # convert to upper case
+```
+
+**`case_when()` preview** — Section 4 covers it fully, but Exercise 3d uses it inside `mutate()`. The rule: conditions are checked top-to-bottom; the first matching condition wins; `TRUE ~` is the catch-all else branch:
+
+```r
+mutate(ANRIND = case_when(
+  AVAL > ANRHI ~ "HIGH",
+  AVAL < ANRLO ~ "LOW",
+  TRUE         ~ "NORMAL"     # else branch
+))
+```
+
+### Exercise 3a — BMI, deviation from mean, and unit conversion in one mutate()
+
+In a single `mutate()` call, add **three** columns to `adsl`:
+
+1. `BMI` = weight (kg) / height (m)² — rounded to 1 decimal
+2. `BMI_DEV` = each subject's BMI minus the **sample-wide mean BMI** (rounded to 2 decimals) — demonstrates that `mean()` inside `mutate()` operates on the whole column, not per-row
+3. `WGTLB` = weight converted to pounds (1 kg = 2.205 lb), rounded to 1 decimal
+
+Then select `USUBJID`, `HEIGHTBL`, `WEIGHTBL`, `BMI`, `BMI_DEV`, `WGTLB`.
+
+```{r mutate-bmi, exercise=TRUE, exercise.lines=12}
+adsl |>
+  mutate(
+    BMI     = round(___ / (___ / 100)^2, 1),
+    BMI_DEV = round(BMI - mean(___, na.rm = TRUE), 2),
+    WGTLB   = round(WEIGHTBL * ___, 1)
+  ) |>
+  select(USUBJID, HEIGHTBL, WEIGHTBL, BMI, BMI_DEV, WGTLB)
+```
+
+```{r mutate-bmi-hint-1}
+# BMI     = WEIGHTBL / (HEIGHTBL / 100)^2
+# BMI_DEV = BMI - mean(BMI, na.rm = TRUE)  — mean() of the whole column, scalar subtraction
+# WGTLB   = WEIGHTBL * 2.205
+```
+
+```{r mutate-bmi-solution}
+adsl |>
+  mutate(
+    BMI     = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1),
+    BMI_DEV = round(BMI - mean(BMI, na.rm = TRUE), 2),
+    WGTLB   = round(WEIGHTBL * 2.205, 1)
+  ) |>
+  select(USUBJID, HEIGHTBL, WEIGHTBL, BMI, BMI_DEV, WGTLB)
+```
+
+### Exercise 3b — string manipulation
+
+Add a column `SITE_SUBJ` by concatenating `SITEID` and the last four characters of `USUBJID` (the subject number, e.g., `"1015"`), separated by `"-"`. Use `substr()` or `str_sub()` and `paste0()`.
+
+```{r mutate-string, exercise=TRUE, exercise.lines=8}
+adsl |>
+  mutate(
+    SITE_SUBJ = paste0(SITEID, "-", substr(USUBJID, nchar(USUBJID)-___, nchar(USUBJID)))
+  ) |>
+  select(USUBJID, SITEID, SITE_SUBJ)
+```
+
+```{r mutate-string-hint-1}
+# In "01-701-1015", the subject number "1015" is the last 4 characters
+# substr(x, nchar(x)-3, nchar(x))  OR  str_sub(USUBJID, -4, -1)
+```
+
+```{r mutate-string-solution}
+adsl |>
+  mutate(
+    SITE_SUBJ = paste0(SITEID, "-", substr(USUBJID, nchar(USUBJID)-3, nchar(USUBJID)))
+  ) |>
+  select(USUBJID, SITEID, SITE_SUBJ)
+```
+
+### Exercise 3c — percent of reference range in lab data
+
+In `adlb`, add `PCT_ULN` = AVAL as a percentage of the upper limit of normal (`ANRHI`). Round to 1 decimal. Flag rows where PCT_ULN > 100 as `ABOVE_ULN = TRUE`.
+
+```{r mutate-pct-uln, exercise=TRUE, exercise.lines=10}
+adlb |>
+  mutate(
+    PCT_ULN   = round(___ / ANRHI * 100, 1),
+    ABOVE_ULN = PCT_ULN > ___
+  ) |>
+  filter(ABOVE_ULN) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, ANRHI, PCT_ULN, ABOVE_ULN)
+```
+
+```{r mutate-pct-uln-hint-1}
+# PCT_ULN = round(AVAL / ANRHI * 100, 1)
+# ABOVE_ULN = PCT_ULN > 100
+```
+
+```{r mutate-pct-uln-solution}
+adlb |>
+  mutate(
+    PCT_ULN   = round(AVAL / ANRHI * 100, 1),
+    ABOVE_ULN = PCT_ULN > 100
+  ) |>
+  filter(ABOVE_ULN) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, ANRHI, PCT_ULN, ABOVE_ULN)
+```
+
+### Exercise 3d — reference range indicator without a function
+
+In `advs`, add `ANRIND` by hand:
+- `"HIGH"` if AVAL > ANRHI
+- `"LOW"` if AVAL < ANRLO
+- `"NORMAL"` otherwise
+
+Then count by ANRIND.
+
+```{r mutate-anrind, exercise=TRUE, exercise.lines=14}
+advs |>
+  mutate(
+    ANRIND = case_when(
+      AVAL > ___  ~ "HIGH",
+      AVAL < ___  ~ "LOW",
+      TRUE        ~ "NORMAL"
+    )
+  ) |>
+  count(ANRIND)
+```
+
+```{r mutate-anrind-hint-1}
+# AVAL > ANRHI → "HIGH"; AVAL < ANRLO → "LOW"
+```
+
+```{r mutate-anrind-solution}
+advs |>
+  mutate(
+    ANRIND = case_when(
+      AVAL > ANRHI ~ "HIGH",
+      AVAL < ANRLO ~ "LOW",
+      TRUE         ~ "NORMAL"
+    )
+  ) |>
+  count(ANRIND)
+```
+
+### Exercise 3e — derive TRTEMFL (on-treatment flag)
+
+In `adlb`, add `TRTEMFL = "Y"` when `ADT` is **on or after** `TRTSDT` (both are `Date` objects in the real data), otherwise `NA_character_`. Use `if_else()`.
+
+> Note: In the real `pharmaverseadam::adlb`, `ADT` is already a `Date`; `as.Date()` is a safe no-op but shown here as a reminder for data where dates may arrive as strings.
+
+```{r mutate-trtemfl, exercise=TRUE, exercise.lines=10}
+adlb |>
+  mutate(
+    ADT_D    = as.Date(ADT),
+    TRTSDT_D = as.Date(TRTSDT),
+    TRTEMFL  = if_else(ADT_D >= TRTSDT_D, "Y", NA_character_)
+  ) |>
+  select(USUBJID, PARAMCD, AVISIT, ADT, TRTSDT, TRTEMFL) |>
+  head(8)
+```
+
+```{r mutate-trtemfl-hint-1}
+# if_else(ADT_D >= TRTSDT_D, "Y", NA_character_)
+# if_else() is type-strict: both branches must be the same type (character here)
+```
+
+```{r mutate-trtemfl-solution}
+adlb |>
+  mutate(
+    ADT_D    = as.Date(ADT),
+    TRTSDT_D = as.Date(TRTSDT),
+    TRTEMFL  = if_else(ADT_D >= TRTSDT_D, "Y", NA_character_)
+  ) |>
+  select(USUBJID, PARAMCD, AVISIT, ADT, TRTSDT, TRTEMFL) |>
+  head(8)
+```
+
+---
+
+## 4 — case_when() — nested if/else
+
+### Concept
+
+`case_when()` evaluates conditions in order — **first match wins**. The `TRUE ~` catch-all is the else branch.
+
+```r
+mutate(
+  AGE_CAT = case_when(
+    AGE < 18              ~ "Pediatric",
+    AGE < 65              ~ "Adult",
+    AGE >= 65 & AGE < 75  ~ "Elderly (65-74)",
+    AGE >= 75             ~ "Elderly (75+)",
+    TRUE                  ~ NA_character_
+  )
+)
+```
+
+**`if_else()` vs `ifelse()`** — Use `if_else()` (dplyr) for binary conditions. It enforces identical types in both branches and is safer in clinical code.
+
+**Typed NAs in `if_else()` and `case_when()`** — when a branch produces a missing value you must supply a type-matching NA constant, not bare `NA` (which is logical):
+
+```r
+if_else(TRT01A == "Placebo", "Y", NA_character_)   # ✓ character NA
+if_else(AGE > 65, 1L,        NA_integer_)           # ✓ integer NA
+if_else(AVAL > 0, AVAL,      NA_real_)              # ✓ numeric NA
+if_else(condition, as.Date("2014-01-01"), as.Date(NA)) # ✓ Date NA
+
+# Bare NA fails type check:
+if_else(TRT01A == "Placebo", "Y", NA)  # ✗ Error: true/false must be same type
+```
+
+### Exercise 4a — five-level age group
+
+Derive `AGEGR2` (a finer grouping than the existing `AGEGR1`) with five levels: `"<45"`, `"45-54"`, `"55-64"`, `"65-74"`, `">=75"`.
+
+> Note: `pharmaverseadam::adsl` already has `AGEGR1` with three levels. Here we derive a five-level version named `AGEGR2` to avoid overwriting it — a common real-world pattern.
+
+```{r casewhen-agegr5, exercise=TRUE, exercise.lines=14}
+adsl |>
+  mutate(
+    AGEGR2 = case_when(
+      AGE <  45             ~ "<45",
+      AGE <  55             ~ ___,
+      AGE <  65             ~ ___,
+      AGE <  75             ~ ___,
+      TRUE                  ~ ">=75"
+    )
+  ) |>
+  count(AGEGR2)
+```
+
+```{r casewhen-agegr5-hint-1}
+# < 55 → "45-54", < 65 → "55-64", < 75 → "65-74"
+```
+
+```{r casewhen-agegr5-solution}
+adsl |>
+  mutate(
+    AGEGR2 = case_when(
+      AGE <  45 ~ "<45",
+      AGE <  55 ~ "45-54",
+      AGE <  65 ~ "55-64",
+      AGE <  75 ~ "65-74",
+      TRUE      ~ ">=75"
+    )
+  ) |>
+  count(AGEGR2)
+```
+
+### Exercise 4b — BMI category
+
+Add `BMIGR1` to `adsl`. First compute BMI, then categorize:
+- `"Underweight"` < 18.5
+- `"Normal"` 18.5–24.9
+- `"Overweight"` 25–29.9
+- `"Obese"` ≥ 30
+
+```{r casewhen-bmi, exercise=TRUE, exercise.lines=14}
+adsl |>
+  mutate(
+    BMI    = WEIGHTBL / (HEIGHTBL / 100)^2,
+    BMIGR1 = case_when(
+      BMI <  18.5             ~ "Underweight",
+      BMI <  25.0             ~ ___,
+      BMI <  30.0             ~ ___,
+      TRUE                    ~ ___
+    )
+  ) |>
+  count(BMIGR1)
+```
+
+```{r casewhen-bmi-hint-1}
+# 18.5 to <25: "Normal", 25 to <30: "Overweight", else "Obese"
+```
+
+```{r casewhen-bmi-solution}
+adsl |>
+  mutate(
+    BMI    = WEIGHTBL / (HEIGHTBL / 100)^2,
+    BMIGR1 = case_when(
+      BMI <  18.5 ~ "Underweight",
+      BMI <  25.0 ~ "Normal",
+      BMI <  30.0 ~ "Overweight",
+      TRUE        ~ "Obese"
+    )
+  ) |>
+  count(BMIGR1)
+```
+
+### Exercise 4c — two-variable cross-condition
+
+In `adae`, add `RELSEV`: combine relatedness and severity into a single priority category.
+
+- `"HIGH CONCERN"` if `AEREL %in% c("PROBABLE","POSSIBLE")` AND `AESEVN >= 2`
+- `"MONITOR"` if `AEREL %in% c("PROBABLE","POSSIBLE")` AND `AESEVN == 1`
+- `"BACKGROUND"` otherwise
+
+```{r casewhen-relsev, exercise=TRUE, exercise.lines=14}
+adae |>
+  mutate(
+    RELSEV = case_when(
+      AEREL %in% c("PROBABLE","POSSIBLE") & AESEVN >= 2 ~ ___,
+      AEREL %in% c("PROBABLE","POSSIBLE") & AESEVN == 1 ~ ___,
+      TRUE ~ "BACKGROUND"
+    )
+  ) |>
+  count(RELSEV)
+```
+
+```{r casewhen-relsev-hint-1}
+# "HIGH CONCERN" and "MONITOR" respectively
+```
+
+```{r casewhen-relsev-solution}
+adae |>
+  mutate(
+    RELSEV = case_when(
+      AEREL %in% c("PROBABLE","POSSIBLE") & AESEVN >= 2 ~ "HIGH CONCERN",
+      AEREL %in% c("PROBABLE","POSSIBLE") & AESEVN == 1 ~ "MONITOR",
+      TRUE ~ "BACKGROUND"
+    )
+  ) |>
+  count(RELSEV)
+```
+
+### Exercise 4d — if_else() type safety trap
+
+The following code silently returns wrong types in base R. Use `if_else()` to enforce that `NA_real_` is returned (not `NA`) when AVAL is below the lower limit.
+
+```{r casewhen-ifelse, exercise=TRUE, exercise.lines=10}
+# Using if_else(): both branches must be numeric
+adlb |>
+  mutate(
+    AVAL_FLAGGED = if_else(
+      AVAL < ANRLO,
+      NA_real_,      # NA, but typed as numeric
+      ___            # otherwise keep AVAL
+    )
+  ) |>
+  filter(PARAMCD == "ALT") |>
+  select(USUBJID, AVISIT, AVAL, ANRLO, AVAL_FLAGGED)
+```
+
+```{r casewhen-ifelse-hint-1}
+# The TRUE branch should return AVAL (numeric)
+```
+
+```{r casewhen-ifelse-solution}
+adlb |>
+  mutate(
+    AVAL_FLAGGED = if_else(
+      AVAL < ANRLO,
+      NA_real_,
+      AVAL
+    )
+  ) |>
+  filter(PARAMCD == "ALT") |>
+  select(USUBJID, AVISIT, AVAL, ANRLO, AVAL_FLAGGED)
+```
+
+```{r quiz-casewhen-adv, echo=FALSE}
+quiz(
+  question("What does `TRUE ~ NA_character_` at the end of case_when() do?",
+    answer("It converts the column to logical type"),
+    answer("It is required syntax and does nothing"),
+    answer("It matches rows where no earlier condition matched — the default/else branch, here setting them to NA", correct = TRUE),
+    answer("It runs only when all conditions are TRUE"),
+    allow_retry = TRUE
+  ),
+  question("Why does `if_else(cond, 1L, NA)` fail in R?",
+    answer("NA is not allowed in if_else()"),
+    answer("if_else() requires both branches to return the same type — 1L is integer but NA is logical", correct = TRUE),
+    answer("if_else() doesn't handle integers"),
+    answer("The condition must return numeric"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 5 — arrange() — PROC SORT
+
+### Concept
+
+```r
+adsl |> arrange(USUBJID)               # ascending
+adsl |> arrange(desc(AGE))             # descending
+adsl |> arrange(TRT01A, desc(AGE))     # multi-column
+adae |> arrange(USUBJID, AESTDTC, desc(AESEVN))
+```
+
+Unlike SAS, `arrange()` is only needed when final row order matters (output, lag/lead, cumulative). `group_by()` never requires pre-sorting.
+
+**`desc()` on a logical expression** — applying `desc()` to a condition pushes `TRUE` rows to the top, useful for "deaths first" or "serious AEs first" orderings:
+
+```r
+adsl |> arrange(desc(DTHFL == "Y"), TRTSDT)   # died subjects first, then by start date
+adae |> arrange(desc(AESER == "Y"), USUBJID)  # serious AEs to top within each subject
+```
+
+### Exercise 5a — sort with a logical expression: deaths first
+
+Sort `adsl` so that subjects who died (`DTHFL == "Y"`) appear **at the top**, then within each group sort by `TRTSDT` ascending. Use `desc()` applied to a logical expression to push `TRUE` rows to the top.
+
+Show `USUBJID`, `TRT01A`, `DTHFL`, `TRTSDT` for the first 10 rows.
+
+```{r arrange-clinical, exercise=TRUE, exercise.lines=8}
+adsl |>
+  arrange(desc(___ == "Y"), ___) |>
+  select(USUBJID, TRT01A, DTHFL, TRTSDT) |>
+  head(10)
+```
+
+```{r arrange-clinical-hint-1}
+# desc(DTHFL == "Y") — applying desc() to a logical puts TRUE before FALSE
+# Then sort by TRTSDT for tie-breaking within each group
+```
+
+```{r arrange-clinical-solution}
+adsl |>
+  arrange(desc(DTHFL == "Y"), TRTSDT) |>
+  select(USUBJID, TRT01A, DTHFL, TRTSDT) |>
+  head(10)
+```
+
+### Exercise 5b — NAs sort last
+
+By default `arrange()` sorts NAs last (ascending) and first (descending). Filter `adae` to show just the ongoing AEs (`AEENDTC` is NA), sort by `USUBJID`. Confirm the NAs appear.
+
+```{r arrange-na, exercise=TRUE, exercise.lines=6}
+adae |>
+  arrange(USUBJID, AEENDTC) |>
+  filter(is.na(AEENDTC)) |>
+  select(USUBJID, AEDECOD, AESTDTC, AEENDTC)
+```
+
+---
+
+## 6 — summarise() — PROC MEANS / PROC SUMMARY
+
+### Concept
+
+```r
+adsl |>
+  filter(SAFFL == "Y") |>
+  summarise(
+    n           = n(),
+    n_distinct  = n_distinct(RACE),
+    mean_age    = mean(AGE, na.rm = TRUE),
+    median_age  = median(AGE, na.rm = TRUE),
+    q25_age     = quantile(AGE, 0.25, na.rm = TRUE),
+    q75_age     = quantile(AGE, 0.75, na.rm = TRUE)
+  )
+```
+
+**Always `na.rm = TRUE`** — R propagates NA where SAS silently skips.
+
+**`sd()` — standard deviation** (base R, no library): `sd(AGE, na.rm = TRUE)`. Combine with `mean()` for descriptive statistics tables:
+
+```r
+summarise(
+  mean = round(mean(AGE, na.rm = TRUE), 1),
+  sd   = round(sd(AGE,   na.rm = TRUE), 1)
+)
+```
+
+**`mean()` of a logical as a proportion** — in R, `TRUE` = 1 and `FALSE` = 0. Taking the mean of a logical vector gives the proportion of TRUE rows — a clean, idiomatic way to compute percentages:
+
+```r
+# Proportion of subjects with DIABFL == "Y"
+summarise(pct_diab = round(mean(DIABFL == "Y", na.rm = TRUE) * 100, 1))
+# Equivalent SAS: mean(diabfl='Y') * 100
+```
+
+### Exercise 6a — full descriptive stats on AGE
+
+For the safety population, compute n, mean, SD, median, Q1, Q3, min, max of `AGE`.
+
+```{r summarise-full, exercise=TRUE, exercise.lines=16}
+adsl |>
+  filter(SAFFL == "Y") |>
+  summarise(
+    n        = n(),
+    mean     = round(mean(AGE, na.rm = TRUE), 1),
+    sd       = round(sd(AGE, na.rm = TRUE), 1),
+    median   = median(AGE, na.rm = TRUE),
+    q1       = quantile(AGE, ___, na.rm = TRUE),
+    q3       = quantile(AGE, ___, na.rm = TRUE),
+    min      = min(AGE, na.rm = TRUE),
+    max      = max(AGE, na.rm = TRUE)
+  )
+```
+
+```{r summarise-full-hint-1}
+# quantile(AGE, 0.25, ...) for Q1; quantile(AGE, 0.75, ...) for Q3
+```
+
+```{r summarise-full-solution}
+adsl |>
+  filter(SAFFL == "Y") |>
+  summarise(
+    n      = n(),
+    mean   = round(mean(AGE, na.rm = TRUE), 1),
+    sd     = round(sd(AGE, na.rm = TRUE), 1),
+    median = median(AGE, na.rm = TRUE),
+    q1     = quantile(AGE, 0.25, na.rm = TRUE),
+    q3     = quantile(AGE, 0.75, na.rm = TRUE),
+    min    = min(AGE, na.rm = TRUE),
+    max    = max(AGE, na.rm = TRUE)
+  )
+```
+
+### Exercise 6b — by-treatment summary
+
+Group by `TRT01A` and summarise: n, mean age, and percentage who are diabetic (`DIABFL == "Y"`).
+
+```{r summarise-by-trt, exercise=TRUE, exercise.lines=12}
+adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(___) |>
+  summarise(
+    n          = n(),
+    mean_age   = round(mean(AGE, na.rm = TRUE), 1),
+    pct_diab   = round(mean(DIABFL == "Y") * 100, 1),
+    .groups    = "drop"
+  )
+```
+
+```{r summarise-by-trt-hint-1}
+# group_by(TRT01A)
+# mean(DIABFL == "Y") gives proportion TRUE (since TRUE=1, FALSE=0)
+```
+
+```{r summarise-by-trt-solution}
+adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(TRT01A) |>
+  summarise(
+    n        = n(),
+    mean_age = round(mean(AGE, na.rm = TRUE), 1),
+    pct_diab = round(mean(DIABFL == "Y") * 100, 1),
+    .groups  = "drop"
+  )
+```
+
+### Exercise 6c — n_distinct count of unique values
+
+For `adae`, summarise: total AE records (`n()`), distinct subjects with at least one AE (`n_distinct(USUBJID)`), and distinct preferred terms (`n_distinct(AEDECOD)`).
+
+```{r summarise-ndistinct, exercise=TRUE, exercise.lines=10}
+adae |>
+  summarise(
+    total_aes    = n(),
+    n_subjects   = n_distinct(___),
+    n_pt         = n_distinct(___),
+    n_soc        = n_distinct(AEBODSYS)
+  )
+```
+
+```{r summarise-ndistinct-hint-1}
+# n_distinct(USUBJID), n_distinct(AEDECOD)
+```
+
+```{r summarise-ndistinct-solution}
+adae |>
+  summarise(
+    total_aes  = n(),
+    n_subjects = n_distinct(USUBJID),
+    n_pt       = n_distinct(AEDECOD),
+    n_soc      = n_distinct(AEBODSYS)
+  )
+```
+
+### Exercise 6d — AE count by body system and severity
+
+Summarise `adae` by `AEBODSYS` and `AESEV`: count records and count distinct subjects. Sort descending by n.
+
+```{r summarise-ae-soc, exercise=TRUE, exercise.lines=10}
+adae |>
+  group_by(___, ___) |>
+  summarise(
+    n_ae   = n(),
+    n_subj = n_distinct(USUBJID),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_ae))
+```
+
+```{r summarise-ae-soc-hint-1}
+# group_by(AEBODSYS, AESEV)
+```
+
+```{r summarise-ae-soc-solution}
+adae |>
+  group_by(AEBODSYS, AESEV) |>
+  summarise(
+    n_ae   = n(),
+    n_subj = n_distinct(USUBJID),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_ae))
+```
+
+---
+
+## 7 — group_by() + mutate() — RETAIN within BY groups
+
+### Concept
+
+`group_by()` + `mutate()` keeps all rows and computes values *within* groups. SAS equivalent: RETAIN + BY.
+
+```r
+adlb |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    BASELINE    = first(AVAL[AVISITN == 0]),  # first() grabs one value from a subset
+    CHG         = AVAL - BASELINE,
+    PCT_SUBJ    = AVAL / sum(AVAL) * 100       # subject's share of total
+  ) |>
+  ungroup()
+```
+
+**`first()` and `last()`** — return the first/last element of a vector. Inside `group_by() + mutate()` this looks up a specific row's value for the entire group:
+
+```r
+first(AVAL[AVISITN == 0])   # AVAL at baseline, broadcast to all rows of the group
+last(AVAL)                  # AVAL at the last (highest-index) row of the group
+```
+
+**`min_rank()` — ranking within a group:** assigns ranks 1, 2, 3 … with ties getting the lowest rank (like SAS `RANK`). Wrap with `desc()` to rank descending:
+
+```r
+group_by(PARAMCD, AVISIT) |>
+  mutate(RANK = min_rank(AVAL))          # lowest AVAL = rank 1
+  mutate(RANK = min_rank(desc(AVAL)))    # highest AVAL = rank 1
+```
+
+**`add_count()` — add group size without collapsing:** shorthand for `group_by() |> mutate(n = n()) |> ungroup()`. Keeps all rows and adds a count column:
+
+```r
+adae |> add_count(USUBJID, name = "N_AE_SUBJ")   # total AEs per subject, on every row
+# identical to:
+adae |> group_by(USUBJID) |> mutate(N_AE_SUBJ = n()) |> ungroup()
+```
+
+### Exercise 7a — baseline and change from baseline
+
+In `adlb`, add `BL_AVAL` (the AVAL at AVISITN == 0 within each subject × parameter) and `CHG` (AVAL - BL_AVAL) to every row.
+
+```{r groupmutate-chg, exercise=TRUE, exercise.lines=14}
+adlb |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    BL_AVAL = first(AVAL[AVISITN == ___]),
+    CHG     = AVAL - BL_AVAL
+  ) |>
+  ungroup() |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, BL_AVAL, CHG)
+```
+
+```{r groupmutate-chg-hint-1}
+# AVISITN == 0 for baseline
+# first() returns the first matching value
+```
+
+```{r groupmutate-chg-solution}
+adlb |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    BL_AVAL = first(AVAL[AVISITN == 0]),
+    CHG     = AVAL - BL_AVAL
+  ) |>
+  ungroup() |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, BL_AVAL, CHG)
+```
+
+### Exercise 7b — percentage of group total
+
+For each `PARAMCD` and `AVISIT` combination in `adlb`, add `PCT_OF_VISIT_TOTAL`: each subject's AVAL as a percentage of the sum across all subjects at that visit.
+
+```{r groupmutate-pct, exercise=TRUE, exercise.lines=12}
+adlb |>
+  group_by(PARAMCD, AVISIT) |>
+  mutate(
+    VISIT_TOTAL    = sum(AVAL, na.rm = TRUE),
+    PCT_OF_VISIT_TOTAL = round(___ / VISIT_TOTAL * 100, 1)
+  ) |>
+  ungroup() |>
+  filter(PARAMCD == "ALT") |>
+  select(USUBJID, AVISIT, AVAL, VISIT_TOTAL, PCT_OF_VISIT_TOTAL)
+```
+
+```{r groupmutate-pct-hint-1}
+# PCT_OF_VISIT_TOTAL = round(AVAL / VISIT_TOTAL * 100, 1)
+```
+
+```{r groupmutate-pct-solution}
+adlb |>
+  group_by(PARAMCD, AVISIT) |>
+  mutate(
+    VISIT_TOTAL        = sum(AVAL, na.rm = TRUE),
+    PCT_OF_VISIT_TOTAL = round(AVAL / VISIT_TOTAL * 100, 1)
+  ) |>
+  ungroup() |>
+  filter(PARAMCD == "ALT") |>
+  select(USUBJID, AVISIT, AVAL, VISIT_TOTAL, PCT_OF_VISIT_TOTAL)
+```
+
+### Exercise 7c — rank within group
+
+For each `PARAMCD` and `AVISIT`, rank subjects by `AVAL` descending (highest = rank 1). Use `min_rank(desc(AVAL))`.
+
+```{r groupmutate-rank, exercise=TRUE, exercise.lines=12}
+adlb |>
+  group_by(PARAMCD, AVISIT) |>
+  mutate(
+    RANK_AVAL = min_rank(desc(___))
+  ) |>
+  ungroup() |>
+  filter(PARAMCD == "ALT") |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, RANK_AVAL) |>
+  arrange(AVISIT, RANK_AVAL)
+```
+
+```{r groupmutate-rank-hint-1}
+# min_rank(desc(AVAL))
+```
+
+```{r groupmutate-rank-solution}
+adlb |>
+  group_by(PARAMCD, AVISIT) |>
+  mutate(
+    RANK_AVAL = min_rank(desc(AVAL))
+  ) |>
+  ungroup() |>
+  filter(PARAMCD == "ALT") |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, RANK_AVAL) |>
+  arrange(AVISIT, RANK_AVAL)
+```
+
+### Exercise 7d — count AEs per subject and add back (add_count)
+
+`add_count()` is shorthand for `group_by() |> mutate(n = n()) |> ungroup()`. Add `N_AE_SUBJ` (total AEs per subject) to every row of `adae`.
+
+```{r addcount-ex, exercise=TRUE, exercise.lines=8}
+adae |>
+  add_count(___, name = "N_AE_SUBJ") |>
+  select(USUBJID, AEDECOD, N_AE_SUBJ) |>
+  arrange(USUBJID)
+```
+
+```{r addcount-ex-hint-1}
+# add_count(USUBJID, name = "N_AE_SUBJ")
+```
+
+```{r addcount-ex-solution}
+adae |>
+  add_count(USUBJID, name = "N_AE_SUBJ") |>
+  select(USUBJID, AEDECOD, N_AE_SUBJ) |>
+  arrange(USUBJID)
+```
+
+---
+
+## 8 — distinct() and count()
+
+### Concept
+
+These two functions are your fast paths for frequency tables and deduplication:
+
+```r
+adsl |> distinct(TRT01A)                      # unique values of one column
+adsl |> distinct(TRT01A, SEX)                 # unique combinations
+adsl |> distinct(USUBJID, .keep_all = TRUE)   # first row per subject, keep all columns
+
+adae |> count(AEBODSYS)                       # tabulate: returns col + n
+adae |> count(TRT01A, AESEV, sort = TRUE)     # cross-tab, sorted descending by n
+adae |> count(AEBODSYS, name = "n_soc")       # rename the count column (default is "n")
+```
+
+**`count()` arguments:**
+
+| Argument | Effect | Default |
+|---|---|---|
+| `...` | grouping columns | — |
+| `sort = TRUE` | sort descending by count | `FALSE` |
+| `name = "col"` | rename the count column | `"n"` |
+| `wt = AVAL` | sum `wt` instead of counting rows | `NULL` |
+
+### Exercise 8a — distinct preferred terms per body system
+
+Find distinct (AEBODSYS, AEDECOD) combinations in `adae`, then count how many unique preferred terms each body system has.
+
+```{r distinct-pt, exercise=TRUE, exercise.lines=7}
+adae |>
+  distinct(AEBODSYS, ___) |>
+  count(AEBODSYS, name = "n_pt") |>
+  arrange(desc(n_pt))
+```
+
+```{r distinct-pt-hint-1}
+# distinct(AEBODSYS, AEDECOD) then count(AEBODSYS, ...)
+```
+
+```{r distinct-pt-solution}
+adae |>
+  distinct(AEBODSYS, AEDECOD) |>
+  count(AEBODSYS, name = "n_pt") |>
+  arrange(desc(n_pt))
+```
+
+### Exercise 8b — cross-tabulation with count()
+
+Use `count()` to create a cross-tab of `TRT01A` × `AESEV` in `adae`. Sort by `TRT01A` then descending `n`.
+
+```{r count-crosstab, exercise=TRUE, exercise.lines=7}
+adae |>
+  count(___, ___, sort = FALSE) |>
+  arrange(TRT01A, desc(n))
+```
+
+```{r count-crosstab-hint-1}
+# count(TRT01A, AESEV)
+```
+
+```{r count-crosstab-solution}
+adae |>
+  count(TRT01A, AESEV, sort = FALSE) |>
+  arrange(TRT01A, desc(n))
+```
+
+### Exercise 8c — proportion using count + mutate
+
+Use `count()` to tabulate subjects by `TRT01A` in `adsl` (SAFFL == "Y"), then add a `PCT` column showing each arm's percentage of the total.
+
+```{r count-prop, exercise=TRUE, exercise.lines=10}
+adsl |>
+  filter(SAFFL == "Y") |>
+  count(TRT01A) |>
+  mutate(PCT = round(n / sum(n) * 100, 1))
+```
+
+---
+
+## 9 — String operations in clinical context
+
+### Concept
+
+SAS programmers rely heavily on character functions. The R equivalents (**all base R unless noted — no library needed**):
+
+| SAS | R (base) | R (stringr) |
+|---|---|---|
+| `upcase()` | `toupper()` | `str_to_upper()` |
+| `lowcase()` | `tolower()` | `str_to_lower()` |
+| `substr(x,1,3)` | `substr(x,1,3)` | `str_sub(x,1,3)` |
+| `index(x,"Y")` | `regexpr("Y",x)` | `str_detect(x,"Y")` |
+| `prxmatch` | `grepl()` | `str_detect()` |
+| `cats(a,b)` | `paste0(a,b)` | `str_c(a,b)` |
+| `trim(x)` | `trimws(x)` | `str_trim(x)` |
+| `lengthn(x)` | `nchar(x)` | `str_length(x)` |
+| `tranwrd(x,old,new)` | `gsub(old,new,x)` | `str_replace_all(x,old,new)` |
+| `put(x, fmt.)` / `catx` | `sprintf(fmt, ...)` | `str_glue(fmt, ...)` |
+
+---
+
+### Key string functions explained
+
+**`substr(x, start, stop)` — extract a substring (base R)**
+
+Extracts characters at positions `start` through `stop` (1-based indexing):
+
+```r
+substr("01-701-1015", 1, 2)   # "01"  — study segment
+substr("01-701-1015", 4, 6)   # "701" — site segment
+substr("01-701-1015", 8, 11)  # "1015"— subject segment
+
+# Vectorised inside mutate():
+adsl |> mutate(SITE = substr(USUBJID, 4, 6))
+
+# Extract last N characters: use nchar() to find end position
+substr(x, nchar(x) - 3, nchar(x))   # last 4 characters
+```
+
+**`nchar(x)` — string length:** returns the number of characters. `nchar("01-701-1015")` = 11.
+
+**`grepl(pattern, x, ignore.case = FALSE)` — pattern detection (base R)**
+
+Returns a logical vector: `TRUE` where the pattern is found. The pattern is a regular expression:
+
+```r
+grepl("Xanomeline", TRT01A)                   # matches any Xanomeline arm
+grepl("xanomeline", TRT01A, ignore.case=TRUE) # case-insensitive
+grepl("^ALT$", PARAMCD)                       # exact match (^ = start, $ = end)
+grepl("(NAUSEA|VOMITING)", AEDECOD)           # match either word
+grepl("^APPLICATION", AEDECOD)               # starts with "APPLICATION"
+
+# Typical uses:
+filter(grepl("Skin", AEBODSYS, ignore.case = TRUE))   # filter on pattern
+mutate(SKIN_FL = grepl("Skin", AEBODSYS, ignore.case = TRUE))  # flag column
+```
+
+**`gsub(pattern, replacement, x)` — replace all matches (base R)**
+
+Replaces every occurrence of `pattern` with `replacement`. Like SAS `tranwrd()` but accepts full regex:
+
+```r
+gsub("BLACK OR AFRICAN AMERICAN", "BLACK", RACE)   # literal string replacement
+gsub("\\s+", "_", PARAM)                           # replace whitespace runs with "_"
+gsub("^\\s+|\\s+$", "", x)                         # trim whitespace (same as trimws())
+gsub("[^A-Za-z0-9]", "", x)                        # keep only alphanumeric characters
+```
+
+`sub()` replaces only the **first** match; `gsub()` replaces **all** matches.
+
+**`paste0(..., sep="")` — string concatenation (base R)**
+
+Concatenates strings with no separator (equivalent to SAS `cats()`). Use `paste(..., sep="-")` when you want a separator:
+
+```r
+paste0(SITEID, "-", USUBJID)           # "701-01-701-1015"
+paste("Site", SITEID, sep = ": ")      # "Site: 701"
+paste0(rep("X", 5), collapse = "")     # "XXXXX" — collapse vector to single string
+```
+
+**`toupper()` / `tolower()` — case conversion (base R)**
+
+```r
+toupper("mild")       # "MILD"
+tolower("MODERATE")   # "moderate"
+# Vectorised in mutate():
+mutate(across(where(is.character), toupper))
+```
+
+**`trimws(x, which = "both")` — strip whitespace (base R)**
+
+Removes leading and/or trailing whitespace. `which` can be `"left"`, `"right"`, or `"both"` (default):
+
+```r
+trimws("  HEADACHE  ")   # "HEADACHE"
+```
+
+---
+
+### Formatted strings: sprintf() and paste0()
+
+**`sprintf()` is a base R function — no library needed.** It works exactly like C's `printf` and SAS's `put()` / `catx()` combination: you write a **format string** with placeholders, then pass the values to substitute in.
+
+```r
+sprintf(format_string, value1, value2, ...)
+```
+
+**Format placeholders:**
+
+| Placeholder | Meaning | Example | Output |
+|---|---|---|---|
+| `%s` | character / string | `sprintf("%s", "MALE")` | `"MALE"` |
+| `%d` | integer | `sprintf("%d", 42L)` | `"42"` |
+| `%f` | floating-point | `sprintf("%f", 3.14)` | `"3.140000"` |
+| `%.1f` | float, 1 decimal | `sprintf("%.1f", 3.14159)` | `"3.1"` |
+| `%05d` | integer, zero-padded to width 5 | `sprintf("%05d", 7)` | `"00007"` |
+| `%-10s` | string, left-aligned in width 10 | `sprintf("%-10s|", "LOW")` | `"LOW       |"` |
+
+**Clinical examples — inside `mutate()`:**
+
+```r
+# "[01-701-1015] | Xanomeline High Dose"
+adsl |> mutate(LABEL = sprintf("[%s] | %s", USUBJID, TRT01A))
+
+# "AGE: 63 yrs  BMI: 24.8"
+adsl |> mutate(SUMMARY = sprintf("AGE: %d yrs  BMI: %.1f", AGE, BMIBL))
+
+# "SITE-007  (n=  3 subjects)"  — fixed-width columns for aligned output
+adsl |> group_by(SITEID) |>
+  mutate(SITE_LABEL = sprintf("SITE-%-3s  (n=%3d subjects)", SITEID, n())) |>
+  ungroup()
+```
+
+**`paste0()` vs `sprintf()`** — Use `paste0()` for simple concatenation with no formatting. Use `sprintf()` when you need decimal precision, zero-padding, or fixed-width alignment.
+
+```r
+paste0("[", USUBJID, "] | [", TRT01A, "]")   # fine for plain concatenation
+sprintf("[%s] | [%s]", USUBJID, TRT01A)       # same result, cleaner template syntax
+sprintf("%.1f%%", pct)                         # %% is a literal percent sign
+```
+
+---
+
+### Exercise 9a — extract site from USUBJID
+
+In the CDISC pilot, `USUBJID` has the form `"01-701-1015"` (study–site–subject). The site number `"701"` sits at characters 4–6. Use `substr()` to extract it and verify it matches `SITEID`.
+
+```{r strings-substr, exercise=TRUE, exercise.lines=6}
+adsl |>
+  mutate(SITE_EXTRACTED = substr(USUBJID, ___, ___)) |>
+  select(USUBJID, SITEID, SITE_EXTRACTED) |>
+  head(4)
+```
+
+```{r strings-substr-hint-1}
+# In "01-701-1015", the site segment "701" is at positions 4-6
+# substr(USUBJID, 4, 6)
+```
+
+```{r strings-substr-solution}
+adsl |>
+  mutate(SITE_EXTRACTED = substr(USUBJID, 4, 6)) |>
+  select(USUBJID, SITEID, SITE_EXTRACTED) |>
+  head(4)
+```
+
+### Exercise 9b — detect pattern and flag
+
+Add `SKIN_AE` = `TRUE` when `AEBODSYS` contains `"Skin"` (case-insensitive). Use `grepl(..., ignore.case = TRUE)`.
+
+```{r strings-detect, exercise=TRUE, exercise.lines=7}
+adae |>
+  mutate(SKIN_AE = grepl("___", AEBODSYS, ignore.case = TRUE)) |>
+  filter(SKIN_AE) |>
+  select(USUBJID, AEDECOD, AEBODSYS, SKIN_AE)
+```
+
+```{r strings-detect-hint-1}
+# grepl("Skin", AEBODSYS, ignore.case = TRUE)
+```
+
+```{r strings-detect-solution}
+adae |>
+  mutate(SKIN_AE = grepl("Skin", AEBODSYS, ignore.case = TRUE)) |>
+  filter(SKIN_AE) |>
+  select(USUBJID, AEDECOD, AEBODSYS, SKIN_AE)
+```
+
+### Exercise 9c — multi-field formatted label with sprintf()
+
+Using `sprintf()`, build a column `SUBJ_SUMMARY` in `adsl` that produces a label like:
+
+```
+"[01-701-1015] | Placebo | Age: 63 | BMI: 24.8"
+```
+
+The format template is `"[%s] | %s | Age: %d | BMI: %.1f"` — fill in `USUBJID`, `TRT01A`, `AGE`, and `BMIBL`.
+
+```{r strings-label, exercise=TRUE, exercise.lines=8}
+adsl |>
+  mutate(
+    SUBJ_SUMMARY = sprintf("[%s] | %s | Age: %d | BMI: %.1f",
+                           ___, ___, ___, ___)
+  ) |>
+  select(USUBJID, TRT01A, AGE, BMIBL, SUBJ_SUMMARY) |>
+  head(4)
+```
+
+```{r strings-label-hint-1}
+# sprintf("[%s] | %s | Age: %d | BMI: %.1f", USUBJID, TRT01A, AGE, BMIBL)
+# %s = string, %d = integer, %.1f = float with 1 decimal
+# Arguments fill placeholders left-to-right
+```
+
+```{r strings-label-solution}
+adsl |>
+  mutate(
+    SUBJ_SUMMARY = sprintf("[%s] | %s | Age: %d | BMI: %.1f",
+                           USUBJID, TRT01A, AGE, BMIBL)
+  ) |>
+  select(USUBJID, TRT01A, AGE, BMIBL, SUBJ_SUMMARY) |>
+  head(4)
+```
+
+### Exercise 9d — replace and standardize
+
+In `adsl`, `RACE` uses full CDISC-controlled terminology labels (e.g., `"BLACK OR AFRICAN AMERICAN"`). Use `gsub()` to shorten them for display tables. Also shorten `"AMERICAN INDIAN OR ALASKA NATIVE"` to `"AM IND"`. Use `count()` to verify.
+
+```{r strings-replace, exercise=TRUE, exercise.lines=10}
+adsl |>
+  mutate(
+    RACE_SHORT = RACE,
+    RACE_SHORT = gsub("BLACK OR AFRICAN AMERICAN", "BLACK", RACE_SHORT),
+    RACE_SHORT = gsub("AMERICAN INDIAN OR ALASKA NATIVE", "AM IND", RACE_SHORT)
+  ) |>
+  count(RACE_SHORT)
+```
+
+---
+
+## 10 — FIRST./LAST. logic: slice_min, slice_max, row_number
+
+### Concept
+
+```r
+# SAS: if first.usubjid then output;
+adae |> group_by(USUBJID) |>
+  slice_min(AESTDTC, n=1, with_ties=FALSE) |> ungroup()
+
+# SAS: if last.usubjid then output;
+adae |> group_by(USUBJID) |>
+  slice_max(AESTDTC, n=1, with_ties=FALSE) |> ungroup()
+
+# Flag first/last rows (keep all rows)
+adae |> arrange(USUBJID, AESTDTC) |> group_by(USUBJID) |>
+  mutate(first = row_number() == 1, last = row_number() == n()) |> ungroup()
+```
+
+**`slice(i)` — keep rows by position:** After `arrange() + group_by()`, `slice(1)` keeps the first row per group (as ordered by your sort). This is often more convenient than `slice_min/max` when the sort is already applied:
+
+```r
+# Worst AE per subject: sort first, then slice(1) to take the top row per group
+adae |>
+  arrange(USUBJID, desc(AESEVN), AESTDTC) |>
+  group_by(USUBJID) |>
+  slice(1) |>           # first row after sort = worst AE
+  ungroup()
+
+# Also valid: slice(1:3) keeps first 3 rows per group
+```
+
+**`row_number()` — sequential integer within group:** Starts at 1 for each new group (equivalent to `_n_` in SAS DATA step after BY):
+
+```r
+adae |> arrange(USUBJID, AESTDTC) |>
+  group_by(USUBJID) |>
+  mutate(AESEQ = row_number()) |>
+  ungroup()
+```
+
+### Exercise 10a — worst AE per subject
+
+For each subject, keep only the **most severe AE** (highest `AESEVN`). Break ties by earliest `AESTDTC`.
+
+```{r firstlast-worst, exercise=TRUE, exercise.lines=10}
+adae |>
+  arrange(USUBJID, desc(AESEVN), AESTDTC) |>
+  group_by(___) |>
+  slice(1) |>
+  ungroup() |>
+  select(USUBJID, AEDECOD, AESEV, AESEVN, AESTDTC)
+```
+
+```{r firstlast-worst-hint-1}
+# group_by(USUBJID), slice(1) after sorting
+```
+
+```{r firstlast-worst-solution}
+adae |>
+  arrange(USUBJID, desc(AESEVN), AESTDTC) |>
+  group_by(USUBJID) |>
+  slice(1) |>
+  ungroup() |>
+  select(USUBJID, AEDECOD, AESEV, AESEVN, AESTDTC)
+```
+
+### Exercise 10b — sequence number per subject (like AESEQ)
+
+Assign a row sequence number `AE_ROWNUM` per subject (1-based, ordered by `AESTDTC`). This is the pattern used to derive AESEQ in ADAE.
+
+```{r firstlast-seq, exercise=TRUE, exercise.lines=10}
+adae |>
+  arrange(USUBJID, AESTDTC) |>
+  group_by(___) |>
+  mutate(AE_ROWNUM = row_number()) |>
+  ungroup() |>
+  select(USUBJID, AE_ROWNUM, AESTDTC, AEDECOD) |>
+  head(8)
+```
+
+```{r firstlast-seq-hint-1}
+# group_by(USUBJID) then row_number()
+```
+
+```{r firstlast-seq-solution}
+adae |>
+  arrange(USUBJID, AESTDTC) |>
+  group_by(USUBJID) |>
+  mutate(AE_ROWNUM = row_number()) |>
+  ungroup() |>
+  select(USUBJID, AE_ROWNUM, AESTDTC, AEDECOD) |>
+  head(8)
+```
+
+### Exercise 10c — last non-missing value per group
+
+In `adlb`, get the **last observed AVAL** per subject × parameter (i.e., highest AVISITN with non-missing AVAL). This is the "last observation carried forward" source record.
+
+```{r firstlast-locf-source, exercise=TRUE, exercise.lines=10}
+adlb |>
+  filter(!is.na(AVAL)) |>
+  group_by(USUBJID, PARAMCD) |>
+  slice_max(___, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(USUBJID, PARAMCD, AVISIT, AVISITN, AVAL)
+```
+
+```{r firstlast-locf-source-hint-1}
+# slice_max(AVISITN, n=1, with_ties=FALSE) to get the latest visit
+```
+
+```{r firstlast-locf-source-solution}
+adlb |>
+  filter(!is.na(AVAL)) |>
+  group_by(USUBJID, PARAMCD) |>
+  slice_max(AVISITN, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(USUBJID, PARAMCD, AVISIT, AVISITN, AVAL)
+```
+
+---
+
+## 11 — lag() and lead() — visit-to-visit changes
+
+### Concept
+
+`lag()` returns the prior value; `lead()` the next value. **Always use inside `group_by()`** so the lag doesn't bleed across subjects.
+
+> **Data type gotcha — always verify column types before comparing:**
+> In `pharmaverseadam::adlb`, `ATOXGR` is stored as **character** (`<chr>`), not integer. Running `ATOXGR > ATOXGR_PREV` on character strings does **alphabetic** comparison — `"0" > "-1"` returns `TRUE` because `"-"` sorts before `"0"` lexicographically, which is numerically wrong. The setup chunk in this lesson already converts `ATOXGR` to integer with `as.integer()`, but in your own ADaM pipelines always check `class(df$ATOXGR)` or `str(df)` before numeric operations on grade variables.
+
+> **DTYPE gotcha — exclude admiral-derived rows before any lag/lead analysis:**
+> admiral appends derived summary records to BDS datasets alongside the real observation rows. These rows carry a non-missing `DTYPE` value (e.g. `"MAXIMUM"`, `"MINIMUM"`, `"LOCF"`) and use sentinel `AVISITN` values such as **9998** ("POST-BASELINE MAXIMUM") or **9997** ("POST-BASELINE MINIMUM"). They are summary artefacts, not actual study visits.
+> If you run `arrange(..., AVISITN) |> lag()` without filtering them out first, the sentinel row sorts last inside each group and the lag comparison fires against the final real visit — incorrectly flagging the derived "maximum" as a worsening event.
+> **Always filter them away before longitudinal work:**
+> ```r
+> adlb |> filter(is.na(DTYPE)) |> arrange(USUBJID, PARAMCD, AVISITN) |> ...
+> ```
+> The setup chunk in this lesson already applies `filter(is.na(DTYPE))` globally to `adlb`, so exercises here are safe. In your own work, add this filter as a reflex whenever you touch visit-sequence logic on a BDS dataset built with admiral.
+
+**`first(x[condition])` — baseline lookup within a group:** Introduced in Section 7, this pattern is important in lag/lead exercises too. Inside `group_by() + mutate()`, it looks up one row's value and broadcasts it to all rows in the group:
+
+```r
+group_by(USUBJID, PARAMCD) |>
+  mutate(
+    BL_AVAL   = first(AVAL[AVISITN == 0]),   # baseline value on every row
+    PCT_CHG_BL = round((AVAL - BL_AVAL) / BL_AVAL * 100, 1)
+  )
+```
+
+The `[AVISITN == 0]` subset filters to baseline rows first; `first()` returns the single value from that subset. This pattern combines naturally with `lag()` in the same `mutate()` call.
+
+```r
+adlb |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    AVAL_PREV   = lag(AVAL),
+    AVAL_NEXT   = lead(AVAL),
+    CHG_PREV    = AVAL - AVAL_PREV,
+    PCT_CHG     = (AVAL - AVAL_PREV) / AVAL_PREV * 100
+  ) |>
+  ungroup()
+```
+
+### Exercise 11a — % change from prior visit AND from baseline in one mutate()
+
+In a single `group_by() + mutate()` block, derive **two** percent-change columns for `adlb`:
+
+- `PCT_CHG_PREV` — % change vs the **previous visit** (use `lag()`)
+- `PCT_CHG_BL` — % change vs **baseline** (AVISITN == 0; use `first()` to look it up within the group)
+
+Both rounded to 1 decimal. Then filter to ALT post-baseline rows only.
+
+```{r lag-pct-chg, exercise=TRUE, exercise.lines=16}
+adlb |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, ___) |>
+  mutate(
+    AVAL_PREV    = lag(AVAL),
+    BL_AVAL      = first(AVAL[AVISITN == ___]),
+    PCT_CHG_PREV = round((___ - AVAL_PREV) / AVAL_PREV * 100, 1),
+    PCT_CHG_BL   = round((___ - BL_AVAL)   / BL_AVAL   * 100, 1)
+  ) |>
+  ungroup() |>
+  filter(PARAMCD == "ALT", AVISITN > 0) |>
+  select(USUBJID, AVISIT, AVAL, AVAL_PREV, BL_AVAL, PCT_CHG_PREV, PCT_CHG_BL)
+```
+
+```{r lag-pct-chg-hint-1}
+# group_by(USUBJID, PARAMCD)
+# BL_AVAL = first(AVAL[AVISITN == 0])  — within-group lookup to baseline row
+# PCT_CHG_PREV uses lag(AVAL); PCT_CHG_BL uses BL_AVAL (same call, both available)
+```
+
+```{r lag-pct-chg-solution}
+adlb |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    AVAL_PREV    = lag(AVAL),
+    BL_AVAL      = first(AVAL[AVISITN == 0]),
+    PCT_CHG_PREV = round((AVAL - AVAL_PREV) / AVAL_PREV * 100, 1),
+    PCT_CHG_BL   = round((AVAL - BL_AVAL)   / BL_AVAL   * 100, 1)
+  ) |>
+  ungroup() |>
+  filter(PARAMCD == "ALT", AVISITN > 0) |>
+  select(USUBJID, AVISIT, AVAL, AVAL_PREV, BL_AVAL, PCT_CHG_PREV, PCT_CHG_BL)
+```
+
+### Exercise 11b — detect worsening toxicity grade
+
+Add `GRADE_WORSENED = TRUE` when `ATOXGR` is **strictly higher** than the previous visit's `ATOXGR` (within subject × parameter).
+
+```{r lag-worsened, exercise=TRUE, exercise.lines=14}
+adlb |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    ATOXGR_PREV    = lag(ATOXGR),
+    GRADE_WORSENED = !is.na(ATOXGR_PREV) & ___ > ATOXGR_PREV
+  ) |>
+  ungroup() |>
+  filter(GRADE_WORSENED) |>
+  select(USUBJID, PARAMCD, AVISIT, ATOXGR_PREV, ATOXGR, GRADE_WORSENED)
+```
+
+```{r lag-worsened-hint-1}
+# ATOXGR > ATOXGR_PREV (and guard against NA with !is.na(ATOXGR_PREV))
+```
+
+```{r lag-worsened-solution}
+adlb |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    ATOXGR_PREV    = lag(ATOXGR),
+    GRADE_WORSENED = !is.na(ATOXGR_PREV) & ATOXGR > ATOXGR_PREV
+  ) |>
+  ungroup() |>
+  filter(GRADE_WORSENED) |>
+  select(USUBJID, PARAMCD, AVISIT, ATOXGR_PREV, ATOXGR, GRADE_WORSENED)
+```
+
+### Exercise 11c — consecutive worsening (grade worsened two visits in a row)
+
+Extend the previous: flag `CONSEC_WORSE = TRUE` when ATOXGR increased at **both** the current AND the previous visit compared to their respective prior visits.
+
+```{r lag-consec, exercise=TRUE, exercise.lines=16}
+adlb |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    ATOXGR_PREV   = lag(ATOXGR),
+    WORSE_NOW     = !is.na(ATOXGR_PREV) & ATOXGR > ATOXGR_PREV,
+    WORSE_PREV    = lag(WORSE_NOW),                    # was previous row also a worsening?
+    CONSEC_WORSE  = WORSE_NOW & !is.na(WORSE_PREV) & ___
+  ) |>
+  ungroup() |>
+  filter(CONSEC_WORSE) |>
+  select(USUBJID, PARAMCD, AVISIT, ATOXGR, WORSE_NOW, WORSE_PREV, CONSEC_WORSE)
+```
+
+```{r lag-consec-hint-1}
+# CONSEC_WORSE = WORSE_NOW & !is.na(WORSE_PREV) & WORSE_PREV == TRUE
+```
+
+```{r lag-consec-solution}
+adlb |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    ATOXGR_PREV  = lag(ATOXGR),
+    WORSE_NOW    = !is.na(ATOXGR_PREV) & ATOXGR > ATOXGR_PREV,
+    WORSE_PREV   = lag(WORSE_NOW),
+    CONSEC_WORSE = WORSE_NOW & !is.na(WORSE_PREV) & WORSE_PREV == TRUE
+  ) |>
+  ungroup() |>
+  filter(CONSEC_WORSE) |>
+  select(USUBJID, PARAMCD, AVISIT, ATOXGR, WORSE_NOW, WORSE_PREV, CONSEC_WORSE)
+```
+
+---
+
+## 12 — Cumulative functions
+
+### Concept
+
+All cumulative functions below are **base R** — no library needed. All respect `group_by()` so they never bleed across subjects.
+
+```r
+cumsum(x)    # running total:    c(1,2,3)  → c(1,3,6)
+cummax(x)    # running maximum:  c(1,3,2)  → c(1,3,3)
+cummin(x)    # running minimum:  c(3,1,2)  → c(3,1,1)
+cumprod(x)   # running product:  c(2,3,4)  → c(2,6,24)
+cumany(cond) # latch TRUE:       c(F,F,T,F)→ c(F,F,T,T)  — stays TRUE once fired
+cumall(cond) # latch FALSE:      c(T,T,F,T)→ c(T,T,F,F)  — stays FALSE once failed
+```
+
+**`cumany(condition)` — "has this ever happened?":** Takes a logical condition and returns TRUE from the first row where it fires, staying TRUE for all subsequent rows in the group. Equivalent to SAS RETAIN with a "once-true" flag:
+
+```r
+# EVER_SEVERE = TRUE from the first SEVERE AE onwards, for each subject
+adae |>
+  arrange(USUBJID, AESTDTC) |>
+  group_by(USUBJID) |>
+  mutate(EVER_SEVERE = cumany(AESEV == "SEVERE")) |>
+  ungroup()
+```
+
+**`cumsum(1)` — running row count:** `cumsum()` of a constant `1` produces sequential integers 1, 2, 3 … — a clean way to add a running event count per group:
+
+```r
+adae |>
+  arrange(USUBJID, AESTDTC) |>
+  group_by(USUBJID) |>
+  mutate(AE_N_TO_DATE = cumsum(1)) |>    # 1st AE=1, 2nd=2, 3rd=3 ...
+  ungroup()
+```
+
+### Exercise 12a — worst toxicity grade to date
+
+Add `WORST_GRADE_TD` = running maximum of `ATOXGR` per subject × parameter across visits ordered by `AVISITN`.
+
+```{r cummax-worst, exercise=TRUE, exercise.lines=10}
+adlb |>
+  arrange(USUBJID, PARAMCD, ___) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(WORST_GRADE_TD = cummax(___)) |>
+  ungroup() |>
+  select(USUBJID, PARAMCD, AVISIT, ATOXGR, WORST_GRADE_TD)
+```
+
+```{r cummax-worst-hint-1}
+# arrange by AVISITN, then cummax(ATOXGR)
+```
+
+```{r cummax-worst-solution}
+adlb |>
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(WORST_GRADE_TD = cummax(ATOXGR)) |>
+  ungroup() |>
+  select(USUBJID, PARAMCD, AVISIT, ATOXGR, WORST_GRADE_TD)
+```
+
+### Exercise 12b — AE ever occurred flag (cumany)
+
+In `adae`, sorted by USUBJID and AESTDTC, add `EVER_SEVERE` = cumany(AESEVN >= 3) — TRUE from the first severe AE onwards.
+
+```{r cumany-ever, exercise=TRUE, exercise.lines=10}
+adae |>
+  arrange(USUBJID, AESTDTC) |>
+  group_by(USUBJID) |>
+  mutate(EVER_SEVERE = cumany(___ >= 3)) |>
+  ungroup() |>
+  select(USUBJID, AESTDTC, AEDECOD, AESEVN, EVER_SEVERE) |>
+  arrange(USUBJID, AESTDTC)
+```
+
+```{r cumany-ever-hint-1}
+# cumany(AESEVN >= 3)
+```
+
+```{r cumany-ever-solution}
+adae |>
+  arrange(USUBJID, AESTDTC) |>
+  group_by(USUBJID) |>
+  mutate(EVER_SEVERE = cumany(AESEVN >= 3)) |>
+  ungroup() |>
+  select(USUBJID, AESTDTC, AEDECOD, AESEVN, EVER_SEVERE) |>
+  arrange(USUBJID, AESTDTC)
+```
+
+### Exercise 12c — running AE count per subject
+
+Add `AE_COUNT_TO_DATE` = cumulative count of AEs per subject up to and including each row (sorted by date).
+
+```{r cumsum-count, exercise=TRUE, exercise.lines=10}
+adae |>
+  arrange(USUBJID, AESTDTC) |>
+  group_by(USUBJID) |>
+  mutate(AE_COUNT_TO_DATE = cumsum(___)) |>  # cumsum of 1 per row = running count
+  ungroup() |>
+  select(USUBJID, AESTDTC, AEDECOD, AE_COUNT_TO_DATE)
+```
+
+```{r cumsum-count-hint-1}
+# cumsum(1) — 1 for every row = running row count within subject
+# Or: cumsum(rep(1, n()))
+```
+
+```{r cumsum-count-solution}
+adae |>
+  arrange(USUBJID, AESTDTC) |>
+  group_by(USUBJID) |>
+  mutate(AE_COUNT_TO_DATE = cumsum(1)) |>
+  ungroup() |>
+  select(USUBJID, AESTDTC, AEDECOD, AE_COUNT_TO_DATE)
+```
+
+---
+
+## 13 — across() — apply operations to many columns
+
+### Concept
+
+```r
+# Mean of all numeric columns
+adsl |> summarise(across(where(is.numeric), ~ mean(.x, na.rm=TRUE)))
+
+# Convert all character columns to upper case (bare function reference, no ~ needed)
+adsl |> mutate(across(where(is.character), toupper))
+
+# Chain functions in a lambda — trimws then toupper
+adsl |> mutate(across(where(is.character), ~ toupper(trimws(.x))))
+
+# Multiple summary functions, with custom output names
+adsl |> summarise(across(c(AGE, HEIGHTBL, WEIGHTBL),
+                          list(mean = ~ round(mean(.x, na.rm=TRUE), 1),
+                               sd   = ~ round(sd(.x,   na.rm=TRUE), 1)),
+                          .names = "{.col}_{.fn}"))   # → AGE_mean, AGE_sd, ...
+```
+
+**`.names` — controlling output column names in `across()`:**
+
+The `.names` argument is a glue template using `{.col}` (original column name) and `{.fn}` (function name from the list):
+
+```r
+.names = "mean_{.col}"    # → mean_AGE, mean_HEIGHTBL, mean_WEIGHTBL
+.names = "{.col}_{.fn}"   # → AGE_mean, AGE_sd  (requires named list of functions)
+.names = "{.col}_new"     # → AGE_new, HEIGHTBL_new (literal suffix)
+```
+
+**`replace_na()` from `{tidyr}` — substitute NA with a value:**
+
+```r
+library(tidyr)
+
+# Single column
+adlb |> mutate(ATOXGR = replace_na(ATOXGR, 0))
+
+# All numeric columns at once via across()
+adlb |> mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+
+# Alternatively with coalesce() (base dplyr, no tidyr needed)
+adlb |> mutate(ATOXGR = coalesce(ATOXGR, 0L))
+```
+
+### Exercise 13a — mean of several baseline vars by treatment
+
+For the safety population, compute mean of `AGE`, `HEIGHTBL`, `WEIGHTBL` by `TRT01A`. Name outputs `mean_AGE`, `mean_HEIGHTBL`, `mean_WEIGHTBL`.
+
+```{r across-means, exercise=TRUE, exercise.lines=12}
+adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(TRT01A) |>
+  summarise(
+    across(
+      c(___, ___, ___),
+      ~ round(mean(.x, na.rm = TRUE), 1),
+      .names = "mean_{.col}"
+    ),
+    .groups = "drop"
+  )
+```
+
+```{r across-means-hint-1}
+# c(AGE, HEIGHTBL, WEIGHTBL)
+```
+
+```{r across-means-solution}
+adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(TRT01A) |>
+  summarise(
+    across(
+      c(AGE, HEIGHTBL, WEIGHTBL),
+      ~ round(mean(.x, na.rm = TRUE), 1),
+      .names = "mean_{.col}"
+    ),
+    .groups = "drop"
+  )
+```
+
+### Exercise 13b — multiple summary functions in one across()
+
+Compute both mean and SD of `AGE`, `HEIGHTBL`, `WEIGHTBL` in one `across()` call. Name outputs `AGE_mean`, `AGE_sd`, etc.
+
+```{r across-multi-fn, exercise=TRUE, exercise.lines=14}
+adsl |>
+  filter(SAFFL == "Y") |>
+  summarise(
+    across(
+      c(AGE, HEIGHTBL, WEIGHTBL),
+      list(
+        mean = ~ round(mean(.x, na.rm = TRUE), 1),
+        sd   = ~ round(sd(.x, na.rm = TRUE), 1)
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  )
+```
+
+### Exercise 13c — chain two string operations inside across()
+
+Apply **two** transformations to every character column in `adsl` in a single `across()` lambda: first `trimws()` to strip any leading/trailing whitespace, then `toupper()` to capitalise. Use the `~ fn(.x)` lambda form so you can chain both calls.
+
+```{r across-toupper, exercise=TRUE, exercise.lines=7}
+adsl |>
+  mutate(across(where(is.character), ~ toupper(trimws(___)))) |>
+  select(USUBJID, TRT01A, RACE, SEX) |>
+  head(3)
+```
+
+```{r across-toupper-hint-1}
+# ~ toupper(trimws(.x))
+# .x is the placeholder for the current column — trimws first, then toupper wraps it
+```
+
+```{r across-toupper-solution}
+adsl |>
+  mutate(across(where(is.character), ~ toupper(trimws(.x)))) |>
+  select(USUBJID, TRT01A, RACE, SEX) |>
+  head(3)
+```
+
+### Exercise 13d — coalesce NA with across
+
+Replace all `NA` values in numeric columns with `0` using `across()` and `replace_na()` (from tidyr) or `coalesce()`.
+
+```{r across-replace-na, exercise=TRUE, exercise.lines=8}
+library(tidyr)
+adlb |>
+  mutate(across(where(is.numeric), ~ replace_na(.x, ___))) |>
+  filter(PARAMCD == "ALT") |>
+  select(USUBJID, AVISIT, AVAL, ATOXGR) |>
+  head(5)
+```
+
+```{r across-replace-na-hint-1}
+# replace_na(.x, 0) — replace NA with 0
+```
+
+```{r across-replace-na-solution}
+library(tidyr)
+adlb |>
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0))) |>
+  filter(PARAMCD == "ALT") |>
+  select(USUBJID, AVISIT, AVAL, ATOXGR) |>
+  head(5)
+```
+
+---
+
+## 14 — rowwise() — per-row operations
+
+### Concept
+
+Sometimes you need to apply a function *across columns within the same row* — not across rows within a column. `rowwise()` + `c_across()` handles this:
+
+```r
+# Maximum of SYSBP, DIABP, PULSE on each row
+advs_wide |>
+  rowwise() |>
+  mutate(MAX_VITAL = max(c_across(c(SYSBP, DIABP, PULSE)), na.rm=TRUE)) |>
+  ungroup()
+```
+
+For simple arithmetic involving a fixed number of columns, `pmax()` / `pmin()` is faster.
+
+**`any()` and `all()` — aggregate logicals across a vector (base R):**
+
+`any()` returns `TRUE` if at least one element is `TRUE`; `all()` requires every element to be `TRUE`. Inside `rowwise() + c_across()`, they operate across columns of the current row:
+
+```r
+# Does this subject have ANY flag set to "Y"?
+rowwise() |>
+  mutate(ANY_FLAG = any(c_across(ends_with("FL")) == "Y")) |>
+  ungroup()
+
+# Are ALL numeric lab values within range?
+rowwise() |>
+  mutate(ALL_NORMAL = all(c_across(starts_with("AVAL")) < 100, na.rm = TRUE)) |>
+  ungroup()
+```
+
+**`pmax()` / `pmin()` — parallel (element-wise) max/min:** Operates across columns row-by-row without `rowwise()` overhead. Much faster for a fixed set of columns:
+
+```r
+mutate(MAX_BP = pmax(SYSBP, DIABP, na.rm = TRUE))   # larger of two columns per row
+mutate(CAPPED = pmin(AVAL, ANRHI, na.rm = TRUE))    # cap AVAL at upper limit of normal
+```
+
+### Exercise 14a — row-wise check across multiple flag columns
+
+In `adsl`, add `ANY_FLAG` = TRUE if **any** of `SAFFL`, `ITTFL`, `DTHFL` equals `"Y"` for that row. Use `rowwise()` + `c_across()` and `any()`.
+
+```{r rowwise-any, exercise=TRUE, exercise.lines=10}
+adsl |>
+  rowwise() |>
+  mutate(ANY_FLAG = any(c_across(c(SAFFL, ITTFL, DTHFL)) == "Y")) |>
+  ungroup() |>
+  select(USUBJID, SAFFL, ITTFL, DTHFL, ANY_FLAG)
+```
+
+### Exercise 14b — pmin for element-wise minimum (faster than rowwise)
+
+Without `rowwise()`, use `pmin()` to add `MIN_MEASURE` = the element-wise minimum of `AVAL` and `ANRHI` per row of `adlb`.
+
+```{r rowwise-pmin, exercise=TRUE, exercise.lines=7}
+adlb |>
+  mutate(MIN_MEASURE = pmin(___, ___, na.rm = TRUE)) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, ANRHI, MIN_MEASURE) |>
+  head(6)
+```
+
+```{r rowwise-pmin-hint-1}
+# pmin(AVAL, ANRHI, na.rm = TRUE)
+```
+
+```{r rowwise-pmin-solution}
+adlb |>
+  mutate(MIN_MEASURE = pmin(AVAL, ANRHI, na.rm = TRUE)) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, ANRHI, MIN_MEASURE) |>
+  head(6)
+```
+
+---
+
+## 15 — Capstone 1: AE incidence summary table
+
+**The task** — Build a standard AE incidence summary by body system and preferred term, similar to what you'd include in a clinical study report appendix.
+
+The output should have:
+- Body system (`AEBODSYS`) and preferred term (`AEDECOD`)
+- Number of subjects with ≥1 AE in that PT per treatment arm (`n_subjects`)
+- Percentage of subjects in that arm (`pct`)
+- Rows sorted by body system then descending subject count on the High Dose arm
+
+This requires: `adsl` (for denominators) + `adae` + multiple `group_by` / `summarise` / `pivot_wider` steps.
+
+```{r capstone-ae-incidence, exercise=TRUE, exercise.lines=55}
+# Step 1: denominators per treatment arm (safety population)
+denom <- adsl |>
+  filter(SAFFL == "Y") |>
+  count(TRT01A, name = "N_ARM")
+
+# Step 2: one row per (subject × PT) — deduplicate multiple AEs with same PT per subject
+ae_dedup <- adae |>
+  distinct(USUBJID, TRT01A, AEBODSYS, AEDECOD)
+
+# Step 3: count subjects per (PT × treatment arm)
+ae_counts <- ae_dedup |>
+  group_by(TRT01A, AEBODSYS, AEDECOD) |>
+  summarise(n_subjects = n_distinct(USUBJID), .groups = "drop")
+
+# Step 4: join denominators and compute percentage
+ae_pct <- ae_counts |>
+  left_join(denom, by = "TRT01A") |>
+  mutate(pct = round(n_subjects / N_ARM * 100, 1))
+
+# Step 5: pivot wide (one column per arm)
+ae_wide <- ae_pct |>
+  select(AEBODSYS, AEDECOD, TRT01A, pct) |>
+  pivot_wider(
+    names_from  = TRT01A,
+    values_from = pct,
+    values_fill = 0
+  )
+
+# Step 6: sort by body system, then by High Dose % descending
+ae_wide |>
+  arrange(AEBODSYS, desc(`Xanomeline High Dose`))
+```
+
+---
+
+## 16 — Capstone 2: lab worsening detection pipeline
+
+**The task** — Starting from `adlb`, build a complete lab-monitoring flags dataset that reports, per subject and parameter:
+
+1. Baseline AVAL
+2. Post-baseline maximum AVAL
+3. Maximum toxicity grade post-baseline
+4. Whether there was any grade worsening from baseline
+5. Whether there were ≥ 2 consecutive visits with grade worsening
+6. The visit at which the maximum grade was first seen
+
+This is a multi-step derivation chain using `group_by`, `mutate`, `lag`, `cummax`, and `summarise`.
+
+```{r capstone-lab-pipeline, exercise=TRUE, exercise.lines=70}
+lab_flags <- adlb |>
+  # Sort for lag/cumulative operations
+  arrange(USUBJID, PARAMCD, AVISITN) |>
+
+  # Step 1: baseline and change from baseline
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    BL_AVAL    = first(AVAL[AVISITN == 0]),
+    BL_TOXGR   = first(ATOXGR[AVISITN == 0]),
+    CHG        = AVAL - BL_AVAL,
+    PCHG       = round((AVAL - BL_AVAL) / BL_AVAL * 100, 1)
+  ) |>
+
+  # Step 2: worst grade to date and grade worsening vs prior visit
+  mutate(
+    WORST_GR_TD  = cummax(ATOXGR),
+    PREV_TOXGR   = lag(ATOXGR),
+    WORSE_THIS   = !is.na(PREV_TOXGR) & ATOXGR > PREV_TOXGR,
+    WORSE_PREV   = lag(WORSE_THIS),
+    CONSEC_WORSE = WORSE_THIS & !is.na(WORSE_PREV) & WORSE_PREV
+  ) |>
+  ungroup() |>
+
+  # Step 3: only post-baseline rows for summary
+  filter(AVISITN > 0) |>
+
+  # Step 4: summarise per subject × parameter
+  group_by(USUBJID, PARAMCD) |>
+  summarise(
+    BL_AVAL        = first(BL_AVAL),
+    BL_TOXGR       = first(BL_TOXGR),
+    MAX_POSTBL     = max(AVAL, na.rm = TRUE),
+    MAX_TOXGR      = max(ATOXGR, na.rm = TRUE),
+    ANY_WORSENING  = any(WORSE_THIS, na.rm = TRUE),
+    ANY_CONSEC     = any(CONSEC_WORSE, na.rm = TRUE),
+    VISIT_MAX_GR   = AVISIT[which.max(ATOXGR)],
+    .groups        = "drop"
+  )
+
+lab_flags
+```
+
+```{r capstone-lab-extend, exercise=TRUE, exercise.lines=16}
+# Extension: from lab_flags, identify subjects with MAX_TOXGR >= 2
+# and summarise: how many subjects, and which PARAMCDs are affected most?
+
+lab_flags |>
+  filter(MAX_TOXGR >= ___) |>
+  group_by(___) |>
+  summarise(
+    n_subjects = n_distinct(USUBJID),
+    .groups    = "drop"
+  ) |>
+  arrange(desc(n_subjects))
+```
+
+```{r capstone-lab-extend-hint-1}
+# filter(MAX_TOXGR >= 2), group_by(PARAMCD)
+```
+
+```{r capstone-lab-extend-solution}
+lab_flags |>
+  filter(MAX_TOXGR >= 2) |>
+  group_by(PARAMCD) |>
+  summarise(
+    n_subjects = n_distinct(USUBJID),
+    .groups    = "drop"
+  ) |>
+  arrange(desc(n_subjects))
+```
+
+---
+
+## 17 — Final Quiz
+
+```{r final-quiz, echo=FALSE}
+quiz(
+  caption = "Lesson 04 — comprehensive self-check",
+
+  question(
+    "Translate SAS: `where saffl='Y' and age >= 65 and race not in ('UNKNOWN');`",
+    answer('filter(SAFFL == "Y", AGE >= 65, !(RACE %in% c("UNKNOWN")))', correct = TRUE),
+    answer('filter(SAFFL = "Y" & AGE >= 65 & RACE != "UNKNOWN")'),
+    answer('where(SAFFL == "Y" & AGE >= 65)'),
+    answer('filter(SAFFL == "Y" & AGE >= 65 & RACE %in% c("UNKNOWN"))'),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "group_by() + summarise() vs group_by() + mutate(): which keeps all rows?",
+    answer("summarise() keeps all rows"),
+    answer("mutate() keeps all rows and adds a computed column per-group; summarise() collapses to one row per group", correct = TRUE),
+    answer("Both collapse rows"),
+    answer("Both keep all rows"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "Why is `lag()` inside `group_by()` safer than SAS's LAG function?",
+    answer("R lag() is vectorised"),
+    answer("SAS LAG ignores missing"),
+    answer("dplyr lag() respects group boundaries — the value never bleeds from the last row of one subject to the first row of the next", correct = TRUE),
+    answer("R lag() returns 0 for the first row"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "What does `add_count(USUBJID, name = 'N')` do?",
+    answer("Returns only the count tibble"),
+    answer("Removes duplicate USUBJID rows"),
+    answer("Adds a column N with the total number of rows per USUBJID — equivalent to group_by(USUBJID) |> mutate(N = n()) |> ungroup()", correct = TRUE),
+    answer("Counts unique subjects into a scalar"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "Which is the preferred way to select all flag columns (SAFFL, ITTFL, DTHFL, DIABFL) at once?",
+    answer("select(contains('FLAG'))"),
+    answer("select(ends_with('FL'))", correct = TRUE),
+    answer("select(starts_with('FL'))"),
+    answer("select(where(is.logical))"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "In `across(where(is.numeric), ~ mean(.x, na.rm=TRUE))`, what does `.x` represent?",
+    answer("The row index"),
+    answer("The column name as a string"),
+    answer("The current column's values (a placeholder in the lambda formula)", correct = TRUE),
+    answer("The group key"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "cumany(ATOXGR >= 3) returns TRUE for a row if:",
+    answer("ATOXGR is 3 or higher on that exact row"),
+    answer("ATOXGR was 3 or higher at any prior row in the group, OR on this row — it latches TRUE once the condition fires", correct = TRUE),
+    answer("All rows in the group have ATOXGR >= 3"),
+    answer("The cumulative sum of ATOXGR exceeds 3"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "What is the difference between `n()` and `n_distinct(USUBJID)` in summarise()?",
+    answer("They are identical"),
+    answer("n() counts total rows; n_distinct(USUBJID) counts unique subject IDs — useful when subjects can have multiple records", correct = TRUE),
+    answer("n_distinct() is only available with group_by()"),
+    answer("n() counts distinct values; n_distinct() counts all rows"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "You have a wide dataset with columns PARAM1, PARAM2, PARAM3. To get the row-wise maximum across these three, the most efficient approach is:",
+    answer("rowwise() |> mutate(MAX = max(PARAM1, PARAM2, PARAM3))"),
+    answer("pmax(PARAM1, PARAM2, PARAM3, na.rm=TRUE)", correct = TRUE),
+    answer("across(c(PARAM1,PARAM2,PARAM3), max)"),
+    answer("summarise(MAX = max(c(PARAM1, PARAM2, PARAM3)))"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "After `arrange(USUBJID, desc(AESEVN)) |> group_by(USUBJID) |> slice(1)`, each group contains:",
+    answer("All rows"),
+    answer("The row with the lowest AESEVN"),
+    answer("The first row as ordered — i.e., the row with the highest AESEVN per subject", correct = TRUE),
+    answer("The last row"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 18 — SAS → dplyr Cheat Sheet (full)
+
+| SAS pattern | dplyr equivalent |
+|---|---|
+| `where age > 50` | `filter(AGE > 50)` |
+| `where var in ("A","B")` | `filter(var %in% c("A","B"))` |
+| `where var not in ("A")` | `filter(!(var %in% c("A")))` |
+| `where missing(var)` | `filter(is.na(var))` |
+| `where not missing(var)` | `filter(!is.na(var))` |
+| `where prxmatch("/HIGH/",trt)` | `filter(grepl("HIGH", TRT))` |
+| `keep var1 var2` | `select(var1, var2)` |
+| `drop var1` | `select(-var1)` |
+| `keep vars starting with 'AE'` | `select(starts_with("AE"))` |
+| `keep flag vars` | `select(ends_with("FL"))` |
+| `rename old=new` | `rename(new = old)` |
+| `proc sort by var` | `arrange(var)` |
+| `proc sort by descending var` | `arrange(desc(var))` |
+| Assignment in DATA step | `mutate(new = expression)` |
+| Nested if/then/else | `case_when(...)` |
+| Binary if/else | `if_else(cond, true_val, false_val)` |
+| `proc means by group` | `group_by() |> summarise()` |
+| RETAIN within BY group | `group_by() |> mutate()` |
+| `if first.var` (subset) | `group_by() |> slice_min()` or `slice(1)` |
+| `if last.var` (subset) | `group_by() |> slice_max()` or `slice(n())` |
+| `first.var` flag column | `mutate(FIRST = row_number() == 1)` |
+| `last.var` flag column | `mutate(LAST = row_number() == n())` |
+| `aeseq + 1` within BY | `mutate(SEQ = row_number())` |
+| LAG function | `lag(var)` — always inside `group_by()` |
+| RETAIN cumulative | `cumsum()`, `cummax()`, `cummin()` |
+| "has ever happened" | `cumany(condition)` |
+| Apply to many vars | `across(c(v1,v2), ~ fn(.x,...))` |
+| Apply to all numeric | `across(where(is.numeric), fn)` |
+| Freq/cross-tab | `count(var1, var2)` |
+| Deduplicate | `distinct(var1, var2)` |
+| Row-wise max/min | `pmax()` / `pmin()` |
+| Add count within group (keep rows) | `add_count(grp_var, name="N")` |
+| `upcase()` | `toupper()` / `str_to_upper()` |
+| `substr(x,1,3)` | `substr(x,1,3)` / `str_sub(x,1,3)` |
+| `index(x,"Y")>0` | `grepl("Y",x)` / `str_detect(x,"Y")` |
+| `tranwrd(x,old,new)` | `gsub(old,new,x)` / `str_replace_all()` |
+| `cats(a,b)` | `paste0(a,b)` / `str_c(a,b)` |
+
+---
+
+## Key Takeaways
+
+1. **Five core verbs** — `filter`, `select`, `mutate`, `summarise`, `arrange` — cover 90% of DATA-step work
+2. **`case_when()`** is the multi-branch conditional; **`if_else()`** enforces type safety in binary conditions
+3. **Always `na.rm = TRUE`** when summarizing — R propagates NA where SAS silently skips
+4. **`group_by() + summarise()`** collapses rows; **`group_by() + mutate()`** keeps rows and computes within-group values
+5. **`slice_min()` / `slice_max()` / `row_number()`** replace SAS FIRST./LAST. logic cleanly
+6. **`lag()` / `lead()`** must be used inside `group_by()` to stay within subject boundaries
+7. **`cummax()` / `cumany()`** handle running worst-to-date and "has this ever happened" patterns
+8. **`across()`** applies operations to many columns at once — both in `mutate()` and `summarise()`
+9. **`count()` / `distinct()` / `add_count()`** are shorthand for common tabulation and deduplication patterns
+10. **String helpers** (`grepl`, `substr`, `gsub`, `sprintf`) cover all SAS character function needs
+11. **`rowwise()` + `c_across()`** for per-row operations; `pmax()` / `pmin()` for simple row-wise extremes
+
+**Next** → Lesson 05: Joins, SQL patterns, and writing your own functions

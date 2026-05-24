@@ -1,0 +1,709 @@
+---
+title: "Lesson 18 — admiral Part 5: Time-to-Event ADaMs (ADTTE)"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tibble)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── shared mocks ─────────────────────────────────────────────────────────────
+exprs <- function(...) {
+  dots <- as.list(substitute(list(...)))[-1]; dots
+}
+
+params <- function(...) list(...)
+
+convert_blanks_to_na <- function(dataset) {
+  dataset |> mutate(across(where(is.character), ~ifelse(.=="", NA_character_, .)))
+}
+
+# ── ADTTE source object constructors ─────────────────────────────────────────
+event_source <- function(dataset_name, filter = NULL, date, set_values_to = list()) {
+  list(
+    type         = "event",
+    dataset_name = dataset_name,
+    filter       = substitute(filter),
+    date         = substitute(date),
+    set_values_to = set_values_to,
+    censor       = 0
+  )
+}
+
+censor_source <- function(dataset_name, filter = NULL, date, set_values_to = list(),
+                           censor = 1) {
+  list(
+    type         = "censor",
+    dataset_name = dataset_name,
+    filter       = substitute(filter),
+    date         = substitute(date),
+    set_values_to = set_values_to,
+    censor       = censor
+  )
+}
+
+# ── derive_param_tte ──────────────────────────────────────────────────────────
+derive_param_tte <- function(dataset_adsl = NULL,
+                              start_date,
+                              event_conditions,
+                              censor_conditions,
+                              source_datasets,
+                              set_values_to = list(),
+                              ...) {
+  start_nm <- deparse(substitute(start_date))
+  adsl_use <- if (!is.null(dataset_adsl)) dataset_adsl else
+              source_datasets[[names(source_datasets)[1]]]
+  # helper to evaluate one source condition for all subjects
+  eval_source <- function(src) {
+    ds <- source_datasets[[src$dataset_name]]
+    if (is.null(ds)) return(NULL)
+    # apply filter
+    if (!is.null(src$filter)) {
+      ds <- tryCatch(filter(ds, !!src$filter), error = function(e) ds)
+    }
+    # evaluate date expression
+    date_nm <- deparse(src$date)
+    if (!date_nm %in% names(ds)) return(NULL)
+    ds$..DATE.. <- ds[[date_nm]]
+    ds <- ds |> filter(!is.na(..DATE..))
+    if (nrow(ds) == 0) return(NULL)
+    # keep just USUBJID + date + meta
+    out <- ds |> select(any_of(c("USUBJID", "STUDYID", "..DATE..")))
+    out$..CENSOR.. <- src$censor
+    for (nm in names(src$set_values_to)) {
+      val <- tryCatch(eval(src$set_values_to[[nm]]), error = function(e) as.character(src$set_values_to[[nm]]))
+      out[[nm]] <- val
+    }
+    out
+  }
+  # Process events: earliest event date per subject
+  event_rows <- lapply(event_conditions, eval_source)
+  event_rows <- Filter(Negate(is.null), event_rows)
+  event_all  <- if (length(event_rows)) bind_rows(event_rows) else NULL
+
+  # Process censorings: latest censor date per subject
+  censor_rows <- lapply(censor_conditions, eval_source)
+  censor_rows <- Filter(Negate(is.null), censor_rows)
+  censor_all  <- if (length(censor_rows)) bind_rows(censor_rows) else NULL
+
+  # Determine ADT and CNSR for each subject
+  subjects <- unique(adsl_use$USUBJID)
+  result   <- vector("list", length(subjects))
+
+  for (i in seq_along(subjects)) {
+    subj     <- subjects[i]
+    adsl_row <- adsl_use |> filter(USUBJID == subj)
+    startdt  <- if (start_nm %in% names(adsl_row)) adsl_row[[start_nm]][1] else NA_real_
+
+    # Events for this subject
+    ev_sub <- if (!is.null(event_all)) filter(event_all, USUBJID == subj) else NULL
+    # Censor for this subject
+    ce_sub <- if (!is.null(censor_all)) filter(censor_all, USUBJID == subj) else NULL
+
+    if (!is.null(ev_sub) && nrow(ev_sub) > 0) {
+      # Take earliest event
+      ev_sub  <- arrange(ev_sub, ..DATE..)
+      best    <- ev_sub[1, , drop = FALSE]
+      adt     <- best$..DATE..[1]
+      cnsr    <- 0
+      evnt    <- best$EVNTDESC[1] %||% NA_character_
+      srcdom  <- best$SRCDOM[1]   %||% NA_character_
+      srcvar  <- best$SRCVAR[1]   %||% NA_character_
+    } else if (!is.null(ce_sub) && nrow(ce_sub) > 0) {
+      # Take latest censor date
+      ce_sub <- arrange(ce_sub, desc(..DATE..))
+      best   <- ce_sub[1, , drop = FALSE]
+      adt    <- best$..DATE..[1]
+      cnsr   <- best$..CENSOR..[1]
+      evnt   <- best$EVNTDESC[1] %||% NA_character_
+      srcdom <- best$SRCDOM[1]   %||% NA_character_
+      srcvar <- best$SRCVAR[1]   %||% NA_character_
+    } else {
+      adt <- NA_real_; cnsr <- NA_real_; evnt <- NA_character_
+      srcdom <- NA_character_; srcvar <- NA_character_
+    }
+
+    aval <- if (!is.na(adt) && !is.na(startdt)) as.numeric(adt - startdt) + 1 else NA_real_
+
+    row_out <- adsl_row |>
+      mutate(STARTDT = startdt, ADT = adt, AVAL = aval, CNSR = cnsr,
+             EVNTDESC = evnt, SRCDOM = srcdom, SRCVAR = srcvar)
+    result[[i]] <- row_out
+  }
+
+  tte_rows <- bind_rows(result)
+  for (nm in names(set_values_to)) {
+    val <- tryCatch(eval(set_values_to[[nm]]), error = function(e) as.character(set_values_to[[nm]]))
+    tte_rows[[nm]] <- val
+  }
+  tte_rows
+}
+
+# call_derivation for TTE
+call_derivation <- function(dataset = NULL, derivation, variable_params, ...) {
+  fixed_args <- list(...)
+  result_list <- vector("list", length(variable_params))
+  for (i in seq_along(variable_params)) {
+    call_args <- c(fixed_args, variable_params[[i]])
+    result_list[[i]] <- tryCatch(do.call(derivation, call_args), error = function(e) NULL)
+  }
+  bind_rows(Filter(Negate(is.null), result_list))
+}
+
+`%||%` <- function(a, b) if (is.null(a) || (length(a) == 1 && is.na(a))) b else a
+
+# ── Sample datasets ───────────────────────────────────────────────────────────
+adsl_tte <- tribble(
+  ~STUDYID,        ~USUBJID,  ~TRTSDT, ~TRTEDT, ~RANDDT, ~TRT01A,
+  ~DTHDT,  ~LSTALVDT, ~EOSDT,  ~DTHFL, ~SAFFL,
+  "CDISCPILOT01","01-001", 19367, 19548,  19360,  "Xanomeli",
+  NA_real_, 19600,     19600, "N",    "Y",
+  "CDISCPILOT01","01-002", 19370, 19430,  19365,  "Placebo",
+  19480,    19480,     19480, "Y",    "Y",
+  "CDISCPILOT01","01-003", 19375, 19540,  19370,  "Xanomeli",
+  NA_real_, 19590,     19590, "N",    "Y",
+  "CDISCPILOT01","01-004", 19378, 19490,  19372,  "Placebo",
+  19510,    19510,     19510, "Y",    "Y",
+  "CDISCPILOT01","01-005", 19380, 19560,  19375,  "Xanomeli",
+  NA_real_, 19610,     19610, "N",    "Y"
+)
+
+adrs <- tribble(
+  ~STUDYID,        ~USUBJID,  ~PARAMCD, ~AVALC, ~ADT,
+  "CDISCPILOT01", "01-001",  "OVR",    "SD",   19450,
+  "CDISCPILOT01", "01-001",  "OVR",    "PD",   19520,
+  "CDISCPILOT01", "01-002",  "OVR",    "PR",   19410,
+  "CDISCPILOT01", "01-003",  "OVR",    "SD",   19440,
+  "CDISCPILOT01", "01-004",  "OVR",    "PD",   19460,
+  "CDISCPILOT01", "01-005",  "OVR",    "CR",   19460
+)
+
+adae_tte <- tribble(
+  ~STUDYID,        ~USUBJID,  ~AETERM,              ~ASTDT, ~TRTEMFL, ~AESER, ~TRTSDT,
+  "CDISCPILOT01", "01-001",  "ANAPHYLACTIC SHOCK",  19400,  "Y",     "Y",    19367,
+  "CDISCPILOT01", "01-003",  "MYOCARDIAL INFARCTION",19420, "Y",     "Y",    19375
+)
+```
+
+## Welcome
+
+This lesson covers **ADTTE — Time-to-Event analysis datasets**. You'll learn admiral's declarative `event_source()` / `censor_source()` design and use `derive_param_tte()` to build Overall Survival, Progression-Free Survival, and safety TTE parameters.
+
+---
+
+## 1 — The ADTTE shape
+
+```{r adtte-shape-demo}
+# One row per (subject × parameter)
+# Key variables: STARTDT, ADT, AVAL, CNSR, EVNTDESC, SRCDOM, SRCVAR
+adsl_tte |>
+  select(USUBJID, TRTSDT, DTHDT, LSTALVDT, DTHFL) |>
+  arrange(USUBJID)
+```
+
+```{r quiz-adtte-shape, echo=FALSE}
+quiz(
+  question(
+    "CNSR = 0 means:",
+    answer("The subject was censored (no event observed by ADT)"),
+    answer("The event occurred", correct = TRUE),
+    answer("ADT is missing"),
+    answer("The subject was not in the analysis"),
+    allow_retry = TRUE
+  ),
+  question(
+    "AVAL in ADTTE is typically:",
+    answer("The analysis value of a measurement"),
+    answer("ADT minus STARTDT plus 1 (time on study in days)", correct = TRUE),
+    answer("CNSR × 100"),
+    answer("A numeric version of PARAMCD"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 2 — event_source() and censor_source()
+
+```{r source-objects-demo}
+# Define event: death
+death_event <- event_source(
+  dataset_name  = "adsl",
+  filter        = !is.na(DTHDT),
+  date          = DTHDT,
+  set_values_to = exprs(
+    EVNTDESC = "DEATH",
+    SRCDOM   = "ADSL",
+    SRCVAR   = "DTHDT"
+  )
+)
+
+# Define censoring: last known alive
+last_alive_censor <- censor_source(
+  dataset_name  = "adsl",
+  date          = LSTALVDT,
+  set_values_to = exprs(
+    EVNTDESC = "LAST DATE KNOWN ALIVE",
+    SRCDOM   = "ADSL",
+    SRCVAR   = "LSTALVDT"
+  )
+)
+
+# Inspect structure
+str(death_event)
+```
+
+```{r quiz-source-objects, echo=FALSE}
+quiz(
+  question(
+    "What field in the source object says which actual dataset to pull data from?",
+    answer("filter"),
+    answer("date"),
+    answer("dataset_name", correct = TRUE),
+    answer("set_values_to"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What differentiates an event_source() from a censor_source()?",
+    answer("event_source() has a filter; censor_source() doesn't"),
+    answer("event_source() produces CNSR = 0; censor_source() produces CNSR = 1+", correct = TRUE),
+    answer("censor_source() uses a different date variable"),
+    answer("They are identical — only the name differs"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 3 — Overall Survival with derive_param_tte()
+
+```{r os-demo}
+# Build OS: event = death, censor = last alive date
+adtte_os <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = TRTSDT,
+  event_conditions  = list(death_event),
+  censor_conditions = list(last_alive_censor),
+  source_datasets   = list(adsl = adsl_tte),
+  set_values_to     = exprs(
+    PARAMCD = "OS",
+    PARAM   = "Overall Survival"
+  )
+)
+
+adtte_os |>
+  select(USUBJID, PARAMCD, STARTDT, ADT, AVAL, CNSR, EVNTDESC)
+```
+
+```{r quiz-os, echo=FALSE}
+quiz(
+  question(
+    "For a subject with DTHDT = 19480 and TRTSDT = 19370, what is AVAL?",
+    answer("19480 - 19370 = 110"),
+    answer("19480 - 19370 + 1 = 111", correct = TRUE),
+    answer("110 / 365.25"),
+    answer("1"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r os-ex, exercise=TRUE, exercise.lines=22}
+# Exercise: build OS using adsl_tte
+# event = !is.na(DTHDT), date = DTHDT
+# censor = date = LSTALVDT
+# STARTDT = RANDDT (not TRTSDT)
+
+death_ev <- event_source(
+  dataset_name  = "adsl",
+  filter        = !is.na(DTHDT),
+  date          = ___,
+  set_values_to = exprs(EVNTDESC = "DEATH", SRCDOM = "ADSL", SRCVAR = "DTHDT")
+)
+
+alive_cs <- censor_source(
+  dataset_name  = "adsl",
+  date          = LSTALVDT,
+  set_values_to = exprs(EVNTDESC = "LAST KNOWN ALIVE", SRCDOM = "ADSL", SRCVAR = "LSTALVDT")
+)
+
+adtte_os2 <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = ___,
+  event_conditions  = list(death_ev),
+  censor_conditions = list(alive_cs),
+  source_datasets   = list(adsl = adsl_tte),
+  set_values_to     = exprs(PARAMCD = "OS", PARAM = "Overall Survival")
+)
+
+adtte_os2 |> select(USUBJID, PARAMCD, AVAL, CNSR, EVNTDESC)
+```
+
+```{r os-ex-hint-1}
+# date = DTHDT
+# start_date = RANDDT
+```
+
+```{r os-ex-solution}
+death_ev <- event_source(
+  dataset_name  = "adsl",
+  filter        = !is.na(DTHDT),
+  date          = DTHDT,
+  set_values_to = exprs(EVNTDESC = "DEATH", SRCDOM = "ADSL", SRCVAR = "DTHDT")
+)
+
+alive_cs <- censor_source(
+  dataset_name  = "adsl",
+  date          = LSTALVDT,
+  set_values_to = exprs(EVNTDESC = "LAST KNOWN ALIVE", SRCDOM = "ADSL", SRCVAR = "LSTALVDT")
+)
+
+adtte_os2 <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = RANDDT,
+  event_conditions  = list(death_ev),
+  censor_conditions = list(alive_cs),
+  source_datasets   = list(adsl = adsl_tte),
+  set_values_to     = exprs(PARAMCD = "OS", PARAM = "Overall Survival")
+)
+
+adtte_os2 |> select(USUBJID, PARAMCD, AVAL, CNSR, EVNTDESC)
+```
+
+---
+
+## 4 — PFS: composite events
+
+PFS uses **two event sources**: disease progression OR death, whichever comes first.
+
+```{r pfs-demo}
+# Progression event
+pd_event <- event_source(
+  dataset_name  = "adrs",
+  filter        = PARAMCD == "OVR" & AVALC == "PD",
+  date          = ADT,
+  set_values_to = exprs(
+    EVNTDESC = "DISEASE PROGRESSION",
+    SRCDOM   = "ADRS",
+    SRCVAR   = "ADT"
+  )
+)
+
+# Death (reuse from above)
+# last tumor assessment censor
+last_assess <- censor_source(
+  dataset_name  = "adrs",
+  filter        = PARAMCD == "OVR" & AVALC %in% c("CR","PR","SD","NE"),
+  date          = ADT,
+  set_values_to = exprs(
+    EVNTDESC = "LAST TUMOR ASSESSMENT",
+    SRCDOM   = "ADRS",
+    SRCVAR   = "ADT"
+  )
+)
+
+adtte_pfs <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = RANDDT,
+  event_conditions  = list(pd_event, death_event),
+  censor_conditions = list(last_assess, last_alive_censor),
+  source_datasets   = list(adsl = adsl_tte, adrs = adrs),
+  set_values_to     = exprs(PARAMCD = "PFS", PARAM = "Progression-Free Survival")
+)
+
+adtte_pfs |>
+  select(USUBJID, PARAMCD, AVAL, CNSR, EVNTDESC)
+```
+
+```{r quiz-pfs, echo=FALSE}
+quiz(
+  question(
+    "When both progression AND death occur for the same subject, derive_param_tte() picks:",
+    answer("Death always wins"),
+    answer("Progression always wins"),
+    answer("The earliest of the two event dates", correct = TRUE),
+    answer("The one listed first in event_conditions"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A subject with no progression and no death gets CNSR =",
+    answer("0"),
+    answer("1 (from the censor source)", correct = TRUE),
+    answer("2 — double censor"),
+    answer("NA"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r pfs-ex, exercise=TRUE, exercise.lines=26}
+# Exercise: build PFS but add a randomization-date fallback censor
+# (for subjects with no assessments at all, censor = 2)
+# Then count subjects by CNSR value
+
+rand_censor <- censor_source(
+  dataset_name  = "adsl",
+  date          = RANDDT,
+  censor        = ___,        # use censor = 2
+  set_values_to = exprs(EVNTDESC = "RANDOMIZATION (NO ASSESSMENT)",
+                         SRCDOM = "ADSL", SRCVAR = "RANDDT")
+)
+
+adtte_pfs2 <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = RANDDT,
+  event_conditions  = list(pd_event, death_event),
+  censor_conditions = list(last_assess, last_alive_censor, rand_censor),
+  source_datasets   = list(adsl = adsl_tte, adrs = adrs),
+  set_values_to     = exprs(PARAMCD = "PFS", PARAM = "PFS")
+)
+
+# Count by CNSR
+adtte_pfs2 |> count(CNSR)
+```
+
+```{r pfs-ex-hint-1}
+# censor = 2
+```
+
+```{r pfs-ex-solution}
+rand_censor <- censor_source(
+  dataset_name  = "adsl",
+  date          = RANDDT,
+  censor        = 2,
+  set_values_to = exprs(EVNTDESC = "RANDOMIZATION (NO ASSESSMENT)",
+                         SRCDOM = "ADSL", SRCVAR = "RANDDT")
+)
+
+adtte_pfs2 <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = RANDDT,
+  event_conditions  = list(pd_event, death_event),
+  censor_conditions = list(last_assess, last_alive_censor, rand_censor),
+  source_datasets   = list(adsl = adsl_tte, adrs = adrs),
+  set_values_to     = exprs(PARAMCD = "PFS", PARAM = "PFS")
+)
+
+adtte_pfs2 |> count(CNSR)
+```
+
+---
+
+## 5 — Time to first serious AE
+
+```{r ttaeser-demo}
+# Event: first treatment-emergent serious AE
+first_sae_event <- event_source(
+  dataset_name  = "adae",
+  filter        = AESER == "Y" & TRTEMFL == "Y",
+  date          = ASTDT,
+  set_values_to = exprs(
+    EVNTDESC = "FIRST SERIOUS AE",
+    SRCDOM   = "ADAE",
+    SRCVAR   = "ASTDT"
+  )
+)
+
+eot_censor <- censor_source(
+  dataset_name  = "adsl",
+  date          = EOSDT,
+  set_values_to = exprs(
+    EVNTDESC = "END OF STUDY",
+    SRCDOM   = "ADSL",
+    SRCVAR   = "EOSDT"
+  )
+)
+
+adtte_sae <- derive_param_tte(
+  dataset_adsl      = adsl_tte |> filter(SAFFL == "Y"),
+  start_date        = TRTSDT,
+  event_conditions  = list(first_sae_event),
+  censor_conditions = list(eot_censor, last_alive_censor),
+  source_datasets   = list(adsl = adsl_tte, adae = adae_tte),
+  set_values_to     = exprs(PARAMCD = "TTAESER", PARAM = "Time to First Serious AE")
+)
+
+adtte_sae |> select(USUBJID, PARAMCD, AVAL, CNSR, EVNTDESC)
+```
+
+---
+
+## 6 — call_derivation() for multiple parameters
+
+```{r call-derivation-demo}
+# Build OS and PFS together in one call_derivation call
+adtte_both <- call_derivation(
+  derivation = derive_param_tte,
+  variable_params = list(
+    params(
+      event_conditions  = list(death_event),
+      censor_conditions = list(last_alive_censor),
+      set_values_to     = exprs(PARAMCD = "OS", PARAM = "Overall Survival")
+    ),
+    params(
+      event_conditions  = list(pd_event, death_event),
+      censor_conditions = list(last_assess, last_alive_censor),
+      set_values_to     = exprs(PARAMCD = "PFS", PARAM = "Progression-Free Survival")
+    )
+  ),
+  # Shared arguments
+  dataset_adsl    = adsl_tte,
+  start_date      = RANDDT,
+  source_datasets = list(adsl = adsl_tte, adrs = adrs)
+)
+
+adtte_both |>
+  select(USUBJID, PARAMCD, AVAL, CNSR, EVNTDESC) |>
+  arrange(PARAMCD, USUBJID)
+```
+
+```{r quiz-call-derivation, echo=FALSE}
+quiz(
+  question(
+    "In `call_derivation()`, the `variable_params` list contains:",
+    answer("Shared arguments applied to every call"),
+    answer("Per-call argument overrides (event_conditions, censor_conditions, set_values_to)", correct = TRUE),
+    answer("Dataset names only"),
+    answer("Filter conditions"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r call-derivation-ex, exercise=TRUE, exercise.lines=28}
+# Exercise: use call_derivation to build OS and TTAESER in one block
+# OS: death event, last alive censor, start = TRTSDT
+# TTAESER: first_sae_event, eot_censor + last_alive_censor, start = TRTSDT
+
+adtte_multi <- call_derivation(
+  derivation = derive_param_tte,
+  variable_params = list(
+    params(
+      event_conditions  = list(death_event),
+      censor_conditions = list(last_alive_censor),
+      set_values_to     = exprs(PARAMCD = "OS", PARAM = "Overall Survival")
+    ),
+    params(
+      event_conditions  = list(first_sae_event),
+      censor_conditions = list(eot_censor, last_alive_censor),
+      set_values_to     = exprs(PARAMCD = "TTAESER", PARAM = "Time to First Serious AE")
+    )
+  ),
+  dataset_adsl    = adsl_tte |> filter(SAFFL == "Y"),
+  start_date      = ___,
+  source_datasets = list(adsl = adsl_tte, adae = adae_tte)
+)
+
+adtte_multi |> select(USUBJID, PARAMCD, AVAL, CNSR) |> arrange(PARAMCD, USUBJID)
+```
+
+```{r call-derivation-ex-hint-1}
+# start_date = TRTSDT
+```
+
+```{r call-derivation-ex-solution}
+adtte_multi <- call_derivation(
+  derivation = derive_param_tte,
+  variable_params = list(
+    params(
+      event_conditions  = list(death_event),
+      censor_conditions = list(last_alive_censor),
+      set_values_to     = exprs(PARAMCD = "OS", PARAM = "Overall Survival")
+    ),
+    params(
+      event_conditions  = list(first_sae_event),
+      censor_conditions = list(eot_censor, last_alive_censor),
+      set_values_to     = exprs(PARAMCD = "TTAESER", PARAM = "Time to First Serious AE")
+    )
+  ),
+  dataset_adsl    = adsl_tte |> filter(SAFFL == "Y"),
+  start_date      = TRTSDT,
+  source_datasets = list(adsl = adsl_tte, adae = adae_tte)
+)
+
+adtte_multi |> select(USUBJID, PARAMCD, AVAL, CNSR) |> arrange(PARAMCD, USUBJID)
+```
+
+---
+
+## 7 — AVAL in months/years and validation
+
+```{r aval-units-demo}
+# AVAL in days → months conversion
+adtte_os |>
+  mutate(
+    AVAL_MONTHS = AVAL / (365.25 / 12),
+    AVAL_YEARS  = AVAL / 365.25
+  ) |>
+  select(USUBJID, PARAMCD, AVAL, AVAL_MONTHS, AVAL_YEARS, CNSR)
+```
+
+```{r quiz-validation, echo=FALSE}
+quiz(
+  question(
+    "Which CNSR distribution check is a key ADTTE validation step?",
+    answer("Confirming no negative AVAL values (AVAL should always be ≥ 1)", correct = TRUE),
+    answer("Confirming CNSR sums to zero"),
+    answer("Confirming every subject has exactly one PARAMCD"),
+    answer("Confirming ADT > STARTDT for all rows"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which check ensures completeness of the subject population?",
+    answer("count(CNSR)"),
+    answer("Every subject in dataset_adsl (filtered population) has exactly one row per PARAMCD", correct = TRUE),
+    answer("nrow() matches ADSL"),
+    answer("SRCDOM is non-missing"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Quiz — final
+
+```{r quiz-final-18, echo=FALSE}
+quiz(
+  question(
+    "PFS is a 'composite endpoint' because:",
+    answer("It requires two datasets"),
+    answer("Either progression OR death qualifies as the event — two event_source objects", correct = TRUE),
+    answer("It uses two censor_source objects"),
+    answer("It has two CNSR values"),
+    allow_retry = TRUE
+  ),
+  question(
+    "EVNTDESC serves what purpose in ADTTE?",
+    answer("It is required by CDISC as a key variable"),
+    answer("It records which specific event or censoring rule fired — providing provenance and auditability", correct = TRUE),
+    answer("It replaces PARAMCD"),
+    answer("It maps to MedDRA terms"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A `censor_source()` with `censor = 2` is useful for:",
+    answer("Marking invalid censorings"),
+    answer("Distinguishing different censoring reasons (e.g., last-alive vs. randomization fallback)", correct = TRUE),
+    answer("Increasing AVAL"),
+    answer("Flagging missing DTHDT"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What does `{admiralonco}` provide for TTE derivations?",
+    answer("A faster derive_param_tte() for large datasets"),
+    answer("Pre-defined event_source() and censor_source() objects for oncology endpoints (OS, PFS, DOR)", correct = TRUE),
+    answer("A ggplot2 extension for Kaplan-Meier plots"),
+    answer("CTCAE toxicity grades"),
+    allow_retry = TRUE
+  )
+)
+```

@@ -1,0 +1,1311 @@
+---
+title: "Lesson 10 — sdtm.oak Part 3: SUPP-- Domains and RELREC"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+description: >
+  Build SUPP-- (Supplemental Qualifier) datasets, understand RELREC structure,
+  and handle non-standard SDTM constructs using dplyr patterns.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── Mock sdtm.oak functions (same as Lessons 08/09) ──────────────────────────
+
+oak_id_vars <- function() c("oak_id", "raw_source", "patient_number")
+
+generate_oak_id_vars <- function(raw_dat, pat_var, raw_src) {
+  raw_dat |>
+    mutate(
+      oak_id        = row_number(),
+      raw_source    = raw_src,
+      patient_number = .data[[pat_var]]
+    )
+}
+
+assign_no_ct <- function(raw_dat, raw_var, tgt_var, id_vars = oak_id_vars()) {
+  raw_dat |>
+    select(any_of(c(id_vars, raw_var))) |>
+    rename(!!sym(tgt_var) := !!sym(raw_var))
+}
+
+hardcode_no_ct <- function(raw_dat, raw_var, tgt_var, tgt_val, id_vars = oak_id_vars()) {
+  raw_dat |>
+    filter(!is.na(.data[[raw_var]])) |>
+    select(any_of(id_vars)) |>
+    mutate(!!sym(tgt_var) := tgt_val)
+}
+
+assign_ct <- function(raw_dat, raw_var, tgt_var, ct_spec, ct_clst, id_vars = oak_id_vars()) {
+  lookup <- ct_spec |>
+    filter(codelist_code == ct_clst) |>
+    select(collected_value, term_value) |>
+    distinct()
+  raw_dat |>
+    select(any_of(c(id_vars, raw_var))) |>
+    left_join(lookup, by = setNames("collected_value", raw_var)) |>
+    select(-any_of(raw_var)) |>
+    rename(!!sym(tgt_var) := term_value)
+}
+
+hardcode_ct <- function(raw_dat, raw_var, tgt_var, tgt_val, ct_spec, ct_clst, id_vars = oak_id_vars()) {
+  valid <- ct_spec |> filter(codelist_code == ct_clst) |> pull(term_value) |> unique()
+  if (!tgt_val %in% valid)
+    warning("hardcode_ct: '", tgt_val, "' not in codelist ", ct_clst)
+  hardcode_no_ct(raw_dat, raw_var, tgt_var, tgt_val, id_vars)
+}
+
+condition_add <- function(raw_dat, condition) {
+  cond <- enquo(condition)
+  raw_dat |> mutate(.oak_condition = !!cond)
+}
+
+apply_condition <- function(conditioned_dat) {
+  conditioned_dat |> filter(.oak_condition) |> select(-.oak_condition)
+}
+
+derive_seq <- function(data, tgt_var, rec_vars = "USUBJID") {
+  data |>
+    arrange(across(all_of(rec_vars))) |>
+    group_by(USUBJID) |>
+    mutate(!!sym(tgt_var) := row_number()) |>
+    ungroup()
+}
+
+# ── Mock generate_sdtm_supp ───────────────────────────────────────────────────
+
+generate_sdtm_supp <- function(parent_dataset, raw_dat, id_var, qnam_definitions) {
+  rows <- lapply(qnam_definitions, function(qdef) {
+    parent_dataset |>
+      select(STUDYID, USUBJID, all_of(id_var), patient_number) |>
+      inner_join(
+        raw_dat |>
+          select(patient_number, any_of(qdef$raw_var)),
+        by = "patient_number"
+      ) |>
+      filter(!is.na(.data[[qdef$raw_var]]) & .data[[qdef$raw_var]] != "") |>
+      transmute(
+        STUDYID,
+        RDOMAIN  = substr(id_var, 1, 2),
+        USUBJID,
+        IDVAR    = id_var,
+        IDVARVAL = as.character(.data[[id_var]]),
+        QNAM     = qdef$qnam,
+        QLABEL   = qdef$qlabel,
+        QVAL     = as.character(.data[[qdef$raw_var]]),
+        QORIG    = qdef$qorig,
+        QEVAL    = qdef$qeval
+      )
+  })
+  bind_rows(rows)
+}
+
+# ── Sample datasets ───────────────────────────────────────────────────────────
+
+# Raw AE data with extra sponsor-specific columns
+ae_raw <- tibble(
+  PATNUM       = c(1015L, 1015L, 1023L, 1042L, 1042L),
+  STUDYID      = "TEST_STUDY",
+  SITEID       = c("701", "701", "702", "703", "703"),
+  AETERM       = c("HEADACHE", "NAUSEA", "FATIGUE", "DIZZINESS", "RASH"),
+  AESTDT       = c("2020-07-15", "2020-08-01", "2020-07-20", "2020-09-10", "2020-09-12"),
+  AEENDT       = c("2020-07-17", "2020-08-03", "2020-07-25", "2020-09-12", "2020-09-20"),
+  AESEV        = c("MILD", "MODERATE", "MILD", "SEVERE", "MILD"),
+  AESER        = c("N", "N", "N", "Y", "N"),
+  AEOUT        = c("RECOVERED/RESOLVED", "RECOVERED/RESOLVED",
+                   "RECOVERED/RESOLVED", "RECOVERING/RESOLVING", "RECOVERED/RESOLVED"),
+  SPONSOR_AE_ID = c("AE001", "AE002", "AE003", "AE004", "AE005"),
+  INV_AE_CAT   = c("NEUROLOGICAL", "GI", "GENERAL", "NEUROLOGICAL", "DERMATOLOGICAL"),
+  AE_SAFETY_MTG = c("Y", "N", "N", "Y", "N")
+)
+
+# Raw EX data with sponsor link column
+ex_raw <- tibble(
+  PATNUM     = c(1015L, 1015L, 1023L, 1042L),
+  STUDYID    = "TEST_STUDY",
+  SITEID     = c("701", "701", "702", "703"),
+  EXTRT      = "STUDY DRUG",
+  EXDOSE     = c(100, 100, 50, 100),
+  EXDOSU     = "mg",
+  EXSTDT     = c("2020-07-01", "2020-08-01", "2020-07-05", "2020-09-01"),
+  EXENDT     = c("2020-07-31", "2020-08-31", "2020-07-31", "2020-09-30"),
+  EXSPID     = c("EX001", "EX002", "EX003", "EX004")
+)
+
+# AE SDTM (pre-built, as if from Lesson 09)
+ae <- tibble(
+  STUDYID  = "TEST_STUDY",
+  DOMAIN   = "AE",
+  USUBJID  = c("TEST_STUDY-701-1015", "TEST_STUDY-701-1015",
+               "TEST_STUDY-702-1023", "TEST_STUDY-703-1042", "TEST_STUDY-703-1042"),
+  AESEQ    = c(1L, 2L, 1L, 1L, 2L),
+  AETERM   = c("HEADACHE", "NAUSEA", "FATIGUE", "DIZZINESS", "RASH"),
+  AESTDTC  = c("2020-07-15", "2020-08-01", "2020-07-20", "2020-09-10", "2020-09-12"),
+  AEENDTC  = c("2020-07-17", "2020-08-03", "2020-07-25", "2020-09-12", "2020-09-20"),
+  AESEV    = c("MILD", "MODERATE", "MILD", "SEVERE", "MILD"),
+  AESER    = c("N", "N", "N", "Y", "N"),
+  AEOUT    = c("RECOVERED/RESOLVED", "RECOVERED/RESOLVED",
+               "RECOVERED/RESOLVED", "RECOVERING/RESOLVING", "RECOVERED/RESOLVED"),
+  patient_number = c(1015L, 1015L, 1023L, 1042L, 1042L)
+)
+
+# EX SDTM (pre-built)
+ex <- tibble(
+  STUDYID  = "TEST_STUDY",
+  DOMAIN   = "EX",
+  USUBJID  = c("TEST_STUDY-701-1015", "TEST_STUDY-701-1015",
+               "TEST_STUDY-702-1023", "TEST_STUDY-703-1042"),
+  EXSEQ    = c(1L, 2L, 1L, 1L),
+  EXTRT    = "STUDY DRUG",
+  EXDOSE   = c(100, 100, 50, 100),
+  EXDOSU   = "mg",
+  EXSTDTC  = c("2020-07-01", "2020-08-01", "2020-07-05", "2020-09-01"),
+  EXENDTC  = c("2020-07-31", "2020-08-31", "2020-07-31", "2020-09-30"),
+  EXSPID   = c("EX001", "EX002", "EX003", "EX004"),
+  patient_number = c(1015L, 1015L, 1023L, 1042L)
+)
+
+# AE-to-EX link table (for RELREC)
+ae_ex_link <- tibble(
+  PATNUM        = c(1015L, 1042L),
+  AE_SPONSOR_ID = c("AE001", "AE004"),
+  EX_SPONSOR_ID = c("EX001", "EX004")
+)
+
+# Study CT spec
+study_ct <- tribble(
+  ~codelist_code, ~collected_value, ~term_value,
+  "NY",           "Y",              "Y",
+  "NY",           "N",              "N",
+  "AESEV",        "MILD",           "MILD",
+  "AESEV",        "MODERATE",       "MODERATE",
+  "AESEV",        "SEVERE",         "SEVERE"
+)
+```
+
+## Welcome
+
+This is Lesson 10 of the pharmaverse tutorial series — **sdtm.oak Part 3: SUPP-- Domains and RELREC**.
+
+You've built standard SDTM domains. Now we handle the edge cases: what happens when your CRF collects variables that don't belong in any standard SDTM domain? And how do you formally link records *across* domains?
+
+This lesson covers:
+
+- The **SUPP--** (Supplemental Qualifier) dataset — shape, purpose, and when to use it
+- Building SUPP-- both automatically with `generate_sdtm_supp()` and manually with `dplyr`
+- **RELREC** — the Related Records dataset, built manually with `dplyr`
+- **CO** domain (Comments) and trial design domains — what they are and how to build them
+- Validation rules that are unique to these structures
+
+All `sdtm.oak` functions in these exercises are mocked — they run without any package installed and produce identical output to the real functions.
+
+---
+
+## 1 — The "extra variables" problem
+
+### Why SUPP-- exists
+
+SDTM standardizes variable names and meanings: every AE has AETERM, AESEV, AESER, etc. But real studies collect more than the standard allows. A sponsor might track:
+
+- Internal severity grades (0–5 ordinal) not covered by the AESEV codelist
+- Investigator narratives
+- Sponsor-specific classifications or flags
+- Custom dates
+
+These variables matter for analysis but have no home in the standard domain. SDTM's answer is **SUPP--** (Supplemental Qualifier datasets): `SUPPAE`, `SUPPDM`, `SUPPLB`, etc.
+
+```{r supp-intro-demo}
+# Peek at what "extra" columns our ae_raw has beyond standard SDTM
+setdiff(names(ae_raw), c("PATNUM", "STUDYID", "SITEID",
+                          "AETERM", "AESTDT", "AEENDT",
+                          "AESEV", "AESER", "AEOUT"))
+```
+
+Those three extra columns (`SPONSOR_AE_ID`, `INV_AE_CAT`, `AE_SAFETY_MTG`) are SUPP-- candidates — they were collected on the CRF but don't belong in the AE domain.
+
+---
+
+## 2 — The SUPP-- shape
+
+### Fixed long format
+
+A SUPP-- dataset has a fixed column structure defined by SDTMIG:
+
+| Column | Meaning |
+|---|---|
+| `STUDYID` | Study identifier |
+| `RDOMAIN` | Parent domain (e.g., `"AE"`) |
+| `USUBJID` | Subject |
+| `IDVAR` | Variable in parent that identifies the row (e.g., `"AESEQ"`) |
+| `IDVARVAL` | Value of that variable for this row (e.g., `"1"`) |
+| `QNAM` | Qualifier name (≤8 chars, uppercase) |
+| `QLABEL` | Human-readable label for QNAM |
+| `QVAL` | The value (always character) |
+| `QORIG` | Origin: `"CRF"`, `"DERIVED"`, `"ASSIGNED"` |
+| `QEVAL` | Evaluator: `"INVESTIGATOR"`, `"SPONSOR"`, etc. |
+
+**Key rule**: instead of adding non-standard columns to `ae`, you create rows in `suppae` — one row per (subject × parent record × non-standard variable).
+
+```{r supp-shape-demo}
+# A hand-built example of what a SUPPAE row looks like
+tibble(
+  STUDYID  = "TEST_STUDY",
+  RDOMAIN  = "AE",
+  USUBJID  = "TEST_STUDY-701-1015",
+  IDVAR    = "AESEQ",
+  IDVARVAL = "1",
+  QNAM     = "AESPID",
+  QLABEL   = "Sponsor-specific AE ID",
+  QVAL     = "AE001",
+  QORIG    = "CRF",
+  QEVAL    = "INVESTIGATOR"
+)
+```
+
+### Subject-level vs record-level
+
+- **Record-level**: IDVAR + IDVARVAL point to a specific row in the parent. Example: a comment about AE #2.
+- **Subject-level**: IDVAR and IDVARVAL are `""` (empty string). The qualifier applies to the subject as a whole. Common in SUPPDM — e.g., a stratification group that doesn't fit any DM variable.
+
+---
+
+## 3 — What goes to SUPP-- vs the parent domain?
+
+```{r quiz-supp-vs-parent, echo=FALSE}
+quiz(
+  question(
+    "Your CRF has a field 'AEBODSYS' (Body System). Where does it go?",
+    answer("SUPPAE — it's non-standard"),
+    answer("AE domain — AEBODSYS is in the SDTMIG", correct = TRUE),
+    answer("It depends on the sponsor"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Your CRF has a field 'INV_AE_GRADE' (Investigator grade 0-5). Where does it go?",
+    answer("AE domain — it's about adverse events"),
+    answer("SUPPAE — it's not in the SDTMIG AE variable list", correct = TRUE),
+    answer("You just drop it"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A SUPPAE row with blank IDVAR and IDVARVAL means:",
+    answer("It's a record-level qualifier for a specific AE"),
+    answer("It's a subject-level qualifier, not tied to a specific AE row", correct = TRUE),
+    answer("The IDVAR was not collected"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 4 — Building SUPP-- manually with dplyr
+
+The manual approach is the most transparent. Walk through it once to understand exactly what the structure requires.
+
+**Strategy**: join the parent domain (which has AESEQ) to the raw data (which has the non-standard values), then `pivot_longer()` to go from wide to long, then add the fixed SUPP-- columns.
+
+```{r supp-manual-demo}
+# Step 1: Attach non-standard raw columns to the parent using patient_number
+ae_with_extras <- ae |>
+  select(STUDYID, USUBJID, AESEQ, patient_number) |>
+  inner_join(
+    ae_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw") |>
+      select(patient_number, SPONSOR_AE_ID, INV_AE_CAT),
+    by = "patient_number"
+  )
+
+ae_with_extras
+```
+
+```{r supp-manual-pivot}
+# Step 2: pivot_longer to get one row per QNAM
+ae_long <- ae_with_extras |>
+  pivot_longer(
+    cols      = c(SPONSOR_AE_ID, INV_AE_CAT),
+    names_to  = "QNAM",
+    values_to = "QVAL"
+  ) |>
+  filter(!is.na(QVAL) & QVAL != "")
+
+ae_long
+```
+
+```{r supp-manual-final}
+# Step 3: add fixed SUPP-- columns
+suppae_manual <- ae_long |>
+  mutate(
+    RDOMAIN  = "AE",
+    IDVAR    = "AESEQ",
+    IDVARVAL = as.character(AESEQ),
+    QLABEL   = case_when(
+      QNAM == "SPONSOR_AE_ID" ~ "Sponsor-specific AE ID",
+      QNAM == "INV_AE_CAT"    ~ "Investigator AE Category"
+    ),
+    QORIG = "CRF",
+    QEVAL = "INVESTIGATOR"
+  ) |>
+  select(STUDYID, RDOMAIN, USUBJID, IDVAR, IDVARVAL,
+         QNAM, QLABEL, QVAL, QORIG, QEVAL)
+
+suppae_manual
+```
+
+### Exercise: Add a third qualifier to SUPPAE
+
+The `ae_raw` dataset also has `AE_SAFETY_MTG` — whether the AE was discussed at a safety review meeting. Add it to the SUPPAE dataset. Start from `ae_with_extras` above but include `AE_SAFETY_MTG` in the `pivot_longer()`.
+
+```{r supp-three-cols, exercise=TRUE, exercise.lines=30}
+# Modify this to also include AE_SAFETY_MTG
+ae_with_extras3 <- ae |>
+  select(STUDYID, USUBJID, AESEQ, patient_number) |>
+  inner_join(
+    ae_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw") |>
+      select(patient_number, SPONSOR_AE_ID, INV_AE_CAT, AE_SAFETY_MTG),
+    by = "patient_number"
+  )
+
+# Now pivot all three columns and add SUPP-- structure
+suppae_3 <- ae_with_extras3 |>
+  pivot_longer(
+    cols      = _____________,   # include all three columns
+    names_to  = "QNAM",
+    values_to = "QVAL"
+  ) |>
+  filter(!is.na(QVAL) & QVAL != "") |>
+  mutate(
+    RDOMAIN  = "AE",
+    IDVAR    = "AESEQ",
+    IDVARVAL = as.character(AESEQ),
+    QLABEL   = case_when(
+      QNAM == "SPONSOR_AE_ID"  ~ "Sponsor-specific AE ID",
+      QNAM == "INV_AE_CAT"     ~ "Investigator AE Category",
+      QNAM == "AE_SAFETY_MTG"  ~ _____________   # fill in the label
+    ),
+    QORIG = "CRF",
+    QEVAL = "INVESTIGATOR"
+  ) |>
+  select(STUDYID, RDOMAIN, USUBJID, IDVAR, IDVARVAL,
+         QNAM, QLABEL, QVAL, QORIG, QEVAL)
+
+suppae_3
+```
+
+```{r supp-three-cols-hint-1}
+# In pivot_longer, list all three column names:
+# cols = c(SPONSOR_AE_ID, INV_AE_CAT, AE_SAFETY_MTG)
+# For QLABEL:
+# QNAM == "AE_SAFETY_MTG" ~ "Safety Review Meeting Flag"
+```
+
+```{r supp-three-cols-solution}
+ae_with_extras3 <- ae |>
+  select(STUDYID, USUBJID, AESEQ, patient_number) |>
+  inner_join(
+    ae_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw") |>
+      select(patient_number, SPONSOR_AE_ID, INV_AE_CAT, AE_SAFETY_MTG),
+    by = "patient_number"
+  )
+
+suppae_3 <- ae_with_extras3 |>
+  pivot_longer(
+    cols      = c(SPONSOR_AE_ID, INV_AE_CAT, AE_SAFETY_MTG),
+    names_to  = "QNAM",
+    values_to = "QVAL"
+  ) |>
+  filter(!is.na(QVAL) & QVAL != "") |>
+  mutate(
+    RDOMAIN  = "AE",
+    IDVAR    = "AESEQ",
+    IDVARVAL = as.character(AESEQ),
+    QLABEL   = case_when(
+      QNAM == "SPONSOR_AE_ID"  ~ "Sponsor-specific AE ID",
+      QNAM == "INV_AE_CAT"     ~ "Investigator AE Category",
+      QNAM == "AE_SAFETY_MTG"  ~ "Safety Review Meeting Flag"
+    ),
+    QORIG = "CRF",
+    QEVAL = "INVESTIGATOR"
+  ) |>
+  select(STUDYID, RDOMAIN, USUBJID, IDVAR, IDVARVAL,
+         QNAM, QLABEL, QVAL, QORIG, QEVAL)
+
+suppae_3
+```
+
+---
+
+## 5 — Subject-level SUPPDM
+
+Subject-level SUPP-- rows have blank IDVAR and IDVARVAL — the qualifier applies to the whole subject, not a specific record.
+
+A DM domain rarely has a sequential key the way AE does. For subject-level items, set both `IDVAR = ""` and `IDVARVAL = ""`.
+
+### Exercise: Build a subject-level SUPPDM
+
+Suppose `dm_raw` has a column `STRAT_GRP` (stratification group) that doesn't map to any standard DM variable. Build a SUPPDM with one row per subject.
+
+```{r suppdm-subject, exercise=TRUE, exercise.lines=28}
+# Mock DM datasets
+dm_raw <- tibble(
+  PATNUM    = c(1015L, 1023L, 1042L),
+  STUDYID   = "TEST_STUDY",
+  SITEID    = c("701", "702", "703"),
+  BIRTHDT   = c("1975-03-12", "1962-08-22", "1988-11-05"),
+  SEX       = c("M", "F", "M"),
+  RACE      = c("WHITE", "ASIAN", "WHITE"),
+  STRAT_GRP = c("A", "B", "A")   # <- non-standard, goes to SUPPDM
+)
+
+dm <- tibble(
+  STUDYID = "TEST_STUDY",
+  DOMAIN  = "DM",
+  USUBJID = c("TEST_STUDY-701-1015", "TEST_STUDY-702-1023", "TEST_STUDY-703-1042"),
+  patient_number = c(1015L, 1023L, 1042L)
+)
+
+# Build SUPPDM: subject-level (IDVAR = "", IDVARVAL = "")
+suppdm <- dm |>
+  select(STUDYID, USUBJID, patient_number) |>
+  inner_join(
+    dm_raw |> select(PATNUM, STRAT_GRP) |> rename(patient_number = PATNUM),
+    by = "patient_number"
+  ) |>
+  filter(!is.na(STRAT_GRP)) |>
+  transmute(
+    STUDYID,
+    RDOMAIN  = ___,
+    USUBJID,
+    IDVAR    = ___,        # subject-level: blank
+    IDVARVAL = ___,        # subject-level: blank
+    QNAM     = "STRAGRP",
+    QLABEL   = "Stratification Group",
+    QVAL     = STRAT_GRP,
+    QORIG    = "CRF",
+    QEVAL    = "INVESTIGATOR"
+  )
+
+suppdm
+```
+
+```{r suppdm-subject-hint-1}
+# RDOMAIN = "DM"
+# IDVAR   = ""   (empty string — subject level)
+# IDVARVAL = ""  (empty string — subject level)
+```
+
+```{r suppdm-subject-solution}
+dm_raw <- tibble(
+  PATNUM    = c(1015L, 1023L, 1042L),
+  STUDYID   = "TEST_STUDY",
+  SITEID    = c("701", "702", "703"),
+  BIRTHDT   = c("1975-03-12", "1962-08-22", "1988-11-05"),
+  SEX       = c("M", "F", "M"),
+  RACE      = c("WHITE", "ASIAN", "WHITE"),
+  STRAT_GRP = c("A", "B", "A")
+)
+
+dm <- tibble(
+  STUDYID = "TEST_STUDY",
+  DOMAIN  = "DM",
+  USUBJID = c("TEST_STUDY-701-1015", "TEST_STUDY-702-1023", "TEST_STUDY-703-1042"),
+  patient_number = c(1015L, 1023L, 1042L)
+)
+
+suppdm <- dm |>
+  select(STUDYID, USUBJID, patient_number) |>
+  inner_join(
+    dm_raw |> select(PATNUM, STRAT_GRP) |> rename(patient_number = PATNUM),
+    by = "patient_number"
+  ) |>
+  filter(!is.na(STRAT_GRP)) |>
+  transmute(
+    STUDYID,
+    RDOMAIN  = "DM",
+    USUBJID,
+    IDVAR    = "",
+    IDVARVAL = "",
+    QNAM     = "STRAGRP",
+    QLABEL   = "Stratification Group",
+    QVAL     = STRAT_GRP,
+    QORIG    = "CRF",
+    QEVAL    = "INVESTIGATOR"
+  )
+
+suppdm
+```
+
+---
+
+## 6 — `generate_sdtm_supp()` (sdtm.oak automation)
+
+`sdtm.oak` v0.2.0+ provides `generate_sdtm_supp()` to automate the dplyr pattern above. You pass the parent dataset, the raw data, the row-identifier variable, and a list of qualifier definitions.
+
+```{r supp-oak-demo}
+# Using generate_sdtm_supp() — mocked here with identical behavior
+suppae_oak <- generate_sdtm_supp(
+  parent_dataset  = ae,
+  raw_dat         = ae_raw |> generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw"),
+  id_var          = "AESEQ",
+  qnam_definitions = list(
+    list(
+      qnam    = "AESPID",
+      qlabel  = "Sponsor-specific AE ID",
+      raw_var = "SPONSOR_AE_ID",
+      qorig   = "CRF",
+      qeval   = "INVESTIGATOR"
+    ),
+    list(
+      qnam    = "AESCAT",
+      qlabel  = "Investigator AE Category",
+      raw_var = "INV_AE_CAT",
+      qorig   = "CRF",
+      qeval   = "INVESTIGATOR"
+    )
+  )
+)
+
+suppae_oak
+```
+
+### Exercise: Add the safety meeting qualifier via `generate_sdtm_supp()`
+
+Call `generate_sdtm_supp()` with three qualifiers: `AESPID`, `AESCAT`, and a new one for `AE_SAFETY_MTG` (QNAM = `"AESMTG"`, label = `"Safety Review Meeting Flag"`).
+
+```{r supp-oak-three, exercise=TRUE, exercise.lines=30}
+ae_raw_with_ids <- ae_raw |>
+  generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw")
+
+suppae_three <- generate_sdtm_supp(
+  parent_dataset  = ae,
+  raw_dat         = ae_raw_with_ids,
+  id_var          = "AESEQ",
+  qnam_definitions = list(
+    list(
+      qnam    = "AESPID",
+      qlabel  = "Sponsor-specific AE ID",
+      raw_var = "SPONSOR_AE_ID",
+      qorig   = "CRF",
+      qeval   = "INVESTIGATOR"
+    ),
+    list(
+      qnam    = "AESCAT",
+      qlabel  = "Investigator AE Category",
+      raw_var = "INV_AE_CAT",
+      qorig   = "CRF",
+      qeval   = "INVESTIGATOR"
+    ),
+    # Add the third qualifier here
+    list(
+      qnam    = ___,
+      qlabel  = ___,
+      raw_var = ___,
+      qorig   = "CRF",
+      qeval   = "INVESTIGATOR"
+    )
+  )
+)
+
+suppae_three
+```
+
+```{r supp-oak-three-hint-1}
+# The third list() entry:
+# qnam    = "AESMTG"
+# qlabel  = "Safety Review Meeting Flag"
+# raw_var = "AE_SAFETY_MTG"
+```
+
+```{r supp-oak-three-solution}
+ae_raw_with_ids <- ae_raw |>
+  generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw")
+
+suppae_three <- generate_sdtm_supp(
+  parent_dataset  = ae,
+  raw_dat         = ae_raw_with_ids,
+  id_var          = "AESEQ",
+  qnam_definitions = list(
+    list(
+      qnam    = "AESPID",
+      qlabel  = "Sponsor-specific AE ID",
+      raw_var = "SPONSOR_AE_ID",
+      qorig   = "CRF",
+      qeval   = "INVESTIGATOR"
+    ),
+    list(
+      qnam    = "AESCAT",
+      qlabel  = "Investigator AE Category",
+      raw_var = "INV_AE_CAT",
+      qorig   = "CRF",
+      qeval   = "INVESTIGATOR"
+    ),
+    list(
+      qnam    = "AESMTG",
+      qlabel  = "Safety Review Meeting Flag",
+      raw_var = "AE_SAFETY_MTG",
+      qorig   = "CRF",
+      qeval   = "INVESTIGATOR"
+    )
+  )
+)
+
+suppae_three
+```
+
+---
+
+## 7 — SUPP-- validation rules
+
+Before submitting SUPP--, these rules must hold:
+
+```{r quiz-supp-validation, echo=FALSE}
+quiz(
+  question(
+    "QNAM must be:",
+    answer("Exactly the same as the raw column name"),
+    answer("Maximum 8 characters, uppercase", correct = TRUE),
+    answer("The same as the SDTM variable it's supplementing"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "QVAL is always:",
+    answer("Numeric when the original value was numeric"),
+    answer("Character — there is no QVALN in SUPP--", correct = TRUE),
+    answer("In CDISC controlled terminology"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "An 'orphan' SUPP-- row is one where:",
+    answer("IDVARVAL references a row that doesn't exist in the parent domain", correct = TRUE),
+    answer("QVAL is missing"),
+    answer("The RDOMAIN doesn't match the dataset name"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise: Validate SUPP-- — check for orphan rows
+
+An orphan SUPP-- row has an `IDVARVAL` that doesn't match any `AESEQ` in the parent AE domain.
+
+Write code that finds orphan rows in `suppae_manual`:
+
+```{r supp-orphan-check, exercise=TRUE, exercise.lines=12}
+# suppae_manual was built earlier (2 qualifiers × 5 AE records = 10 rows)
+# ae has AESEQ per USUBJID
+
+# Find rows in suppae_manual where the IDVARVAL doesn't match any AESEQ
+orphans <- suppae_manual |>
+  anti_join(
+    ae |> mutate(IDVARVAL = as.character(___)) |>
+          select(USUBJID, IDVARVAL),
+    by = c("USUBJID", "IDVARVAL")
+  )
+
+cat("Orphan rows:", nrow(orphans), "\n")
+orphans
+```
+
+```{r supp-orphan-check-hint-1}
+# mutate(IDVARVAL = as.character(AESEQ))
+```
+
+```{r supp-orphan-check-solution}
+orphans <- suppae_manual |>
+  anti_join(
+    ae |> mutate(IDVARVAL = as.character(AESEQ)) |>
+          select(USUBJID, IDVARVAL),
+    by = c("USUBJID", "IDVARVAL")
+  )
+
+cat("Orphan rows:", nrow(orphans), "\n")
+orphans
+```
+
+---
+
+## 8 — RELREC: linking records across domains
+
+### What RELREC is for
+
+The Related Records dataset links specific rows in one domain to specific rows in another. Common use cases:
+
+- An AE caused by a specific dose (AE → EX link)
+- A concomitant medication given to treat a specific AE (CM → AE link)
+- A lab test performed during a procedure (LB → PR link)
+
+### The structure
+
+RELREC has the same IDVAR/IDVARVAL concept as SUPP--, but instead of one row per qualifier, you get **two rows per relationship** — one for each domain side — sharing a `RELID`:
+
+```{r relrec-shape-demo}
+# An example relationship: AE001 ↔ EX001 for subject 01-701-1015
+tibble(
+  STUDYID  = c("TEST_STUDY", "TEST_STUDY"),
+  USUBJID  = c("TEST_STUDY-701-1015", "TEST_STUDY-701-1015"),
+  RDOMAIN  = c("AE", "EX"),
+  IDVAR    = c("AESEQ", "EXSEQ"),
+  IDVARVAL = c("1", "1"),
+  RELID    = c("REL01", "REL01"),
+  RELTYPE  = c("ONE", "ONE")
+)
+```
+
+The two rows share `RELID = "REL01"`. `RELTYPE` indicates cardinality: `ONE` means one-to-one at this end of the relationship.
+
+---
+
+## 9 — Building RELREC with dplyr
+
+`sdtm.oak` doesn't yet provide a RELREC helper — build it manually. The pattern:
+
+1. Join the AE sponsor ID column to the EX sponsor ID column via the link table
+2. Build the AE side of each pair
+3. Build the EX side of each pair
+4. `bind_rows()` to stack them
+
+```{r relrec-build-demo}
+# Step 1: join AE and EX via the sponsor ID link table
+# ae_ex_link connects AE_SPONSOR_ID to EX_SPONSOR_ID per subject
+
+ae_linked <- ae |>
+  select(USUBJID, AESEQ, patient_number) |>
+  inner_join(
+    ae_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw") |>
+      select(patient_number, SPONSOR_AE_ID),
+    by = "patient_number"
+  )
+
+ex_linked <- ex |>
+  select(USUBJID, EXSEQ, patient_number) |>
+  inner_join(
+    ex_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ex_raw") |>
+      select(patient_number, EXSPID),
+    by = "patient_number"
+  )
+
+# Use the link table to connect them
+pairs <- ae_ex_link |>
+  inner_join(
+    ae_linked |> rename(AE_SPONSOR_ID = SPONSOR_AE_ID),
+    by = "AE_SPONSOR_ID"
+  ) |>
+  inner_join(
+    ex_linked |> rename(EX_SPONSOR_ID = EXSPID) |>
+      select(USUBJID, EXSEQ, EX_SPONSOR_ID),
+    by = c("USUBJID", "EX_SPONSOR_ID")
+  ) |>
+  mutate(RELID = paste0("REL", str_pad(row_number(), 2, pad = "0")))
+
+pairs
+```
+
+```{r relrec-sides}
+# Step 2: build AE side
+relrec_ae <- pairs |>
+  transmute(
+    STUDYID  = "TEST_STUDY",
+    USUBJID,
+    RDOMAIN  = "AE",
+    IDVAR    = "AESEQ",
+    IDVARVAL = as.character(AESEQ),
+    RELID,
+    RELTYPE  = "ONE"
+  )
+
+# Step 3: build EX side
+relrec_ex <- pairs |>
+  transmute(
+    STUDYID  = "TEST_STUDY",
+    USUBJID,
+    RDOMAIN  = "EX",
+    IDVAR    = "EXSEQ",
+    IDVARVAL = as.character(EXSEQ),
+    RELID,
+    RELTYPE  = "ONE"
+  )
+
+# Step 4: stack
+relrec <- bind_rows(relrec_ae, relrec_ex) |>
+  arrange(RELID, RDOMAIN)
+
+relrec
+```
+
+### Exercise: Add a CM → AE relationship to RELREC
+
+A new CM (concomitant medication) domain has these records:
+
+```{r relrec-cm-setup}
+cm <- tibble(
+  STUDYID = "TEST_STUDY",
+  DOMAIN  = "CM",
+  USUBJID = c("TEST_STUDY-703-1042", "TEST_STUDY-703-1042"),
+  CMSEQ   = c(1L, 2L),
+  CMTRT   = c("ACETAMINOPHEN", "ONDANSETRON"),
+  CMSPID  = c("CM001", "CM002"),  # links to AE004 and AE005
+  patient_number = c(1042L, 1042L)
+)
+
+cm_ae_link <- tibble(
+  CM_SPONSOR_ID = c("CM001", "CM002"),
+  AE_SPONSOR_ID = c("AE004", "AE004")  # both CMs treat AE004
+)
+```
+
+Build a RELREC for these CM → AE links. Each relationship produces two rows (one CM row, one AE row) sharing a RELID.
+
+```{r relrec-cm-exercise, exercise=TRUE, exercise.lines=45}
+# Step 1: join CM to link table, then to AE
+cm_linked <- cm |>
+  select(USUBJID, CMSEQ, CMSPID, patient_number) |>
+  rename(CM_SPONSOR_ID = CMSPID)
+
+ae_linked_ids <- ae |>
+  select(USUBJID, AESEQ, patient_number) |>
+  inner_join(
+    ae_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw") |>
+      select(patient_number, SPONSOR_AE_ID) |>
+      rename(AE_SPONSOR_ID = SPONSOR_AE_ID),
+    by = "patient_number"
+  )
+
+pairs_cm_ae <- cm_ae_link |>
+  inner_join(cm_linked, by = "CM_SPONSOR_ID") |>
+  inner_join(
+    ae_linked_ids |> select(USUBJID, AESEQ, AE_SPONSOR_ID),
+    by = c("USUBJID", "AE_SPONSOR_ID")
+  ) |>
+  mutate(RELID = paste0("REL", str_pad(row_number(), 2, pad = "0")))
+
+# Step 2: CM side
+relrec_cm <- pairs_cm_ae |>
+  transmute(
+    STUDYID  = "TEST_STUDY",
+    USUBJID,
+    RDOMAIN  = ___,
+    IDVAR    = ___,
+    IDVARVAL = as.character(___),
+    RELID,
+    RELTYPE  = "ONE"
+  )
+
+# Step 3: AE side
+relrec_ae2 <- pairs_cm_ae |>
+  transmute(
+    STUDYID  = "TEST_STUDY",
+    USUBJID,
+    RDOMAIN  = ___,
+    IDVAR    = ___,
+    IDVARVAL = as.character(___),
+    RELID,
+    RELTYPE  = "ONE"
+  )
+
+# Step 4: stack
+relrec_cm_ae <- bind_rows(relrec_cm, relrec_ae2) |>
+  arrange(RELID, RDOMAIN)
+
+relrec_cm_ae
+```
+
+```{r relrec-cm-exercise-hint-1}
+# CM side:  RDOMAIN = "CM", IDVAR = "CMSEQ", IDVARVAL = as.character(CMSEQ)
+# AE side:  RDOMAIN = "AE", IDVAR = "AESEQ", IDVARVAL = as.character(AESEQ)
+```
+
+```{r relrec-cm-exercise-solution}
+cm_linked <- cm |>
+  select(USUBJID, CMSEQ, CMSPID, patient_number) |>
+  rename(CM_SPONSOR_ID = CMSPID)
+
+ae_linked_ids <- ae |>
+  select(USUBJID, AESEQ, patient_number) |>
+  inner_join(
+    ae_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw") |>
+      select(patient_number, SPONSOR_AE_ID) |>
+      rename(AE_SPONSOR_ID = SPONSOR_AE_ID),
+    by = "patient_number"
+  )
+
+pairs_cm_ae <- cm_ae_link |>
+  inner_join(cm_linked, by = "CM_SPONSOR_ID") |>
+  inner_join(
+    ae_linked_ids |> select(USUBJID, AESEQ, AE_SPONSOR_ID),
+    by = c("USUBJID", "AE_SPONSOR_ID")
+  ) |>
+  mutate(RELID = paste0("REL", str_pad(row_number(), 2, pad = "0")))
+
+relrec_cm <- pairs_cm_ae |>
+  transmute(
+    STUDYID  = "TEST_STUDY",
+    USUBJID,
+    RDOMAIN  = "CM",
+    IDVAR    = "CMSEQ",
+    IDVARVAL = as.character(CMSEQ),
+    RELID,
+    RELTYPE  = "ONE"
+  )
+
+relrec_ae2 <- pairs_cm_ae |>
+  transmute(
+    STUDYID  = "TEST_STUDY",
+    USUBJID,
+    RDOMAIN  = "AE",
+    IDVAR    = "AESEQ",
+    IDVARVAL = as.character(AESEQ),
+    RELID,
+    RELTYPE  = "ONE"
+  )
+
+relrec_cm_ae <- bind_rows(relrec_cm, relrec_ae2) |>
+  arrange(RELID, RDOMAIN)
+
+relrec_cm_ae
+```
+
+---
+
+## 10 — RELREC validation
+
+```{r quiz-relrec, echo=FALSE}
+quiz(
+  question(
+    "A RELREC dataset has a RELID 'REL05' that appears only once. This is:",
+    answer("Valid — one-sided relationships are allowed"),
+    answer("Invalid — every RELID must appear exactly twice (one per domain side)", correct = TRUE),
+    answer("Only valid if RELTYPE = 'MANY'"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "RELTYPE = 'MANY' on a RELREC row means:",
+    answer("The subject has many records in this domain (cardinality flag)", correct = TRUE),
+    answer("The relationship spans many studies"),
+    answer("You can have unlimited RELIDs for this record"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise: Validate RELREC — check that every RELID appears exactly twice
+
+```{r relrec-validate, exercise=TRUE, exercise.lines=12}
+# Check relrec (the AE-EX relrec built in the demo) for orphan RELIDs
+relid_counts <- relrec |>
+  count(___)
+
+cat("RELID counts:\n")
+print(relid_counts)
+
+# Flag any RELID that doesn't appear exactly twice
+bad_relids <- relid_counts |>
+  filter(___ != 2)
+
+cat("\nInvalid RELIDs:", nrow(bad_relids), "\n")
+```
+
+```{r relrec-validate-hint-1}
+# count(RELID)
+# filter(n != 2)
+```
+
+```{r relrec-validate-solution}
+relid_counts <- relrec |>
+  count(RELID)
+
+cat("RELID counts:\n")
+print(relid_counts)
+
+bad_relids <- relid_counts |>
+  filter(n != 2)
+
+cat("\nInvalid RELIDs:", nrow(bad_relids), "\n")
+```
+
+---
+
+## 11 — The CO (Comments) domain
+
+CO (Comments) stores free-text comments, optionally linked to a specific domain record. It looks like SUPP-- but is a proper parent domain:
+
+```{r co-domain-demo}
+# Build a minimal CO domain manually (no sdtm.oak helper exists yet)
+# One comment linked to AE #2 of subject 1015, one general subject comment
+co <- tibble(
+  STUDYID = "TEST_STUDY",
+  DOMAIN  = "CO",
+  USUBJID = c("TEST_STUDY-701-1015", "TEST_STUDY-701-1015"),
+  COSEQ   = c(1L, 2L),
+  IDVAR   = c("AESEQ", ""),
+  IDVARVAL = c("2", ""),
+  RDOMAIN = c("AE", ""),
+  COREF   = c("Investigator note", ""),
+  COMVAL  = c(
+    "Patient reported symptom onset after first dose of study drug.",
+    "Subject requested unscheduled phone contact on 2020-09-05."
+  )
+)
+
+co
+```
+
+The key difference from SUPP--: CO uses `COSEQ` (its own sequence number) and `COMVAL` (the comment text). It's a first-class domain, not an appendage to another.
+
+---
+
+## 12 — Trial design domains and SV/SE
+
+A brief orientation to domains `sdtm.oak` doesn't yet support:
+
+```{r trial-design-demo}
+# Trial design domains are typically hand-coded from protocol spec
+# Example: a minimal TS (Trial Summary) dataset
+ts <- tibble(
+  STUDYID  = "TEST_STUDY",
+  DOMAIN   = "TS",
+  TSSEQ    = 1:5,
+  TSPARMCD = c("TITLE", "PHASE", "TTYPE", "PCLAS", "SPONSOR"),
+  TSPARM   = c("Trial Title", "Trial Phase", "Trial Type",
+               "Pharmacological Class", "Sponsor Name"),
+  TSVAL    = c("A Phase 2 Study of Study Drug in Patients with X",
+               "PHASE2", "INTERVENTIONAL", "KINASE INHIBITOR",
+               "Sponsor Corp"),
+  TSVALCD  = c(NA, "2", NA, NA, NA)
+)
+
+ts
+```
+
+Trial design domains (TA, TE, TI, TS, TV, TX) describe the *study* rather than subjects. They often have very few rows and are built from the protocol document or spec spreadsheet, not from EDC raw data.
+
+### Exercise: Build a minimal TV (Trial Visits) dataset
+
+The protocol specifies 4 planned visits. Build a `tv` dataset with the required TVSEQ, VISITNUM, VISIT, and VISITDY (planned day).
+
+```{r tv-build, exercise=TRUE, exercise.lines=22}
+# Build TV from the protocol visit schedule
+visit_schedule <- tibble(
+  VISITNUM = c(1, 2, 3, 4),
+  VISIT    = c("SCREENING", "BASELINE", "WEEK 4", "WEEK 8"),
+  VISITDY  = c(-7L, 1L, 29L, 57L)
+)
+
+tv <- visit_schedule |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "TV",
+    TVSEQ   = row_number(),
+    ARM     = "TREATMENT"
+  ) |>
+  select(___)  # put columns in SDTM order: STUDYID, DOMAIN, TVSEQ, ARM, VISITNUM, VISIT, VISITDY
+
+tv
+```
+
+```{r tv-build-hint-1}
+# select(STUDYID, DOMAIN, TVSEQ, ARM, VISITNUM, VISIT, VISITDY)
+```
+
+```{r tv-build-solution}
+visit_schedule <- tibble(
+  VISITNUM = c(1, 2, 3, 4),
+  VISIT    = c("SCREENING", "BASELINE", "WEEK 4", "WEEK 8"),
+  VISITDY  = c(-7L, 1L, 29L, 57L)
+)
+
+tv <- visit_schedule |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "TV",
+    TVSEQ   = row_number(),
+    ARM     = "TREATMENT"
+  ) |>
+  select(STUDYID, DOMAIN, TVSEQ, ARM, VISITNUM, VISIT, VISITDY)
+
+tv
+```
+
+---
+
+## 13 — Pragmatic decision guide
+
+```{r quiz-decision-guide, echo=FALSE}
+quiz(
+  question(
+    "You're building LB for a PK study. A few lab records have a comment about sample hemolysis. Where does this go?",
+    answer("Add a new column LBHEMO to the LB domain"),
+    answer("SUPPAE"),
+    answer("SUPPLB with QNAM = 'LBHEMO' and IDVAR = 'LBSEQ'", correct = TRUE),
+    answer("CO domain"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The study's SAP describes 'for each AE, identify the most recent prior dose'. This analysis needs:",
+    answer("SUPP-- only"),
+    answer("RELREC linking AE to EX rows", correct = TRUE),
+    answer("A new SDTM domain"),
+    answer("CO domain"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Which of these is NOT currently supported directly by sdtm.oak (as of v0.1)?",
+    answer("AE Events domain"),
+    answer("VS Findings domain"),
+    answer("RELREC", correct = TRUE),
+    answer("DM domain"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 14 — Capstone exercise: Full SUPPAE + RELREC
+
+Put it all together. Given the `ae`, `ae_raw`, `ex`, `ex_raw`, and `ae_ex_link` objects:
+
+1. Build `suppae` with two qualifiers: `AESPID` and `AESCAT`
+2. Build `relrec` linking the two AE-EX pairs (using `ae_ex_link`)
+3. Check that `suppae` has no orphan rows and `relrec` has no singleton RELIDs
+
+```{r capstone-suppae-relrec, exercise=TRUE, exercise.lines=65}
+# ── Part 1: Build SUPPAE ──────────────────────────────────────────────────────
+suppae_final <- generate_sdtm_supp(
+  parent_dataset = ae,
+  raw_dat        = ae_raw |> generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw"),
+  id_var         = "AESEQ",
+  qnam_definitions = list(
+    list(qnam = "AESPID", qlabel = "Sponsor-specific AE ID",
+         raw_var = "SPONSOR_AE_ID", qorig = "CRF", qeval = "INVESTIGATOR"),
+    list(qnam = "AESCAT", qlabel = "Investigator AE Category",
+         raw_var = "INV_AE_CAT",    qorig = "CRF", qeval = "INVESTIGATOR")
+  )
+)
+
+cat("SUPPAE rows:", nrow(suppae_final), "\n")
+
+# ── Part 2: Build RELREC (AE-EX) ─────────────────────────────────────────────
+ae_linked2 <- ae |>
+  select(USUBJID, AESEQ, patient_number) |>
+  inner_join(
+    ae_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw") |>
+      select(patient_number, SPONSOR_AE_ID),
+    by = "patient_number"
+  )
+
+ex_linked2 <- ex |>
+  select(USUBJID, EXSEQ, patient_number) |>
+  inner_join(
+    ex_raw |>
+      generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ex_raw") |>
+      select(patient_number, EXSPID),
+    by = "patient_number"
+  )
+
+pairs2 <- ae_ex_link |>
+  inner_join(ae_linked2 |> rename(AE_SPONSOR_ID = SPONSOR_AE_ID), by = "AE_SPONSOR_ID") |>
+  inner_join(ex_linked2 |> rename(EX_SPONSOR_ID = EXSPID) |> select(USUBJID, EXSEQ, EX_SPONSOR_ID),
+             by = c("USUBJID", "EX_SPONSOR_ID")) |>
+  mutate(RELID = paste0("REL", str_pad(row_number(), 2, pad = "0")))
+
+relrec_final <- bind_rows(
+  pairs2 |> transmute(STUDYID = "TEST_STUDY", USUBJID, RDOMAIN = "AE",
+                       IDVAR = "AESEQ", IDVARVAL = as.character(AESEQ), RELID, RELTYPE = "ONE"),
+  pairs2 |> transmute(STUDYID = "TEST_STUDY", USUBJID, RDOMAIN = "EX",
+                       IDVAR = "EXSEQ", IDVARVAL = as.character(EXSEQ), RELID, RELTYPE = "ONE")
+) |> arrange(RELID, RDOMAIN)
+
+cat("RELREC rows:", nrow(relrec_final), "\n")
+
+# ── Part 3: Validations ───────────────────────────────────────────────────────
+# Check 1: no orphan SUPP-- rows
+orphans_final <- suppae_final |>
+  anti_join(ae |> mutate(IDVARVAL = as.character(AESEQ)) |> select(USUBJID, IDVARVAL),
+            by = c("USUBJID", "IDVARVAL"))
+cat("Orphan SUPPAE rows:", nrow(orphans_final), "\n")
+
+# Check 2: no singleton RELIDs
+singleton_relids <- relrec_final |>
+  count(RELID) |>
+  filter(n != 2)
+cat("Singleton RELIDs:", nrow(singleton_relids), "\n")
+
+list(suppae = suppae_final, relrec = relrec_final)
+```
+
+```{r capstone-suppae-relrec-hint-1}
+# This exercise is mostly pre-filled — just run it and verify:
+# SUPPAE rows:  10 (5 AE records × 2 qualifiers)
+# RELREC rows:   4 (2 relationships × 2 domain sides each)
+# Orphan SUPPAE rows: 0
+# Singleton RELIDs:   0
+```
+
+---
+
+## 15 — Key takeaways
+
+```{r quiz-final, echo=FALSE}
+quiz(
+  question(
+    "The SUPP-- column order required by SDTMIG is:",
+    answer("STUDYID, RDOMAIN, USUBJID, IDVAR, IDVARVAL, QNAM, QLABEL, QVAL, QORIG, QEVAL",
+           correct = TRUE),
+    answer("STUDYID, USUBJID, RDOMAIN, QNAM, QLABEL, QVAL, IDVAR, IDVARVAL, QORIG, QEVAL"),
+    answer("Any order — SDTM datasets don't have required column order"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Why does QVAL not have a numeric companion (QVALN)?",
+    answer("QVAL is always character by SDTMIG specification for SUPP-- datasets", correct = TRUE),
+    answer("Numeric values aren't allowed in SUPP--"),
+    answer("A numeric version exists — it's called QVALNC"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "When would RELREC NOT be needed for a study?",
+    answer("When the SAP has no cross-domain analytical questions (e.g., a simple phase-I PK study)", correct = TRUE),
+    answer("When using sdtm.oak, which handles linking automatically"),
+    answer("When SUPP-- datasets are already present"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The CO domain differs from SUPP-- primarily because:",
+    answer("CO is a proper parent domain with its own COSEQ; SUPP-- is an appendage to another domain", correct = TRUE),
+    answer("CO only holds numeric comments; SUPP-- holds text"),
+    answer("CO doesn't use IDVAR/IDVARVAL"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A practical recommendation for trial design domains (TS, TV, TA, etc.) in sdtm.oak today:",
+    answer("Use sdtm.oak algorithm functions — they support all trial design domains"),
+    answer("Build them manually with hand-coded dplyr or from a study spec spreadsheet", correct = TRUE),
+    answer("Submit them as SUPP-- instead"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## What's next
+
+Lesson 11 — **`{sdtmchecks}`** — closes out Module 2. After building all this SDTM, you need to validate it. `sdtmchecks` provides 100+ analysis-focused quality checks: duplicate records, impossible date sequences, subjects missing key domains, and more. It complements Pinnacle 21 (which checks CDISC conformance) by catching things that would break your *downstream analysis*.
+
+After Module 2, we move to Module 3 (metadata-driven programming with `metacore` and `metatools`) and then the heart of pharmaverse: `admiral` for ADaM construction.

@@ -1,0 +1,1031 @@
+---
+title: "Lesson 11 — {sdtmchecks}: Analysis-Focused SDTM Quality Checks"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+description: >
+  Run quality checks on SDTM datasets, interpret results, generate Excel reports,
+  and write custom checks using the sdtmchecks package conventions.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── Mock sdtmchecks infrastructure ───────────────────────────────────────────
+# Each check follows the same contract:
+#   Input : one or more SDTM domain data frames
+#   Output: a data frame of OFFENDING ROWS (empty = check passed)
+
+check_dm_usubjid_dup <- function(DM) {
+  DM |>
+    group_by(USUBJID) |>
+    filter(n() > 1) |>
+    ungroup() |>
+    arrange(USUBJID)
+}
+
+check_ae_dup <- function(AE) {
+  AE |>
+    group_by(USUBJID, AETERM, AESTDTC) |>
+    filter(n() > 1) |>
+    ungroup() |>
+    arrange(USUBJID, AETERM)
+}
+
+check_ex_dup <- function(EX) {
+  EX |>
+    group_by(USUBJID, EXTRT, EXSTDTC, EXENDTC) |>
+    filter(n() > 1) |>
+    ungroup()
+}
+
+check_ae_aestdtc_after_dm_death <- function(AE, DM) {
+  dm_death <- DM |>
+    filter(!is.na(DTHDTC)) |>
+    select(USUBJID, DTHDTC)
+  AE |>
+    inner_join(dm_death, by = "USUBJID") |>
+    filter(!is.na(AESTDTC) & ymd(AESTDTC) > ymd(DTHDTC)) |>
+    select(-DTHDTC)
+}
+
+check_ae_aestdtc_before_exstdtc <- function(AE, EX) {
+  first_dose <- EX |>
+    group_by(USUBJID) |>
+    summarise(FIRST_DOSE = min(ymd(EXSTDTC), na.rm = TRUE), .groups = "drop")
+  AE |>
+    inner_join(first_dose, by = "USUBJID") |>
+    filter(!is.na(AESTDTC) & ymd(AESTDTC) < FIRST_DOSE) |>
+    select(-FIRST_DOSE)
+}
+
+check_lb_dup <- function(LB) {
+  LB |>
+    group_by(USUBJID, LBTESTCD, VISIT, LBDTC) |>
+    filter(n() > 1) |>
+    ungroup() |>
+    arrange(USUBJID, LBTESTCD)
+}
+
+check_lb_lbornrlo_lbornrhi <- function(LB) {
+  LB |>
+    filter(!is.na(LBORNRLO) & !is.na(LBORNRHI)) |>
+    filter(as.numeric(LBORNRLO) > as.numeric(LBORNRHI))
+}
+
+check_vs_dup <- function(VS) {
+  VS |>
+    group_by(USUBJID, VSTESTCD, VISIT, VSDTC) |>
+    filter(n() > 1) |>
+    ungroup()
+}
+
+check_dm_no_ex <- function(DM, EX) {
+  subjects_with_ex <- EX |> distinct(USUBJID)
+  DM |>
+    anti_join(subjects_with_ex, by = "USUBJID") |>
+    filter(ARMCD != "SCRNFAIL")
+}
+
+# ── Mock check metadata ───────────────────────────────────────────────────────
+sdtmchecksmeta <- tribble(
+  ~check,                              ~category, ~priority, ~description,                                    ~datasets,
+  "check_dm_usubjid_dup",              "DM",      "High",    "Duplicate USUBJID in DM",                      "DM",
+  "check_ae_dup",                      "AE",      "High",    "Duplicate AE records (same USUBJID/term/date)", "AE",
+  "check_ex_dup",                      "EX",      "High",    "Duplicate EX records",                          "EX",
+  "check_ae_aestdtc_after_dm_death",   "AE",      "High",    "AE start date after subject death date",        "AE,DM",
+  "check_ae_aestdtc_before_exstdtc",   "AE",      "High",    "AE start date before first exposure date",      "AE,EX",
+  "check_lb_dup",                      "LB",      "High",    "Duplicate LB records per test/visit/date",      "LB",
+  "check_lb_lbornrlo_lbornrhi",        "LB",      "Medium",  "Lab reference range low > high",                "LB",
+  "check_vs_dup",                      "VS",      "Medium",  "Duplicate VS records",                          "VS",
+  "check_dm_no_ex",                    "DM",      "Medium",  "Subjects in DM with no EX records",             "DM,EX"
+)
+
+# ── Mock run_all_checks ───────────────────────────────────────────────────────
+run_all_checks <- function(metads, ...) {
+  datasets <- list(...)
+  results <- lapply(seq_len(nrow(metads)), function(i) {
+    fn_name <- metads$check[i]
+    fn <- tryCatch(get(fn_name), error = function(e) NULL)
+    if (is.null(fn)) return(list(check = fn_name, status = "skipped", issues = NULL))
+
+    needed <- strsplit(metads$datasets[i], ",")[[1]]
+    args <- datasets[needed]
+    if (any(sapply(args, is.null))) return(list(check = fn_name, status = "skipped", issues = NULL))
+
+    issues <- tryCatch(do.call(fn, args), error = function(e) NULL)
+    if (is.null(issues)) return(list(check = fn_name, status = "error", issues = NULL))
+
+    status <- if (nrow(issues) == 0) "passed" else "failed"
+    list(check = fn_name, priority = metads$priority[i],
+         status = status, issues = issues, n_issues = nrow(issues))
+  })
+  names(results) <- metads$check
+  results
+}
+
+# ── Mock report_to_xlsx ───────────────────────────────────────────────────────
+report_to_xlsx <- function(res, outfile = "sdtm_qc_report.xlsx") {
+  summary_df <- lapply(names(res), function(nm) {
+    r <- res[[nm]]
+    tibble(
+      check    = nm,
+      priority = r$priority %||% NA_character_,
+      status   = r$status,
+      n_issues = r$n_issues %||% NA_integer_
+    )
+  }) |> bind_rows()
+
+  message(sprintf(
+    "Report written to: %s\n  %d checks: %d passed, %d failed, %d skipped",
+    outfile,
+    nrow(summary_df),
+    sum(summary_df$status == "passed", na.rm = TRUE),
+    sum(summary_df$status == "failed", na.rm = TRUE),
+    sum(summary_df$status == "skipped", na.rm = TRUE)
+  ))
+  invisible(summary_df)
+}
+
+# Null-coalescing helper
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ── Sample clean SDTM datasets ────────────────────────────────────────────────
+dm <- tibble(
+  STUDYID = "TEST_STUDY",
+  DOMAIN  = "DM",
+  USUBJID = c("TS-701-1015", "TS-702-1023", "TS-703-1042", "TS-704-1101"),
+  SUBJID  = c("1015", "1023", "1042", "1101"),
+  RFSTDTC = c("2020-07-01", "2020-07-05", "2020-09-01", "2020-06-15"),
+  DTHDTC  = c(NA, NA, NA, NA),
+  ARMCD   = c("TRT", "TRT", "TRT", "TRT"),
+  ARM     = "TREATMENT"
+)
+
+ae <- tibble(
+  STUDYID = "TEST_STUDY",
+  DOMAIN  = "AE",
+  USUBJID = c("TS-701-1015", "TS-701-1015", "TS-702-1023", "TS-703-1042", "TS-703-1042"),
+  AESEQ   = c(1L, 2L, 1L, 1L, 2L),
+  AETERM  = c("HEADACHE", "NAUSEA", "FATIGUE", "DIZZINESS", "RASH"),
+  AESTDTC = c("2020-07-15", "2020-08-01", "2020-07-20", "2020-09-10", "2020-09-12"),
+  AEENDTC = c("2020-07-17", "2020-08-03", "2020-07-25", "2020-09-12", "2020-09-20"),
+  AESEV   = c("MILD", "MODERATE", "MILD", "SEVERE", "MILD"),
+  AESER   = c("N", "N", "N", "Y", "N")
+)
+
+ex <- tibble(
+  STUDYID = "TEST_STUDY",
+  DOMAIN  = "EX",
+  USUBJID = c("TS-701-1015", "TS-701-1015", "TS-702-1023", "TS-703-1042"),
+  EXSEQ   = c(1L, 2L, 1L, 1L),
+  EXTRT   = "STUDY DRUG",
+  EXDOSE  = c(100, 100, 50, 100),
+  EXSTDTC = c("2020-07-01", "2020-08-01", "2020-07-05", "2020-09-01"),
+  EXENDTC = c("2020-07-31", "2020-08-31", "2020-07-31", "2020-09-30")
+)
+
+lb <- tibble(
+  STUDYID  = "TEST_STUDY",
+  DOMAIN   = "LB",
+  USUBJID  = c("TS-701-1015", "TS-701-1015", "TS-702-1023", "TS-703-1042"),
+  LBSEQ    = c(1L, 2L, 1L, 1L),
+  LBTESTCD = c("ALT", "ALT", "ALT", "ALT"),
+  LBTEST   = "Alanine Aminotransferase",
+  VISIT    = c("BASELINE", "WEEK 4", "BASELINE", "BASELINE"),
+  LBDTC    = c("2020-07-01", "2020-07-29", "2020-07-05", "2020-09-01"),
+  LBORRES  = c("28", "35", "22", "41"),
+  LBORRESU = "U/L",
+  LBORNRLO = c("7", "7", "7", "7"),
+  LBORNRHI = c("56", "56", "56", "56")
+)
+
+vs <- tibble(
+  STUDYID  = "TEST_STUDY",
+  DOMAIN   = "VS",
+  USUBJID  = c("TS-701-1015", "TS-701-1015", "TS-702-1023"),
+  VSSEQ    = c(1L, 2L, 1L),
+  VSTESTCD = c("SYSBP", "DIABP", "SYSBP"),
+  VSDTC    = c("2020-07-01", "2020-07-01", "2020-07-05"),
+  VISIT    = c("BASELINE", "BASELINE", "BASELINE"),
+  VSORRES  = c("122", "78", "118")
+)
+
+# ── "Dirty" versions with intentional issues ──────────────────────────────────
+
+# DM with a duplicate subject
+dm_dirty <- bind_rows(
+  dm,
+  dm |> filter(USUBJID == "TS-701-1015")  # duplicate row
+)
+
+# AE with a duplicate record
+ae_dirty <- bind_rows(
+  ae,
+  ae |> filter(USUBJID == "TS-703-1042" & AESEQ == 1)  # duplicate AE
+)
+
+# AE with an impossible date (AE after death)
+dm_with_death <- dm |>
+  mutate(DTHDTC = case_when(
+    USUBJID == "TS-703-1042" ~ "2020-09-11",
+    TRUE ~ NA_character_
+  ))
+# ae has TS-703-1042 AESTDTC = "2020-09-12" — after death on 09-11
+
+# LB with inverted reference range
+lb_dirty <- lb |>
+  mutate(
+    LBORNRLO = ifelse(USUBJID == "TS-702-1023", "60", LBORNRLO),  # 60 > 56
+    LBORNRHI = ifelse(USUBJID == "TS-702-1023", "56", LBORNRHI)
+  )
+
+# AE with record before first dose (AE on 2020-06-25, first dose 2020-07-01)
+ae_early <- bind_rows(
+  ae,
+  tibble(
+    STUDYID = "TEST_STUDY", DOMAIN = "AE",
+    USUBJID = "TS-701-1015", AESEQ = 99L,
+    AETERM = "FATIGUE", AESTDTC = "2020-06-25",
+    AEENDTC = "2020-06-28", AESEV = "MILD", AESER = "N"
+  )
+)
+```
+
+## Welcome
+
+This is Lesson 11 — the final lesson of Module 2 — covering **`{sdtmchecks}`**.
+
+You've built SDTM datasets with `sdtm.oak`. Now you need to validate them. `{sdtmchecks}` is a Roche-originated, pharmaverse-community-extended package with 100+ analysis-focused quality checks.
+
+This lesson covers:
+
+- How `{sdtmchecks}` differs from Pinnacle 21 (and why you need both)
+- The check function contract: what goes in, what comes out
+- Running single checks and interpreting results
+- Running all checks with `run_all_checks()`
+- Generating an Excel report with `report_to_xlsx()`
+- Priority triage (High / Medium / Low)
+- Writing your own custom check
+- Wrapping checks in assertion style for production pipelines
+
+All functions are mocked — they run without installing the package and faithfully implement the real contract.
+
+---
+
+## 1 — sdtmchecks vs Pinnacle 21
+
+```{r quiz-p21-vs-sdtmchecks, echo=FALSE}
+quiz(
+  question(
+    "Pinnacle 21 (P21) focuses primarily on:",
+    answer("CDISC conformance — does the dataset match the SDTMIG schema?", correct = TRUE),
+    answer("Analysis-impacting issues like duplicate records or impossible dates"),
+    answer("Cross-domain consistency checks"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "sdtmchecks focuses primarily on:",
+    answer("Correct codelist values (CDISC CT)"),
+    answer("Analysis-impacting issues that would corrupt downstream analysis", correct = TRUE),
+    answer("Column ordering and length requirements"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A dataset can be P21-clean but still fail sdtmchecks because:",
+    answer("sdtmchecks has stricter CDISC conformance rules than P21"),
+    answer("A dataset can be structurally valid but contain logically impossible or analysis-corrupting data", correct = TRUE),
+    answer("P21 only checks AE and DM domains"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 2 — The check function contract
+
+Every check in `{sdtmchecks}` follows the same pattern:
+
+- **Input**: one or more SDTM domain data frames (named for the domain: `AE`, `DM`, `LB`, etc.)
+- **Output**: a data frame of **offending rows** — if empty, the check passed; if non-empty, those are the issues
+
+```{r contract-demo}
+# A passing check returns an empty data frame
+result_clean <- check_ae_dup(ae)
+cat("Clean AE — rows flagged:", nrow(result_clean), "\n")
+
+# A failing check returns the offending rows with context
+result_dirty <- check_ae_dup(ae_dirty)
+cat("Dirty AE — rows flagged:", nrow(result_dirty), "\n")
+result_dirty
+```
+
+The returned data frame contains the actual offending rows so you can investigate: you see USUBJID, AETERM, AESTDTC, and all the columns needed to track the issue down in the EDC.
+
+---
+
+## 3 — Single-domain checks
+
+### DM: Duplicate subjects
+
+```{r check-dm-dup}
+# Check for duplicate USUBJIDs in DM
+issues_dm_dup <- check_dm_usubjid_dup(dm_dirty)
+
+cat("DM duplicate subjects found:", nrow(issues_dm_dup) / 2, "\n")
+issues_dm_dup
+```
+
+### Exercise: Run the DM duplicate check on clean data
+
+The clean `dm` dataset has no duplicates. Confirm this.
+
+```{r check-dm-clean, exercise=TRUE, exercise.lines=6}
+# Run check_dm_usubjid_dup on the clean dm dataset
+result <- check_dm_usubjid_dup(___)
+
+cat("Issues found:", nrow(result), "\n")
+```
+
+```{r check-dm-clean-hint-1}
+# check_dm_usubjid_dup(dm)
+```
+
+```{r check-dm-clean-solution}
+result <- check_dm_usubjid_dup(dm)
+cat("Issues found:", nrow(result), "\n")
+```
+
+---
+
+## 4 — Multi-domain checks
+
+Some checks need more than one dataset. Pass them as separate arguments.
+
+```{r check-multi-demo}
+# AE start date after death date — needs both AE and DM
+ae_after_death <- check_ae_aestdtc_after_dm_death(
+  AE = ae,
+  DM = dm_with_death
+)
+
+cat("AEs starting after death date:", nrow(ae_after_death), "\n")
+ae_after_death
+```
+
+```{r check-before-dose-demo}
+# AE before first dose — needs both AE and EX
+ae_before_dose <- check_ae_aestdtc_before_exstdtc(
+  AE = ae_early,
+  EX = ex
+)
+
+cat("AEs starting before first dose:", nrow(ae_before_dose), "\n")
+ae_before_dose
+```
+
+### Exercise: Check for lab duplicate records
+
+`lb_dirty` doesn't have any duplicates (we'll create one below). First check the clean `lb` — it should pass — then check a version with a duplicate row.
+
+```{r check-lb-dup, exercise=TRUE, exercise.lines=14}
+# Check the clean lb dataset
+result_clean <- check_lb_dup(___)
+cat("Clean LB issues:", nrow(result_clean), "\n")
+
+# Now add a duplicate row and check again
+lb_with_dup <- bind_rows(
+  lb,
+  lb |> filter(USUBJID == "TS-701-1015" & LBTESTCD == "ALT" & VISIT == "BASELINE")
+)
+
+result_dirty <- check_lb_dup(___)
+cat("Dirty LB issues:", nrow(result_dirty), "\n")
+result_dirty
+```
+
+```{r check-lb-dup-hint-1}
+# check_lb_dup(lb)
+# check_lb_dup(lb_with_dup)
+```
+
+```{r check-lb-dup-solution}
+result_clean <- check_lb_dup(lb)
+cat("Clean LB issues:", nrow(result_clean), "\n")
+
+lb_with_dup <- bind_rows(
+  lb,
+  lb |> filter(USUBJID == "TS-701-1015" & LBTESTCD == "ALT" & VISIT == "BASELINE")
+)
+
+result_dirty <- check_lb_dup(lb_with_dup)
+cat("Dirty LB issues:", nrow(result_dirty), "\n")
+result_dirty
+```
+
+### Exercise: Check for inverted lab reference ranges
+
+`lb_dirty` has an inverted reference range for subject TS-702-1023 (LBORNRLO = 60, LBORNRHI = 56 — low > high).
+
+```{r check-lb-refrange, exercise=TRUE, exercise.lines=8}
+# Run check_lb_lbornrlo_lbornrhi on lb_dirty
+result <- check_lb_lbornrlo_lbornrhi(___)
+
+cat("Inverted reference ranges:", nrow(result), "\n")
+result
+```
+
+```{r check-lb-refrange-hint-1}
+# check_lb_lbornrlo_lbornrhi(lb_dirty)
+```
+
+```{r check-lb-refrange-solution}
+result <- check_lb_lbornrlo_lbornrhi(lb_dirty)
+cat("Inverted reference ranges:", nrow(result), "\n")
+result
+```
+
+---
+
+## 5 — The check metadata: `sdtmchecksmeta`
+
+The package ships a metadata data frame describing every check:
+
+```{r meta-explore}
+# Browse the metadata
+sdtmchecksmeta |>
+  select(check, category, priority, description) |>
+  arrange(priority, category)
+```
+
+```{r meta-filter}
+# Filter to just High-priority AE checks
+sdtmchecksmeta |>
+  filter(category == "AE", priority == "High")
+```
+
+### Exercise: Find all High-priority checks that need the DM domain
+
+```{r meta-dm-high, exercise=TRUE, exercise.lines=8}
+# Filter sdtmchecksmeta for High priority checks whose datasets column includes "DM"
+high_dm_checks <- sdtmchecksmeta |>
+  filter(priority == "High", str_detect(___, "DM"))
+
+high_dm_checks
+```
+
+```{r meta-dm-high-hint-1}
+# str_detect(datasets, "DM")
+```
+
+```{r meta-dm-high-solution}
+high_dm_checks <- sdtmchecksmeta |>
+  filter(priority == "High", str_detect(datasets, "DM"))
+
+high_dm_checks
+```
+
+---
+
+## 6 — Priority triage
+
+Each check has a priority: **High**, **Medium**, or **Low**.
+
+```{r quiz-priority, echo=FALSE}
+quiz(
+  question(
+    "Which priority level should you resolve before running any analysis?",
+    answer("Low — these are the most informational"),
+    answer("High — these strongly suggest a data error that would corrupt analysis", correct = TRUE),
+    answer("Medium — these are the most common"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A Medium-priority issue is flagged but you can explain why it's expected for your study design. You should:",
+    answer("Treat it as a High issue and block analysis"),
+    answer("Document the explanation and confirm it's expected — no action on the data needed", correct = TRUE),
+    answer("Delete the check from sdtmchecksmeta"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You can change a check's priority because:",
+    answer("Priority is hard-coded in the function — it cannot be changed"),
+    answer("Priority is stored in the sdtmchecksmeta data frame, which you can modify for your study", correct = TRUE),
+    answer("You can only change it by forking the GitHub repo"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 7 — `run_all_checks()`: running the full suite
+
+`run_all_checks()` loops over every check in the metadata and runs each against the matching named datasets in your environment.
+
+```{r run-all-demo}
+# Run all checks against our clean datasets
+all_results <- run_all_checks(
+  metads = sdtmchecksmeta,
+  DM = dm,
+  AE = ae,
+  EX = ex,
+  LB = lb,
+  VS = vs
+)
+
+# Summarise results
+lapply(names(all_results), function(nm) {
+  r <- all_results[[nm]]
+  tibble(check = nm, status = r$status, n_issues = r$n_issues %||% NA_integer_)
+}) |> bind_rows()
+```
+
+### Exercise: Run all checks on datasets with known issues
+
+Run `run_all_checks()` using the dirty datasets (`dm_dirty`, `ae_dirty`, `lb_dirty`) and compare the summary to the clean run above.
+
+```{r run-all-dirty, exercise=TRUE, exercise.lines=20}
+# Run all checks against the dirty datasets
+dirty_results <- run_all_checks(
+  metads = sdtmchecksmeta,
+  DM = ___,
+  AE = ___,
+  EX = ex,
+  LB = ___,
+  VS = vs
+)
+
+# Summarise
+summary_dirty <- lapply(names(dirty_results), function(nm) {
+  r <- dirty_results[[nm]]
+  tibble(check = nm, priority = r$priority %||% NA_character_,
+         status = r$status, n_issues = r$n_issues %||% NA_integer_)
+}) |> bind_rows()
+
+# Show only failed checks
+summary_dirty |> filter(status == "failed")
+```
+
+```{r run-all-dirty-hint-1}
+# DM = dm_dirty, AE = ae_dirty, LB = lb_dirty
+```
+
+```{r run-all-dirty-solution}
+dirty_results <- run_all_checks(
+  metads = sdtmchecksmeta,
+  DM = dm_dirty,
+  AE = ae_dirty,
+  EX = ex,
+  LB = lb_dirty,
+  VS = vs
+)
+
+summary_dirty <- lapply(names(dirty_results), function(nm) {
+  r <- dirty_results[[nm]]
+  tibble(check = nm, priority = r$priority %||% NA_character_,
+         status = r$status, n_issues = r$n_issues %||% NA_integer_)
+}) |> bind_rows()
+
+summary_dirty |> filter(status == "failed")
+```
+
+### Exercise: Run only High-priority checks
+
+Filter `sdtmchecksmeta` to High priority and pass the filtered metadata to `run_all_checks()`.
+
+```{r run-high-only, exercise=TRUE, exercise.lines=18}
+# Filter metadata to High priority
+meta_high <- sdtmchecksmeta |>
+  filter(priority == ___)
+
+# Run only those checks
+high_results <- run_all_checks(
+  metads = meta_high,
+  DM = dm_dirty,
+  AE = ae_dirty,
+  EX = ex,
+  LB = lb_dirty,
+  VS = vs
+)
+
+# Summary
+lapply(names(high_results), function(nm) {
+  r <- high_results[[nm]]
+  tibble(check = nm, status = r$status, n_issues = r$n_issues %||% NA_integer_)
+}) |> bind_rows()
+```
+
+```{r run-high-only-hint-1}
+# filter(priority == "High")
+```
+
+```{r run-high-only-solution}
+meta_high <- sdtmchecksmeta |>
+  filter(priority == "High")
+
+high_results <- run_all_checks(
+  metads = meta_high,
+  DM = dm_dirty,
+  AE = ae_dirty,
+  EX = ex,
+  LB = lb_dirty,
+  VS = vs
+)
+
+lapply(names(high_results), function(nm) {
+  r <- high_results[[nm]]
+  tibble(check = nm, status = r$status, n_issues = r$n_issues %||% NA_integer_)
+}) |> bind_rows()
+```
+
+---
+
+## 8 — `report_to_xlsx()`: generating the Excel report
+
+For sharing with non-R stakeholders (data managers, clinical operations), `report_to_xlsx()` produces a multi-tab Excel file: a summary tab and one tab per failed check.
+
+```{r report-demo}
+# Generate an Excel QC report
+report_to_xlsx(
+  res     = dirty_results,   # from run_all_checks() above
+  outfile = "sdtm_qc_report.xlsx"
+)
+```
+
+In production, this file is what study teams review:
+
+- **Summary tab**: every check, its priority, pass/fail status
+- **One tab per failed check**: the offending rows for investigation
+
+### Exercise: Generate a High-priority-only report
+
+Combine `run_all_checks()` (High priority only) with `report_to_xlsx()`.
+
+```{r report-high-only, exercise=TRUE, exercise.lines=14}
+# Step 1: run only High priority checks
+high_results2 <- run_all_checks(
+  metads = sdtmchecksmeta |> filter(___),
+  DM = dm_dirty, AE = ae_dirty, EX = ex, LB = lb_dirty, VS = vs
+)
+
+# Step 2: generate Excel report
+report_to_xlsx(
+  res     = high_results2,
+  outfile = "high_priority_qc.xlsx"
+)
+```
+
+```{r report-high-only-hint-1}
+# filter(priority == "High")
+```
+
+```{r report-high-only-solution}
+high_results2 <- run_all_checks(
+  metads = sdtmchecksmeta |> filter(priority == "High"),
+  DM = dm_dirty, AE = ae_dirty, EX = ex, LB = lb_dirty, VS = vs
+)
+
+report_to_xlsx(
+  res     = high_results2,
+  outfile = "high_priority_qc.xlsx"
+)
+```
+
+---
+
+## 9 — Writing your own custom check
+
+Adding a new check follows a simple convention: write a function returning a data frame of offending rows.
+
+```{r custom-check-demo}
+# Custom check: subjects with more than 5 AE records (unusually high)
+check_ae_high_count_per_subject <- function(AE) {
+  AE |>
+    group_by(USUBJID) |>
+    summarise(n_ae = n(), .groups = "drop") |>
+    filter(n_ae > 5) |>
+    arrange(desc(n_ae))
+}
+
+# Test it
+check_ae_high_count_per_subject(ae)
+```
+
+### Exercise: Write a check for VS records missing VSORRES
+
+A valid VS record must have a non-missing `VSORRES`. Write `check_vs_missing_result()` that returns rows where VSORRES is `NA` or empty.
+
+```{r custom-vs-check, exercise=TRUE, exercise.lines=20}
+# Write the custom check
+check_vs_missing_result <- function(VS) {
+  VS |>
+    filter(___)
+}
+
+# Test with clean VS
+cat("Clean VS issues:", nrow(check_vs_missing_result(vs)), "\n")
+
+# Test with a VS that has a missing result
+vs_with_missing <- vs |>
+  mutate(VSORRES = ifelse(row_number() == 2, NA_character_, VSORRES))
+
+cat("Dirty VS issues:", nrow(check_vs_missing_result(vs_with_missing)), "\n")
+check_vs_missing_result(vs_with_missing)
+```
+
+```{r custom-vs-check-hint-1}
+# filter(is.na(VSORRES) | VSORRES == "")
+```
+
+```{r custom-vs-check-solution}
+check_vs_missing_result <- function(VS) {
+  VS |>
+    filter(is.na(VSORRES) | VSORRES == "")
+}
+
+cat("Clean VS issues:", nrow(check_vs_missing_result(vs)), "\n")
+
+vs_with_missing <- vs |>
+  mutate(VSORRES = ifelse(row_number() == 2, NA_character_, VSORRES))
+
+cat("Dirty VS issues:", nrow(check_vs_missing_result(vs_with_missing)), "\n")
+check_vs_missing_result(vs_with_missing)
+```
+
+### Exercise: Write a check for subjects in DM with no EX records
+
+Subjects who are randomized (ARMCD ≠ "SCRNFAIL") should have at least one exposure record. Write `check_dm_no_ex()` (already mocked — try writing it from scratch before looking).
+
+```{r custom-dm-ex-check, exercise=TRUE, exercise.lines=16}
+my_check_dm_no_ex <- function(DM, EX) {
+  # 1. Get distinct USUBJIDs that appear in EX
+  subjects_with_ex <- EX |> distinct(___)
+
+  # 2. Find DM subjects not in EX, excluding screen failures
+  DM |>
+    anti_join(subjects_with_ex, by = "USUBJID") |>
+    filter(ARMCD != "SCRNFAIL")
+}
+
+# Test: add a subject in DM who has no EX record
+dm_with_no_dose <- bind_rows(dm,
+  tibble(STUDYID = "TEST_STUDY", DOMAIN = "DM",
+         USUBJID = "TS-705-1999", SUBJID = "1999",
+         RFSTDTC = "2020-10-01", DTHDTC = NA_character_,
+         ARMCD = "TRT", ARM = "TREATMENT"))
+
+cat("Subjects in DM with no EX:", nrow(my_check_dm_no_ex(dm_with_no_dose, ex)), "\n")
+my_check_dm_no_ex(dm_with_no_dose, ex)
+```
+
+```{r custom-dm-ex-check-hint-1}
+# subjects_with_ex <- EX |> distinct(USUBJID)
+```
+
+```{r custom-dm-ex-check-solution}
+my_check_dm_no_ex <- function(DM, EX) {
+  subjects_with_ex <- EX |> distinct(USUBJID)
+  DM |>
+    anti_join(subjects_with_ex, by = "USUBJID") |>
+    filter(ARMCD != "SCRNFAIL")
+}
+
+dm_with_no_dose <- bind_rows(dm,
+  tibble(STUDYID = "TEST_STUDY", DOMAIN = "DM",
+         USUBJID = "TS-705-1999", SUBJID = "1999",
+         RFSTDTC = "2020-10-01", DTHDTC = NA_character_,
+         ARMCD = "TRT", ARM = "TREATMENT"))
+
+cat("Subjects in DM with no EX:", nrow(my_check_dm_no_ex(dm_with_no_dose, ex)), "\n")
+my_check_dm_no_ex(dm_with_no_dose, ex)
+```
+
+---
+
+## 10 — Assertion-style wrapping for production
+
+`{sdtmchecks}` returns a data frame — it doesn't throw errors. For a production pipeline where you want the script to *stop* on a High-priority failure, wrap checks in an assertion helper.
+
+```{r assertion-demo}
+# Assertion wrapper
+stop_if_issues <- function(check_fn, ..., msg = NULL) {
+  issues <- check_fn(...)
+  if (nrow(issues) > 0) {
+    stop(
+      msg %||% sprintf("Check failed: %s", deparse(substitute(check_fn))),
+      "\n  Flagged rows: ", nrow(issues),
+      "\n  First issue: USUBJID = ", issues$USUBJID[1]
+    )
+  }
+  message(deparse(substitute(check_fn)), ": PASSED")
+  invisible(issues)
+}
+
+# Use it — runs silently on clean data
+stop_if_issues(check_ae_dup, AE = ae)
+```
+
+```{r assertion-fail-demo}
+# Fails loudly on dirty data
+tryCatch(
+  stop_if_issues(check_ae_dup, AE = ae_dirty),
+  error = function(e) cat("PIPELINE BLOCKED:\n", conditionMessage(e), "\n")
+)
+```
+
+### Exercise: Build a "critical checks" block for a pipeline
+
+Write a series of `stop_if_issues()` calls that would block a production pipeline if any High-priority check fails. Use the clean datasets so they all pass.
+
+```{r assertion-pipeline, exercise=TRUE, exercise.lines=16}
+run_critical_checks <- function(DM, AE, EX, LB) {
+  stop_if_issues(check_dm_usubjid_dup,             DM = DM)
+  stop_if_issues(check_ae_dup,                     AE = AE)
+  stop_if_issues(check_ex_dup,                     EX = EX)
+  stop_if_issues(check_ae_aestdtc_after_dm_death,  AE = AE, DM = DM)
+  stop_if_issues(check_ae_aestdtc_before_exstdtc,  AE = AE, EX = EX)
+  message("All critical checks passed.")
+}
+
+# Run against clean datasets — should pass silently
+run_critical_checks(DM = ___, AE = ___, EX = ___, LB = ___)
+```
+
+```{r assertion-pipeline-hint-1}
+# run_critical_checks(DM = dm, AE = ae, EX = ex, LB = lb)
+```
+
+```{r assertion-pipeline-solution}
+run_critical_checks <- function(DM, AE, EX, LB) {
+  stop_if_issues(check_dm_usubjid_dup,             DM = DM)
+  stop_if_issues(check_ae_dup,                     AE = AE)
+  stop_if_issues(check_ex_dup,                     EX = EX)
+  stop_if_issues(check_ae_aestdtc_after_dm_death,  AE = AE, DM = DM)
+  stop_if_issues(check_ae_aestdtc_before_exstdtc,  AE = AE, EX = EX)
+  message("All critical checks passed.")
+}
+
+run_critical_checks(DM = dm, AE = ae, EX = ex, LB = lb)
+```
+
+---
+
+## 11 — Roche-specific assumptions
+
+`{sdtmchecks}` originated at Roche. A practical caveat:
+
+```{r quiz-roche-caveat, echo=FALSE}
+quiz(
+  question(
+    "A check flags an issue in your study that looks like a Roche-specific assumption. You should:",
+    answer("Accept the flag — Roche's conventions are always correct"),
+    answer("Read the check's help page, decide if it applies to your study, and document/disable if not relevant", correct = TRUE),
+    answer("Remove the check from sdtmchecksmeta permanently"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The best way to propose a generalization of a Roche-specific check is:",
+    answer("Email the Roche team directly"),
+    answer("Open a pull request on pharmaverse/sdtmchecks with a more general implementation", correct = TRUE),
+    answer("Write a competing package"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 12 — Full QC workflow: capstone exercise
+
+Put it all together. Given the `dm_dirty`, `ae_early` (AEs before first dose), and `lb_dirty` datasets:
+
+1. Run `run_all_checks()` with High priority checks only
+2. Print which checks failed
+3. For the failing AE check, inspect the offending rows
+4. Call `report_to_xlsx()` to generate the report
+
+```{r capstone-workflow, exercise=TRUE, exercise.lines=35}
+# Step 1: Run High priority checks
+high_meta <- sdtmchecksmeta |> filter(priority == "High")
+
+results <- run_all_checks(
+  metads = high_meta,
+  DM = dm_dirty,
+  AE = ae_early,
+  EX = ex,
+  LB = lb_dirty,
+  VS = vs
+)
+
+# Step 2: Summary of failed checks
+cat("=== QC Summary ===\n")
+failed_checks <- lapply(names(results), function(nm) {
+  r <- results[[nm]]
+  if (r$status == "failed")
+    tibble(check = nm, n_issues = r$n_issues)
+}) |> bind_rows()
+
+print(failed_checks)
+
+# Step 3: Inspect AE early-dose issue
+cat("\n=== AE before first dose ===\n")
+print(results[["check_ae_aestdtc_before_exstdtc"]]$issues)
+
+# Step 4: Generate Excel report
+report_to_xlsx(results, outfile = "capstone_qc_report.xlsx")
+```
+
+```{r capstone-workflow-hint-1}
+# This exercise is mostly pre-filled. Just run it and observe:
+# - dm_dirty fails check_dm_usubjid_dup (1 duplicate subject)
+# - ae_early fails check_ae_aestdtc_before_exstdtc (1 AE before first dose)
+# - lb_dirty may or may not fail depending on which High checks touch LB
+```
+
+---
+
+## 13 — `{datacutr}`: a sibling package
+
+```{r quiz-datacutr, echo=FALSE}
+quiz(
+  question(
+    "The primary purpose of {datacutr} is:",
+    answer("Running quality checks like sdtmchecks, but for ADaM"),
+    answer("Applying a data cutoff date to SDTM datasets for interim analyses", correct = TRUE),
+    answer("Converting SAS XPT files to R data frames"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 14 — Key takeaways and Module 2 wrap-up
+
+```{r quiz-final-11, echo=FALSE}
+quiz(
+  question(
+    "A check function returns an empty data frame. This means:",
+    answer("The check encountered an error and couldn't run"),
+    answer("The check passed — no offending rows found", correct = TRUE),
+    answer("The check is not applicable to this domain"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "To run only the checks relevant to your currently available domains, you:",
+    answer("Run all checks — skipped checks just return NULL"),
+    answer("Filter sdtmchecksmeta by the domains you have, then pass to run_all_checks()", correct = TRUE),
+    answer("Delete the inapplicable functions from the package"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The check function naming convention `check_ae_aestdtc_after_dm_death` tells you:",
+    answer("The domain (ae), the variable (aestdtc), the relationship (after), and the comparison domain/variable (dm_death)", correct = TRUE),
+    answer("Nothing — names are arbitrary"),
+    answer("The priority level of the check"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You are running sdtmchecks as part of an automated CI pipeline. You want the build to fail if any High-priority check fails. The best pattern is:",
+    answer("Use run_all_checks() and check the return value manually"),
+    answer("Wrap each High-priority check in stop_if_issues() so it throws an error on failure", correct = TRUE),
+    answer("Email the team if checks fail"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You need both sdtmchecks AND Pinnacle 21 because:",
+    answer("sdtmchecks catches analysis-impacting issues; P21 catches CDISC conformance issues — they cover different problem classes", correct = TRUE),
+    answer("They duplicate each other — pick whichever your sponsor prefers"),
+    answer("sdtmchecks only runs on ADaM; P21 only runs on SDTM"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Module 2 Complete — What's Next
+
+Congratulations on completing Module 2: Raw Data and SDTM.
+
+You've covered:
+
+- Lesson 07: `{pharmaverseraw}` — the test data chain's starting point
+- Lesson 08: `{sdtm.oak}` Part 1 — architecture and algorithm functions
+- Lesson 09: `{sdtm.oak}` Part 2 — building full Findings and Events domains
+- Lesson 10: `{sdtm.oak}` Part 3 — SUPP--, RELREC, and edge cases
+- Lesson 11: `{sdtmchecks}` — analysis-focused quality validation
+
+**Module 3** (coming next) covers metadata-driven programming with `{metacore}` (the spec object) and `{metatools}` (using the spec to validate and build datasets). These are smaller packages but load-bearing for traceability from specification to final dataset.
+
+After Module 3, **Module 4** enters the heart of pharmaverse: `{admiral}` for ADaM construction — ADSL, ADAE, ADLB, TTE endpoints, and more.

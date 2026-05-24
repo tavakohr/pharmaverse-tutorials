@@ -1,0 +1,25 @@
+# ── RStudio / R project files ─────────────────────────────────────────────────
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.positai
+
+# ── renv — keep renv.lock (package manifest) but exclude the library itself ───
+# renv.lock is intentionally tracked: it lets anyone restore the exact package
+# versions with renv::restore(). The library folder is huge and reproducible.
+renv/library/
+renv/python/
+renv/staging/
+
+# ── learnr / knitr build artifacts ───────────────────────────────────────────
+# HTML files in pharmaverse_tutorials are auto-generated when you Run/Knit an
+# Rmd in RStudio. They are not source files — exclude them from version control.
+pharmaverse_tutorials/*.html
+
+# ── General R build artifacts ─────────────────────────────────────────────────
+*.Rout
+*.aux
+*.log
+*.pdf
+Rplots.pdf

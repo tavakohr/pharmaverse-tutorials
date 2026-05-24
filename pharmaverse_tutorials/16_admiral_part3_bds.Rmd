@@ -1,0 +1,1152 @@
+---
+title: "Lesson 16 — admiral Part 3: BDS Datasets (ADVS, ADLB, ADEG)"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ── Mock helpers from earlier lessons ────────────────────────────────────────
+exprs <- function(...) {
+  dots <- as.list(substitute(list(...)))[-1]
+  dots
+}
+
+convert_blanks_to_na <- function(dataset) {
+  dataset |>
+    mutate(across(where(is.character), ~ifelse(. == "", NA_character_, .)))
+}
+
+# ── Date utilities ────────────────────────────────────────────────────────────
+.impute_dtc <- function(dtc, date_imputation = "first") {
+  sapply(dtc, function(d) {
+    if (is.na(d)) return(NA_character_)
+    if (nchar(d) == 4) {
+      suffix <- if (date_imputation == "last") "-12-31" else "-01-01"
+      paste0(d, suffix)
+    } else if (nchar(d) == 7) {
+      if (date_imputation == "last") {
+        yr  <- as.integer(substr(d, 1, 4))
+        mo  <- as.integer(substr(d, 6, 7))
+        nxt <- if (mo == 12) paste0(yr + 1, "-01-01") else paste0(yr, "-", sprintf("%02d", mo + 1), "-01")
+        as.character(as.Date(nxt) - 1)
+      } else {
+        paste0(d, "-01")
+      }
+    } else {
+      d
+    }
+  })
+}
+
+convert_dtc_to_dt <- function(dtc, date_imputation = "first") {
+  suppressWarnings(as.numeric(as.Date(.impute_dtc(dtc, date_imputation))))
+}
+
+# ── Core admiral mocks ────────────────────────────────────────────────────────
+derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
+                                order = NULL, filter_add = NULL, mode = NULL, ...) {
+  by_nm   <- sapply(by_vars, function(x) deparse(x))
+  join_df <- dataset_add
+  if (!is.null(filter_add)) {
+    fe <- substitute(filter_add)
+    join_df <- tryCatch(filter(join_df, !!fe), error = function(e) join_df)
+  }
+  if (!is.null(new_vars)) {
+    old_nms <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d, "=")[[1]][2]) else d
+    })
+    new_nms <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d, "=")[[1]][1]) else d
+    })
+    keep <- intersect(c(by_nm, old_nms), names(join_df))
+    join_df <- join_df |> select(all_of(keep))
+    for (i in seq_along(old_nms)) {
+      if (old_nms[i] != new_nms[i] && old_nms[i] %in% names(join_df))
+        join_df <- join_df |> rename(!!new_nms[i] := !!old_nms[i])
+    }
+  }
+  by_present <- intersect(by_nm, names(join_df))
+  left_join(dataset, join_df, by = by_present)
+}
+
+derive_vars_dt <- function(dataset, dtc, new_vars_prefix,
+                            date_imputation = "none", highest_imputation = "n",
+                            flag_imputation = "auto", ...) {
+  dtc_nm  <- deparse(substitute(dtc))
+  imp_rule <- if (date_imputation == "none" && highest_imputation == "n") "none"
+              else if (date_imputation == "last") "last" else "first"
+  raw <- if (dtc_nm %in% names(dataset)) dataset[[dtc_nm]] else rep(NA_character_, nrow(dataset))
+  imputed <- if (imp_rule == "none") raw else .impute_dtc(raw, imp_rule)
+  dataset[[paste0(new_vars_prefix, "DT")]] <- suppressWarnings(as.numeric(as.Date(imputed)))
+  if (flag_imputation != "none") {
+    orig_len <- nchar(raw); imp_len <- nchar(imputed)
+    dataset[[paste0(new_vars_prefix, "DTF")]] <- case_when(
+      is.na(raw)                        ~ NA_character_,
+      orig_len <= 4 & !is.na(imputed)  ~ "Y",
+      orig_len <= 7 & !is.na(imputed)  ~ "M",
+      TRUE                              ~ NA_character_
+    )
+  }
+  dataset
+}
+
+derive_vars_dtm <- function(dataset, dtc, new_vars_prefix,
+                             date_imputation = "first", time_imputation = "first",
+                             highest_imputation = "n", ...) {
+  dtc_nm <- deparse(substitute(dtc))
+  raw    <- if (dtc_nm %in% names(dataset)) dataset[[dtc_nm]] else rep(NA_character_, nrow(dataset))
+  imputed <- .impute_dtc(raw, date_imputation)
+  suffix  <- if (time_imputation == "last") "T23:59:59" else "T00:00:00"
+  dataset[[paste0(new_vars_prefix, "DTM")]] <- suppressWarnings(
+    as.numeric(as.POSIXct(paste0(imputed, suffix), tz = "UTC"))
+  )
+  dataset[[paste0(new_vars_prefix, "DTF")]] <- case_when(
+    is.na(raw)                              ~ NA_character_,
+    nchar(raw) <= 4 & !is.na(imputed)      ~ "Y",
+    nchar(raw) <= 7 & !is.na(imputed)      ~ "M",
+    TRUE                                    ~ NA_character_
+  )
+  dataset[[paste0(new_vars_prefix, "TMF")]] <- case_when(
+    is.na(raw)                              ~ NA_character_,
+    !grepl("T", raw)                        ~ "H",
+    TRUE                                    ~ NA_character_
+  )
+  dataset
+}
+
+derive_vars_dy <- function(dataset, reference_date, source_vars) {
+  ref_nm  <- deparse(substitute(reference_date))
+  src_nms <- sapply(source_vars, deparse)
+  for (sv in src_nms) {
+    dy_nm <- sub("DT$", "DY", sv)
+    if (sv %in% names(dataset) && ref_nm %in% names(dataset)) {
+      v <- dataset[[sv]]; r <- dataset[[ref_nm]]
+      dataset[[dy_nm]] <- ifelse(is.na(v) | is.na(r), NA_real_,
+        ifelse(v >= r, as.numeric(v - r) + 1, as.numeric(v - r)))
+    }
+  }
+  dataset
+}
+
+derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "first") {
+  new_nm  <- deparse(substitute(new_var))
+  by_nm   <- sapply(by_vars, deparse)
+  ord_nms <- sapply(order, function(x) {
+    d <- deparse(x); gsub("desc\\(|\\)", "", d)
+  })
+  desc_flags <- sapply(order, function(x) grepl("^desc\\(", deparse(x)))
+  ord_df <- dataset
+  for (i in rev(seq_along(ord_nms))) {
+    if (ord_nms[i] %in% names(ord_df)) {
+      ord_df <- if (desc_flags[i]) arrange(ord_df, desc(.data[[ord_nms[i]]]))
+                else arrange(ord_df, .data[[ord_nms[i]]])
+    }
+  }
+  by_present <- intersect(by_nm, names(ord_df))
+  if (mode == "first") {
+    flagged <- ord_df |> group_by(across(all_of(by_present))) |>
+      slice(1) |> ungroup() |> mutate(!!new_nm := "Y") |>
+      select(all_of(c(by_present, ord_nms[ord_nms %in% names(ord_df)], new_nm)))
+  } else {
+    flagged <- ord_df |> group_by(across(all_of(by_present))) |>
+      slice(n()) |> ungroup() |> mutate(!!new_nm := "Y") |>
+      select(all_of(c(by_present, ord_nms[ord_nms %in% names(ord_df)], new_nm)))
+  }
+  if (new_nm %in% names(dataset)) dataset[[new_nm]] <- NULL
+  left_join(dataset, flagged, by = intersect(names(flagged), names(dataset)))
+}
+
+restrict_derivation <- function(dataset, derivation, args = list(), filter = NULL) {
+  fe <- substitute(filter)
+  in_rows <- if (!is.null(fe)) {
+    tryCatch(which(eval(fe, dataset, parent.frame())), error = function(e) seq_len(nrow(dataset)))
+  } else seq_len(nrow(dataset))
+  out_rows <- setdiff(seq_len(nrow(dataset)), in_rows)
+  sub_data  <- dataset[in_rows, , drop = FALSE]
+  all_args  <- c(list(dataset = sub_data), args)
+  derived   <- tryCatch(do.call(derivation, all_args), error = function(e) sub_data)
+  bind_rows(derived, dataset[out_rows, , drop = FALSE]) |>
+    arrange(match(seq_len(nrow(dataset)),
+                  c(in_rows[seq_len(nrow(derived))], out_rows)))
+}
+
+params <- function(...) list(...)
+
+derivation_slice <- function(filter = NULL, args = list()) {
+  list(filter = substitute(filter), args = args)
+}
+
+slice_derivation <- function(dataset, derivation, args = list(), ...) {
+  slices  <- list(...)
+  result  <- dataset
+  covered <- integer(0)
+  for (sl in slices) {
+    fe <- sl$filter
+    idx <- if (!is.null(fe)) {
+      tryCatch(which(eval(fe, result, parent.frame())), error = function(e) integer(0))
+    } else seq_len(nrow(result))
+    idx <- setdiff(idx, covered)
+    if (length(idx) == 0) next
+    merged_args <- modifyList(args, sl$args)
+    sub_data    <- result[idx, , drop = FALSE]
+    all_args    <- c(list(dataset = sub_data), merged_args)
+    derived     <- tryCatch(do.call(derivation, all_args), error = function(e) sub_data)
+    result[idx, names(derived)] <- derived[seq_len(length(idx)), names(derived)]
+    covered <- c(covered, idx)
+  }
+  result
+}
+
+# ── BDS-specific mocks ────────────────────────────────────────────────────────
+derive_vars_merged_lookup <- function(dataset, dataset_add, by_vars, new_vars = NULL, ...) {
+  by_nm   <- sapply(by_vars, deparse)
+  if (!is.null(new_vars)) {
+    nms <- sapply(new_vars, deparse)
+    keep <- intersect(c(by_nm, nms), names(dataset_add))
+    dataset_add <- dataset_add |> select(all_of(keep))
+  }
+  by_present <- intersect(by_nm, names(dataset_add))
+  left_join(dataset, dataset_add, by = by_present)
+}
+
+derive_var_anrind <- function(dataset) {
+  dataset |> mutate(
+    ANRIND = case_when(
+      is.na(AVAL)               ~ NA_character_,
+      !is.na(ANRHI) & AVAL > ANRHI ~ "HIGH",
+      !is.na(ANRLO) & AVAL < ANRLO ~ "LOW",
+      TRUE                          ~ "NORMAL"
+    )
+  )
+}
+
+derive_var_ontrtfl <- function(dataset, start_date, end_date = NULL,
+                                ref_start_date, ref_end_date,
+                                ref_end_window = 0, ...) {
+  sd_nm  <- deparse(substitute(start_date))
+  rs_nm  <- deparse(substitute(ref_start_date))
+  re_nm  <- deparse(substitute(ref_end_date))
+  dataset |> mutate(
+    ONTRTFL = case_when(
+      is.na(.data[[sd_nm]]) | is.na(.data[[rs_nm]]) ~ NA_character_,
+      .data[[sd_nm]] >= .data[[rs_nm]] &
+        .data[[sd_nm]] <= (.data[[re_nm]] + ref_end_window) ~ "Y",
+      TRUE ~ NA_character_
+    )
+  )
+}
+
+derive_var_base <- function(dataset, by_vars, source_var, new_var) {
+  src_nm <- deparse(substitute(source_var))
+  new_nm <- deparse(substitute(new_var))
+  by_nm  <- sapply(by_vars, deparse)
+  by_present <- intersect(by_nm, names(dataset))
+  baseline <- dataset |>
+    filter(!is.na(ABLFL) & ABLFL == "Y") |>
+    select(all_of(c(by_present, src_nm))) |>
+    rename(!!new_nm := !!src_nm)
+  if (new_nm %in% names(dataset)) dataset[[new_nm]] <- NULL
+  left_join(dataset, baseline, by = by_present)
+}
+
+derive_var_chg <- function(dataset) {
+  dataset |> mutate(CHG = if ("BASE" %in% names(dataset)) AVAL - BASE else NA_real_)
+}
+
+derive_var_pchg <- function(dataset) {
+  dataset |> mutate(
+    PCHG = if ("BASE" %in% names(dataset))
+      ifelse(BASE == 0, NA_real_, (AVAL - BASE) / abs(BASE) * 100)
+    else NA_real_
+  )
+}
+
+derive_var_shift <- function(dataset, new_var, from_var, to_var) {
+  new_nm  <- deparse(substitute(new_var))
+  from_nm <- deparse(substitute(from_var))
+  to_nm   <- deparse(substitute(to_var))
+  dataset |> mutate(
+    !!new_nm := case_when(
+      is.na(.data[[from_nm]]) | is.na(.data[[to_nm]]) ~ NA_character_,
+      TRUE ~ paste0(.data[[from_nm]], " to ", .data[[to_nm]])
+    )
+  )
+}
+
+# derive_param_bmi / derive_param_map / derive_param_computed
+derive_param_bmi <- function(dataset, by_vars, weight_code = "WEIGHT",
+                              height_code = "HEIGHT", set_values_to = list(),
+                              constant_by_vars = NULL) {
+  by_nm <- sapply(by_vars, deparse)
+  by_nm <- setdiff(by_nm, c("PARAMCD", "PARAM", "PARAMN", "PARCAT1"))
+  w_rows <- dataset |> filter(PARAMCD == weight_code)
+  h_rows <- dataset |> filter(PARAMCD == height_code)
+  if (!is.null(constant_by_vars)) {
+    h_key <- sapply(constant_by_vars, deparse)
+    h_rows <- h_rows |>
+      group_by(across(all_of(intersect(h_key, names(h_rows))))) |>
+      slice(1) |> ungroup()
+  }
+  h_use <- h_rows |> select(any_of(c("USUBJID", "AVAL"))) |>
+    rename(HEIGHT_AVAL = AVAL)
+  bmi_rows <- w_rows |>
+    left_join(h_use, by = "USUBJID") |>
+    filter(!is.na(AVAL) & !is.na(HEIGHT_AVAL) & HEIGHT_AVAL > 0) |>
+    mutate(AVAL = AVAL / (HEIGHT_AVAL / 100)^2)
+  for (nm in names(set_values_to)) {
+    val <- tryCatch(eval(set_values_to[[nm]]), error = function(e) as.character(set_values_to[[nm]]))
+    bmi_rows[[nm]] <- val
+  }
+  bmi_rows <- bmi_rows |> select(-any_of("HEIGHT_AVAL"))
+  bind_rows(dataset, bmi_rows)
+}
+
+derive_param_map <- function(dataset, by_vars, set_values_to = list(), ...) {
+  by_nm <- sapply(by_vars, deparse)
+  by_nm <- setdiff(by_nm, c("PARAMCD", "PARAM", "PARAMN"))
+  by_key <- intersect(by_nm, names(dataset))
+  sys_rows <- dataset |> filter(PARAMCD == "SYSBP") |>
+    select(all_of(c(by_key, "AVAL"))) |> rename(SYS = AVAL)
+  dia_rows <- dataset |> filter(PARAMCD == "DIABP") |>
+    select(all_of(c(by_key, "AVAL"))) |> rename(DIA = AVAL)
+  map_rows <- inner_join(sys_rows, dia_rows, by = by_key) |>
+    mutate(AVAL = (SYS + 2 * DIA) / 3) |>
+    select(-SYS, -DIA)
+  for (nm in names(set_values_to)) {
+    val <- tryCatch(eval(set_values_to[[nm]]), error = function(e) as.character(set_values_to[[nm]]))
+    map_rows[[nm]] <- val
+  }
+  bind_rows(dataset, map_rows)
+}
+
+derive_param_computed <- function(dataset, by_vars, parameters, set_values_to = list(), ...) {
+  by_nm  <- sapply(by_vars, deparse)
+  by_key <- intersect(by_nm, names(dataset))
+  wide <- dataset |>
+    filter(PARAMCD %in% parameters) |>
+    select(all_of(c(by_key, "PARAMCD", "AVAL"))) |>
+    pivot_wider(names_from = PARAMCD, values_from = AVAL,
+                names_prefix = "AVAL.")
+  valid_cols <- paste0("AVAL.", parameters)
+  wide <- wide |> filter(if_all(all_of(valid_cols), ~ !is.na(.)))
+  if (nrow(wide) == 0) return(dataset)
+  eval_env <- list2env(as.list(wide), parent = baseenv())
+  for (nm in names(set_values_to)) {
+    val <- tryCatch(eval(set_values_to[[nm]], envir = eval_env),
+                    error = function(e) as.character(set_values_to[[nm]]))
+    wide[[nm]] <- val
+  }
+  new_rows <- wide |> select(-any_of(valid_cols))
+  bind_rows(dataset, new_rows)
+}
+
+# ── Sample datasets ───────────────────────────────────────────────────────────
+vs <- tribble(
+  ~STUDYID, ~USUBJID, ~VSTESTCD, ~VSTEST,                   ~VSSTRESN, ~VSSTRESC,
+  ~VSDTC,          ~VISIT,      ~ANRLO, ~ANRHI,
+  "CDISCPILOT01", "01-001", "SYSBP",  "Systolic Blood Pressure",  118, "118",
+  "2024-01-05", "SCREENING",  90, 140,
+  "CDISCPILOT01", "01-001", "DIABP",  "Diastolic Blood Pressure",  76, "76",
+  "2024-01-05", "SCREENING",  60,  90,
+  "CDISCPILOT01", "01-001", "SYSBP",  "Systolic Blood Pressure",  124, "124",
+  "2024-02-05", "WEEK 4",     90, 140,
+  "CDISCPILOT01", "01-001", "DIABP",  "Diastolic Blood Pressure",  80, "80",
+  "2024-02-05", "WEEK 4",     60,  90,
+  "CDISCPILOT01", "01-001", "WEIGHT", "Weight",                    72,  "72",
+  "2024-01-05", "SCREENING",  NA,  NA,
+  "CDISCPILOT01", "01-001", "HEIGHT", "Height",                   172, "172",
+  "2024-01-05", "SCREENING",  NA,  NA,
+  "CDISCPILOT01", "01-002", "SYSBP",  "Systolic Blood Pressure",  148, "148",
+  "2024-01-08", "SCREENING",  90, 140,
+  "CDISCPILOT01", "01-002", "DIABP",  "Diastolic Blood Pressure",  92, "92",
+  "2024-01-08", "SCREENING",  60,  90,
+  "CDISCPILOT01", "01-002", "SYSBP",  "Systolic Blood Pressure",  138, "138",
+  "2024-02-08", "WEEK 4",     90, 140,
+  "CDISCPILOT01", "01-002", "DIABP",  "Diastolic Blood Pressure",  86, "86",
+  "2024-02-08", "WEEK 4",     60,  90,
+  "CDISCPILOT01", "01-002", "WEIGHT", "Weight",                    85,  "85",
+  "2024-01-08", "SCREENING",  NA,  NA,
+  "CDISCPILOT01", "01-002", "HEIGHT", "Height",                   180, "180",
+  "2024-01-08", "SCREENING",  NA,  NA
+)
+
+adsl_bds <- tribble(
+  ~STUDYID,        ~USUBJID, ~TRTSDT, ~TRTEDT, ~TRT01A,    ~TRT01P,    ~SEX, ~AGE, ~SAFFL,
+  "CDISCPILOT01", "01-001",  19367,   19548,   "Xanomeli", "Xanomeli", "F",   52,   "Y",
+  "CDISCPILOT01", "01-002",  19370,   19551,   "Placebo",  "Placebo",  "M",   61,   "Y"
+)
+
+param_lookup <- tribble(
+  ~VSTESTCD, ~PARAMCD, ~PARAM,                              ~PARAMN, ~PARCAT1,
+  "SYSBP",   "SYSBP",  "Systolic Blood Pressure (mmHg)",    1,       "Hemodynamic",
+  "DIABP",   "DIABP",  "Diastolic Blood Pressure (mmHg)",   2,       "Hemodynamic",
+  "PULSE",   "PULSE",  "Pulse Rate (beats/min)",            3,       "Hemodynamic",
+  "TEMP",    "TEMP",   "Temperature (C)",                   4,       "Body System",
+  "WEIGHT",  "WEIGHT", "Weight (kg)",                       10,      "Anthropometric",
+  "HEIGHT",  "HEIGHT", "Height (cm)",                       11,      "Anthropometric"
+)
+```
+
+## Welcome
+
+This lesson covers **BDS (Basic Data Structure) ADaMs** — the long-format analysis datasets used for vitals (ADVS), labs (ADLB), and ECGs (ADEG). You'll build a complete ADVS step by step using admiral's canonical 13-step workflow.
+
+**Key mocks in scope:** `derive_vars_merged_lookup()`, `derive_param_bmi()`, `derive_param_map()`, `derive_param_computed()`, `derive_var_anrind()`, `derive_var_ontrtfl()`, `derive_var_base()`, `derive_var_chg()`, `derive_var_pchg()`, `derive_var_shift()`, `restrict_derivation()`, `slice_derivation()`
+
+---
+
+## 1 — The BDS shape
+
+```{r bds-shape-demo}
+# BDS = one row per (subject × parameter × visit)
+# Compare: ADSL has one row per subject; BDS has many
+vs |>
+  filter(VSTESTCD %in% c("SYSBP", "DIABP")) |>
+  select(USUBJID, VSTESTCD, VSSTRESN, VSDTC, VISIT) |>
+  arrange(USUBJID, VSTESTCD, VSDTC)
+```
+
+```{r quiz-bds-shape, echo=FALSE}
+quiz(
+  question(
+    "Which of the following ADaMs uses the BDS structure?",
+    answer("ADSL"),
+    answer("ADAE"),
+    answer("ADVS", correct = TRUE),
+    answer("ADTTE"),
+    allow_retry = TRUE
+  ),
+  question(
+    "In a BDS dataset, what does PARAMCD identify?",
+    answer("The subject"),
+    answer("The analysis visit"),
+    answer("The measured parameter (e.g., SYSBP)", correct = TRUE),
+    answer("The baseline flag"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 2 — Step 1: Merge ADSL variables
+
+The first step brings treatment dates and arm from ADSL so every VS row knows its treatment window.
+
+```{r merge-adsl-demo}
+adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
+
+advs <- vs |>
+  derive_vars_merged(
+    dataset_add = adsl_bds,
+    new_vars    = adsl_vars,
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+advs |> select(USUBJID, VSTESTCD, VSDTC, TRTSDT, TRTEDT, TRT01A) |> head(4)
+```
+
+```{r merge-adsl-ex, exercise=TRUE, exercise.lines=14}
+# Exercise: merge TRTSDT, TRTEDT and TRT01A from adsl_bds onto vs
+# then count how many non-NA TRTSDT values result
+adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
+
+advs_tmp <- vs |>
+  derive_vars_merged(
+    dataset_add = ___,
+    new_vars    = ___,
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+sum(!is.na(advs_tmp$TRTSDT))
+```
+
+```{r merge-adsl-ex-hint-1}
+# dataset_add = adsl_bds
+# new_vars    = adsl_vars
+# by_vars already given
+```
+
+```{r merge-adsl-ex-solution}
+adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
+
+advs_tmp <- vs |>
+  derive_vars_merged(
+    dataset_add = adsl_bds,
+    new_vars    = adsl_vars,
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+sum(!is.na(advs_tmp$TRTSDT))
+```
+
+---
+
+## 3 — Step 2: Derive ADT and ADY
+
+```{r derive-adt-demo}
+advs <- advs |>
+  derive_vars_dt(
+    new_vars_prefix = "A",   # produces ADT (and ADTF if imputation flag)
+    dtc             = VSDTC
+  ) |>
+  derive_vars_dy(
+    reference_date = TRTSDT,
+    source_vars    = exprs(ADT)   # produces ADY
+  )
+
+advs |> select(USUBJID, VSTESTCD, VSDTC, ADT, ADY) |> head(4)
+```
+
+```{r quiz-adt, echo=FALSE}
+quiz(
+  question(
+    "What does `new_vars_prefix = 'A'` produce in `derive_vars_dt()`?",
+    answer("AVAL and AVALC"),
+    answer("ADT and ADTF", correct = TRUE),
+    answer("ASTDT and AENDT"),
+    answer("ABLFL and ANRIND"),
+    allow_retry = TRUE
+  ),
+  question(
+    "ADY on the treatment start date equals:",
+    answer("0"),
+    answer("1", correct = TRUE),
+    answer("-1"),
+    answer("Depends on TRTSDT"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 4 — Step 3: Assign PARAMCD via lookup
+
+`derive_vars_merged_lookup()` is like `derive_vars_merged()` but designed for static lookup tables. It maps VSTESTCD → PARAMCD/PARAM/PARAMN.
+
+```{r param-lookup-demo}
+advs <- advs |>
+  derive_vars_merged_lookup(
+    dataset_add = param_lookup,
+    by_vars     = exprs(VSTESTCD),
+    new_vars    = exprs(PARAMCD, PARAM, PARAMN, PARCAT1)
+  )
+
+advs |> select(VSTESTCD, PARAMCD, PARAM, PARAMN) |> distinct() |> head(6)
+```
+
+```{r aval-assign}
+# Assign AVAL from the standardized numeric result
+advs <- advs |>
+  mutate(
+    AVAL   = VSSTRESN,
+    AVALC  = VSSTRESC,
+    AVISIT = VISIT,
+    AVISITN = case_when(
+      VISIT == "SCREENING" ~ 0,
+      VISIT == "WEEK 4"    ~ 4,
+      TRUE                 ~ NA_real_
+    )
+  )
+```
+
+```{r paramcd-ex, exercise=TRUE, exercise.lines=14}
+# Exercise: using param_lookup, map VSTESTCD → PARAMCD and PARAM
+# then verify no NA PARAMCD for SYSBP or DIABP rows
+
+vs_tmp <- vs |>
+  derive_vars_merged_lookup(
+    dataset_add = param_lookup,
+    by_vars     = exprs(VSTESTCD),
+    new_vars    = exprs(___, ___)
+  )
+
+vs_tmp |> filter(VSTESTCD %in% c("SYSBP", "DIABP")) |>
+  select(VSTESTCD, PARAMCD, PARAM) |> distinct()
+```
+
+```{r paramcd-ex-hint-1}
+# new_vars = exprs(PARAMCD, PARAM)
+```
+
+```{r paramcd-ex-solution}
+vs_tmp <- vs |>
+  derive_vars_merged_lookup(
+    dataset_add = param_lookup,
+    by_vars     = exprs(VSTESTCD),
+    new_vars    = exprs(PARAMCD, PARAM)
+  )
+
+vs_tmp |> filter(VSTESTCD %in% c("SYSBP", "DIABP")) |>
+  select(VSTESTCD, PARAMCD, PARAM) |> distinct()
+```
+
+---
+
+## 5 — Derived parameters: BMI and MAP
+
+```{r derived-params-demo}
+# BMI from WEIGHT and HEIGHT
+advs <- advs |>
+  derive_param_bmi(
+    by_vars          = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
+    weight_code      = "WEIGHT",
+    height_code      = "HEIGHT",
+    constant_by_vars = exprs(USUBJID),
+    set_values_to    = exprs(
+      PARAMCD = "BMI",
+      PARAM   = "Body Mass Index (kg/m^2)",
+      PARAMN  = 20
+    )
+  )
+
+# MAP from SYSBP and DIABP
+advs <- advs |>
+  derive_param_map(
+    by_vars       = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
+    set_values_to = exprs(
+      PARAMCD = "MAP",
+      PARAM   = "Mean Arterial Pressure (mmHg)",
+      PARAMN  = 21
+    )
+  )
+
+advs |> filter(PARAMCD %in% c("BMI", "MAP")) |>
+  select(USUBJID, PARAMCD, AVAL, AVISIT) |>
+  arrange(USUBJID, PARAMCD, AVISIT)
+```
+
+```{r quiz-params, echo=FALSE}
+quiz(
+  question(
+    "What does `constant_by_vars = exprs(USUBJID)` do in `derive_param_bmi()`?",
+    answer("Filters to one height per visit"),
+    answer("Uses the single height value for all visits of a subject", correct = TRUE),
+    answer("Forces BMI to be recalculated once"),
+    answer("Nothing — it is ignored"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which function handles arbitrary formula parameters like FLI or HOMA-IR?",
+    answer("derive_param_bmi()"),
+    answer("derive_param_map()"),
+    answer("derive_param_computed()", correct = TRUE),
+    answer("derive_var_anrind()"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r computed-param-ex, exercise=TRUE, exercise.lines=18}
+# Exercise: use derive_param_computed() to compute MAP with the formula
+# AVAL = (AVAL.SYSBP + 2 * AVAL.DIABP) / 3
+# Add PARAMCD = "MAP2", PARAM = "MAP (computed)", PARAMN = 22
+
+advs_with_map2 <- advs |>
+  filter(PARAMCD %in% c("SYSBP", "DIABP")) |>
+  derive_param_computed(
+    by_vars       = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
+    parameters    = ___,
+    set_values_to = exprs(
+      AVAL    = ___,
+      PARAMCD = "MAP2",
+      PARAM   = "MAP (computed)",
+      PARAMN  = 22
+    )
+  )
+
+advs_with_map2 |> filter(PARAMCD == "MAP2") |>
+  select(USUBJID, PARAMCD, AVAL, AVISIT)
+```
+
+```{r computed-param-ex-hint-1}
+# parameters = c("SYSBP", "DIABP")
+# AVAL = (AVAL.SYSBP + 2 * AVAL.DIABP) / 3
+```
+
+```{r computed-param-ex-solution}
+advs_with_map2 <- advs |>
+  filter(PARAMCD %in% c("SYSBP", "DIABP")) |>
+  derive_param_computed(
+    by_vars       = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
+    parameters    = c("SYSBP", "DIABP"),
+    set_values_to = exprs(
+      AVAL    = (AVAL.SYSBP + 2 * AVAL.DIABP) / 3,
+      PARAMCD = "MAP2",
+      PARAM   = "MAP (computed)",
+      PARAMN  = 22
+    )
+  )
+
+advs_with_map2 |> filter(PARAMCD == "MAP2") |>
+  select(USUBJID, PARAMCD, AVAL, AVISIT)
+```
+
+---
+
+## 6 — ANRIND and ONTRTFL
+
+```{r anrind-ontrtfl-demo}
+advs <- advs |>
+  derive_var_anrind() |>       # reads AVAL, ANRLO, ANRHI → ANRIND
+  derive_var_ontrtfl(
+    start_date      = ADT,
+    ref_start_date  = TRTSDT,
+    ref_end_date    = TRTEDT
+  )
+
+advs |>
+  filter(PARAMCD == "SYSBP") |>
+  select(USUBJID, AVAL, ANRLO, ANRHI, ANRIND, ONTRTFL, AVISIT)
+```
+
+```{r anrind-ex, exercise=TRUE, exercise.lines=12}
+# Exercise: add ONTRTFL with a 30-day window after TRTEDT (ref_end_window = 30)
+# then count how many rows get ONTRTFL = "Y"
+
+advs_ont <- advs |>
+  derive_var_ontrtfl(
+    start_date     = ADT,
+    ref_start_date = TRTSDT,
+    ref_end_date   = TRTEDT,
+    ref_end_window = ___
+  )
+
+sum(advs_ont$ONTRTFL == "Y", na.rm = TRUE)
+```
+
+```{r anrind-ex-hint-1}
+# ref_end_window = 30
+```
+
+```{r anrind-ex-solution}
+advs_ont <- advs |>
+  derive_var_ontrtfl(
+    start_date     = ADT,
+    ref_start_date = TRTSDT,
+    ref_end_date   = TRTEDT,
+    ref_end_window = 30
+  )
+
+sum(advs_ont$ONTRTFL == "Y", na.rm = TRUE)
+```
+
+---
+
+## 7 — Baseline: ABLFL, BASE, BASEC, BNRIND
+
+The baseline row is the last pre-treatment observation per subject per parameter.
+
+```{r baseline-demo}
+# Step 1: flag baseline rows with restrict_derivation
+advs <- advs |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      order   = exprs(ADT, AVISITN),
+      new_var = ABLFL,
+      mode    = "last"
+    ),
+    filter = (!is.na(AVAL) & ADT <= TRTSDT)
+  )
+
+# Step 2: copy baseline AVAL and ANRIND to every row
+advs <- advs |>
+  derive_var_base(
+    by_vars    = exprs(STUDYID, USUBJID, PARAMCD),
+    source_var = AVAL,
+    new_var    = BASE
+  ) |>
+  derive_var_base(
+    by_vars    = exprs(STUDYID, USUBJID, PARAMCD),
+    source_var = ANRIND,
+    new_var    = BNRIND
+  )
+
+advs |>
+  filter(PARAMCD == "SYSBP") |>
+  select(USUBJID, AVISIT, AVAL, ABLFL, BASE, ANRIND, BNRIND)
+```
+
+```{r quiz-baseline, echo=FALSE}
+quiz(
+  question(
+    "What value is stored in ABLFL for the baseline row?",
+    answer("1"),
+    answer("TRUE"),
+    answer("Y", correct = TRUE),
+    answer("BASELINE"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Why do you call `derive_var_base()` twice (for AVAL and ANRIND)?",
+    answer("It can only copy one variable at a time", correct = TRUE),
+    answer("ANRIND doesn't exist yet when BASE is derived"),
+    answer("Admiral mandates two-step baseline"),
+    answer("BASE needs a separate call from BASEC"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r ablfl-ex, exercise=TRUE, exercise.lines=20}
+# Exercise: for DIABP only, flag the LAST pre-treatment row as ABLFL
+# then check: how many DIABP rows have ABLFL = "Y"?
+
+advs_bl <- advs |>
+  filter(PARAMCD == "DIABP") |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      order   = exprs(ADT),
+      new_var = ABLFL,
+      mode    = "___"   # last pre-treatment = "last"
+    ),
+    filter = (!is.na(AVAL) & ADT <= TRTSDT)
+  )
+
+sum(advs_bl$ABLFL == "Y", na.rm = TRUE)
+```
+
+```{r ablfl-ex-hint-1}
+# mode = "last"
+```
+
+```{r ablfl-ex-solution}
+advs_bl <- advs |>
+  filter(PARAMCD == "DIABP") |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      order   = exprs(ADT),
+      new_var = ABLFL,
+      mode    = "last"
+    ),
+    filter = (!is.na(AVAL) & ADT <= TRTSDT)
+  )
+
+sum(advs_bl$ABLFL == "Y", na.rm = TRUE)
+```
+
+---
+
+## 8 — CHG, PCHG, and SHIFT1
+
+```{r chg-shift-demo}
+advs <- advs |>
+  derive_var_chg() |>
+  derive_var_pchg() |>
+  derive_var_shift(
+    new_var  = SHIFT1,
+    from_var = BNRIND,
+    to_var   = ANRIND
+  )
+
+advs |>
+  filter(PARAMCD == "SYSBP" & !is.na(BASE)) |>
+  select(USUBJID, AVISIT, AVAL, BASE, CHG, PCHG, BNRIND, ANRIND, SHIFT1)
+```
+
+```{r chg-ex, exercise=TRUE, exercise.lines=14}
+# Exercise: compute CHG and PCHG for DIABP rows, then show
+# max absolute CHG per subject
+
+advs_chg <- advs |>
+  filter(PARAMCD == "DIABP") |>
+  derive_var_chg() |>
+  derive_var_pchg()
+
+advs_chg |>
+  group_by(USUBJID) |>
+  summarise(max_abs_chg = max(abs(CHG), na.rm = TRUE))
+```
+
+```{r chg-ex-hint-1}
+# derive_var_chg() reads BASE and AVAL automatically — no arguments needed
+```
+
+```{r chg-ex-solution}
+advs_chg <- advs |>
+  filter(PARAMCD == "DIABP") |>
+  derive_var_chg() |>
+  derive_var_pchg()
+
+advs_chg |>
+  group_by(USUBJID) |>
+  summarise(max_abs_chg = max(abs(CHG), na.rm = TRUE))
+```
+
+---
+
+## 9 — restrict_derivation vs slice_derivation
+
+```{r restrict-demo}
+# restrict_derivation: apply a derivation only to filtered rows
+# Here: flag worst on-treatment SYSBP per subject (highest = worst)
+
+advs_worst <- advs |>
+  filter(PARAMCD == "SYSBP") |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      order   = exprs(desc(AVAL)),
+      new_var = WORSTFL,
+      mode    = "first"
+    ),
+    filter = ONTRTFL == "Y" & !is.na(AVAL)
+  )
+
+advs_worst |> select(USUBJID, AVISIT, AVAL, ONTRTFL, WORSTFL)
+```
+
+```{r slice-demo}
+# slice_derivation: different rule per slice
+# Slice 1: hemodynamic params → highest AVAL is worst
+# Slice 2: DIABP → same rule here for demo
+
+advs_sliced <- advs |>
+  filter(PARAMCD %in% c("SYSBP", "DIABP")) |>
+  slice_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      new_var = WORSTFL,
+      mode    = "first"
+    ),
+    derivation_slice(
+      filter = PARAMCD == "SYSBP" & ONTRTFL == "Y" & !is.na(AVAL),
+      args   = params(order = exprs(desc(AVAL)))
+    ),
+    derivation_slice(
+      filter = PARAMCD == "DIABP" & ONTRTFL == "Y" & !is.na(AVAL),
+      args   = params(order = exprs(desc(AVAL)))
+    )
+  )
+
+advs_sliced |> filter(!is.na(WORSTFL)) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, WORSTFL)
+```
+
+```{r quiz-restrict-slice, echo=FALSE}
+quiz(
+  question(
+    "What is the key difference between `restrict_derivation()` and `slice_derivation()`?",
+    answer("restrict_derivation() is faster"),
+    answer("slice_derivation() can use different derivation arguments per data slice", correct = TRUE),
+    answer("restrict_derivation() creates new rows; slice_derivation() doesn't"),
+    answer("They are interchangeable"),
+    allow_retry = TRUE
+  )
+)
+```
+
+```{r restrict-ex, exercise=TRUE, exercise.lines=16}
+# Exercise: using restrict_derivation, derive ANL01FL = "Y"
+# for the LATEST observation per (USUBJID, PARAMCD, AVISIT)
+# among rows where AVAL is not NA
+
+advs_anl <- advs |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD, AVISIT),
+      order   = exprs(desc(ADT)),
+      new_var = ANL01FL,
+      mode    = "___"
+    ),
+    filter = !is.na(AVAL) & !is.na(AVISIT)
+  )
+
+sum(advs_anl$ANL01FL == "Y", na.rm = TRUE)
+```
+
+```{r restrict-ex-hint-1}
+# mode = "first" (after sorting desc(ADT), first = latest)
+```
+
+```{r restrict-ex-solution}
+advs_anl <- advs |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD, AVISIT),
+      order   = exprs(desc(ADT)),
+      new_var = ANL01FL,
+      mode    = "first"
+    ),
+    filter = !is.na(AVAL) & !is.na(AVISIT)
+  )
+
+sum(advs_anl$ANL01FL == "Y", na.rm = TRUE)
+```
+
+---
+
+## 10 — Full ADVS pipeline capstone
+
+```{r capstone-advs, exercise=TRUE, exercise.lines=70}
+# Build a complete ADVS from vs + adsl_bds in one pipe:
+# 1. Merge ADSL vars (TRTSDT, TRTEDT, TRT01A, TRT01P)
+# 2. Derive ADT and ADY
+# 3. Map PARAMCD/PARAM/PARAMN via param_lookup
+# 4. Assign AVAL, AVALC, AVISIT, AVISITN
+# 5. Derive BMI and MAP parameters
+# 6. Derive ANRIND and ONTRTFL
+# 7. Flag ABLFL (last pre-treatment row per subj × param)
+# 8. Derive BASE and BNRIND
+# 9. Derive CHG, PCHG, SHIFT1
+
+adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
+
+advs_full <- vs |>
+  derive_vars_merged(
+    dataset_add = adsl_bds, new_vars = adsl_vars,
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  derive_vars_dt(new_vars_prefix = "A", dtc = VSDTC) |>
+  derive_vars_dy(reference_date = TRTSDT, source_vars = exprs(ADT)) |>
+  derive_vars_merged_lookup(
+    dataset_add = param_lookup, by_vars = exprs(VSTESTCD),
+    new_vars    = exprs(PARAMCD, PARAM, PARAMN)
+  ) |>
+  mutate(
+    AVAL    = VSSTRESN,
+    AVALC   = VSSTRESC,
+    AVISIT  = VISIT,
+    AVISITN = case_when(
+      VISIT == "SCREENING" ~ 0,
+      VISIT == "WEEK 4"    ~ 4,
+      TRUE                 ~ NA_real_
+    )
+  ) |>
+  derive_param_bmi(
+    by_vars = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
+    weight_code = "WEIGHT", height_code = "HEIGHT",
+    constant_by_vars = exprs(USUBJID),
+    set_values_to = exprs(PARAMCD = "BMI", PARAM = "BMI (kg/m^2)", PARAMN = 20)
+  ) |>
+  derive_param_map(
+    by_vars = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
+    set_values_to = exprs(PARAMCD = "MAP", PARAM = "MAP (mmHg)", PARAMN = 21)
+  ) |>
+  derive_var_anrind() |>
+  derive_var_ontrtfl(start_date = ADT, ref_start_date = TRTSDT, ref_end_date = TRTEDT) |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      order   = exprs(ADT, AVISITN),
+      new_var = ABLFL, mode = "last"
+    ),
+    filter = !is.na(AVAL) & ADT <= TRTSDT
+  ) |>
+  derive_var_base(by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+                  source_var = AVAL, new_var = BASE) |>
+  derive_var_base(by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+                  source_var = ANRIND, new_var = BNRIND) |>
+  derive_var_chg() |>
+  derive_var_pchg() |>
+  derive_var_shift(new_var = SHIFT1, from_var = BNRIND, to_var = ANRIND)
+
+# Inspect the result
+advs_full |>
+  filter(PARAMCD %in% c("SYSBP", "BMI", "MAP")) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, BASE, CHG, ANRIND, SHIFT1) |>
+  arrange(USUBJID, PARAMCD, AVISIT)
+```
+
+---
+
+## 11 — ADLB & ADEG differences
+
+```{r quiz-adlb-adeg, echo=FALSE}
+quiz(
+  question(
+    "ADLB lab values: what SDTM variable maps to AVAL?",
+    answer("LBORRES"),
+    answer("LBSTRESN", correct = TRUE),
+    answer("LBTEST"),
+    answer("LBORNRHI"),
+    allow_retry = TRUE
+  ),
+  question(
+    "For ADEG with triplicate ECGs per visit, which variable captures the sub-visit timepoint?",
+    answer("AVISITN"),
+    answer("APERIOD"),
+    answer("ATPT", correct = TRUE),
+    answer("ADY"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which admiral function computes QTcF (Fridericia-corrected QT)?",
+    answer("derive_param_computed()"),
+    answer("derive_param_qtc()", correct = TRUE),
+    answer("derive_var_anrind()"),
+    answer("derive_param_map()"),
+    allow_retry = TRUE
+  ),
+  question(
+    "NCI CTCAE grading for lab toxicity uses which admiral function?",
+    answer("derive_var_anrind()"),
+    answer("derive_var_atoxgr()", correct = TRUE),
+    answer("derive_var_base()"),
+    answer("derive_var_chg()"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Quiz — final
+
+```{r quiz-final-16, echo=FALSE}
+quiz(
+  question(
+    "What does ABLFL = 'Y' mark?",
+    answer("Any post-baseline row"),
+    answer("The row used as the baseline reference for that subject and parameter", correct = TRUE),
+    answer("An adverse event flag"),
+    answer("An on-treatment row"),
+    allow_retry = TRUE
+  ),
+  question(
+    "CHG is defined as:",
+    answer("BASE - AVAL"),
+    answer("AVAL / BASE"),
+    answer("AVAL - BASE", correct = TRUE),
+    answer("(AVAL - BASE) / BASE * 100"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What does SHIFT1 = 'NORMAL to HIGH' tell you?",
+    answer("AVAL exceeded the reference range"),
+    answer("The subject's reference range category went from NORMAL at baseline to HIGH on-treatment", correct = TRUE),
+    answer("The parameter was flagged as worst"),
+    answer("The baseline was missing"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which higher-order wrapper lets you apply the same derivation with different argument sets to different data slices?",
+    answer("restrict_derivation()"),
+    answer("call_derivation()"),
+    answer("slice_derivation()", correct = TRUE),
+    answer("derive_vars_merged()"),
+    allow_retry = TRUE
+  )
+)
+```
