@@ -9,13 +9,15 @@ output:
 runtime: shiny_prerendered
 description: >
   Understand where pharmaverseraw sits in the data pipeline (raw → SDTM → ADaM).
-  Explore realistic raw EDC data, compare it to SDTM, manually preview the key
-  derivations sdtm.oak will later automate, and understand what annotated CRFs provide.
+  Explore realistic raw EDC data, compare it to real pharmaversesdtm SDTM output,
+  manually preview every derivation sdtm.oak will later automate, perform cross-domain
+  joins, compute clinical variables, and understand what annotated CRFs provide.
 ---
 
 ```{r setup, include=FALSE}
 library(learnr)
 library(dplyr)
+library(tidyr)
 library(tibble)
 library(lubridate)
 library(stringr)
@@ -23,51 +25,85 @@ library(stringr)
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 tutorial_options(exercise.timelimit = 60)
 
-# ── Mock raw datasets that mirror pharmaverseraw structure ───────────────────
-# These reproduce the column patterns documented in pharmaverseraw v0.1.0.
-# If pharmaverseraw is installed you would use:  data("ae_raw", package="pharmaverseraw")
+# ── 1. Raw datasets ───────────────────────────────────────────────────────────
+# Try the real pharmaverseraw package first; fall back to realistic tribbles
+# if the package is not installed in this environment.
 
-ae_raw <- tribble(
-  ~STUDYID,     ~PATNUM, ~SITEID, ~AETERM,                       ~AESTDT,       ~AEENDT,       ~AESEV,      ~AESER, ~AEOUT,
-  "TEST_STUDY",    1015,   "701",  "HEADACHE",                   "2020-07-15",  "2020-07-17",  "MILD",      "N",    "RECOVERED/RESOLVED",
-  "TEST_STUDY",    1015,   "701",  "NAUSEA",                     "2020-08-02",  "2020-08-05",  "MODERATE",  "N",    "RECOVERED/RESOLVED",
-  "TEST_STUDY",    1023,   "701",  "DIZZINESS",                  "2020-07-20",  NA,            "MILD",      "N",    "NOT RECOVERED/NOT RESOLVED",
-  "TEST_STUDY",    1023,   "701",  "APPLICATION SITE ERYTHEMA",  "2020-09-10",  "2020-09-12",  "MODERATE",  "N",    "RECOVERED/RESOLVED",
-  "TEST_STUDY",    1034,   "702",  "FALL",                       "2020-07-28",  "2020-07-28",  "SEVERE",    "Y",    "RECOVERED/RESOLVED",
-  "TEST_STUDY",    1034,   "702",  "HEADACHE",                   "2020-08-14",  "2020-08-16",  "MILD",      "N",    "RECOVERED/RESOLVED",
-  "TEST_STUDY",    1056,   "703",  "FATIGUE",                    "2020-10-01",  "2020-10-10",  "MILD",      "N",    "RECOVERED/RESOLVED",
-  "TEST_STUDY",    1056,   "703",  "VOMITING",                   "2020-10-03",  "2020-10-04",  "SEVERE",    "Y",    "RECOVERED/RESOLVED"
-)
+if (requireNamespace("pharmaverseraw", quietly = TRUE)) {
 
-dm_raw <- tribble(
-  ~STUDYID,     ~PATNUM, ~SITEID, ~BRTHDAT,      ~SEX, ~RACE,                    ~ARM,
-  "TEST_STUDY",    1015,   "701",  "1955-04-12",  "F",  "WHITE",                  "Xanomeline High Dose",
-  "TEST_STUDY",    1023,   "701",  "1948-09-30",  "M",  "WHITE",                  "Placebo",
-  "TEST_STUDY",    1034,   "702",  "1961-07-22",  "F",  "BLACK OR AFRICAN AMERICAN", "Xanomeline Low Dose",
-  "TEST_STUDY",    1056,   "703",  "1940-11-05",  "M",  "WHITE",                  "Xanomeline High Dose",
-  "TEST_STUDY",    1078,   "703",  "1953-02-18",  "F",  "ASIAN",                  "Placebo"
-)
+  data("ae_raw", package = "pharmaverseraw")
+  data("dm_raw", package = "pharmaverseraw")
+  data("ds_raw", package = "pharmaverseraw")
+  message("pharmaverseraw loaded from package.")
 
-ds_raw <- tribble(
-  ~STUDYID,     ~PATNUM, ~SITEID, ~DSTERM,                         ~DSSTDT,
-  "TEST_STUDY",    1015,   "701",  "COMPLETED",                    "2021-01-15",
-  "TEST_STUDY",    1023,   "701",  "ADVERSE EVENT",                "2020-10-05",
-  "TEST_STUDY",    1034,   "702",  "COMPLETED",                    "2021-01-15",
-  "TEST_STUDY",    1056,   "703",  "SUBJECT/GUARDIAN DECISION",    "2020-11-20",
-  "TEST_STUDY",    1078,   "703",  "COMPLETED",                    "2021-01-15"
-)
+} else {
 
-# The SDTM-shaped OUTPUT (what pharmaversesdtm contains)
+  message("pharmaverseraw not installed — using built-in fallback datasets.")
+
+  # ae_raw: mirrors pharmaverseraw AE structure (PATNUM not USUBJID, no AESEQ,
+  # no AEDECOD / AEBODSYS, dates as plain ISO 8601 strings without 'DTC' suffix)
+  ae_raw <- tribble(
+    ~STUDYID,     ~PATNUM, ~SITEID, ~AETERM,                       ~AESTDT,       ~AEENDT,       ~AESEV,      ~AESER, ~AEOUT,                          ~AEREL,
+    "TEST_STUDY",    1015,   "701",  "HEADACHE",                   "2020-07-15",  "2020-07-17",  "MILD",      "N",    "RECOVERED/RESOLVED",            "POSSIBLE",
+    "TEST_STUDY",    1015,   "701",  "NAUSEA",                     "2020-08-02",  "2020-08-05",  "MODERATE",  "N",    "RECOVERED/RESOLVED",            "PROBABLE",
+    "TEST_STUDY",    1023,   "701",  "DIZZINESS",                  "2020-07-20",  NA,            "MILD",      "N",    "NOT RECOVERED/NOT RESOLVED",    "POSSIBLE",
+    "TEST_STUDY",    1023,   "701",  "APPLICATION SITE ERYTHEMA",  "2020-09-10",  "2020-09-12",  "MODERATE",  "N",    "RECOVERED/RESOLVED",            "PROBABLE",
+    "TEST_STUDY",    1034,   "702",  "FALL",                       "2020-07-28",  "2020-07-28",  "SEVERE",    "Y",    "RECOVERED/RESOLVED",            "NOT RELATED",
+    "TEST_STUDY",    1034,   "702",  "HEADACHE",                   "2020-08-14",  "2020-08-16",  "MILD",      "N",    "RECOVERED/RESOLVED",            "REMOTE",
+    "TEST_STUDY",    1056,   "703",  "FATIGUE",                    "2020-10-01",  "2020-10-10",  "MILD",      "N",    "RECOVERED/RESOLVED",            "POSSIBLE",
+    "TEST_STUDY",    1056,   "703",  "VOMITING",                   "2020-10-03",  "2020-10-04",  "SEVERE",    "Y",    "RECOVERED/RESOLVED",            "PROBABLE",
+    "TEST_STUDY",    1078,   "703",  "PRURITUS",                   "2020-11-02",  "2020-11-15",  "MILD",      "N",    "RECOVERED/RESOLVED",            "PROBABLE",
+    "TEST_STUDY",    1099,   "704",  "INSOMNIA",                   "2020-08-20",  "2020-09-01",  "MODERATE",  "N",    "RECOVERED/RESOLVED",            "POSSIBLE"
+  )
+
+  # dm_raw: mirrors pharmaverseraw DM structure (BRTHDAT not BRTHDTC, PATNUM not USUBJID)
+  dm_raw <- tribble(
+    ~STUDYID,     ~PATNUM, ~SITEID, ~BRTHDAT,      ~SEX, ~RACE,                          ~ETHNIC,                 ~ARM,                    ~RFSTDAT,
+    "TEST_STUDY",    1015,   "701",  "1955-04-12",  "F",  "WHITE",                        "NOT HISPANIC OR LATINO", "Xanomeline High Dose",  "2020-07-01",
+    "TEST_STUDY",    1023,   "701",  "1948-09-30",  "M",  "WHITE",                        "NOT HISPANIC OR LATINO", "Placebo",               "2020-07-01",
+    "TEST_STUDY",    1034,   "702",  "1961-07-22",  "F",  "BLACK OR AFRICAN AMERICAN",    "NOT HISPANIC OR LATINO", "Xanomeline Low Dose",   "2020-07-01",
+    "TEST_STUDY",    1056,   "703",  "1940-11-05",  "M",  "WHITE",                        "NOT HISPANIC OR LATINO", "Xanomeline High Dose",  "2020-07-01",
+    "TEST_STUDY",    1078,   "703",  "1953-02-18",  "F",  "ASIAN",                        "NOT HISPANIC OR LATINO", "Placebo",               "2020-07-01"
+    # Note: PATNUM 1099 is intentionally absent from dm_raw → referential integrity exercise
+  )
+
+  # ds_raw: disposition events
+  ds_raw <- tribble(
+    ~STUDYID,     ~PATNUM, ~SITEID, ~DSTERM,                          ~DSSTDT,       ~DSCAT,
+    "TEST_STUDY",    1015,   "701",  "COMPLETED",                     "2021-01-15",  "DISPOSITION EVENT",
+    "TEST_STUDY",    1023,   "701",  "ADVERSE EVENT",                 "2020-10-05",  "DISPOSITION EVENT",
+    "TEST_STUDY",    1034,   "702",  "COMPLETED",                     "2021-01-15",  "DISPOSITION EVENT",
+    "TEST_STUDY",    1056,   "703",  "SUBJECT/GUARDIAN DECISION",     "2020-11-20",  "DISPOSITION EVENT",
+    "TEST_STUDY",    1078,   "703",  "COMPLETED",                     "2021-01-15",  "DISPOSITION EVENT",
+    "TEST_STUDY",    1015,   "701",  "PROTOCOL VISIT COMPLETED",      "2020-07-01",  "PROTOCOL MILESTONE",
+    "TEST_STUDY",    1023,   "701",  "PROTOCOL VISIT COMPLETED",      "2020-07-01",  "PROTOCOL MILESTONE",
+    "TEST_STUDY",    1034,   "702",  "PROTOCOL VISIT COMPLETED",      "2020-07-01",  "PROTOCOL MILESTONE"
+  )
+}
+
+# ── 2. SDTM reference — real pharmaversesdtm output ──────────────────────────
+# pharmaversesdtm is installed (v1.3.1). These are the CDISC pilot SDTM datasets
+# that represent the TARGET structure raw data must be mapped to.
+library(pharmaversesdtm)
+
+ae_sdtm_real <- pharmaversesdtm::ae   # 1,191 rows, 35 columns — full AE SDTM
+dm_sdtm_real <- pharmaversesdtm::dm   # 306 rows,  25 columns — full DM SDTM
+ds_sdtm_real <- pharmaversesdtm::ds   # disposition
+suppae_real  <- pharmaversesdtm::suppae  # supplemental AE qualifiers
+
+# ── 3. Small illustrative ae_sdtm mirroring what sdtm.oak produces from ae_raw ──
+# (Same study as ae_raw — kept for the "before vs after" comparison exercises)
 ae_sdtm <- tribble(
-  ~STUDYID,       ~DOMAIN, ~USUBJID,             ~AESEQ, ~AETERM,                      ~AEDECOD,               ~AEBODSYS,                  ~AESTDTC,      ~AEENDTC,      ~AESEV,      ~AESER,
-  "TEST_STUDY",   "AE",    "TEST_STUDY-701-1015",  1,     "HEADACHE",                  "Headache",             "Nervous system disorders", "2020-07-15",  "2020-07-17",  "MILD",      "N",
-  "TEST_STUDY",   "AE",    "TEST_STUDY-701-1015",  2,     "NAUSEA",                    "Nausea",               "Gastrointestinal disorders","2020-08-02",  "2020-08-05",  "MODERATE",  "N",
-  "TEST_STUDY",   "AE",    "TEST_STUDY-701-1023",  1,     "DIZZINESS",                 "Dizziness",            "Nervous system disorders", "2020-07-20",  NA,            "MILD",      "N",
-  "TEST_STUDY",   "AE",    "TEST_STUDY-701-1023",  2,     "APPLICATION SITE ERYTHEMA", "Application site erythema","General disorders",     "2020-09-10",  "2020-09-12",  "MODERATE",  "N",
-  "TEST_STUDY",   "AE",    "TEST_STUDY-702-1034",  1,     "FALL",                      "Fall",                 "Injury, poisoning",        "2020-07-28",  "2020-07-28",  "SEVERE",    "Y",
-  "TEST_STUDY",   "AE",    "TEST_STUDY-702-1034",  2,     "HEADACHE",                  "Headache",             "Nervous system disorders", "2020-08-14",  "2020-08-16",  "MILD",      "N",
-  "TEST_STUDY",   "AE",    "TEST_STUDY-703-1056",  1,     "FATIGUE",                   "Fatigue",              "General disorders",        "2020-10-01",  "2020-10-10",  "MILD",      "N",
-  "TEST_STUDY",   "AE",    "TEST_STUDY-703-1056",  2,     "VOMITING",                  "Vomiting",             "Gastrointestinal disorders","2020-10-03",  "2020-10-04",  "SEVERE",    "Y"
+  ~STUDYID,      ~DOMAIN, ~USUBJID,               ~AESEQ, ~AETERM,                       ~AEDECOD,                      ~AEBODSYS,                              ~AESTDTC,      ~AEENDTC,      ~AESEV,      ~AESER, ~AEOUT,                       ~AEREL,
+  "TEST_STUDY",  "AE",    "TEST_STUDY-701-1015",    1,     "HEADACHE",                    "Headache",                    "Nervous system disorders",             "2020-07-15",  "2020-07-17",  "MILD",      "N",    "RECOVERED/RESOLVED",         "POSSIBLE",
+  "TEST_STUDY",  "AE",    "TEST_STUDY-701-1015",    2,     "NAUSEA",                      "Nausea",                      "Gastrointestinal disorders",           "2020-08-02",  "2020-08-05",  "MODERATE",  "N",    "RECOVERED/RESOLVED",         "PROBABLE",
+  "TEST_STUDY",  "AE",    "TEST_STUDY-701-1023",    1,     "DIZZINESS",                   "Dizziness",                   "Nervous system disorders",             "2020-07-20",  NA,            "MILD",      "N",    "NOT RECOVERED/NOT RESOLVED", "POSSIBLE",
+  "TEST_STUDY",  "AE",    "TEST_STUDY-701-1023",    2,     "APPLICATION SITE ERYTHEMA",   "Application site erythema",   "General disorders and admin site cond","2020-09-10",  "2020-09-12",  "MODERATE",  "N",    "RECOVERED/RESOLVED",         "PROBABLE",
+  "TEST_STUDY",  "AE",    "TEST_STUDY-702-1034",    1,     "FALL",                        "Fall",                        "Injury, poisoning and proc complications","2020-07-28","2020-07-28",  "SEVERE",    "Y",    "RECOVERED/RESOLVED",         "NOT RELATED",
+  "TEST_STUDY",  "AE",    "TEST_STUDY-702-1034",    2,     "HEADACHE",                    "Headache",                    "Nervous system disorders",             "2020-08-14",  "2020-08-16",  "MILD",      "N",    "RECOVERED/RESOLVED",         "REMOTE",
+  "TEST_STUDY",  "AE",    "TEST_STUDY-703-1056",    1,     "FATIGUE",                     "Fatigue",                     "General disorders and admin site cond","2020-10-01",  "2020-10-10",  "MILD",      "N",    "RECOVERED/RESOLVED",         "POSSIBLE",
+  "TEST_STUDY",  "AE",    "TEST_STUDY-703-1056",    2,     "VOMITING",                    "Vomiting",                    "Gastrointestinal disorders",           "2020-10-03",  "2020-10-04",  "SEVERE",    "Y",    "RECOVERED/RESOLVED",         "PROBABLE",
+  "TEST_STUDY",  "AE",    "TEST_STUDY-703-1078",    1,     "PRURITUS",                    "Pruritus",                    "Skin and subcutaneous tissue disorders","2020-11-02",  "2020-11-15",  "MILD",      "N",    "RECOVERED/RESOLVED",         "PROBABLE"
 )
 ```
 
@@ -82,7 +118,7 @@ ae_sdtm <- tribble(
    │  raw EDC data
    │  via {sdtm.oak}  ← Lessons 08–10
    ▼
-{pharmaversesdtm}     ← SDTM datasets
+{pharmaversesdtm}     ← SDTM datasets  (used live in this lesson)
    │
    │  via {admiral}   ← Lessons 11+
    ▼
@@ -93,11 +129,15 @@ ae_sdtm <- tribble(
    TLFs (Tables, Listings, Figures)
 ```
 
-This package was released in mid-2025 to fill a long-standing gap: before it, the raw → SDTM step had no canonical test data. `pharmaverseraw` itself does almost **no computation** — it is a pure **data package** bundling raw datasets and annotated CRFs.
+This lesson uses **two complementary data sources**:
 
-> **In this tutorial** the datasets `ae_raw`, `dm_raw`, and `ds_raw` mirror the real
-> `pharmaverseraw` package structure. `ae_sdtm` mirrors `pharmaversesdtm::ae`.
-> If the packages are installed on your system, try `data("ae_raw", package = "pharmaverseraw")`.
+- **`ae_raw`, `dm_raw`, `ds_raw`** — raw EDC-style datasets (real `{pharmaverseraw}` if installed, otherwise realistic fallback tribbles mirroring its structure)
+- **`ae_sdtm_real`, `dm_sdtm_real`** — actual `{pharmaversesdtm}` SDTM output from the CDISC pilot study, loaded live so you can compare real SDTM structure against raw
+
+> **Run this to see which source is active:**
+> ```r
+> if (requireNamespace("pharmaverseraw", quietly=TRUE)) "pharmaverseraw" else "fallback tribbles"
+> ```
 
 ---
 
@@ -115,9 +155,20 @@ quiz(
   question(
     "pharmaverseraw is best described as:",
     answer("A package that builds SDTM datasets automatically"),
-    answer("A data package — it bundles raw datasets and annotated CRFs with minimal computation", correct = TRUE),
+    answer("A data package — it bundles raw datasets and annotated CRFs with minimal computation",
+           correct = TRUE),
     answer("A validation framework for SDTM conformance checking"),
     answer("A replacement for {pharmaversesdtm}"),
+    allow_retry = TRUE
+  ),
+  question(
+    "In this lesson, pharmaversesdtm is used alongside pharmaverseraw. Why?",
+    answer("They contain the same datasets — one is just a backup of the other"),
+    answer("pharmaversesdtm provides the SDTM target structure, so you can compare
+           what raw data looks like versus what a finished SDTM dataset looks like",
+           correct = TRUE),
+    answer("pharmaversesdtm must be loaded before pharmaverseraw can function"),
+    answer("pharmaversesdtm supplies the MedDRA coding tables"),
     allow_retry = TRUE
   )
 )
@@ -133,9 +184,7 @@ Real raw data comes from Veeva Vault, Medidata Rave, Castor, REDCap, and dozens 
 
 ### Standards-agnostic
 
-Some columns follow **CDASH** (Clinical Data Acquisition Standards Harmonization — the CDISC standard for CRF design), while others don't. This mirrors real-world variability: your sponsor might have CDASH-conformant CRFs for some pages and bespoke naming for others.
-
-The test data is *intentionally* a bit inconsistent — it's a realistic playground, not a clean reference.
+Some columns follow **CDASH** (Clinical Data Acquisition Standards Harmonization — the CDISC standard for CRF design), while others don't. This mirrors real-world variability: your sponsor might have CDASH-conformant CRFs for some pages and bespoke naming for others. The data is *intentionally* a bit inconsistent — it is a realistic playground, not a clean reference.
 
 ```{r quiz-philosophy, echo=FALSE}
 quiz(
@@ -143,7 +192,8 @@ quiz(
   question(
     "Why is pharmaverseraw deliberately EDC-agnostic?",
     answer("To make it compatible only with Medidata Rave"),
-    answer("So the SDTM mapping patterns you learn apply generically to any EDC, not just one system", correct = TRUE),
+    answer("So the SDTM mapping patterns you learn apply generically to any EDC,
+           not just one system", correct = TRUE),
     answer("Because no CDISC standard governs raw data"),
     answer("To avoid licensing issues with EDC vendors"),
     allow_retry = TRUE
@@ -151,9 +201,21 @@ quiz(
   question(
     "CDASH stands for:",
     answer("Clinical Data Analysis and Submission Harmonization"),
-    answer("Clinical Data Acquisition Standards Harmonization — the CDISC standard for CRF design and raw variable naming", correct = TRUE),
+    answer("Clinical Data Acquisition Standards Harmonization — the CDISC standard
+           for CRF design and raw variable naming", correct = TRUE),
     answer("Controlled Dose Assignment for Standard Hosts"),
     answer("Clinical Domain Attribute Schema Hierarchy"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A sponsor's raw AE data uses the column name 'ADVERSE_REACTION_START' instead
+     of the CDASH-recommended 'AESTDAT'. Which pharmaverseraw design principle
+     does this illustrate?",
+    answer("EDC-agnostic — real raw data uses whatever naming the EDC enforces,
+           so mapping code must handle any name", correct = TRUE),
+    answer("Standards-agnostic means all column names are randomised"),
+    answer("CDASH forbids 'ADVERSE_REACTION_START' as a column name"),
+    answer("The data is wrong and must be corrected before sdtm.oak can run"),
     allow_retry = TRUE
   )
 )
@@ -165,140 +227,159 @@ quiz(
 
 ### Available domains
 
-The initial v0.1.0 release covers:
-
 | Raw dataset | Maps to SDTM | Description |
 |---|---|---|
 | `dm_raw` | DM | Demographics — one row per subject |
-| `ae_raw` | AE | Adverse Events |
-| `ec_raw`, `ex_raw` | EC, EX | Exposure (planned / actual) |
+| `ae_raw` | AE | Adverse Events — one row per AE per subject |
 | `ds_raw` | DS | Disposition events |
+| `ec_raw`, `ex_raw` | EC, EX | Exposure (planned / actual) |
 
-The naming convention is consistent: `<domain>_raw`. Check installed versions with `data(package = "pharmaverseraw")`.
+The naming convention is consistent: `<domain>_raw`. Check installed versions with
+`data(package = "pharmaverseraw")`.
 
-### Exercise 2a — inspect ae_raw
+### Exercise 2a — structural contrast: raw vs real SDTM
 
-Use `glimpse()` to inspect the structure of `ae_raw`. Note the column names carefully — how do they differ from what you'd see in SDTM?
+Run the code below to compare the column count and names of `ae_raw` (raw EDC) against
+the real `pharmaversesdtm::ae` dataset. Note which columns exist only in SDTM.
 
-```{r explore-ae, exercise=TRUE, exercise.lines=6}
-glimpse(ae_raw)
+```{r explore-structural, exercise=TRUE, exercise.lines=16}
+cat("=== ae_raw: EDC columns ===\n")
+cat(sprintf("Rows: %d   Columns: %d\n", nrow(ae_raw), ncol(ae_raw)))
+names(ae_raw)
+
+cat("\n=== pharmaversesdtm::ae: SDTM columns ===\n")
+cat(sprintf("Rows: %d   Columns: %d\n", nrow(ae_sdtm_real), ncol(ae_sdtm_real)))
+
+cat("\nColumns in SDTM AE that do NOT exist in raw (must be derived/coded):\n")
+setdiff(names(ae_sdtm_real), names(ae_raw))
+
+cat("\nColumns in raw that do NOT appear in SDTM AE (EDC-internal, dropped):\n")
+setdiff(names(ae_raw), names(ae_sdtm_real))
 ```
 
-```{r explore-ae-hint-1}
-# Notice: PATNUM not USUBJID, AESTDT not AESTDTC, no AESEQ, no AEDECOD
+```{r explore-structural-hint-1}
+# Just run it and observe carefully.
+# Key SDTM columns absent from raw:
+#   DOMAIN (hardcode), USUBJID (derive), AESEQ (derive),
+#   AEDECOD / AEBODSYS / AESOC (MedDRA external coding)
+# Key raw columns absent from SDTM:
+#   PATNUM (replaced by USUBJID), STUDYID/SITEID embedded in USUBJID,
+#   AESTDT / AEENDT renamed to AESTDTC / AEENDTC
 ```
 
-### Exercise 2b — inspect dm_raw
+### Exercise 2b — inspect record counts and key variables
 
-Inspect `dm_raw`. What is the subject identifier called? What date format is used for birthdate?
+How many AE records exist per site in `ae_raw`? Then, for comparison, show the top
+5 most common AE preferred terms (`AEDECOD`) in the real SDTM dataset.
 
-```{r explore-dm, exercise=TRUE, exercise.lines=5}
-glimpse(dm_raw)
+```{r count-ae, exercise=TRUE, exercise.lines=12}
+# Raw: AEs per site
+cat("Raw AEs per site:\n")
+ae_raw |> count(SITEID, sort = TRUE) |> print()
+
+# Real SDTM: top 5 preferred terms
+cat("\nReal pharmaversesdtm::ae — top 5 AE preferred terms:\n")
+ae_sdtm_real |>
+  count(___, sort = TRUE) |>
+  slice_head(n = 5)
 ```
 
-### Exercise 2c — count records
+```{r count-ae-hint-1}
+# count(AEDECOD, sort = TRUE) on ae_sdtm_real
+```
 
-How many AE records exist per site? Use `count()`.
+```{r count-ae-solution}
+ae_raw |> count(SITEID, sort = TRUE)
 
-```{r count-ae-by-site, exercise=TRUE, exercise.lines=5}
+ae_sdtm_real |>
+  count(AEDECOD, sort = TRUE) |>
+  slice_head(n = 5)
+```
+
+### Exercise 2c — severity distribution: raw vs real SDTM
+
+Compare the severity profile between `ae_raw` (raw `AESEV`) and the real
+`pharmaversesdtm::ae` (also `AESEV`). Do the severity distributions look similar?
+What does this tell you about the representativeness of the test data?
+
+```{r severity-compare, exercise=TRUE, exercise.lines=14}
+cat("=== ae_raw severity distribution ===\n")
 ae_raw |>
-  count(___, sort = TRUE)
+  count(AESEV) |>
+  mutate(pct = round(100 * n / sum(n), 1)) |>
+  print()
+
+cat("\n=== pharmaversesdtm::ae severity distribution ===\n")
+ae_sdtm_real |>
+  count(___) |>
+  mutate(pct = round(100 * n / sum(n), 1)) |>
+  print()
 ```
 
-```{r count-ae-by-site-hint-1}
-# count(SITEID)
+```{r severity-compare-hint-1}
+# count(AESEV) on ae_sdtm_real
 ```
 
-```{r count-ae-by-site-solution}
+```{r severity-compare-solution}
 ae_raw |>
-  count(SITEID, sort = TRUE)
-```
+  count(AESEV) |>
+  mutate(pct = round(100 * n / sum(n), 1))
 
-### Exercise 2d — list column names side by side
-
-Compare the column names of `ae_raw` and `ae_sdtm` side by side. Which columns are present in SDTM but absent from raw, and vice versa?
-
-```{r colnames-compare, exercise=TRUE, exercise.lines=12}
-# Columns in ae_raw
-raw_cols  <- names(ae_raw)
-
-# Columns in ae_sdtm
-sdtm_cols <- names(ae_sdtm)
-
-# In SDTM but NOT in raw
-cat("In SDTM only:\n")
-setdiff(sdtm_cols, raw_cols)
-```
-
-```{r colnames-compare-hint-1}
-# setdiff(sdtm_cols, raw_cols) — in SDTM but missing from raw
-# setdiff(raw_cols, sdtm_cols) — in raw but missing from SDTM
+ae_sdtm_real |>
+  count(AESEV) |>
+  mutate(pct = round(100 * n / sum(n), 1))
 ```
 
 ---
 
-## 3  What raw data has — and what it doesn't
+## 3  The four mapping patterns
 
-### The gap between raw and SDTM
+Every raw → SDTM variable transformation falls into one of four categories:
 
-Run this comparison to see raw and SDTM rows for the same subject:
-
-```{r raw-sdtm-compare, exercise=TRUE, exercise.lines=14}
-cat("=== RAW: subject 1015 ===\n")
-ae_raw |>
-  filter(PATNUM == 1015) |>
-  select(STUDYID, PATNUM, AETERM, AESTDT, AESEV, AESER) |>
-  print()
-
-cat("\n=== SDTM: subject TEST_STUDY-701-1015 ===\n")
-ae_sdtm |>
-  filter(USUBJID == "TEST_STUDY-701-1015") |>
-  select(USUBJID, AESEQ, AETERM, AEDECOD, AEBODSYS, AESTDTC, AESEV, AESER) |>
-  print()
-```
-
-```{r raw-sdtm-compare-hint-1}
-# Just run it and observe — focus on what SDTM has that raw doesn't:
-# USUBJID (derived), DOMAIN (hardcoded), AESEQ (derived),
-# AEDECOD & AEBODSYS (from MedDRA coding), AESTDTC (renamed/formatted)
-```
-
-### The four mapping patterns
-
-Every raw → SDTM variable falls into one of four categories:
-
-| Pattern | Description | Example |
+| Pattern | Description | AE example |
 |---|---|---|
-| **Hardcode** | Same value for every row — no input needed | `DOMAIN = "AE"` |
-| **Direct map** | Copy value directly, possibly rename | `AETERM` from `ae_raw$AETERM` |
-| **Derive** | Compute from one or more source columns | `USUBJID` from `STUDYID + SITEID + PATNUM` |
-| **External** | From an outside process — not in raw data | `AEDECOD` / `AEBODSYS` from MedDRA coding |
+| **Hardcode** | Same value for every row | `DOMAIN = "AE"` |
+| **Direct map** | Copy/rename from source column | `AETERM` → `AETERM`; `AESTDT` → `AESTDTC` |
+| **Derive** | Compute from one or more source columns | `USUBJID` from `STUDYID + SITEID + PATNUM`; `AESEQ` from `row_number()` |
+| **External** | From an outside process not present in raw | `AEDECOD` / `AEBODSYS` from MedDRA coding |
 
 ```{r quiz-patterns, echo=FALSE}
 quiz(
   caption = "Mapping patterns",
   question(
-    "AEDECOD (the MedDRA preferred term for an AE) is an example of which mapping pattern?",
+    "AEDECOD (the MedDRA preferred term for an AE) is an example of which pattern?",
     answer("Hardcode — it's always 'Adverse Event'"),
     answer("Direct map — it's the same as AETERM"),
-    answer("External — it comes from medical coding (MedDRA), not from the raw CRF data", correct = TRUE),
-    answer("Derive — it's computed from AETERM using a formula"),
+    answer("External — it comes from medical coding (MedDRA), not from the raw CRF data",
+           correct = TRUE),
+    answer("Derive — it is computed from AETERM using a formula"),
     allow_retry = TRUE
   ),
   question(
-    "DOMAIN = 'AE' for every row in the AE dataset is an example of which pattern?",
+    "DOMAIN = 'AE' for every row in the AE dataset is which pattern?",
     answer("Direct map"),
-    answer("Hardcode — the same value is assigned to every row regardless of input", correct = TRUE),
+    answer("Hardcode — the same value is assigned to every row regardless of input",
+           correct = TRUE),
     answer("Derive"),
     answer("External"),
     allow_retry = TRUE
   ),
   question(
-    "Which variable must be DERIVED (not directly mapped) because it doesn't exist anywhere in the raw data?",
-    answer("AETERM — copied from ae_raw$AETERM"),
-    answer("AESEV — copied from ae_raw$AESEV"),
-    answer("AESEQ — the within-subject sequence number that must be computed", correct = TRUE),
-    answer("AESER — copied from ae_raw$AESER"),
+    "AESEQ — the within-subject sequence number — is which pattern, and why?",
+    answer("Hardcode — it's always 1"),
+    answer("Direct map — it exists in the raw data as a row counter"),
+    answer("Derive — it must be computed (e.g. via row_number()) because it doesn't
+           exist anywhere in the raw EDC extract", correct = TRUE),
+    answer("External — it comes from the data management system"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A sponsor's raw DM dataset has a column 'TRT_ASSIGNED'. In SDTM DM this
+     becomes ARM. Which mapping pattern is this?",
+    answer("Hardcode"),
+    answer("Direct map — copy the value and rename the column", correct = TRUE),
+    answer("Derive"),
+    answer("External"),
     allow_retry = TRUE
   )
 )
@@ -306,182 +387,285 @@ quiz(
 
 ---
 
-## 4  Manually previewing SDTM derivations
+## 4  Manually building SDTM from raw data
 
-In Lesson 08 you'll use `{sdtm.oak}` functions to automate these. First, do them by hand — it builds the mental model for what `sdtm.oak` is actually doing.
+In Lesson 08 you'll use `{sdtm.oak}` functions to automate these steps. Here you do them by hand — building the mental model that makes `sdtm.oak` intuitive.
 
 ### Exercise 4a — derive USUBJID
 
-In raw data the subject is identified by `PATNUM` (an EDC integer). SDTM requires `USUBJID` in the format `STUDYID-SITEID-PATNUM`. Derive it using `paste()` or `str_c()`.
+In raw data the subject is identified by `PATNUM` (an EDC integer). SDTM requires
+`USUBJID` in the format `STUDYID-SITEID-PATNUM`. Derive it using `str_c()` and verify
+it matches the `USUBJID` pattern seen in `ae_sdtm_real`.
 
-```{r derive-usubjid, exercise=TRUE, exercise.lines=8}
-ae_raw |>
+```{r derive-usubjid, exercise=TRUE, exercise.lines=12}
+# Derive from ae_raw
+ae_with_id <- ae_raw |>
   mutate(
-    USUBJID = paste(___, ___, ___, sep = "-")
+    USUBJID = str_c(___, ___, ___, sep = "-")
   ) |>
-  select(USUBJID, PATNUM, AETERM)
+  select(USUBJID, PATNUM, SITEID, AETERM)
+
+ae_with_id |> slice_head(n = 4)
+
+# Compare format to real SDTM
+cat("\nReal SDTM USUBJID examples:\n")
+ae_sdtm_real |> distinct(USUBJID) |> slice_head(n = 4)
 ```
 
 ```{r derive-usubjid-hint-1}
-# paste(STUDYID, SITEID, PATNUM, sep = "-")
-# This mirrors what sdtm.oak's oak_id_vars concept handles
+# str_c(STUDYID, SITEID, PATNUM, sep = "-")
+# Notice: real SDTM uses "01-701-1015" pattern (study prefix-site-subject)
+# Our test study uses "TEST_STUDY-701-1015" — same logic, different study name
 ```
 
 ```{r derive-usubjid-solution}
-ae_raw |>
-  mutate(
-    USUBJID = paste(STUDYID, SITEID, PATNUM, sep = "-")
-  ) |>
-  select(USUBJID, PATNUM, AETERM)
+ae_with_id <- ae_raw |>
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  select(USUBJID, PATNUM, SITEID, AETERM)
+
+ae_with_id |> slice_head(n = 4)
+
+ae_sdtm_real |> distinct(USUBJID) |> slice_head(n = 4)
 ```
 
-### Exercise 4b — derive AESEQ
+### Exercise 4b — derive AESEQ with tie-breaking
 
-`AESEQ` is the within-subject sequence number — a row counter per USUBJID. After deriving USUBJID, use `group_by()` + `mutate(row_number())` to add it.
+`AESEQ` is the within-subject AE sequence number. It must be unique per `USUBJID` and
+is sorted by AE start date. Add a secondary sort on `AETERM` to break ties when two
+AEs start on the same day.
 
-```{r derive-aeseq, exercise=TRUE, exercise.lines=12}
+```{r derive-aeseq, exercise=TRUE, exercise.lines=14}
 ae_raw |>
-  mutate(USUBJID = paste(STUDYID, SITEID, PATNUM, sep = "-")) |>
-  arrange(USUBJID, AESTDT) |>
-  group_by(___) |>
-  mutate(AESEQ = ___) |>
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  arrange(USUBJID, AESTDT, ___) |>       # secondary sort for tie-breaking
+  group_by(USUBJID) |>
+  mutate(AESEQ = row_number()) |>
   ungroup() |>
-  select(USUBJID, AESEQ, AETERM, AESTDT)
+  select(USUBJID, AESEQ, AETERM, AESTDT) |>
+  arrange(USUBJID, AESEQ)
 ```
 
 ```{r derive-aeseq-hint-1}
-# group_by(USUBJID)
-# mutate(AESEQ = row_number())
+# arrange(USUBJID, AESTDT, AETERM) — alphabetical AETERM breaks same-date ties
+# This is a production best practice: always specify a deterministic secondary sort
 ```
 
 ```{r derive-aeseq-solution}
 ae_raw |>
-  mutate(USUBJID = paste(STUDYID, SITEID, PATNUM, sep = "-")) |>
-  arrange(USUBJID, AESTDT) |>
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  arrange(USUBJID, AESTDT, AETERM) |>
   group_by(USUBJID) |>
   mutate(AESEQ = row_number()) |>
   ungroup() |>
-  select(USUBJID, AESEQ, AETERM, AESTDT)
+  select(USUBJID, AESEQ, AETERM, AESTDT) |>
+  arrange(USUBJID, AESEQ)
 ```
 
-### Exercise 4c — hardcode DOMAIN
+### Exercise 4c — hardcode DOMAIN and rename date columns in one pipeline
 
-Add a `DOMAIN` column with the hardcoded value `"AE"` for every row.
+Combine two mapping patterns: hardcode `DOMAIN = "AE"` and rename the raw date
+columns to SDTM convention (`AESTDT` → `AESTDTC`, `AEENDT` → `AEENDTC`). The `C`
+suffix signals that SDTM stores dates as collected **character** strings in ISO 8601.
 
-```{r hardcode-domain, exercise=TRUE, exercise.lines=6}
+```{r hardcode-rename, exercise=TRUE, exercise.lines=10}
 ae_raw |>
   mutate(DOMAIN = "___") |>
-  select(DOMAIN, AETERM, AESEV)
-```
-
-```{r hardcode-domain-solution}
-ae_raw |>
-  mutate(DOMAIN = "AE") |>
-  select(DOMAIN, AETERM, AESEV)
-```
-
-### Exercise 4d — rename date columns to SDTM convention
-
-In raw data the AE start date is `AESTDT`. In SDTM it must be named `AESTDTC` (the `C` suffix means "collected character", ISO 8601). Use `rename()` to align.
-
-```{r rename-dtc, exercise=TRUE, exercise.lines=7}
-ae_raw |>
   rename(
     AESTDTC = ___,
     AEENDTC = ___
   ) |>
-  select(AETERM, AESTDTC, AEENDTC)
+  select(DOMAIN, AETERM, AESTDTC, AEENDTC, AESEV) |>
+  slice_head(n = 4)
 ```
 
-```{r rename-dtc-hint-1}
+```{r hardcode-rename-hint-1}
+# DOMAIN = "AE"
 # rename(AESTDTC = AESTDT, AEENDTC = AEENDT)
 ```
 
-```{r rename-dtc-solution}
+```{r hardcode-rename-solution}
 ae_raw |>
-  rename(
-    AESTDTC = AESTDT,
-    AEENDTC = AEENDT
-  ) |>
-  select(AETERM, AESTDTC, AEENDTC)
+  mutate(DOMAIN = "AE") |>
+  rename(AESTDTC = AESTDT, AEENDTC = AEENDT) |>
+  select(DOMAIN, AETERM, AESTDTC, AEENDTC, AESEV) |>
+  slice_head(n = 4)
 ```
 
-### Exercise 4e — put it all together: a manual AE SDTM shell
+### Exercise 4d — cross-domain join: enrich AEs with demographics
 
-Combine all four patterns into one pipeline that produces a partial SDTM AE dataset. This is exactly what `sdtm.oak` will automate in Lesson 08.
+In the raw data, `ae_raw` and `dm_raw` are separate CRF pages joined by `PATNUM`
+and `SITEID`. Join them to bring subject demographics (birth date, sex, treatment arm)
+into the AE dataset — the foundation for any treatment-stratified AE analysis.
 
-```{r ae-sdtm-manual, exercise=TRUE, exercise.lines=20}
+```{r cross-domain-join, exercise=TRUE, exercise.lines=16}
 ae_raw |>
-  # 1. Derive USUBJID
-  mutate(USUBJID = paste(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  left_join(
+    dm_raw |>
+      mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+      select(USUBJID, BRTHDAT, SEX, ARM),
+    by = "___"
+  ) |>
+  select(USUBJID, AETERM, AESTDT, AESEV, SEX, ARM, BRTHDAT) |>
+  arrange(USUBJID, AESTDT)
+```
 
-  # 2. Hardcode DOMAIN
+```{r cross-domain-join-hint-1}
+# by = "USUBJID"
+# The join fails gracefully for subjects in ae_raw with no dm_raw record
+# (PATNUM 1099) — those rows get NA for demographics.
+```
+
+```{r cross-domain-join-solution}
+ae_raw |>
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  left_join(
+    dm_raw |>
+      mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+      select(USUBJID, BRTHDAT, SEX, ARM),
+    by = "USUBJID"
+  ) |>
+  select(USUBJID, AETERM, AESTDT, AESEV, SEX, ARM, BRTHDAT) |>
+  arrange(USUBJID, AESTDT)
+```
+
+### Exercise 4e — compute AGE at AE onset
+
+Extend the cross-domain join: compute `AGE_AT_AE` — the subject's age in completed
+years at the time of each AE start, derived from `BRTHDAT` and `AESTDT`.
+This is a realistic clinical programming task that combines demographic and event data.
+
+```{r age-at-ae, exercise=TRUE, exercise.lines=18}
+ae_raw |>
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  left_join(
+    dm_raw |>
+      mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+      select(USUBJID, BRTHDAT, ARM),
+    by = "USUBJID"
+  ) |>
+  filter(!is.na(BRTHDAT)) |>
+  mutate(
+    AESTDT_D  = ymd(AESTDT),
+    BRTHDAT_D = ymd(BRTHDAT),
+    AGE_AT_AE = floor(as.numeric(___ - ___) / 365.25)
+  ) |>
+  select(USUBJID, ARM, AETERM, AESTDT, AGE_AT_AE, AESEV) |>
+  arrange(USUBJID, AESTDT)
+```
+
+```{r age-at-ae-hint-1}
+# floor(as.numeric(AESTDT_D - BRTHDAT_D) / 365.25)
+# floor() ensures completed years (same as SAS floor(intck('day',birth,event)/365.25))
+```
+
+```{r age-at-ae-solution}
+ae_raw |>
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  left_join(
+    dm_raw |>
+      mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+      select(USUBJID, BRTHDAT, ARM),
+    by = "USUBJID"
+  ) |>
+  filter(!is.na(BRTHDAT)) |>
+  mutate(
+    AESTDT_D  = ymd(AESTDT),
+    BRTHDAT_D = ymd(BRTHDAT),
+    AGE_AT_AE = floor(as.numeric(AESTDT_D - BRTHDAT_D) / 365.25)
+  ) |>
+  select(USUBJID, ARM, AETERM, AESTDT, AGE_AT_AE, AESEV) |>
+  arrange(USUBJID, AESTDT)
+```
+
+### Exercise 4f — full SDTM AE shell pipeline
+
+Combine all mapping steps into one pipeline: USUBJID, DOMAIN, AESEQ, date rename,
+and AEREL (already present as a direct map). This is exactly what `sdtm.oak` will
+automate in Lesson 08 — one function call per step.
+
+```{r ae-sdtm-manual, exercise=TRUE, exercise.lines=22}
+ae_raw |>
+  # Derive USUBJID
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-")) |>
+  # Hardcode DOMAIN
   mutate(DOMAIN = "AE") |>
-
-  # 3. Derive AESEQ (sequence within subject, sorted by start date)
-  arrange(USUBJID, AESTDT) |>
+  # Derive AESEQ with deterministic sort
+  arrange(USUBJID, AESTDT, AETERM) |>
   group_by(USUBJID) |>
   mutate(AESEQ = row_number()) |>
   ungroup() |>
-
-  # 4. Rename date columns to SDTM convention
+  # Rename date columns to SDTM DTC convention
   rename(AESTDTC = AESTDT, AEENDTC = AEENDT) |>
-
-  # 5. Select SDTM columns (AEDECOD excluded — comes from MedDRA coding)
+  # Select SDTM columns (AEDECOD / AEBODSYS excluded — come from MedDRA coding)
   select(STUDYID, DOMAIN, USUBJID, AESEQ,
-         AETERM, AESTDTC, AEENDTC, AESEV, AESER) |>
-
+         AETERM, AESTDTC, AEENDTC, AESEV, AESER, AEREL, AEOUT) |>
   arrange(USUBJID, AESEQ)
 ```
 
 ```{r ae-sdtm-manual-hint-1}
-# Just run it — all the pieces are already there.
-# Notice: AEDECOD and AEBODSYS are absent because they require MedDRA coding.
-# sdtm.oak provides functions for every step above — hardcode_ct(), assign_no_ct(),
-# oak_id_vars(), etc. Lesson 08 will introduce each one.
+# Just run it — all pieces are assembled.
+# Notice what is still MISSING vs ae_sdtm_real:
+#   AEDECOD, AEBODSYS, AESOC, AELLTCD, AEPTCD, AEHLT etc. (MedDRA coding)
+# sdtm.oak provides hardcode_ct(), assign_no_ct(), oak_id_vars()
+# for each step above. Lesson 08 introduces each one.
 ```
 
 ---
 
-## 5  Parsing raw dates
+## 5  Date quality and referential integrity
 
-Raw date strings may not always be in ISO 8601 format. Always validate before converting.
+### Exercise 5a — validate date format and detect partial dates
 
-### Exercise 5a — check date format consistency
+Raw dates are not always well-formed ISO 8601. Use `str_detect()` to classify
+`AESTDT` values as full dates (`YYYY-MM-DD`), partial dates (`YYYY-MM`), or invalid.
+Then parse only the full dates and flag the rest.
 
-Inspect the `AESTDT` column in `ae_raw`. Are all values ISO 8601 (`YYYY-MM-DD`) format? Use `str_detect()` to flag any that don't match.
-
-```{r date-check, exercise=TRUE, exercise.lines=10}
+```{r date-check, exercise=TRUE, exercise.lines=16}
 ae_raw |>
   mutate(
-    IS_ISO = str_detect(AESTDT, "^\\d{4}-\\d{2}-\\d{2}$"),
-    AESTDT_PARSED = if_else(IS_ISO, lubridate::ymd(AESTDT), NA)
+    DATE_TYPE = case_when(
+      str_detect(AESTDT, "^\\d{4}-\\d{2}-\\d{2}$") ~ "FULL",
+      str_detect(AESTDT, "^\\d{4}-\\d{2}$")        ~ "PARTIAL_YM",
+      str_detect(AESTDT, "^\\d{4}$")                ~ "PARTIAL_Y",
+      TRUE                                           ~ "INVALID"
+    ),
+    AESTDTC_D = if_else(DATE_TYPE == "FULL", ymd(AESTDT), NA)
   ) |>
-  select(PATNUM, AESTDT, IS_ISO, AESTDT_PARSED)
+  select(PATNUM, AETERM, AESTDT, DATE_TYPE, AESTDTC_D)
 ```
 
 ```{r date-check-hint-1}
-# ^\\d{4}-\\d{2}-\\d{2}$ matches YYYY-MM-DD exactly
-# IS_ISO tells you if the string is already well-formed
+# ^\\d{4}-\\d{2}-\\d{2}$  matches exactly YYYY-MM-DD
+# ^\\d{4}-\\d{2}$         matches YYYY-MM (partial — day missing)
+# CDISC ISO 8601 allows partial dates: "2020-07" is a valid AESTDTC value
 ```
 
 ### Exercise 5b — compute AE duration in days
 
-For AEs where both start and end date are present, compute `AEDUR` — the number of days the AE lasted (end − start + 1 is the clinical convention for inclusive days).
+For AEs where both start and end date are present, compute `AEDUR` — the number of
+days the AE lasted. Use the CDISC inclusive convention: end − start + 1.
+Then summarise the mean and max duration by severity.
 
-```{r ae-duration, exercise=TRUE, exercise.lines=10}
+```{r ae-duration, exercise=TRUE, exercise.lines=14}
 ae_raw |>
   filter(!is.na(AEENDT)) |>
   mutate(
     AESTDT_D = ymd(AESTDT),
     AEENDT_D = ymd(AEENDT),
-    AEDUR    = as.numeric(___ - ___) + 1   # inclusive days
+    AEDUR    = as.numeric(___ - ___) + 1L
   ) |>
-  select(PATNUM, AETERM, AESTDT, AEENDT, AEDUR)
+  group_by(AESEV) |>
+  summarise(
+    N        = n(),
+    MEAN_DUR = round(mean(AEDUR), 1),
+    MAX_DUR  = max(AEDUR),
+    .groups  = "drop"
+  )
 ```
 
 ```{r ae-duration-hint-1}
-# as.numeric(AEENDT_D - AESTDT_D) + 1
+# as.numeric(AEENDT_D - AESTDT_D) + 1L  — inclusive of both endpoints
 ```
 
 ```{r ae-duration-solution}
@@ -490,88 +674,246 @@ ae_raw |>
   mutate(
     AESTDT_D = ymd(AESTDT),
     AEENDT_D = ymd(AEENDT),
-    AEDUR    = as.numeric(AEENDT_D - AESTDT_D) + 1
+    AEDUR    = as.numeric(AEENDT_D - AESTDT_D) + 1L
   ) |>
-  select(PATNUM, AETERM, AESTDT, AEENDT, AEDUR)
+  group_by(AESEV) |>
+  summarise(
+    N        = n(),
+    MEAN_DUR = round(mean(AEDUR), 1),
+    MAX_DUR  = max(AEDUR),
+    .groups  = "drop"
+  )
+```
+
+### Exercise 5c — referential integrity check
+
+A subject present in `ae_raw` but absent from `dm_raw` is a data quality issue —
+you cannot create a complete SDTM AE record without the demographics to derive
+USUBJID and populate the ISM columns. Identify any orphaned AE subjects.
+
+```{r referential-integrity, exercise=TRUE, exercise.lines=14}
+ae_subjects <- ae_raw |> distinct(STUDYID, SITEID, PATNUM)
+dm_subjects <- dm_raw |> distinct(STUDYID, SITEID, PATNUM)
+
+# Subjects with AEs but NO demographics
+orphaned <- anti_join(ae_subjects, dm_subjects,
+                      by = c("___", "___", "___"))
+
+cat("Subjects in ae_raw with no matching dm_raw record:\n")
+print(orphaned)
+
+cat("\nAEs that cannot be fully mapped to SDTM without a DM record:\n")
+ae_raw |>
+  semi_join(orphaned, by = c("STUDYID", "SITEID", "PATNUM")) |>
+  select(STUDYID, SITEID, PATNUM, AETERM, AESEV)
+```
+
+```{r referential-integrity-hint-1}
+# anti_join(ae_subjects, dm_subjects, by = c("STUDYID", "SITEID", "PATNUM"))
+# PATNUM 1099 is in ae_raw but deliberately absent from dm_raw —
+# this represents a real DM data issue that must be resolved before SDTM mapping.
+```
+
+```{r referential-integrity-solution}
+ae_subjects <- ae_raw |> distinct(STUDYID, SITEID, PATNUM)
+dm_subjects <- dm_raw |> distinct(STUDYID, SITEID, PATNUM)
+
+orphaned <- anti_join(ae_subjects, dm_subjects,
+                      by = c("STUDYID", "SITEID", "PATNUM"))
+
+orphaned
+
+ae_raw |>
+  semi_join(orphaned, by = c("STUDYID", "SITEID", "PATNUM")) |>
+  select(STUDYID, SITEID, PATNUM, AETERM, AESEV)
 ```
 
 ---
 
-## 6  dm_raw — demographics mapping preview
+## 6  dm_raw — deriving analysis-ready variables
 
-### Exercise 6a — derive USUBJID from dm_raw
+Rather than simply renaming columns, clinical programmers derive new variables
+from demographic raw data. Two common derivations: age groups and the ISO 8601
+birth date column.
 
-`dm_raw` has `STUDYID`, `SITEID`, and `PATNUM`. Derive `USUBJID` the same way you did for AE.
+### Exercise 6a — derive AGEGR1 from birth date
 
-```{r dm-usubjid, exercise=TRUE, exercise.lines=7}
+`dm_raw$BRTHDAT` gives the birth date. Using a study reference date of `"2020-07-01"`
+(first dosing date), compute `AGE` in completed years, then classify into `AGEGR1`
+using the Alzheimer's trial grouping (`<65` / `65-80` / `>80`).
+
+```{r dm-agegr1, exercise=TRUE, exercise.lines=16}
+study_start <- ymd("2020-07-01")
+
 dm_raw |>
-  mutate(USUBJID = paste(___, ___, ___, sep = "___")) |>
-  select(USUBJID, SEX, RACE, BRTHDAT)
+  mutate(
+    USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-"),
+    AGE     = floor(as.numeric(study_start - ymd(BRTHDAT)) / 365.25),
+    AGEGR1  = case_when(
+      AGE <  65           ~ "___",
+      AGE <= 80           ~ "___",
+      TRUE                ~ "___"
+    )
+  ) |>
+  select(USUBJID, BRTHDAT, AGE, AGEGR1, SEX, ARM)
 ```
 
-```{r dm-usubjid-hint-1}
-# paste(STUDYID, SITEID, PATNUM, sep = "-")
+```{r dm-agegr1-hint-1}
+# case_when:
+#   AGE < 65  ~ "<65"
+#   AGE <= 80 ~ "65-80"
+#   TRUE      ~ ">80"
+# Compare: pharmaverseadam::adsl$AGEGR1 uses exactly this grouping
 ```
 
-```{r dm-usubjid-solution}
+```{r dm-agegr1-solution}
+study_start <- ymd("2020-07-01")
+
 dm_raw |>
-  mutate(USUBJID = paste(STUDYID, SITEID, PATNUM, sep = "-")) |>
-  select(USUBJID, SEX, RACE, BRTHDAT)
+  mutate(
+    USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-"),
+    AGE     = floor(as.numeric(study_start - ymd(BRTHDAT)) / 365.25),
+    AGEGR1  = case_when(
+      AGE <  65 ~ "<65",
+      AGE <= 80 ~ "65-80",
+      TRUE      ~ ">80"
+    )
+  ) |>
+  select(USUBJID, BRTHDAT, AGE, AGEGR1, SEX, ARM)
 ```
 
-### Exercise 6b — identify raw→SDTM naming gaps in DM
+### Exercise 6b — rename to SDTM conventions and add hardcoded variables
 
-In SDTM DM, the birthdate column is called `BRTHDTC`. In `dm_raw` it is called `BRTHDAT`. Rename and add a hardcoded `DOMAIN` column.
+Complete a partial DM SDTM shell: derive USUBJID, rename `BRTHDAT` → `BRTHDTC`,
+rename `RFSTDAT` → `RFSTDTC`, hardcode `DOMAIN = "DM"`, and add `AGEU = "YEARS"`.
+Then compare your output column names to `dm_sdtm_real`.
 
-```{r dm-rename, exercise=TRUE, exercise.lines=8}
-dm_raw |>
-  mutate(DOMAIN = "___") |>
-  rename(BRTHDTC = ___) |>
-  select(DOMAIN, BRTHDTC, SEX, RACE)
+```{r dm-sdtm-shell, exercise=TRUE, exercise.lines=18}
+dm_shell <- dm_raw |>
+  mutate(
+    USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-"),
+    DOMAIN  = "___",
+    AGEU    = "___"
+  ) |>
+  rename(
+    BRTHDTC = BRTHDAT,
+    RFSTDTC = RFSTDAT
+  ) |>
+  select(STUDYID, DOMAIN, USUBJID, RFSTDTC, BRTHDTC, AGE = ?, AGEU, SEX, RACE, ETHNIC, ARM)
+
+# Columns in real SDTM DM not yet in our shell:
+setdiff(names(dm_sdtm_real), names(dm_shell))
 ```
 
-```{r dm-rename-hint-1}
-# DOMAIN = "DM"
-# rename(BRTHDTC = BRTHDAT)
+```{r dm-sdtm-shell-hint-1}
+# DOMAIN = "DM", AGEU = "YEARS"
+# The select() needs: AGE is derived in 6a but not present in dm_raw directly
+# Simplification: select without AGE for now — it's derived separately
+# setdiff() will show what SDTM DM has that we haven't mapped yet
 ```
 
-```{r dm-rename-solution}
-dm_raw |>
-  mutate(DOMAIN = "DM") |>
-  rename(BRTHDTC = BRTHDAT) |>
-  select(DOMAIN, BRTHDTC, SEX, RACE)
+```{r dm-sdtm-shell-solution}
+dm_shell <- dm_raw |>
+  mutate(
+    USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-"),
+    DOMAIN  = "DM",
+    AGEU    = "YEARS"
+  ) |>
+  rename(
+    BRTHDTC = BRTHDAT,
+    RFSTDTC = RFSTDAT
+  ) |>
+  select(STUDYID, DOMAIN, USUBJID, RFSTDTC, BRTHDTC, AGEU, SEX, RACE, ETHNIC, ARM)
+
+setdiff(names(dm_sdtm_real), names(dm_shell))
 ```
 
 ---
 
-## 7  ds_raw — disposition mapping preview
+## 7  ds_raw — mapping to CDISC controlled terminology
 
-Disposition (`ds_raw`) records why and when subjects left the study.
+CDISC requires that `DSDECOD` (the standardised disposition reason) uses **controlled
+terminology** — a fixed vocabulary defined by the CDISC CT package. Raw `DSTERM`
+values are free-text and must be mapped to these standard values.
 
-### Exercise 7 — flag completers vs discontinuers
+### Exercise 7a — map DSTERM to DSDECOD using case_when
 
-In `ds_raw`, subjects who left early have a `DSTERM` other than `"COMPLETED"`. Add a flag `DISC_FL` that is `"Y"` if the subject discontinued, `"N"` if they completed.
+Map `ds_raw$DSTERM` to the CDISC controlled term for `DSDECOD`. Focus on
+`DSCAT == "DISPOSITION EVENT"` records (the study-completion dispositions).
 
-```{r ds-flag, exercise=TRUE, exercise.lines=10}
+| Raw DSTERM | CDISC DSDECOD |
+|---|---|
+| `COMPLETED` | `COMPLETED` |
+| `ADVERSE EVENT` | `ADVERSE EVENT` |
+| `SUBJECT/GUARDIAN DECISION` | `WITHDRAWAL BY SUBJECT` |
+| `LACK OF EFFICACY` | `LACK OF EFFICACY` |
+| `PROTOCOL VIOLATION` | `PROTOCOL DEVIATION` |
+| Any other | `OTHER` |
+
+```{r ds-dsdecod, exercise=TRUE, exercise.lines=18}
 ds_raw |>
   mutate(
-    USUBJID = paste(STUDYID, SITEID, PATNUM, sep = "-"),
-    DISC_FL = if_else(DSTERM == "___", "N", "Y")
+    USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-"),
+    DSDECOD = case_when(
+      DSTERM == "COMPLETED"                 ~ "COMPLETED",
+      DSTERM == "ADVERSE EVENT"             ~ "ADVERSE EVENT",
+      DSTERM == "SUBJECT/GUARDIAN DECISION" ~ "___",
+      DSTERM == "LACK OF EFFICACY"          ~ "___",
+      DSTERM == "PROTOCOL VIOLATION"        ~ "___",
+      TRUE                                  ~ "OTHER"
+    )
   ) |>
-  select(USUBJID, DSTERM, DISC_FL, DSSTDT)
+  select(USUBJID, DSTERM, DSDECOD, DSCAT, DSSTDT) |>
+  arrange(USUBJID, DSCAT)
 ```
 
-```{r ds-flag-hint-1}
-# if_else(DSTERM == "COMPLETED", "N", "Y")
+```{r ds-dsdecod-hint-1}
+# "SUBJECT/GUARDIAN DECISION" → "WITHDRAWAL BY SUBJECT"
+# "LACK OF EFFICACY"          → "LACK OF EFFICACY"
+# "PROTOCOL VIOLATION"        → "PROTOCOL DEVIATION"
+# Compare to pharmaversesdtm::ds$DSDECOD to see all real CT values used
 ```
 
-```{r ds-flag-solution}
+```{r ds-dsdecod-solution}
 ds_raw |>
   mutate(
-    USUBJID = paste(STUDYID, SITEID, PATNUM, sep = "-"),
-    DISC_FL = if_else(DSTERM == "COMPLETED", "N", "Y")
+    USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-"),
+    DSDECOD = case_when(
+      DSTERM == "COMPLETED"                 ~ "COMPLETED",
+      DSTERM == "ADVERSE EVENT"             ~ "ADVERSE EVENT",
+      DSTERM == "SUBJECT/GUARDIAN DECISION" ~ "WITHDRAWAL BY SUBJECT",
+      DSTERM == "LACK OF EFFICACY"          ~ "LACK OF EFFICACY",
+      DSTERM == "PROTOCOL VIOLATION"        ~ "PROTOCOL DEVIATION",
+      TRUE                                  ~ "OTHER"
+    )
   ) |>
-  select(USUBJID, DSTERM, DISC_FL, DSSTDT)
+  select(USUBJID, DSTERM, DSDECOD, DSCAT, DSSTDT) |>
+  arrange(USUBJID, DSCAT)
+```
+
+### Exercise 7b — cross-reference with real pharmaversesdtm::ds
+
+Compare the DSDECOD values you derived above against those in the real
+`pharmaversesdtm::ds` dataset to verify your CT mapping is correct.
+
+```{r ds-compare, exercise=TRUE, exercise.lines=12}
+cat("DSDECOD values in your mapped ds_raw (DISPOSITION EVENT only):\n")
+ds_raw |>
+  filter(DSCAT == "DISPOSITION EVENT") |>
+  mutate(
+    DSDECOD = case_when(
+      DSTERM == "COMPLETED"                 ~ "COMPLETED",
+      DSTERM == "ADVERSE EVENT"             ~ "ADVERSE EVENT",
+      DSTERM == "SUBJECT/GUARDIAN DECISION" ~ "WITHDRAWAL BY SUBJECT",
+      TRUE ~ "OTHER"
+    )
+  ) |>
+  count(DSDECOD)
+
+cat("\nDSDECOD values in real pharmaversesdtm::ds:\n")
+ds_sdtm_real |>
+  count(DSDECOD, sort = TRUE) |>
+  slice_head(n = 8)
 ```
 
 ---
@@ -580,10 +922,11 @@ ds_raw |>
 
 ### Concept — what an aCRF tells you
 
-An **annotated CRF** is a PDF of each CRF page with annotations showing which SDTM domain and variable each collected field maps to. They are:
+An **annotated CRF** is a PDF of each CRF page with annotations showing which SDTM
+domain and variable each collected field maps to. They are:
 
 - A **regulatory requirement** — FDA expects them in eCTD Module 5
-- A **learning tool** — before writing any `sdtm.oak` mapping, check the aCRF to understand the intended raw→SDTM intent
+- A **programming guide** — before writing any `sdtm.oak` mapping, check the aCRF to understand the intended raw→SDTM intent
 
 `pharmaverseraw` bundles its aCRFs under `inst/acrf/`. Locate them with:
 
@@ -595,13 +938,6 @@ list.files(acrf_dir)
 **Typical aCRF annotation example:**
 
 ```
-CRF Page: Demographics
-─────────────────────────────────────────────────
-Field: "Date of Birth"       → DM.BRTHDTC
-Field: "Sex"                 → DM.SEX
-Field: "Race"                → DM.RACE
-Field: "Ethnic Group"        → DM.ETHNIC
-
 CRF Page: Adverse Events
 ─────────────────────────────────────────────────
 Field: "Adverse Event Term"  → AE.AETERM
@@ -609,9 +945,10 @@ Field: "Start Date"          → AE.AESTDTC
 Field: "End Date"            → AE.AEENDTC
 Field: "Severity"            → AE.AESEV
 Field: "Serious?"            → AE.AESER
+[No annotation]              ← AEDECOD (from MedDRA coding — not on CRF)
+[No annotation]              ← AEBODSYS (from MedDRA coding — not on CRF)
+[No annotation]              ← AESEQ (derived — not collected)
 ```
-
-Notice: `AEDECOD`, `AEBODSYS`, and `AESOC` are **not** annotated here — they don't come from the CRF; they come from MedDRA coding done post-collection.
 
 ```{r quiz-acrf, echo=FALSE}
 quiz(
@@ -626,10 +963,22 @@ quiz(
   ),
   question(
     "Why are AEDECOD and AEBODSYS NOT annotated on the AE CRF page?",
-    answer("They were accidentally omitted"),
+    answer("They were accidentally omitted from the aCRF"),
     answer("They are derived computationally from AETERM using a formula"),
-    answer("They come from MedDRA medical coding — an external process after data collection", correct = TRUE),
+    answer("They come from MedDRA medical coding — an external process performed
+           after data collection, not something captured on a CRF",
+           correct = TRUE),
     answer("They are always the same value as AETERM"),
+    allow_retry = TRUE
+  ),
+  question(
+    "You receive a new study's aCRF and notice the field 'Sponsor Subject Number'
+     is annotated as DM.SUBJID. What does this tell you about the mapping?",
+    answer("SUBJID is a hardcode — always the same value"),
+    answer("SUBJID is a direct map from the raw sponsor subject number field",
+           correct = TRUE),
+    answer("SUBJID must be derived using a complex formula"),
+    answer("SUBJID requires MedDRA coding"),
     allow_retry = TRUE
   )
 )
@@ -637,54 +986,93 @@ quiz(
 
 ---
 
-## 9  pharmaversesdtm — the expected output
+## 9  Exploring real pharmaversesdtm output
 
-### Comparing raw to its SDTM target
+The datasets you just built manually are structurally similar to what `sdtm.oak`
+produces. Now explore the real output to deepen your understanding.
 
-Use `ae_sdtm` (which mirrors `pharmaversesdtm::ae`) to build your mental model of what SDTM mapping produces.
+### Exercise 9a — AE severity by treatment arm in real SDTM
 
-### Exercise 9a — columns in SDTM that need to be derived
+Join `ae_sdtm_real` with `dm_sdtm_real` to compute a cross-tabulation of
+AE severity (`AESEV`) by treatment arm (`ARM`). This is the same join you performed
+with raw data in Exercise 4d, now using proper SDTM variables.
 
-Which columns exist in `ae_sdtm` but are absent from `ae_raw`? These are the ones `sdtm.oak` must create.
-
-```{r sdtm-gaps, exercise=TRUE, exercise.lines=8}
-in_sdtm_not_raw <- setdiff(names(ae_sdtm), names(ae_raw))
-in_raw_not_sdtm <- setdiff(names(ae_raw), names(ae_sdtm))
-
-cat("Columns in SDTM but NOT in raw (must be derived/hardcoded/coded):\n")
-print(in_sdtm_not_raw)
-
-cat("\nColumns in raw but NOT in SDTM (EDC-internal, dropped):\n")
-print(in_raw_not_sdtm)
+```{r sdtm-ae-by-arm, exercise=TRUE, exercise.lines=16}
+ae_sdtm_real |>
+  left_join(
+    dm_sdtm_real |> select(USUBJID, ARM),
+    by = "USUBJID"
+  ) |>
+  filter(!is.na(AESEV)) |>
+  count(ARM, AESEV) |>
+  pivot_wider(names_from = AESEV, values_from = n, values_fill = 0) |>
+  arrange(ARM)
 ```
 
-### Exercise 9b — verify your manual output matches SDTM structure
+```{r sdtm-ae-by-arm-hint-1}
+# left_join on USUBJID — both ae and dm have this column in SDTM
+# This works because SDTM guarantees USUBJID consistency across domains
+```
 
-Run your manual AE pipeline from Exercise 4e and compare its column set to `ae_sdtm`. Are the shared columns present?
+### Exercise 9b — explore the SUPP domain (supplemental qualifiers)
 
-```{r verify-manual-ae, exercise=TRUE, exercise.lines=22}
+SDTM has a maximum column width constraint. Variables that don't fit in the main domain
+or represent non-standard qualifiers live in a **supplemental** (`SUPP--`) dataset.
+Explore `suppae_real` to understand its structure.
+
+```{r suppae-explore, exercise=TRUE, exercise.lines=14}
+cat("=== suppae structure ===\n")
+glimpse(suppae_real)
+
+cat("\n=== Unique qualifier names (QNAM) and their labels (QLABEL) ===\n")
+suppae_real |>
+  distinct(QNAM, QLABEL) |>
+  arrange(QNAM)
+
+cat("\n=== Example rows for one qualifier ===\n")
+suppae_real |>
+  filter(QNAM == first(suppae_real$QNAM)) |>
+  slice_head(n = 4)
+```
+
+```{r suppae-explore-hint-1}
+# SUPP domains link back to the parent domain via:
+#   RDOMAIN = parent domain (e.g. "AE")
+#   USUBJID = subject identifier
+#   IDVAR   = the key variable in the parent domain (e.g. "AESEQ")
+#   IDVARVAL = the value of that key (e.g. "1", "2")
+#   QNAM    = the new variable name
+#   QVAL    = the value
+# This 'tall' structure avoids adding many sparse columns to the main AE domain.
+```
+
+### Exercise 9c — verify your manual pipeline against real SDTM structure
+
+Compare the column names your manual pipeline produces to those in `ae_sdtm_real`.
+Which SDTM columns are still absent and why?
+
+```{r verify-vs-real, exercise=TRUE, exercise.lines=20}
 manual_ae <- ae_raw |>
-  mutate(USUBJID = paste(STUDYID, SITEID, PATNUM, sep = "-"),
+  mutate(USUBJID = str_c(STUDYID, SITEID, PATNUM, sep = "-"),
          DOMAIN  = "AE") |>
-  arrange(USUBJID, AESTDT) |>
+  arrange(USUBJID, AESTDT, AETERM) |>
   group_by(USUBJID) |>
   mutate(AESEQ = row_number()) |>
   ungroup() |>
   rename(AESTDTC = AESTDT, AEENDTC = AEENDT) |>
   select(STUDYID, DOMAIN, USUBJID, AESEQ,
-         AETERM, AESTDTC, AEENDTC, AESEV, AESER)
+         AETERM, AESTDTC, AEENDTC, AESEV, AESER, AEREL, AEOUT)
 
-# Columns your manual pipeline has
-cat("Manual pipeline columns:\n"); names(manual_ae)
+cat("Columns produced by manual pipeline:\n")
+names(manual_ae)
 
-# Columns in ae_sdtm that you're still missing
-cat("\nStill missing from manual (need sdtm.oak or MedDRA):\n")
-setdiff(names(ae_sdtm), names(manual_ae))
-```
+cat("\nColumns in pharmaversesdtm::ae NOT yet in manual pipeline:\n")
+setdiff(names(ae_sdtm_real), names(manual_ae))
 
-```{r verify-manual-ae-hint-1}
-# You'll be missing: AEDECOD, AEBODSYS (need MedDRA coding)
-# sdtm.oak handles all other mapping steps with cleaner, auditable functions
+cat("\nThese fall into which mapping pattern?\n")
+cat("  AEDECOD, AEBODSYS, AESOC, AESOCCD, etc. → EXTERNAL (MedDRA coding)\n")
+cat("  AESPID → DIRECT MAP (sponsor-provided ID, absent from our ae_raw)\n")
+cat("  AESTDY, AEENDY → DERIVE (study day = date - RFSTDTC + 1)\n")
 ```
 
 ---
@@ -697,8 +1085,9 @@ quiz(
   question(
     "Which of the following is an appropriate use of {pharmaverseraw}?",
     answer("Validating your company's production SDTM pipeline for a regulatory submission"),
-    answer("Practicing sdtm.oak derivations and comparing results to pharmaversesdtm", correct = TRUE),
-    answer("Benchmarking SDTM performance at scale"),
+    answer("Practicing sdtm.oak derivations and comparing results to pharmaversesdtm",
+           correct = TRUE),
+    answer("Benchmarking SDTM mapping performance at scale"),
     answer("Running a real clinical study's SDTM mapping"),
     allow_retry = TRUE
   ),
@@ -706,7 +1095,8 @@ quiz(
     "Why would you NOT use pharmaverseraw for real study work?",
     answer("It is too large to load into memory"),
     answer("It uses the wrong R version"),
-    answer("It is simulated test data — real studies require actual EDC extracts representative of their specific data", correct = TRUE),
+    answer("It is simulated test data — real studies require actual EDC extracts
+           representative of their specific data", correct = TRUE),
     answer("It doesn't support the DM domain"),
     allow_retry = TRUE
   )
@@ -715,41 +1105,33 @@ quiz(
 
 ---
 
-## 11  Installing the real package
-
-To use the real `pharmaverseraw` (and follow along with official vignettes):
+## 11  Installing the real packages
 
 ```r
-# Stable CRAN release
-install.packages("pharmaverseraw")
-install.packages("pharmaversesdtm")
+install.packages("pharmaverseraw")    # raw EDC test data
+install.packages("pharmaversesdtm")   # SDTM target datasets
 
-# Development version (latest domains not yet on CRAN)
+# Development version
 remotes::install_github("pharmaverse/pharmaverseraw", ref = "main")
 
-# List all available datasets
-data(package = "pharmaverseraw")
-
-# Load and inspect
+# Verify and list datasets
 library(pharmaverseraw)
-data("ae_raw")
+data(package = "pharmaverseraw")  # lists ae_raw, dm_raw, ds_raw, ex_raw, ec_raw ...
 glimpse(ae_raw)
 
-# Find the bundled aCRFs
+# Find bundled aCRFs
 list.files(system.file("acrf", package = "pharmaverseraw"))
 ```
 
 ### Exercise 11 — environment check
 
-Run this code to see which pharmaverse data packages are available in your current environment:
-
-```{r pkg-check, exercise=TRUE, exercise.lines=12}
+```{r pkg-check, exercise=TRUE, exercise.lines=14}
 pkgs <- c("pharmaverseraw", "pharmaversesdtm", "pharmaverseadam",
           "admiral", "sdtm.oak", "xportr")
 
 status <- sapply(pkgs, function(p) {
   if (requireNamespace(p, quietly = TRUE)) {
-    paste0("✓ ", packageVersion(p))
+    paste0("✓ v", packageVersion(p))
   } else {
     "✗ not installed"
   }
@@ -764,7 +1146,7 @@ data.frame(Package = names(status), Status = unname(status), row.names = NULL)
 
 ```{r final-quiz-07, echo=FALSE}
 quiz(
-  caption = "Lesson 07 — self-check",
+  caption = "Lesson 07 — comprehensive self-check",
 
   question(
     "In pharmaverseraw, the raw dataset for adverse events is named:",
@@ -778,36 +1160,120 @@ quiz(
   question(
     "Why does PATNUM in raw data become USUBJID in SDTM?",
     answer("PATNUM and USUBJID are identical — just renamed"),
-    answer("EDC systems use site-local patient numbers; SDTM requires a globally unique subject ID built from STUDYID + SITEID + PATNUM", correct = TRUE),
+    answer("EDC systems use site-local patient numbers; SDTM requires a globally
+           unique subject ID built from STUDYID + SITEID + PATNUM", correct = TRUE),
     answer("USUBJID is shorter and easier to type"),
     answer("The FDA requires all identifiers to start with 'U'"),
     allow_retry = TRUE
   ),
 
   question(
-    "Which of these four mapping patterns requires data from OUTSIDE the raw CRF?",
-    answer("Hardcode (DOMAIN = 'AE')"),
-    answer("Direct map (AETERM → AETERM)"),
-    answer("Derive (AESEQ from row_number())"),
-    answer("External — MedDRA coding for AEDECOD / AEBODSYS", correct = TRUE),
+    "A subject appears in ae_raw but has no matching record in dm_raw. What is
+     the most important consequence for SDTM mapping?",
+    answer("The AE records will be silently dropped by sdtm.oak"),
+    answer("AESEQ cannot be computed for that subject"),
+    answer("USUBJID can still be derived correctly — there is no consequence"),
+    answer("You cannot validate the USUBJID derivation or populate required DM-based
+           ISM columns without a DM record — this is a data quality issue that must
+           be resolved before mapping", correct = TRUE),
     allow_retry = TRUE
   ),
 
   question(
-    "AESTDTC in SDTM has the suffix 'C' (for 'collected character'). What does this tell you?",
+    "AESTDTC in SDTM has the suffix 'C'. What does this mean?",
     answer("The value was collected as a numeric code that maps to a character label"),
-    answer("The column stores the date as a character string in ISO 8601 format", correct = TRUE),
-    answer("The date was collected via a checkbox (C = checked)"),
-    answer("The 'C' suffix is arbitrary — it has no meaning"),
+    answer("The column stores the date as a character string in ISO 8601 format",
+           correct = TRUE),
+    answer("The date was collected via a checkbox"),
+    answer("'C' is an arbitrary suffix with no meaning"),
     allow_retry = TRUE
   ),
 
   question(
-    "What is the single biggest thing pharmaverseraw was released to provide?",
-    answer("Faster SDTM building performance"),
-    answer("A canonical raw test dataset so the complete raw → SDTM → ADaM pipeline can be demonstrated end to end", correct = TRUE),
-    answer("A replacement for pharmaversesdtm"),
-    answer("A validated SDTM conformance checker"),
+    "CDISC ISO 8601 allows partial dates such as '2020-07' (year-month only, no day).
+     When would you expect a partial AESTDTC in real data?",
+    answer("Never — SDTM always requires a full YYYY-MM-DD date"),
+    answer("When the subject recalls only the month and year of their AE onset,
+           and the day was genuinely not captured on the CRF", correct = TRUE),
+    answer("When the AE was resolved before the end date was recorded"),
+    answer("Only for serious adverse events"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "Which four mapping patterns cover all raw→SDTM variable transformations?",
+    answer("Copy, Rename, Calculate, Lookup"),
+    answer("Hardcode, Direct map, Derive, External", correct = TRUE),
+    answer("Assign, Conditionally assign, Sequence, Code"),
+    answer("CDASH, Non-CDASH, MedDRA, WHO-Drug"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "You use anti_join(ae_subjects, dm_subjects) to check referential integrity.
+     What does a non-empty result tell you?",
+    answer("All subjects are correctly represented in both datasets"),
+    answer("Some subjects have more AEs than demographics records"),
+    answer("There are subjects in ae_raw with no matching dm_raw record — a data
+           quality issue requiring resolution before SDTM mapping", correct = TRUE),
+    answer("The join keys are mismatched"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "When computing AESEQ using group_by(USUBJID) |> mutate(AESEQ = row_number()),
+     why is it important to arrange() first?",
+    answer("arrange() is required before group_by() — it is a syntax rule"),
+    answer("row_number() assigns sequence based on current row order, so sorting by
+           AESTDT (and a tie-breaker) ensures AESEQ is chronologically reproducible
+           and deterministic", correct = TRUE),
+    answer("Without arrange(), row_number() returns missing values"),
+    answer("It doesn't matter — AESEQ is just an arbitrary counter"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "What is the purpose of the SUPP (supplemental) domain in SDTM?",
+    answer("To store duplicate records for quality checking"),
+    answer("To hold variables that cannot be accommodated in the main domain due to
+           SDTM column constraints or because they are non-standard qualifiers",
+           correct = TRUE),
+    answer("To archive raw data alongside SDTM"),
+    answer("To provide a long-format version of the main domain"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "A sponsor maps DSTERM = 'SUBJECT/GUARDIAN DECISION' to DSDECOD = 'WITHDRAWAL
+     BY SUBJECT'. This mapping step is an example of which pattern?",
+    answer("Hardcode — the value is always 'WITHDRAWAL BY SUBJECT'"),
+    answer("Direct map — the values are identical"),
+    answer("Derive — the CDISC CT value is computed from the raw free-text term
+           using conditional logic (case_when)", correct = TRUE),
+    answer("External — the mapping comes from a WHO-Drug lookup table"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "In pharmaversesdtm::ae, AEDECOD uses MedDRA preferred terms in title case
+     (e.g. 'Headache'), while raw AETERM uses all-caps ('HEADACHE'). Why?",
+    answer("It is a display preference only — both formats are equally valid in SDTM"),
+    answer("SDTM requires all text fields in lower case"),
+    answer("AEDECOD is populated from the MedDRA dictionary during medical coding,
+           which uses the MedDRA standard casing (title case preferred terms)",
+           correct = TRUE),
+    answer("sdtm.oak automatically converts to title case during mapping"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "AGE_AT_AE was computed as floor(as.numeric(AESTDT_D - BRTHDAT_D) / 365.25).
+     Why use 365.25 rather than 365?",
+    answer("365 gives a result in months, not years"),
+    answer("365.25 accounts for leap years, giving a more accurate estimate of
+           completed years over multi-year spans", correct = TRUE),
+    answer("The CDISC standard mandates 365.25 for all age calculations"),
+    answer("floor() only works correctly when dividing by 365.25"),
     allow_retry = TRUE
   )
 )
@@ -817,13 +1283,15 @@ quiz(
 
 ## Key Takeaways
 
-1. **`{pharmaverseraw}`** is the first link in the chain: raw EDC → SDTM → ADaM. It's a data package, not a computation package.
-2. **EDC-agnostic and standards-agnostic** by design — what you learn applies to any EDC, not just one system.
-3. Datasets are named **`<domain>_raw`**: `ae_raw`, `dm_raw`, `ds_raw`, etc.
-4. Raw data is missing **USUBJID** (derive it), **sequence numbers** (derive them), **ISO 8601 date suffixes** (rename), and **coded terms** (MedDRA provides those externally).
-5. The **four mapping patterns** — hardcode, direct map, derive, external — cover every raw→SDTM transformation. `sdtm.oak` provides a function for each.
-6. **Annotated CRFs** ship with the package and show the intended raw→SDTM field mapping. They're also a regulatory deliverable (eCTD Module 5).
-7. **`{pharmaversesdtm}`** is the matching output — use it as a reference to check your mapping work.
+1. **`{pharmaverseraw}`** is the first link in the chain: raw EDC → SDTM → ADaM. It is a data package, not a computation package. Use `ae_raw`, `dm_raw`, `ds_raw` naming.
+2. **`{pharmaversesdtm}`** is the matching SDTM output — load it with `library(pharmaversesdtm)` to use real SDTM reference datasets for structural comparison.
+3. **EDC-agnostic and standards-agnostic** by design — what you learn applies to any EDC, not just one system.
+4. **The four mapping patterns** — hardcode, direct map, derive, external — cover every raw→SDTM transformation. `sdtm.oak` provides a function for each.
+5. **Referential integrity matters**: use `anti_join()` to detect subjects present in one domain but missing from another before mapping begins.
+6. **`case_when()`** is the primary tool for mapping raw free-text to CDISC controlled terminology (DSDECOD, AEREL, etc.) — far superior to nested `if_else()`.
+7. **SUPP domains** hold variables that overflow SDTM column limits; they link back via `RDOMAIN`, `USUBJID`, `IDVAR`, and `IDVARVAL`.
+8. **Annotated CRFs** ship with `{pharmaverseraw}` and show the intended raw→SDTM field mapping. They're also a regulatory deliverable (eCTD Module 5).
 
 **Next** → Lesson 08: `{sdtm.oak}` Part 1 — the OAK algorithm framework
+
 (`rmarkdown::run("08_sdtm_oak_part1.Rmd")`)

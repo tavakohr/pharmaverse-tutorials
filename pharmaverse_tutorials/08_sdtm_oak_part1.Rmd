@@ -21,6 +21,7 @@ library(tibble)
 library(lubridate)
 library(stringr)
 library(rlang)
+library(pharmaversesdtm)
 
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 tutorial_options(exercise.timelimit = 60)
@@ -138,6 +139,11 @@ cm_raw <- tribble(
   "TEST_STUDY",    1023,  "701",  "PARACETAMOL",  NA,              500,     "mg",
   "TEST_STUDY",    1034,  "702",  NA,             "VITAMIN D",     1000,    "IU"
 )
+
+# ── Real pharmaversesdtm datasets (for comparison exercises) ─────────────────
+vs_sdtm_real  <- pharmaversesdtm::vs
+ae_sdtm_real  <- pharmaversesdtm::ae
+dm_sdtm_real  <- pharmaversesdtm::dm
 
 # Controlled terminology spec
 study_ct <- tribble(
@@ -352,6 +358,45 @@ quiz(
 )
 ```
 
+### Exercise 2c — compare raw vs real SDTM structure
+
+`vs_sdtm_real` is the actual pharmaversesdtm::vs SDTM dataset — a properly completed VS domain. Use `names()` and `setdiff()` to answer two questions:
+
+1. Which SDTM VS variables are **not** directly present in our raw `vs_raw`? (These need OAK derivation.)
+2. What are the `VSTESTCD` values in the real dataset — do they match the codes we've been using?
+
+```{r compare-raw-sdtm, exercise=TRUE, exercise.lines=14}
+# Columns in the real SDTM VS domain
+names(vs_sdtm_real)
+
+# Columns in our raw source — what's missing from the raw side?
+setdiff(names(vs_sdtm_real), names(vs_raw))
+
+# What topic codes are actually in the real domain?
+vs_sdtm_real |> distinct(VSTESTCD, VSTEST) |> arrange(VSTESTCD)
+```
+
+```{r compare-raw-sdtm-hint-1}
+# setdiff(A, B) gives elements in A that are NOT in B.
+# Variables like DOMAIN, STUDYID, USUBJID, VSTESTCD, VSTEST, VSORRES, VSORRESU,
+# VSPOS, VSDTC, VSSEQ etc. appear in the real SDTM but not in vs_raw — they all
+# need to be derived by OAK algorithm calls.
+```
+
+```{r quiz-compare-raw-sdtm, echo=FALSE}
+quiz(
+  caption = "Raw vs SDTM gap",
+  question(
+    "VSSEQ is present in the real pharmaversesdtm::vs but not in vs_raw. Which sdtm.oak utility function is responsible for deriving it?",
+    answer("assign_no_ct()"),
+    answer("hardcode_no_ct()"),
+    answer("derive_seq()", correct = TRUE),
+    answer("generate_oak_id_vars()"),
+    allow_retry = TRUE
+  )
+)
+```
+
 ---
 
 ## 3  assign_no_ct() — direct copy, no CT
@@ -445,6 +490,56 @@ cm_trt |> select(patient_number, CMTRT)
 # coalesce(CMTRT, CMTRT_OTH) fills NA positions in CMTRT with the "Other" value
 # In real sdtm.oak, the second assign_no_ct() call handles this automatically
 # because it only fills NAs in the existing tgt_dat
+```
+
+### Exercise 3c — condition_add as a guard for OAK mappings
+
+In the previous exercise you used `if_else()` to replace `"OTHER"` with NA before chaining. In OAK, `condition_add()` is the idiomatic way to guard a mapping to a subset of rows — keeping all rows traceable.
+
+Rewrite the primary-source step so that `CMTRT` is mapped from `IT.CMTRT` **only** for rows where `IT.CMTRT` is not NA **and** not `"OTHER"`. Use `condition_add()` followed by `apply_condition()`.
+
+```{r assign-no-ct-condition, exercise=TRUE, exercise.lines=16}
+cm_id <- generate_oak_id_vars(cm_raw, pat_var = "PATNUM", raw_src = "cm_raw")
+
+# Map CMTRT only when IT.CMTRT is not NA and not "OTHER"
+cmtrt_primary <- cm_id |>
+  condition_add(!is.na(IT.CMTRT) & IT.CMTRT != "___") |>
+  apply_condition() |>
+  assign_no_ct(raw_var = "IT.CMTRT", tgt_var = "CMTRT", id_vars = oak_id_vars())
+
+# Map from the "Other, specify" column for the remaining rows
+cmtrt_other <- cm_id |>
+  condition_add(is.na(IT.CMTRT) | IT.CMTRT == "OTHER") |>
+  apply_condition() |>
+  assign_no_ct(raw_var = "IT.CMTRTOTH", tgt_var = "CMTRT", id_vars = oak_id_vars())
+
+bind_rows(cmtrt_primary, cmtrt_other) |>
+  select(patient_number, CMTRT) |>
+  arrange(patient_number)
+```
+
+```{r assign-no-ct-condition-hint-1}
+# condition_add(!is.na(IT.CMTRT) & IT.CMTRT != "OTHER")
+# The two conditioned subsets are mutually exclusive — bind_rows() merges them.
+# In real sdtm.oak, this pattern avoids any pre-processing mutation of the raw data.
+```
+
+```{r assign-no-ct-condition-solution}
+cm_id <- generate_oak_id_vars(cm_raw, pat_var = "PATNUM", raw_src = "cm_raw")
+
+cmtrt_primary <- cm_id |>
+  condition_add(!is.na(IT.CMTRT) & IT.CMTRT != "OTHER") |>
+  apply_condition() |>
+  assign_no_ct(raw_var = "IT.CMTRT", tgt_var = "CMTRT", id_vars = oak_id_vars())
+
+cmtrt_other <- cm_id |>
+  condition_add(is.na(IT.CMTRT) | IT.CMTRT == "OTHER") |>
+  apply_condition() |>
+  assign_no_ct(raw_var = "IT.CMTRTOTH", tgt_var = "CMTRT", id_vars = oak_id_vars())
+
+bind_rows(cmtrt_primary, cmtrt_other) |>
+  select(patient_number, CMTRT) |>
+  arrange(patient_number)
 ```
 
 ---
@@ -687,6 +782,61 @@ vs_sysbp_code
 hardcode_ct(vs_id, "SYS_BP", "VSTESTCD", "INVALIDCODE", study_ct, "C66741")
 ```
 
+### Exercise 5c — hardcode a domain-wide STUDYID
+
+`STUDYID` is the same fixed string for every row in a domain — a classic `hardcode_no_ct()` job. The `raw_var` here identifies which rows are "active": rows with a non-NA `AETERM`.
+
+Hardcode `STUDYID = "TEST_STUDY"` for every AE record. Then verify that all 5 rows in `ae_raw` received the value.
+
+```{r hardcode-studyid, exercise=TRUE, exercise.lines=14}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_studyid <- hardcode_no_ct(
+  raw_dat = ae_id,
+  raw_var = "___",          # activating variable
+  tgt_var = "___",
+  tgt_val = "___",
+  id_vars = oak_id_vars()
+)
+
+# How many rows and what is the unique STUDYID value?
+ae_studyid |>
+  count(STUDYID)
+```
+
+```{r hardcode-studyid-hint-1}
+# raw_var = "AETERM"  (rows with non-NA AETERM get the hardcoded value)
+# tgt_var = "STUDYID", tgt_val = "TEST_STUDY"
+```
+
+```{r hardcode-studyid-solution}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_studyid <- hardcode_no_ct(
+  raw_dat = ae_id,
+  raw_var = "AETERM",
+  tgt_var = "STUDYID",
+  tgt_val = "TEST_STUDY",
+  id_vars = oak_id_vars()
+)
+
+ae_studyid |> count(STUDYID)
+```
+
+```{r quiz-hardcode-studyid, echo=FALSE}
+quiz(
+  caption = "hardcode_no_ct vs hardcode_ct",
+  question(
+    "STUDYID uses hardcode_no_ct() rather than hardcode_ct(). The best reason is:",
+    answer("STUDYID is short and doesn't need validation"),
+    answer("STUDYID is not subject to a controlled terminology codelist — any sponsor-assigned value is valid", correct = TRUE),
+    answer("hardcode_ct() cannot handle string values"),
+    answer("STUDYID is always the same length so CT checks are redundant"),
+    allow_retry = TRUE
+  )
+)
+```
+
 ---
 
 ## 6  assign_datetime() — ISO 8601 from raw date/time columns
@@ -851,6 +1001,46 @@ quiz(
 )
 ```
 
+### Exercise 7c — compound condition: non-missing AND non-screening visits
+
+In clinical trials, baseline (SCREENING) vital signs are sometimes handled separately from on-treatment visits. Map `VSORRES` from `SYS_BP` only for rows where **both** conditions hold:
+
+- `SYS_BP` is not NA, **and**
+- `VISIT` is not `"SCREENING"`
+
+How many rows pass this compound condition?
+
+```{r compound-condition, exercise=TRUE, exercise.lines=14}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vs_ontreatment <- vs_id |>
+  condition_add(!is.na(SYS_BP) & VISIT != "___") |>
+  apply_condition() |>
+  assign_no_ct(raw_var = "SYS_BP", tgt_var = "VSORRES", id_vars = oak_id_vars())
+
+# Expect: WEEK 4 and WEEK 8 rows only (not SCREENING, not the NA row)
+vs_ontreatment |> select(patient_number, VSORRES)
+nrow(vs_ontreatment)
+```
+
+```{r compound-condition-hint-1}
+# VISIT != "SCREENING" removes all three screening rows.
+# The NA SYS_BP row (patient 1034, WEEK 4) also fails the !is.na(SYS_BP) check.
+# You should end up with 3 rows: patient 1015 WEEK4+WEEK8, patient 1023 WEEK4.
+```
+
+```{r compound-condition-solution}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vs_ontreatment <- vs_id |>
+  condition_add(!is.na(SYS_BP) & VISIT != "SCREENING") |>
+  apply_condition() |>
+  assign_no_ct(raw_var = "SYS_BP", tgt_var = "VSORRES", id_vars = oak_id_vars())
+
+vs_ontreatment |> select(patient_number, VSORRES)
+nrow(vs_ontreatment)
+```
+
 ---
 
 ## 8  The CT spec in detail
@@ -948,7 +1138,7 @@ A typical OAK pipeline for one **topic variable** (e.g., SYSBP) chains:
 
 Then you repeat for DIABP and PULSE, `bind_rows()` all three, and add domain-wide columns (STUDYID, USUBJID, VSSEQ, VSDTC).
 
-### Exercise 9 — build the SYSBP topic variable
+### Exercise 9a — build the SYSBP topic variable
 
 Chain all five steps above for SYSBP. Use the mock functions and `study_ct`. The result should be a tibble with one row per measurement of systolic BP.
 
@@ -992,6 +1182,116 @@ vs_sysbp_full |> select(patient_number, VSTESTCD, VSTEST, VSORRES, VSORRESU, VSP
 # Each step() returns a tibble with oak_id_vars() + the derived SDTM column.
 # left_join by oak_id_vars() aligns them all correctly.
 # In real sdtm.oak, a single chained pipeline with tgt_dat= argument handles this.
+```
+
+### Exercise 9b — build DIABP and PULSE, then bind_rows all three
+
+Now repeat the pattern for `DIA_BP` → `DIABP` and `PULSE` → `PULSE`. Use `hardcode_ct()` to set VSTESTCD and VSTEST from the CT spec, then `bind_rows()` the three topic tibbles into one VS snapshot. How many rows does the combined dataset have?
+
+```{r oak-full-vs-pipeline, exercise=TRUE, exercise.lines=50}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+# ── SYSBP (completed for you) ───────────────────────────────────────────────
+vs_sysbp <- vs_id |> condition_add(!is.na(SYS_BP)) |> apply_condition()
+
+sysbp_domain <- hardcode_ct(vs_sysbp, "SYS_BP", "VSTESTCD", "SYSBP", study_ct, "C66741", oak_id_vars()) |>
+  left_join(hardcode_ct(vs_sysbp, "SYS_BP", "VSTEST", "Systolic Blood Pressure", study_ct, "C67153", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_no_ct(vs_sysbp, "SYS_BP", "VSORRES", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(hardcode_no_ct(vs_sysbp, "SYS_BP", "VSORRESU", "mmHg", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_ct(vs_sysbp, "SUBPOS", "VSPOS", study_ct, "C71148", oak_id_vars()), by = oak_id_vars())
+
+# ── DIABP — your turn ───────────────────────────────────────────────────────
+vs_diabp <- vs_id |> condition_add(!is.na(___)) |> apply_condition()
+
+diabp_domain <- hardcode_ct(vs_diabp, "DIA_BP", "VSTESTCD", "___", study_ct, "C66741", oak_id_vars()) |>
+  left_join(hardcode_ct(vs_diabp, "DIA_BP", "VSTEST", "___", study_ct, "C67153", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_no_ct(vs_diabp, "___", "VSORRES", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(hardcode_no_ct(vs_diabp, "DIA_BP", "VSORRESU", "mmHg", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_ct(vs_diabp, "SUBPOS", "VSPOS", study_ct, "C71148", oak_id_vars()), by = oak_id_vars())
+
+# ── PULSE ────────────────────────────────────────────────────────────────────
+vs_pulse <- vs_id |> condition_add(!is.na(PULSE)) |> apply_condition()
+
+pulse_domain <- hardcode_ct(vs_pulse, "PULSE", "VSTESTCD", "PULSE", study_ct, "C66741", oak_id_vars()) |>
+  left_join(hardcode_ct(vs_pulse, "PULSE", "VSTEST", "Pulse Rate", study_ct, "C67153", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_no_ct(vs_pulse, "PULSE", "VSORRES", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(hardcode_no_ct(vs_pulse, "PULSE", "VSORRESU", "beats/min", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_ct(vs_pulse, "SUBPOS", "VSPOS", study_ct, "C71148", oak_id_vars()), by = oak_id_vars())
+
+# ── Combine all three topic variables ────────────────────────────────────────
+vs_domain <- bind_rows(sysbp_domain, diabp_domain, pulse_domain) |>
+  arrange(patient_number, VSTESTCD)
+
+vs_domain |> select(patient_number, VSTESTCD, VSTEST, VSORRES, VSORRESU, VSPOS)
+nrow(vs_domain)
+```
+
+```{r oak-full-vs-pipeline-hint-1}
+# DIABP: condition_add(!is.na(DIA_BP))
+# VSTESTCD = "DIABP", VSTEST = "Diastolic Blood Pressure"
+# raw_var for VSORRES = "DIA_BP"
+# VSORRESU = "mmHg" (same units as SYSBP)
+# Expected total rows: 7 SYSBP + 7 DIABP + 7 PULSE = 21 rows
+# (all 7 raw rows have PULSE recorded; only 6 have SYS_BP / DIA_BP)
+```
+
+```{r oak-full-vs-pipeline-solution}
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+
+vs_sysbp <- vs_id |> condition_add(!is.na(SYS_BP)) |> apply_condition()
+sysbp_domain <- hardcode_ct(vs_sysbp, "SYS_BP", "VSTESTCD", "SYSBP", study_ct, "C66741", oak_id_vars()) |>
+  left_join(hardcode_ct(vs_sysbp, "SYS_BP", "VSTEST", "Systolic Blood Pressure", study_ct, "C67153", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_no_ct(vs_sysbp, "SYS_BP", "VSORRES", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(hardcode_no_ct(vs_sysbp, "SYS_BP", "VSORRESU", "mmHg", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_ct(vs_sysbp, "SUBPOS", "VSPOS", study_ct, "C71148", oak_id_vars()), by = oak_id_vars())
+
+vs_diabp <- vs_id |> condition_add(!is.na(DIA_BP)) |> apply_condition()
+diabp_domain <- hardcode_ct(vs_diabp, "DIA_BP", "VSTESTCD", "DIABP", study_ct, "C66741", oak_id_vars()) |>
+  left_join(hardcode_ct(vs_diabp, "DIA_BP", "VSTEST", "Diastolic Blood Pressure", study_ct, "C67153", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_no_ct(vs_diabp, "DIA_BP", "VSORRES", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(hardcode_no_ct(vs_diabp, "DIA_BP", "VSORRESU", "mmHg", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_ct(vs_diabp, "SUBPOS", "VSPOS", study_ct, "C71148", oak_id_vars()), by = oak_id_vars())
+
+vs_pulse <- vs_id |> condition_add(!is.na(PULSE)) |> apply_condition()
+pulse_domain <- hardcode_ct(vs_pulse, "PULSE", "VSTESTCD", "PULSE", study_ct, "C66741", oak_id_vars()) |>
+  left_join(hardcode_ct(vs_pulse, "PULSE", "VSTEST", "Pulse Rate", study_ct, "C67153", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_no_ct(vs_pulse, "PULSE", "VSORRES", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(hardcode_no_ct(vs_pulse, "PULSE", "VSORRESU", "beats/min", oak_id_vars()), by = oak_id_vars()) |>
+  left_join(assign_ct(vs_pulse, "SUBPOS", "VSPOS", study_ct, "C71148", oak_id_vars()), by = oak_id_vars())
+
+vs_domain <- bind_rows(sysbp_domain, diabp_domain, pulse_domain) |>
+  arrange(patient_number, VSTESTCD)
+
+vs_domain |> select(patient_number, VSTESTCD, VSTEST, VSORRES, VSORRESU, VSPOS)
+nrow(vs_domain)
+```
+
+### Exercise 9c — compare your VS domain against the real pharmaversesdtm::vs
+
+You've built a VS domain from a small mock raw dataset. The real pharmaversesdtm::vs was produced from the full CDISCPILOT01 study. Use `setdiff()` to check which SDTM VS variables you derived versus which the real domain has — a practical gap analysis.
+
+```{r compare-vs-domains, exercise=TRUE, exercise.lines=12}
+# Variables you derived in your vs_domain:
+# (re-run the pipeline just to get the column list)
+vs_id <- generate_oak_id_vars(vs_raw, pat_var = "PATNUM", raw_src = "vs_raw")
+vs_sysbp_ex <- vs_id |> condition_add(!is.na(SYS_BP)) |> apply_condition()
+my_vs_cols <- c("VSTESTCD", "VSTEST", "VSORRES", "VSORRESU", "VSPOS")
+
+# SDTM VS variables in the real pharmaversesdtm::vs
+real_vs_cols <- names(vs_sdtm_real)
+
+# What's in the real domain that you haven't derived yet?
+setdiff(real_vs_cols, my_vs_cols)
+
+# What unique test codes exist in the real domain?
+vs_sdtm_real |> distinct(VSTESTCD) |> arrange(VSTESTCD)
+```
+
+```{r compare-vs-domains-hint-1}
+# You'll see variables like STUDYID, DOMAIN, USUBJID, VSSEQ, VSDTC, VISITNUM,
+# VISIT, EPOCH, VSBLFL, VSDTC etc. — all needing additional OAK calls.
+# VSTESTCD values in the real data include HEIGHT, WEIGHT, TEMP, and others
+# beyond the three you mapped — each would be a separate topic variable chain.
 ```
 
 ---
@@ -1053,6 +1353,60 @@ quiz(
     answer("When assign_ct() encounters 'sitting' in the raw data, it writes 'SITTING' to the SDTM variable", correct = TRUE),
     answer("Both 'sitting' and 'SITTING' are valid SDTM outputs"),
     answer("The spec entry is invalid — collected and term values must match exactly"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "The CT spec column 'collected_value' can have MULTIPLE rows pointing to the same 'term_value'. This design allows:",
+    answer("Multiple SDTM variables to share the same codelist"),
+    answer("Dirty raw data (case variants, abbreviations, synonyms) to all map to a single standard CDISC term", correct = TRUE),
+    answer("The same raw value to produce different SDTM outputs based on domain"),
+    answer("Codelists to be shared across studies without modification"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "You call generate_oak_id_vars() before any algorithm. If you forget this step and call assign_no_ct() directly on vs_raw, the most likely outcome is:",
+    answer("assign_no_ct() adds oak_id_vars automatically so nothing changes"),
+    answer("An error because the required oak_id, raw_source, and patient_number columns are missing from the data", correct = TRUE),
+    answer("The function silently uses row numbers as a fallback identifier"),
+    answer("The output omits the id columns but the mapping still succeeds"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "assign_datetime() is told a date column contains two possible formats: 'dd-mmm-yyyy' (e.g. '15-JUL-2020') and 'yyyy-mm-dd' (e.g. '2020-07-15'). When a value matches neither format, the function:",
+    answer("Picks the first format and parses it anyway"),
+    answer("Stops the pipeline with a fatal error"),
+    answer("Returns NA for that row and records the failure in problems() so it can be audited later", correct = TRUE),
+    answer("Converts the value to a character string as-is"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "In the full OAK pipeline for one topic variable (e.g., SYSBP in a VS domain), results from each algorithm call are joined back together using which column(s)?",
+    answer("USUBJID alone"),
+    answer("PATNUM and VISIT"),
+    answer("The three oak_id_vars() columns: oak_id, raw_source, patient_number", correct = TRUE),
+    answer("The target variable name"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "A programmer needs to map CMTRT for 'Other, specify' rows. They use: condition_add(IT.CMTRT == 'OTHER') followed by assign_no_ct(raw_var = 'IT.CMTRTOTH', tgt_var = 'CMTRT'). What is the result for rows where IT.CMTRT is NOT 'OTHER'?",
+    answer("Those rows get CMTRT = IT.CMTRT (the primary value)"),
+    answer("Those rows get CMTRT = NA — the condition excluded them from this mapping", correct = TRUE),
+    answer("Those rows cause an error"),
+    answer("Those rows are permanently deleted from the dataset"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "sdtm.oak was co-developed by Roche, Pfizer, GSK, Vertex, and Merck and is sponsored by CDISC COSA. Why does cross-company collaboration matter for a mapping package specifically?",
+    answer("It lowers licensing costs for each company"),
+    answer("Shared algorithm implementations mean a validation done once by any company benefits all — no duplicate re-validation effort", correct = TRUE),
+    answer("It ensures the package meets FDA regulatory submission requirements automatically"),
+    answer("Each company contributes different programming languages so the package works everywhere"),
     allow_retry = TRUE
   )
 )

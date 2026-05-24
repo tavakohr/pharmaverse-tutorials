@@ -16,6 +16,7 @@ library(dplyr)
 library(tidyr)
 library(lubridate)
 library(stringr)
+library(pharmaversesdtm)
 
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
@@ -181,6 +182,9 @@ ae_ex_link <- tibble(
   EX_SPONSOR_ID = c("EX001", "EX004")
 )
 
+# ── Real pharmaversesdtm SUPP-- data (for comparison exercises) ───────────────
+suppae_real <- pharmaversesdtm::suppae
+
 # Study CT spec
 study_ct <- tribble(
   ~codelist_code, ~collected_value, ~term_value,
@@ -231,6 +235,42 @@ setdiff(names(ae_raw), c("PATNUM", "STUDYID", "SITEID",
 ```
 
 Those three extra columns (`SPONSOR_AE_ID`, `INV_AE_CAT`, `AE_SAFETY_MTG`) are SUPP-- candidates — they were collected on the CRF but don't belong in the AE domain.
+
+### Exercise 1b — programmatically identify SUPP-- candidates
+
+In practice, raw datasets can have dozens of columns. Rather than inspecting them manually, use `setdiff()` to compare raw column names against the known standard SDTM AE variable list. Anything left over is a SUPP-- candidate.
+
+```{r supp-autodetect, exercise=TRUE, exercise.lines=18}
+# Standard SDTM AE variables (from SDTMIG v3.4)
+sdtm_ae_vars <- c(
+  "STUDYID", "DOMAIN", "USUBJID", "AESEQ", "AESPID",
+  "AETERM", "AELLT", "AELLTCD", "AEDECOD", "AEPTCD",
+  "AEHLT", "AEHLTCD", "AEHLGT", "AEHLGTCD", "AEBODSYS",
+  "AEBDSYCD", "AESOC", "AESOCCD", "AESEV", "AESER",
+  "AEACN", "AEREL", "AEOUT", "AESCAN", "AESCONG",
+  "AESDISAB", "AESDTH", "AESHOSP", "AESLIFE", "AESOD",
+  "AESMIE", "AECONTRT", "AESTDTC", "AEENDTC", "AESTDY",
+  "AEENDY", "AEDUR", "AETOXGR", "EPOCH"
+)
+
+# Raw columns that are NOT in the SDTM AE standard → SUPP-- candidates
+raw_ae_cols <- names(ae_raw)
+
+supp_candidates <- setdiff(raw_ae_cols, c(sdtm_ae_vars, "PATNUM", "SITEID",
+                                           "AESTDT", "AEENDT"))  # raw-format names
+cat("SUPP-- candidates found in ae_raw:\n")
+print(supp_candidates)
+
+# How many?
+cat("\nTotal SUPP-- candidates:", length(supp_candidates), "\n")
+```
+
+```{r supp-autodetect-hint-1}
+# setdiff(raw_ae_cols, known_vars) returns raw columns with no SDTM home.
+# PATNUM, SITEID are raw identifiers (become part of USUBJID — not SUPP--).
+# AESTDT / AEENDT are raw date formats (become AESTDTC / AEENDTC — not SUPP--).
+# The three remaining columns are genuine SUPP-- candidates.
+```
 
 ---
 
@@ -663,6 +703,51 @@ suppae_three <- generate_sdtm_supp(
 suppae_three
 ```
 
+### Exercise 6b — compare with real pharmaversesdtm::suppae
+
+`suppae_real` is the actual SUPPAE from the CDISCPILOT01 Alzheimer's study. Explore its structure and compare it with our tutorial SUPPAE — both must follow the same fixed schema.
+
+```{r suppae-real-compare, exercise=TRUE, exercise.lines=20}
+# Column structure of the real SUPPAE — should match SDTMIG column order
+names(suppae_real)
+
+# How many distinct QNAMs are used in the real study?
+suppae_real |>
+  distinct(QNAM, QLABEL) |>
+  arrange(QNAM)
+
+# How are QORIG values distributed? (CRF vs DERIVED vs ASSIGNED)
+suppae_real |>
+  count(QORIG, sort = TRUE)
+
+# Does the real SUPPAE use subject-level rows (blank IDVAR)?
+suppae_real |>
+  filter(IDVAR == "" | is.na(IDVAR)) |>
+  nrow()
+```
+
+```{r suppae-real-compare-hint-1}
+# The real SUPPAE columns must be exactly:
+# STUDYID, RDOMAIN, USUBJID, IDVAR, IDVARVAL, QNAM, QLABEL, QVAL, QORIG, QEVAL
+# Any deviation from this schema is a Pinnacle 21 compliance finding.
+# QORIG = "CRF" for values collected on the form; "DERIVED" for computed values.
+# The real study may use subject-level rows (IDVAR = "") in SUPPDM, not usually in SUPPAE.
+```
+
+```{r quiz-suppae-real, echo=FALSE}
+quiz(
+  caption = "Real SUPPAE structure check",
+  question(
+    "In pharmaversesdtm::suppae, IDVAR is 'AESEQ' for every row. Why is AESEQ used rather than AETERM?",
+    answer("AETERM may contain spaces or special characters that are invalid in IDVAR"),
+    answer("AESEQ is a unique numeric row identifier within a subject — AETERM is not unique and could repeat", correct = TRUE),
+    answer("AESEQ is shorter than AETERM so it satisfies the 8-character IDVAR limit"),
+    answer("SDTMIG mandates AESEQ as IDVAR for all SUPPAE datasets"),
+    allow_retry = TRUE
+  )
+)
+```
+
 ---
 
 ## 7 — SUPP-- validation rules
@@ -695,11 +780,58 @@ quiz(
 )
 ```
 
-### Exercise: Validate SUPP-- — check for orphan rows
+### Exercise 7a — validate QNAM naming rules
+
+QNAM must satisfy three rules: at most 8 characters, all uppercase, and must be a valid SAS variable name (starts with a letter or underscore, contains only letters, digits, and underscores). Write a check that flags any violating QNAMs in `suppae_3`.
+
+```{r qnam-validate, exercise=TRUE, exercise.lines=18}
+# suppae_3 has three QNAMs: SPONSOR_AE_ID, INV_AE_CAT, AE_SAFETY_MTG
+# (These raw column names were used directly as QNAMs — a common mistake!)
+
+qnam_check <- suppae_3 |>
+  distinct(QNAM) |>
+  mutate(
+    too_long     = nchar(QNAM) > 8,
+    not_upper    = QNAM != toupper(QNAM),
+    invalid_char = !grepl("^[A-Z_][A-Z0-9_]*$", QNAM),
+    valid        = !too_long & !not_upper & !invalid_char
+  )
+
+qnam_check
+
+# How many QNAMs violate at least one rule?
+qnam_check |> filter(!valid) |> nrow()
+```
+
+```{r qnam-validate-hint-1}
+# SPONSOR_AE_ID: 13 chars → too_long = TRUE; contains underscore → fine for SAS name
+# INV_AE_CAT:   10 chars → too_long = TRUE
+# AE_SAFETY_MTG: 13 chars → too_long = TRUE
+# All three are uppercase and start with a letter, so only the length rule is violated.
+# The fixed QNAMs used in generate_sdtm_supp (AESPID, AESCAT, AESMTG) all pass.
+```
+
+```{r qnam-validate-solution}
+qnam_check <- suppae_3 |>
+  distinct(QNAM) |>
+  mutate(
+    too_long     = nchar(QNAM) > 8,
+    not_upper    = QNAM != toupper(QNAM),
+    invalid_char = !grepl("^[A-Z_][A-Z0-9_]*$", QNAM),
+    valid        = !too_long & !not_upper & !invalid_char
+  )
+qnam_check
+qnam_check |> filter(!valid) |> nrow()
+```
+
+> **Key insight**: raw column names are almost never valid QNAMs. `SPONSOR_AE_ID` is 13 characters and contains underscores. Always define a short, meaningful QNAM (≤8 chars) separately from the raw column name.
+
+### Exercise 7b — validate SUPP-- — check for orphan rows
 
 An orphan SUPP-- row has an `IDVARVAL` that doesn't match any `AESEQ` in the parent AE domain.
 
 Write code that finds orphan rows in `suppae_manual`:
+
 
 ```{r supp-orphan-check, exercise=TRUE, exercise.lines=12}
 # suppae_manual was built earlier (2 qualifiers × 5 AE records = 10 rows)
@@ -977,6 +1109,121 @@ relrec_cm_ae <- bind_rows(relrec_cm, relrec_ae2) |>
   arrange(RELID, RDOMAIN)
 
 relrec_cm_ae
+```
+
+### Exercise 9b — one-to-many RELREC (RELTYPE = "MANY")
+
+In the AE-EX example above, each relationship was ONE-to-ONE: one AE matched one EX record. Sometimes a single exposure record is responsible for multiple AEs — a one-to-many relationship. When one side has multiple records sharing a RELID, `RELTYPE = "MANY"` for that side.
+
+Build a RELREC showing that EX record `EX001` (PATNUM 1015, first dose period) is linked to **both** AE001 (HEADACHE) and AE002 (NAUSEA). EX001 appears once with `RELTYPE = "ONE"`. Each AE row gets its own pair entry with `RELTYPE = "MANY"` on the AE side.
+
+```{r relrec-many, exercise=TRUE, exercise.lines=38}
+# EX001 caused two AEs for patient 1015
+ae_ex_one_many <- tibble(
+  AE_SPONSOR_ID = c("AE001", "AE002"),   # both caused by EX001
+  EX_SPONSOR_ID = c("EX001", "EX001")
+)
+
+# Join to get AESEQ and EXSEQ
+ae_side_data <- ae |>
+  select(USUBJID, AESEQ, patient_number) |>
+  left_join(
+    ae_raw |>
+      generate_oak_id_vars("PATNUM", "ae_raw") |>
+      select(patient_number, SPONSOR_AE_ID),
+    by = "patient_number"
+  )
+
+ex_side_data <- ex |>
+  select(USUBJID, EXSEQ, patient_number) |>
+  left_join(
+    ex_raw |>
+      generate_oak_id_vars("PATNUM", "ex_raw") |>
+      select(patient_number, EXSPID),
+    by = "patient_number"
+  )
+
+pairs_many <- ae_ex_one_many |>
+  inner_join(ae_side_data |> rename(AE_SPONSOR_ID = SPONSOR_AE_ID), by = "AE_SPONSOR_ID") |>
+  inner_join(ex_side_data |> rename(EX_SPONSOR_ID = EXSPID) |>
+               select(USUBJID, EXSEQ, EX_SPONSOR_ID),
+             by = c("USUBJID", "EX_SPONSOR_ID")) |>
+  mutate(RELID = "REL01")   # same RELID for all rows in this relationship
+
+# Build AE side — RELTYPE = "MANY" because multiple AEs share this RELID
+relrec_ae_many <- pairs_many |>
+  transmute(STUDYID = "TEST_STUDY", USUBJID, RDOMAIN = "AE",
+            IDVAR = "AESEQ", IDVARVAL = as.character(AESEQ),
+            RELID, RELTYPE = "___")
+
+# Build EX side — one unique EX record, RELTYPE = "ONE"
+relrec_ex_one <- pairs_many |>
+  distinct(USUBJID, EXSEQ, RELID) |>
+  transmute(STUDYID = "TEST_STUDY", USUBJID, RDOMAIN = "EX",
+            IDVAR = "EXSEQ", IDVARVAL = as.character(EXSEQ),
+            RELID, RELTYPE = "___")
+
+bind_rows(relrec_ae_many, relrec_ex_one) |>
+  arrange(RELID, RDOMAIN)
+```
+
+```{r relrec-many-hint-1}
+# AE side: RELTYPE = "MANY"  (multiple AE rows share RELID REL01)
+# EX side: RELTYPE = "ONE"   (only one EX row in this relationship)
+# Result should have 3 rows: AE001 (AESEQ=1), AE002 (AESEQ=2), EX001 (EXSEQ=1)
+# all with RELID = "REL01"
+```
+
+```{r relrec-many-solution}
+ae_ex_one_many <- tibble(
+  AE_SPONSOR_ID = c("AE001", "AE002"),
+  EX_SPONSOR_ID = c("EX001", "EX001")
+)
+
+ae_side_data <- ae |>
+  select(USUBJID, AESEQ, patient_number) |>
+  left_join(ae_raw |> generate_oak_id_vars("PATNUM", "ae_raw") |>
+              select(patient_number, SPONSOR_AE_ID), by = "patient_number")
+
+ex_side_data <- ex |>
+  select(USUBJID, EXSEQ, patient_number) |>
+  left_join(ex_raw |> generate_oak_id_vars("PATNUM", "ex_raw") |>
+              select(patient_number, EXSPID), by = "patient_number")
+
+pairs_many <- ae_ex_one_many |>
+  inner_join(ae_side_data |> rename(AE_SPONSOR_ID = SPONSOR_AE_ID), by = "AE_SPONSOR_ID") |>
+  inner_join(ex_side_data |> rename(EX_SPONSOR_ID = EXSPID) |>
+               select(USUBJID, EXSEQ, EX_SPONSOR_ID),
+             by = c("USUBJID", "EX_SPONSOR_ID")) |>
+  mutate(RELID = "REL01")
+
+relrec_ae_many <- pairs_many |>
+  transmute(STUDYID = "TEST_STUDY", USUBJID, RDOMAIN = "AE",
+            IDVAR = "AESEQ", IDVARVAL = as.character(AESEQ),
+            RELID, RELTYPE = "MANY")
+
+relrec_ex_one <- pairs_many |>
+  distinct(USUBJID, EXSEQ, RELID) |>
+  transmute(STUDYID = "TEST_STUDY", USUBJID, RDOMAIN = "EX",
+            IDVAR = "EXSEQ", IDVARVAL = as.character(EXSEQ),
+            RELID, RELTYPE = "ONE")
+
+bind_rows(relrec_ae_many, relrec_ex_one) |>
+  arrange(RELID, RDOMAIN)
+```
+
+```{r quiz-relrec-many, echo=FALSE}
+quiz(
+  caption = "One-to-many RELREC",
+  question(
+    "In a one-to-many RELREC where one EX record caused three AEs, how many total rows appear in RELREC for this single relationship?",
+    answer("2 — one for each domain"),
+    answer("3 — one per AE"),
+    answer("4 — three AE rows + one EX row", correct = TRUE),
+    answer("6 — each pairing gets two rows"),
+    allow_retry = TRUE
+  )
+)
 ```
 
 ---
@@ -1297,6 +1544,46 @@ quiz(
     answer("Use sdtm.oak algorithm functions — they support all trial design domains"),
     answer("Build them manually with hand-coded dplyr or from a study spec spreadsheet", correct = TRUE),
     answer("Submit them as SUPP-- instead"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A QNAM is defined as 'AEINVGRD' (Investigator Grade) in the spec. During SUPP-- build you find three rows where the raw value is NA. The correct action is:",
+    answer("Set QVAL = 'NA' (the string) for these rows"),
+    answer("Include the rows with QVAL = '' (empty string)"),
+    answer("Exclude these rows entirely — SUPP-- rows with missing QVAL are invalid and create orphan-like noise", correct = TRUE),
+    answer("Hardcode QVAL = '0' as a safe placeholder"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "QORIG = 'DERIVED' should be used when:",
+    answer("The value comes directly from a CRF field"),
+    answer("The value was assigned by the sponsor's data management team"),
+    answer("The value was computed algorithmically (e.g., from other variables), not collected on the CRF", correct = TRUE),
+    answer("The value was transcribed from a lab report"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "An analyst needs to know 'which study drug dose period was ongoing when each AE started'. The correct SDTM structure to support this analysis is:",
+    answer("Add EXSTDTC and EXENDTC columns to the AE domain"),
+    answer("Add AESTDTC and AEENDTC columns to the EX domain"),
+    answer("RELREC linking AE rows to EX rows so the analyst can join across domains by RELID", correct = TRUE),
+    answer("A SUPP-- qualifier in SUPPAE pointing to the dose period"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You run the QNAM validation check and find 'AE_SAFETY_MTG' has 13 characters. The correct fix is:",
+    answer("Truncate to 'AE_SAFETY' (9 chars) — close enough"),
+    answer("Define a valid short QNAM such as 'AESMTG' (6 chars) and map the raw column to it in the qualifier definition", correct = TRUE),
+    answer("Split the QNAM into two rows in SUPPAE"),
+    answer("Move the variable to the CO domain instead"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "In the pharmaversesdtm::suppae dataset for the CDISCPILOT01 study, IDVAR = 'AESEQ' for every row. What would it mean if you found a row with IDVAR = '' (empty string)?",
+    answer("The row is invalid — SUPPAE always requires a non-blank IDVAR"),
+    answer("The row is a subject-level qualifier that applies to the subject as a whole, not to a specific AE record", correct = TRUE),
+    answer("The AESEQ was missing in the parent AE domain for that subject"),
+    answer("The row is a header placeholder inserted by generate_sdtm_supp()"),
     random_answer_order = TRUE
   )
 )

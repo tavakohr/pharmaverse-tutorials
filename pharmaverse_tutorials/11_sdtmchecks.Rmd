@@ -258,6 +258,32 @@ ae_early <- bind_rows(
     AEENDTC = "2020-06-28", AESEV = "MILD", AESER = "N"
   )
 )
+
+# ── Additional check: AE end before start ─────────────────────────────────────
+check_ae_aeendtc_before_aestdtc <- function(AE) {
+  AE |>
+    filter(!is.na(AESTDTC) & !is.na(AEENDTC)) |>
+    filter(ymd(AEENDTC) < ymd(AESTDTC))
+}
+
+# AE with end date before start date (data entry error)
+ae_end_before_start <- bind_rows(
+  ae,
+  tibble(
+    STUDYID = "TEST_STUDY", DOMAIN = "AE",
+    USUBJID = "TS-702-1023", AESEQ   = 99L,
+    AETERM  = "BACK PAIN",
+    AESTDTC = "2020-08-15",
+    AEENDTC = "2020-08-10",   # ends 5 days BEFORE it starts — impossible
+    AESEV   = "MILD", AESER = "N"
+  )
+)
+
+# ── Real pharmaversesdtm datasets ─────────────────────────────────────────────
+library(pharmaversesdtm)
+ae_sdtm_real <- pharmaversesdtm::ae
+dm_sdtm_real <- pharmaversesdtm::dm
+lb_sdtm_real <- pharmaversesdtm::lb
 ```
 
 ## Welcome
@@ -454,6 +480,35 @@ cat("Inverted reference ranges:", nrow(result), "\n")
 result
 ```
 
+### Exercise: Check for AE end dates before start dates
+
+A common data entry error is entering an AE resolution date earlier than the onset date. The check `check_ae_aeendtc_before_aestdtc()` flags these impossible dates. The dataset `ae_end_before_start` has one such record for subject TS-702-1023 with BACK PAIN (AESTDTC 2020-08-15, AEENDTC 2020-08-10).
+
+```{r check-ae-end-before-start, exercise=TRUE, exercise.lines=14}
+# Check the clean ae first — should return 0 rows
+result_clean <- check_ae_aeendtc_before_aestdtc(___)
+cat("Clean AE issues:", nrow(result_clean), "\n")
+
+# Now check ae_end_before_start — should flag the impossible BACK PAIN record
+result_dirty <- check_ae_aeendtc_before_aestdtc(___)
+cat("Dirty AE issues:", nrow(result_dirty), "\n")
+result_dirty |> select(USUBJID, AETERM, AESTDTC, AEENDTC, AESEV)
+```
+
+```{r check-ae-end-before-start-hint-1}
+# check_ae_aeendtc_before_aestdtc(ae)
+# check_ae_aeendtc_before_aestdtc(ae_end_before_start)
+```
+
+```{r check-ae-end-before-start-solution}
+result_clean <- check_ae_aeendtc_before_aestdtc(ae)
+cat("Clean AE issues:", nrow(result_clean), "\n")
+
+result_dirty <- check_ae_aeendtc_before_aestdtc(ae_end_before_start)
+cat("Dirty AE issues:", nrow(result_dirty), "\n")
+result_dirty |> select(USUBJID, AETERM, AESTDTC, AEENDTC, AESEV)
+```
+
 ---
 
 ## 5 — The check metadata: `sdtmchecksmeta`
@@ -492,6 +547,47 @@ high_dm_checks <- sdtmchecksmeta |>
   filter(priority == "High", str_detect(datasets, "DM"))
 
 high_dm_checks
+```
+
+### Exercise: Customise a check's priority for your study
+
+Your study has a known problem with inverted reference ranges from a specific site's EDC configuration. You want `check_lb_lbornrlo_lbornrhi` to be treated as High priority instead of Medium so it blocks the analysis pipeline. Modify a copy of `sdtmchecksmeta` and confirm the change.
+
+```{r meta-customize-priority, exercise=TRUE, exercise.lines=16}
+# Make a study-specific copy of the metadata
+study_meta <- sdtmchecksmeta |>
+  mutate(priority = case_when(
+    check == ___ ~ "High",
+    TRUE ~ priority
+  ))
+
+# Confirm the change
+study_meta |>
+  filter(check == "check_lb_lbornrlo_lbornrhi") |>
+  select(check, priority, description)
+
+# Count High-priority checks before vs. after
+cat("Original High checks:", sum(sdtmchecksmeta$priority == "High"), "\n")
+cat("Study-specific High checks:", sum(study_meta$priority == "High"), "\n")
+```
+
+```{r meta-customize-priority-hint-1}
+# check == "check_lb_lbornrlo_lbornrhi" ~ "High"
+```
+
+```{r meta-customize-priority-solution}
+study_meta <- sdtmchecksmeta |>
+  mutate(priority = case_when(
+    check == "check_lb_lbornrlo_lbornrhi" ~ "High",
+    TRUE ~ priority
+  ))
+
+study_meta |>
+  filter(check == "check_lb_lbornrlo_lbornrhi") |>
+  select(check, priority, description)
+
+cat("Original High checks:", sum(sdtmchecksmeta$priority == "High"), "\n")
+cat("Study-specific High checks:", sum(study_meta$priority == "High"), "\n")
 ```
 
 ---
@@ -810,6 +906,83 @@ cat("Subjects in DM with no EX:", nrow(my_check_dm_no_ex(dm_with_no_dose, ex)), 
 my_check_dm_no_ex(dm_with_no_dose, ex)
 ```
 
+### Exercise: Run a check on real pharmaversesdtm data
+
+The `ae_sdtm_real` object holds the actual CDISC pilot AE domain from `{pharmaversesdtm}`. Run `check_ae_dup()` on it and compare how it looks versus the mock dataset.
+
+```{r real-ae-check, exercise=TRUE, exercise.lines=16}
+# How many subjects and AE records in real data?
+cat("Real AE records:", nrow(ae_sdtm_real), "\n")
+cat("Real AE subjects:", n_distinct(ae_sdtm_real$USUBJID), "\n")
+
+# Run the duplicate check on real data
+real_issues <- check_ae_dup(___)
+cat("Duplicate AE records flagged:", nrow(real_issues), "\n")
+
+# What AE terms appear in the real data? (first 10)
+ae_sdtm_real |>
+  distinct(AETERM) |>
+  arrange(AETERM) |>
+  head(10)
+```
+
+```{r real-ae-check-hint-1}
+# check_ae_dup(ae_sdtm_real)
+```
+
+```{r real-ae-check-solution}
+cat("Real AE records:", nrow(ae_sdtm_real), "\n")
+cat("Real AE subjects:", n_distinct(ae_sdtm_real$USUBJID), "\n")
+
+real_issues <- check_ae_dup(ae_sdtm_real)
+cat("Duplicate AE records flagged:", nrow(real_issues), "\n")
+
+ae_sdtm_real |>
+  distinct(AETERM) |>
+  arrange(AETERM) |>
+  head(10)
+```
+
+### Exercise: Write a custom out-of-range lab check using real data
+
+The real lab data in `lb_sdtm_real` includes `LBSTRESN` (numeric standardised result), `LBSTNRLO` (lower normal limit), and `LBSTNRHI` (upper normal limit). Write `check_lb_out_of_range()` that flags rows where the standardised result falls outside the normal range.
+
+```{r custom-lb-out-of-range, exercise=TRUE, exercise.lines=22}
+check_lb_out_of_range <- function(LB) {
+  LB |>
+    filter(!is.na(LBSTRESN) & !is.na(LBSTNRLO) & !is.na(LBSTNRHI)) |>
+    filter(___ | ___)
+}
+
+# Run on real LB data
+oor_issues <- check_lb_out_of_range(lb_sdtm_real)
+cat("Out-of-range lab results:", nrow(oor_issues), "\n")
+
+# Which tests are most commonly flagged?
+oor_issues |>
+  count(LBTESTCD, sort = TRUE) |>
+  head(10)
+```
+
+```{r custom-lb-out-of-range-hint-1}
+# filter(LBSTRESN < LBSTNRLO | LBSTRESN > LBSTNRHI)
+```
+
+```{r custom-lb-out-of-range-solution}
+check_lb_out_of_range <- function(LB) {
+  LB |>
+    filter(!is.na(LBSTRESN) & !is.na(LBSTNRLO) & !is.na(LBSTNRHI)) |>
+    filter(LBSTRESN < LBSTNRLO | LBSTRESN > LBSTNRHI)
+}
+
+oor_issues <- check_lb_out_of_range(lb_sdtm_real)
+cat("Out-of-range lab results:", nrow(oor_issues), "\n")
+
+oor_issues |>
+  count(LBTESTCD, sort = TRUE) |>
+  head(10)
+```
+
 ---
 
 ## 10 — Assertion-style wrapping for production
@@ -1007,6 +1180,41 @@ quiz(
     answer("sdtmchecks catches analysis-impacting issues; P21 catches CDISC conformance issues — they cover different problem classes", correct = TRUE),
     answer("They duplicate each other — pick whichever your sponsor prefers"),
     answer("sdtmchecks only runs on ADaM; P21 only runs on SDTM"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A check for `check_ae_aeendtc_before_aestdtc` on a dataset where some AEs have no AEENDTC. Those rows will:",
+    answer("Cause the check to error with an NA comparison warning"),
+    answer("Be excluded from flagging because the filter requires both dates to be non-missing", correct = TRUE),
+    answer("Always be flagged as issues since NA is treated as the earliest possible date"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Your study protocol allows AEs to be recorded up to 30 days after the last dose. The standard `check_ae_aestdtc_before_exstdtc` flags one AE that is actually a valid late-reported pre-dose event. You should:",
+    answer("Delete the AE record from SDTM"),
+    answer("Change the check's logic in the package source"),
+    answer("Document that this AE is expected, and consider writing a study-specific check that reflects the protocol window", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The `sdtmchecksmeta` column named `datasets` contains a comma-separated string like `'AE,DM'`. Inside `run_all_checks()` this string is used to:",
+    answer("Validate that the domain has the required CDISC columns"),
+    answer("Look up the named datasets from the `...` arguments passed to run_all_checks()", correct = TRUE),
+    answer("Set the order in which domains are loaded from XPT files"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You write a custom check and want it to appear in `run_all_checks()` output without any changes to the package. You should:",
+    answer("Submit a pull request to pharmaverse/sdtmchecks"),
+    answer("Add a row for your check to your study-specific copy of sdtmchecksmeta and define the function in your session", correct = TRUE),
+    answer("Override the run_all_checks() function"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`{datacutr}` is used before running `{sdtmchecks}` in an interim analysis workflow because:",
+    answer("datacutr applies the data cutoff date so that sdtmchecks only evaluates data within the analysis window", correct = TRUE),
+    answer("datacutr converts SAS XPT files to R data frames that sdtmchecks can read"),
+    answer("datacutr removes all Medium-priority issues automatically"),
     random_answer_order = TRUE
   )
 )

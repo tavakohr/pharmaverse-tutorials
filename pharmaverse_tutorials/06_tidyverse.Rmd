@@ -10,7 +10,8 @@ runtime: shiny_prerendered
 description: >
   Reshape data with pivot_longer/pivot_wider (PROC TRANSPOSE). Handle CDISC ISO 8601
   dates with lubridate. Manipulate strings with stringr. Control factor levels with
-  forcats. All illustrated with clinical pharmaverse data patterns.
+  forcats. Fill and complete sparse visit structures. All illustrated with real
+  pharmaverseadam clinical datasets (CDISCPILOT01 Alzheimer's trial).
 ---
 
 ```{r setup, include=FALSE}
@@ -21,80 +22,73 @@ library(lubridate)
 library(stringr)
 library(forcats)
 library(tibble)
+library(pharmaverseadam)
 
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 tutorial_options(exercise.timelimit = 60)
 
-# ── Shared datasets ──────────────────────────────────────────────────────────
+# ── Load pharmaverseadam datasets ─────────────────────────────────────────────
+data(adsl, package = "pharmaverseadam")
+data(adae, package = "pharmaverseadam")
+data(adlb, package = "pharmaverseadam")
+data(advs, package = "pharmaverseadam")
+data(adcm, package = "pharmaverseadam")
+data(adex, package = "pharmaverseadam")
 
-# Long-format lab data (BDS structure)
-adlb <- tribble(
-  ~USUBJID,       ~PARAMCD, ~AVISIT,     ~AVISITN, ~ABLFL, ~AVAL,
-  "CDIS-001-001", "HGB",    "BASELINE",  0,        "Y",    13.2,
-  "CDIS-001-001", "HGB",    "WEEK 4",    4,        "N",    12.1,
-  "CDIS-001-001", "HGB",    "WEEK 8",    8,        "N",    11.8,
-  "CDIS-001-001", "ALT",    "BASELINE",  0,        "Y",    22.0,
-  "CDIS-001-001", "ALT",    "WEEK 4",    4,        "N",    28.0,
-  "CDIS-001-001", "ALT",    "WEEK 8",    8,        "N",    19.0,
-  "CDIS-001-002", "HGB",    "BASELINE",  0,        "Y",    14.5,
-  "CDIS-001-002", "HGB",    "WEEK 4",    4,        "N",    13.9,
-  "CDIS-001-002", "HGB",    "WEEK 8",    8,        "N",    13.2,
-  "CDIS-001-002", "ALT",    "BASELINE",  0,        "Y",    35.0,
-  "CDIS-001-002", "ALT",    "WEEK 4",    4,        "N",    42.0,
-  "CDIS-001-002", "ALT",    "WEEK 8",    8,        "N",    38.0,
-  "CDIS-001-003", "HGB",    "BASELINE",  0,        "Y",    11.8,
-  "CDIS-001-003", "HGB",    "WEEK 4",    4,        "N",    11.2,
-  "CDIS-001-003", "ALT",    "BASELINE",  0,        "Y",    18.0,
-  "CDIS-001-003", "ALT",    "WEEK 4",    4,        "N",    20.0
-)
+# Strip admiral-appended derived rows (DTYPE = "MINIMUM", "MAXIMUM", "LOCF" …)
+# so exercises work on observed records only
+adlb <- adlb |> filter(is.na(DTYPE))
+advs <- advs |> filter(is.na(DTYPE))
 
-# Wide-format baseline snapshot (for pivot_longer exercises)
-wide_labs <- tribble(
-  ~USUBJID,       ~BASE_HGB, ~BASE_ALT, ~BASE_WBC,
-  "CDIS-001-001",   13.2,      22.0,      6.5,
-  "CDIS-001-002",   14.5,      35.0,      7.1,
-  "CDIS-001-003",   11.8,      18.0,      5.9,
-  "CDIS-001-004",   12.9,      27.0,      6.8
-)
+# ── Wide baseline vital signs snapshot (for pivot_longer exercises) ───────────
+# One row per subject with columns BASE_SYSBP, BASE_DIABP, BASE_PULSE
+wide_advs <- advs |>
+  filter(PARAMCD %in% c("SYSBP", "DIABP", "PULSE"), ABLFL == "Y") |>
+  group_by(USUBJID, PARAMCD) |>
+  slice(1) |>
+  ungroup() |>
+  select(USUBJID, PARAMCD, AVAL) |>
+  pivot_wider(names_from  = PARAMCD,
+              values_from = AVAL,
+              names_prefix = "BASE_") |>
+  filter(!is.na(BASE_SYSBP), !is.na(BASE_DIABP), !is.na(BASE_PULSE))
 
-# ADSL with dates and treatments
-adsl <- tribble(
-  ~USUBJID,       ~AGE, ~SEX, ~SAFFL, ~TRT01A,               ~TRTSDT,       ~BRTHDT,
-  "CDIS-001-001",   63,  "F",  "Y",   "Xanomeline High Dose", "2014-01-01",  "1950-03-10",
-  "CDIS-001-002",   52,  "M",  "Y",   "Placebo",              "2014-01-01",  "1961-07-22",
-  "CDIS-001-003",   70,  "F",  "Y",   "Xanomeline Low Dose",  "2014-01-01",  "1943-09-05",
-  "CDIS-001-004",   45,  "M",  "Y",   "Xanomeline High Dose", "2014-01-01",  "1968-11-30",
-  "CDIS-001-005",   67,  "F",  "Y",   "Placebo",              "2014-01-01",  "1946-04-14",
-  "CDIS-001-006",   38,  "M",  "N",   "Xanomeline Low Dose",  "2014-01-01",  "1975-08-01"
-)
+# ── Wide baseline lab snapshot (for supplementary exercises) ──────────────────
+# One row per subject with columns BASE_ALT, BASE_AST, BASE_ALB
+wide_labs <- adlb |>
+  filter(PARAMCD %in% c("ALT", "AST", "ALB"), ABLFL == "Y") |>
+  group_by(USUBJID, PARAMCD) |>
+  slice(1) |>
+  ungroup() |>
+  select(USUBJID, PARAMCD, AVAL) |>
+  pivot_wider(names_from  = PARAMCD,
+              values_from = AVAL,
+              names_prefix = "BASE_") |>
+  filter(!is.na(BASE_ALT))
 
-# ADAE with ISO 8601 date strings
-adae <- tribble(
-  ~USUBJID,       ~AEDECOD,            ~AESEV,     ~AESTDTC,
-  "CDIS-001-001", "HEADACHE",          "MILD",     "2014-01-05",
-  "CDIS-001-001", "NAUSEA",            "MODERATE", "2014-02-10",
-  "CDIS-001-002", "DIZZINESS",         "MILD",     "2014-01-20",
-  "CDIS-001-003", "APPLICATION SITE PRURITUS","MODERATE","2014-03-15",
-  "CDIS-001-004", "VOMITING",          "SEVERE",   "2014-01-28",
-  "CDIS-001-005", "  FATIGUE  ",       "MILD",     "2014-02-22"  # dirty whitespace
-)
+# ── Combined TESTCD_CAT column (for separate_wider_delim exercise) ────────────
+lab_combined <- adlb |>
+  filter(ABLFL == "Y",
+         PARAMCD %in% c("ALT", "HGB", "WBC", "AST", "ALB", "PLAT")) |>
+  select(USUBJID, LBTESTCD, LBCAT) |>
+  mutate(TESTCD_CAT = str_c(LBTESTCD, "_", LBCAT)) |>
+  select(USUBJID, TESTCD_CAT) |>
+  distinct() |>
+  arrange(USUBJID, TESTCD_CAT) |>
+  slice_head(n = 8)
 
-# Dataset with combined TESTCD_CAT column (for separate exercise)
-lab_combined <- tribble(
-  ~USUBJID,       ~TESTCD_CAT,
-  "CDIS-001-001", "HGB_HEMATOLOGY",
-  "CDIS-001-001", "ALT_CHEMISTRY",
-  "CDIS-001-002", "HGB_HEMATOLOGY",
-  "CDIS-001-002", "RBC_HEMATOLOGY"
-)
-
-# Dataset with split date columns (for unite exercise)
-dates_split <- tribble(
-  ~USUBJID,       ~YEAR, ~MONTH, ~DAY,
-  "CDIS-001-001", "2014", "01",  "05",
-  "CDIS-001-002", "2014", "01",  "20",
-  "CDIS-001-003", "2014", "03",  "15"
-)
+# ── Split date columns from adae AESTDTC (for unite exercise) ─────────────────
+dates_split <- adae |>
+  filter(!is.na(AESTDTC)) |>
+  select(USUBJID, AESTDTC) |>
+  distinct(USUBJID, .keep_all = TRUE) |>
+  mutate(
+    YEAR  = str_sub(AESTDTC, 1, 4),
+    MONTH = str_sub(AESTDTC, 6, 7),
+    DAY   = str_sub(AESTDTC, 9, 10)
+  ) |>
+  select(USUBJID, YEAR, MONTH, DAY) |>
+  slice_head(n = 5)
 ```
 
 ## Overview
@@ -112,12 +106,14 @@ In clinical work, the packages beyond `{dplyr}` you'll use most are:
 
 | Package | Clinical use | SAS equivalent |
 |---|---|---|
-| `{tidyr}` | Reshape wide ↔ long (BDS structure) | `PROC TRANSPOSE` |
+| `{tidyr}` | Reshape wide ↔ long (BDS structure); fill sparse visits | `PROC TRANSPOSE`, `RETAIN` |
 | `{lubridate}` | Parse & do arithmetic on CDISC ISO 8601 dates | `INPUT(., YYMMDD10.)`, `INTCK`, `INTNX` |
 | `{stringr}` | Clean, extract, detect strings | `SUBSTR`, `TRANWRD`, `INDEX` |
 | `{forcats}` | Control factor / category order for TLGs | `PROC FORMAT` |
 
-> All datasets are pre-loaded: `adsl`, `adae`, `adlb`, `wide_labs`, `lab_combined`, `dates_split`.
+> All datasets are pre-loaded from `{pharmaverseadam}` (CDISCPILOT01 Alzheimer's trial):
+> `adsl` (254 subjects), `adae`, `adlb`, `advs`, `adcm`, `adex`, plus helper snapshots
+> `wide_advs` and `wide_labs` for reshape exercises.
 
 ---
 
@@ -127,7 +123,8 @@ quiz(
   question(
     "CDISC's BDS (Basic Data Structure) format is best described as:",
     answer("One row per subject with parameters in separate columns (wide)"),
-    answer("One row per parameter per subject per visit (long / tidy)", correct = TRUE),
+    answer("One row per parameter per subject per analysis timepoint (long / tidy)",
+           correct = TRUE),
     answer("One row per study with all subjects embedded"),
     answer("Identical to ADSL structure"),
     allow_retry = TRUE
@@ -138,6 +135,16 @@ quiz(
     answer("stringr"),
     answer("tidyr", correct = TRUE),
     answer("forcats"),
+    allow_retry = TRUE
+  ),
+  question(
+    "The pharmaverseadam BDS datasets (adlb, advs) contain rows where DTYPE is
+     non-missing (e.g. 'MINIMUM', 'LOCF'). What are these rows?",
+    answer("Duplicate source records that should always be kept"),
+    answer("Admiral-appended derived / imputed records that must be filtered out
+           before most analyses", correct = TRUE),
+    answer("Records where the analysis value is missing"),
+    answer("Baseline records flagged by ABLFL"),
     allow_retry = TRUE
   )
 )
@@ -152,32 +159,35 @@ quiz(
 **Wide** format — one row per subject, each measurement in its own column:
 
 ```
-USUBJID   BASE_HGB  BASE_ALT  BASE_WBC
-001         13.2      22.0      6.5
-002         14.5      35.0      7.1
+USUBJID      BASE_SYSBP  BASE_DIABP  BASE_PULSE
+01-701-1015  130         78          84
+01-701-1023  118         72          72
 ```
 
-**Long (BDS)** format — one row per measurement, with a column for which parameter:
+**Long (BDS)** format — one row per measurement, with a column identifying which parameter:
 
 ```
-USUBJID   PARAMCD   AVAL
-001       HGB       13.2
-001       ALT       22.0
-001       WBC       6.5
-002       HGB       14.5
+USUBJID      PARAMCD  AVAL
+01-701-1015  SYSBP    130
+01-701-1015  DIABP    78
+01-701-1015  PULSE    84
+01-701-1023  SYSBP    118
 ...
 ```
 
-CDISC's BDS datasets (ADLB, ADVS, ADEG) are long. Some analyses need wide (correlations, shift tables). You'll constantly reshape between them.
+CDISC's BDS datasets (`adlb`, `advs`, `adex`) are long. Correlation analyses, shift tables, and TLG listings sometimes need wide. You'll constantly reshape between them.
 
-Run the code below to compare `wide_labs` and `adlb` side-by-side:
+Run the code below to compare `wide_advs` and a filtered `advs` side-by-side:
 
-```{r compare-shapes, exercise=TRUE, exercise.lines=6}
+```{r compare-shapes, exercise=TRUE, exercise.lines=8}
 # Wide — one row per subject, parameter in columns
-wide_labs
+wide_advs |> slice_head(n = 4)
 
 # Long — one row per parameter per subject per visit
-adlb |> filter(AVISIT == "BASELINE") |> select(USUBJID, PARAMCD, AVAL)
+advs |>
+  filter(PARAMCD %in% c("SYSBP", "DIABP", "PULSE"), ABLFL == "Y") |>
+  select(USUBJID, PARAMCD, AVAL) |>
+  slice_head(n = 8)
 ```
 
 ---
@@ -189,23 +199,25 @@ adlb |> filter(AVISIT == "BASELINE") |> select(USUBJID, PARAMCD, AVAL)
 ```r
 wide_data |>
   pivot_longer(
-    cols      = c(BASE_HGB, BASE_ALT, BASE_WBC),  # columns to stack
-    names_to  = "PARAMCD",                         # column for old names
-    values_to = "AVAL"                             # column for old values
+    cols      = c(BASE_SYSBP, BASE_DIABP, BASE_PULSE),  # columns to stack
+    names_to  = "PARAMCD",                               # column for old names
+    values_to = "AVAL"                                   # column for old values
   )
 ```
 
 Key `cols` options:
-- **Explicit list**: `c(BASE_HGB, BASE_ALT, BASE_WBC)`
+
+- **Explicit list**: `c(BASE_SYSBP, BASE_DIABP, BASE_PULSE)`
 - **Exclude key columns**: `-USUBJID`
 - **Tidyselect helpers**: `starts_with("BASE_")`, `where(is.numeric)`
 
 ### Exercise 2a — basic pivot_longer
 
-Pivot `wide_labs` so each baseline lab value is on its own row. Name the new key column `PARAMCD` and value column `AVAL`.
+Pivot `wide_advs` so each baseline vital sign value is on its own row.
+Name the new key column `PARAMCD` and value column `AVAL`.
 
 ```{r pivot-longer-basic, exercise=TRUE, exercise.lines=10}
-wide_labs |>
+wide_advs |>
   pivot_longer(
     cols      = ___,
     names_to  = "___",
@@ -214,12 +226,12 @@ wide_labs |>
 ```
 
 ```{r pivot-longer-basic-hint-1}
-# cols = c(BASE_HGB, BASE_ALT, BASE_WBC)  OR  cols = -USUBJID
+# cols = c(BASE_SYSBP, BASE_DIABP, BASE_PULSE)  OR  cols = -USUBJID
 # names_to = "PARAMCD", values_to = "AVAL"
 ```
 
 ```{r pivot-longer-basic-solution}
-wide_labs |>
+wide_advs |>
   pivot_longer(
     cols      = -USUBJID,
     names_to  = "PARAMCD",
@@ -227,33 +239,87 @@ wide_labs |>
   )
 ```
 
-### Exercise 2b — pivot with a tidyselect helper
+### Exercise 2b — pivot with names_prefix to strip column prefix
 
-Do the same pivot using `starts_with("BASE_")` as the `cols` selector. Then strip the `"BASE_"` prefix from the parameter names using `names_prefix`.
+Pivot `wide_advs` using `starts_with("BASE_")` as the `cols` selector.
+Use `names_prefix` to strip the `"BASE_"` prefix so the resulting `PARAMCD` column
+contains `"SYSBP"`, `"DIABP"`, and `"PULSE"` — not `"BASE_SYSBP"`, etc.
 
 ```{r pivot-longer-prefix, exercise=TRUE, exercise.lines=10}
-wide_labs |>
+wide_advs |>
   pivot_longer(
     cols         = starts_with("___"),
-    names_to     = "PARAMCD",
-    values_to    = "AVAL",
-    names_prefix = "___"        # strip this prefix from the names
+    names_to     = "___",
+    values_to    = "___",
+    names_prefix = "___"
   )
 ```
 
 ```{r pivot-longer-prefix-hint-1}
 # starts_with("BASE_")
-# names_prefix = "BASE_"  removes the prefix, leaving just "HGB", "ALT", "WBC"
+# names_prefix = "BASE_"  strips the prefix, leaving "SYSBP", "DIABP", "PULSE"
 ```
 
 ```{r pivot-longer-prefix-solution}
-wide_labs |>
+wide_advs |>
   pivot_longer(
     cols         = starts_with("BASE_"),
-    names_to     = "PARAMCD",
-    values_to    = "AVAL",
+    names_to     = "___",
+    values_to    = "___",
     names_prefix = "BASE_"
   )
+```
+
+### Exercise 2c — pivot multiple value columns simultaneously
+
+`wide_labs` has columns `BASE_ALT`, `BASE_AST`, `BASE_ALB`.
+A collaborator delivers an **extended** snapshot that also has `CHNG_ALT`, `CHNG_AST`,
+`CHNG_ALB` (change from baseline). Pivot both groups at once using `.value` in
+`names_to` and a `names_pattern` regex so you get columns `AVAL` (from BASE_*)
+and `CHG` (from CHNG_*).
+
+```{r pivot-longer-multivalue, exercise=TRUE, exercise.lines=18}
+# Build the extended wide snapshot first
+wide_labs_ext <- wide_labs |>
+  mutate(
+    CHNG_ALT = BASE_ALT * 0.1,   # synthetic change-from-baseline
+    CHNG_AST = BASE_AST * 0.08,
+    CHNG_ALB = BASE_ALB * -0.05
+  )
+
+# Now pivot both BASE_* and CHNG_* into AVAL and CHG columns
+wide_labs_ext |>
+  pivot_longer(
+    cols          = -USUBJID,
+    names_to      = c("___", "PARAMCD"),  # .value triggers multi-column output
+    names_pattern = "___"                 # regex: capture prefix then testcd
+  )
+```
+
+```{r pivot-longer-multivalue-hint-1}
+# names_to      = c(".value", "PARAMCD")
+# names_pattern = "^(BASE|CHNG)_(.+)$"
+# .value maps "BASE" → AVAL, "CHNG" → CHG, but we need explicit values_to
+# A cleaner approach: names_pattern = "^(BASE|CHNG)_(.+)$"
+# and rename BASE->AVAL / CHNG->CHG with a rename_with() afterwards,
+# OR: names_to = c("TYPE", "PARAMCD"), then pivot_wider TYPE → AVAL/CHG
+```
+
+```{r pivot-longer-multivalue-solution}
+wide_labs_ext <- wide_labs |>
+  mutate(
+    CHNG_ALT = BASE_ALT * 0.1,
+    CHNG_AST = BASE_AST * 0.08,
+    CHNG_ALB = BASE_ALB * -0.05
+  )
+
+wide_labs_ext |>
+  pivot_longer(
+    cols          = -USUBJID,
+    names_to      = c(".value", "PARAMCD"),
+    names_pattern = "^(BASE|CHNG)_(.+)$"
+  ) |>
+  rename(AVAL = BASE, CHG = CHNG)
 ```
 
 ---
@@ -270,15 +336,19 @@ long_data |>
   )
 ```
 
-Common clinical use: turn long `adlb` into a wide view — one row per subject-visit, one column per lab parameter.
+Common clinical uses: shift tables (ANRIND at baseline vs. on-treatment), correlation
+matrices of lab parameters, and wide demography snapshots joined to BDS datasets.
 
-### Exercise 3a — pivot adlb to wide by parameter
+### Exercise 3a — pivot adlb to wide by parameter at each visit
 
-Pivot `adlb` so that `HGB` and `ALT` become separate columns, with one row per `(USUBJID, AVISIT)`. Select only those two parameters first.
+From `adlb`, select SYSBP is in `advs` — let's use lab parameters.
+Pivot the **on-treatment** `adlb` records (filter `ONTRTFL == "Y"`, then pick
+`ALT`, `AST`, `ALB`) so that each row is one `(USUBJID, AVISIT)` pair with
+separate columns per parameter. Select only the columns you need before pivoting.
 
-```{r pivot-wider-basic, exercise=TRUE, exercise.lines=10}
+```{r pivot-wider-basic, exercise=TRUE, exercise.lines=12}
 adlb |>
-  filter(PARAMCD %in% c("HGB", "ALT")) |>
+  filter(ONTRTFL == "Y", PARAMCD %in% c("ALT", "AST", "ALB")) |>
   select(USUBJID, AVISIT, PARAMCD, AVAL) |>
   pivot_wider(
     names_from  = ___,
@@ -288,55 +358,71 @@ adlb |>
 
 ```{r pivot-wider-basic-hint-1}
 # names_from = PARAMCD, values_from = AVAL
+# If you see list-columns, a subject had more than one record per AVISIT/PARAMCD.
+# Add values_fn = list(AVAL = mean) to collapse them.
 ```
 
 ```{r pivot-wider-basic-solution}
 adlb |>
-  filter(PARAMCD %in% c("HGB", "ALT")) |>
+  filter(ONTRTFL == "Y", PARAMCD %in% c("ALT", "AST", "ALB")) |>
   select(USUBJID, AVISIT, PARAMCD, AVAL) |>
   pivot_wider(
     names_from  = PARAMCD,
-    values_from = AVAL
+    values_from = AVAL,
+    values_fn   = list(AVAL = mean)   # collapse any duplicates
   )
 ```
 
-### Exercise 3b — pivot with a names_prefix
+### Exercise 3b — pivot with names_prefix and multiple value columns
 
-Repeat, but prefix each new column with `"AVAL_"` using the `names_prefix` argument.
+Repeat the pivot from 3a, but this time capture **both** `AVAL` (analysis value)
+and `CHG` (change from baseline) for each parameter. Add a `"V_"` prefix to avoid
+ambiguous column names.
 
-```{r pivot-wider-prefix, exercise=TRUE, exercise.lines=10}
+```{r pivot-wider-multicol, exercise=TRUE, exercise.lines=14}
 adlb |>
-  filter(PARAMCD %in% c("HGB", "ALT")) |>
-  select(USUBJID, AVISIT, PARAMCD, AVAL) |>
+  filter(ONTRTFL == "Y", PARAMCD %in% c("ALT", "AST", "ALB"),
+         !is.na(CHG)) |>
+  select(USUBJID, AVISIT, PARAMCD, AVAL, CHG) |>
   pivot_wider(
-    names_from   = PARAMCD,
-    values_from  = AVAL,
-    names_prefix = "___"
+    names_from   = ___,
+    values_from  = c(___, ___),
+    names_prefix = "___",
+    values_fn    = mean
   )
 ```
 
-```{r pivot-wider-prefix-hint-1}
-# names_prefix = "AVAL_"
+```{r pivot-wider-multicol-hint-1}
+# names_from = PARAMCD
+# values_from = c(AVAL, CHG)
+# names_prefix = "V_"
+# This creates columns like V_AVAL_ALT, V_AVAL_AST, V_CHG_ALT, etc.
 ```
 
-```{r pivot-wider-prefix-solution}
+```{r pivot-wider-multicol-solution}
 adlb |>
-  filter(PARAMCD %in% c("HGB", "ALT")) |>
-  select(USUBJID, AVISIT, PARAMCD, AVAL) |>
+  filter(ONTRTFL == "Y", PARAMCD %in% c("ALT", "AST", "ALB"),
+         !is.na(CHG)) |>
+  select(USUBJID, AVISIT, PARAMCD, AVAL, CHG) |>
   pivot_wider(
     names_from   = PARAMCD,
-    values_from  = AVAL,
-    names_prefix = "AVAL_"
+    values_from  = c(AVAL, CHG),
+    names_prefix = "V_",
+    values_fn    = mean
   )
 ```
 
 ### Exercise 3c — baseline wide table joined back to adsl
 
-Build a wide baseline table (one row per subject, columns `BASE_HGB` and `BASE_ALT`), then `left_join` it to `adsl`.
+Build a wide baseline lab table (one row per subject, columns `BASE_ALT`, `BASE_AST`,
+`BASE_ALB`), then `left_join` it to `adsl` (keeping `USUBJID`, `TRT01A`, `AGE`, `AGEGR1`).
 
-```{r pivot-join-pipeline, exercise=TRUE, exercise.lines=15}
+```{r pivot-join-pipeline, exercise=TRUE, exercise.lines=18}
 baseline_wide <- adlb |>
-  filter(PARAMCD %in% c("HGB", "ALT"), ABLFL == "Y") |>
+  filter(PARAMCD %in% c("ALT", "AST", "ALB"), ABLFL == "Y") |>
+  group_by(USUBJID, PARAMCD) |>
+  slice(1) |>
+  ungroup() |>
   select(USUBJID, PARAMCD, AVAL) |>
   pivot_wider(
     names_from   = ___,
@@ -345,18 +431,21 @@ baseline_wide <- adlb |>
   )
 
 adsl |>
-  select(USUBJID, TRT01A, AGE) |>
+  select(USUBJID, TRT01A, AGE, AGEGR1) |>
   left_join(baseline_wide, by = "USUBJID")
 ```
 
 ```{r pivot-join-pipeline-hint-1}
 # names_from = PARAMCD, values_from = AVAL
-# names_prefix = "BASE_" gives columns BASE_HGB and BASE_ALT
+# names_prefix = "BASE_" → columns BASE_ALT, BASE_AST, BASE_ALB
 ```
 
 ```{r pivot-join-pipeline-solution}
 baseline_wide <- adlb |>
-  filter(PARAMCD %in% c("HGB", "ALT"), ABLFL == "Y") |>
+  filter(PARAMCD %in% c("ALT", "AST", "ALB"), ABLFL == "Y") |>
+  group_by(USUBJID, PARAMCD) |>
+  slice(1) |>
+  ungroup() |>
   select(USUBJID, PARAMCD, AVAL) |>
   pivot_wider(
     names_from   = PARAMCD,
@@ -365,19 +454,90 @@ baseline_wide <- adlb |>
   )
 
 adsl |>
-  select(USUBJID, TRT01A, AGE) |>
+  select(USUBJID, TRT01A, AGE, AGEGR1) |>
   left_join(baseline_wide, by = "USUBJID")
+```
+
+### Exercise 3d — shift table: ANRIND baseline vs. post-baseline
+
+A shift table shows the reference-range indicator at **baseline** vs. at each
+post-baseline visit. Starting from `adlb`, filter to `PARAMCD == "ALT"` and
+pivot ANRIND so each row is one `(USUBJID, AVISIT)` and two columns show
+`ANRIND_BASE` and `ANRIND_POST`. Hint: you will need to flag baseline rows first.
+
+```{r shift-table, exercise=TRUE, exercise.lines=20}
+# Step 1: baseline ANRIND per subject
+base_anr <- adlb |>
+  filter(PARAMCD == "ALT", ABLFL == "Y") |>
+  group_by(USUBJID) |>
+  slice(1) |>
+  ungroup() |>
+  select(USUBJID, ANRIND_BASE = ANRIND)
+
+# Step 2: post-baseline ANRIND per subject per visit
+post_anr <- adlb |>
+  filter(PARAMCD == "ALT", ONTRTFL == "Y", !is.na(AVISIT)) |>
+  select(USUBJID, AVISIT, ANRIND)
+
+# Step 3: join them
+post_anr |>
+  left_join(___, by = "___") |>
+  select(USUBJID, AVISIT, ANRIND_BASE, ANRIND_POST = ANRIND) |>
+  count(ANRIND_BASE, ANRIND_POST)
+```
+
+```{r shift-table-hint-1}
+# left_join(base_anr, by = "USUBJID")
+# Then count(ANRIND_BASE, ANRIND_POST) gives the shift counts
+```
+
+```{r shift-table-solution}
+base_anr <- adlb |>
+  filter(PARAMCD == "ALT", ABLFL == "Y") |>
+  group_by(USUBJID) |>
+  slice(1) |>
+  ungroup() |>
+  select(USUBJID, ANRIND_BASE = ANRIND)
+
+post_anr <- adlb |>
+  filter(PARAMCD == "ALT", ONTRTFL == "Y", !is.na(AVISIT)) |>
+  select(USUBJID, AVISIT, ANRIND)
+
+post_anr |>
+  left_join(base_anr, by = "USUBJID") |>
+  select(USUBJID, AVISIT, ANRIND_BASE, ANRIND_POST = ANRIND) |>
+  count(ANRIND_BASE, ANRIND_POST)
 ```
 
 ```{r quiz-pivot, echo=FALSE}
 quiz(
   caption = "pivot check",
   question(
-    "You have a wide dataset with columns LBTEST1, LBTEST2, LBTEST3. Which call produces a long dataset with a 'TESTNUM' column and a 'RESULT' column?",
-    answer("pivot_wider(names_from = TESTNUM, values_from = RESULT)"),
-    answer("pivot_longer(cols = c(LBTEST1,LBTEST2,LBTEST3), names_to='TESTNUM', values_to='RESULT')", correct = TRUE),
-    answer("pivot_longer(cols = RESULT, names_to='TESTNUM')"),
-    answer("pivot_wider(cols = starts_with('LB'), names_to='TESTNUM')"),
+    "You call pivot_wider(names_from = PARAMCD, values_from = c(AVAL, CHG)) on
+     adlb filtered to three PARAMCDs. How many new columns are created per
+     PARAMCD value?",
+    answer("One column per PARAMCD"),
+    answer("Two columns per PARAMCD — one for AVAL, one for CHG", correct = TRUE),
+    answer("Three columns: AVAL, CHG, and a combined column"),
+    answer("It depends on the number of distinct AVISITN values"),
+    allow_retry = TRUE
+  ),
+  question(
+    "pivot_wider() warns 'Values from AVAL are not uniquely identified'. This means:",
+    answer("AVAL contains only missing values"),
+    answer("There is more than one AVAL for at least one (USUBJID, AVISIT, PARAMCD)
+           combination — the output will contain list-columns", correct = TRUE),
+    answer("The names_from column has duplicates"),
+    answer("You forgot to supply values_to"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What argument in pivot_wider lets you specify how to collapse duplicates —
+     for example, taking the mean when there are multiple AVAL values per cell?",
+    answer("values_fill"),
+    answer("names_repair"),
+    answer("values_fn", correct = TRUE),
+    answer("id_cols"),
     allow_retry = TRUE
   )
 )
@@ -385,19 +545,16 @@ quiz(
 
 ---
 
-## 4  separate_wider_delim() and unite() — splitting and combining columns
+## 4  separate_wider_delim(), unite(), complete(), fill()
 
 ### Concept
 
-**Split** a single column on a delimiter into two or more columns:
+**Split** a single column on a delimiter:
 
 ```r
 df |>
-  separate_wider_delim(
-    TESTCD_CAT,
-    delim = "_",
-    names = c("LBTESTCD", "LBCAT")
-  )
+  separate_wider_delim(TESTCD_CAT, delim = "_",
+                       names = c("LBTESTCD", "LBCAT"))
 ```
 
 **Combine** multiple columns into one:
@@ -407,11 +564,28 @@ df |>
   unite("AESTDTC", c(YEAR, MONTH, DAY), sep = "-")
 ```
 
-Both are common in SDTM derivation — ISO 8601 dates are often assembled from separate raw components, and combined codes sometimes need splitting into their domain parts.
+**Fill in structural gaps** — add rows for combinations that should exist but are missing:
 
-### Exercise 4a — split TESTCD_CAT
+```r
+long_data |>
+  complete(USUBJID, AVISIT)   # ensures every subject × visit slot exists
+```
 
-Split `lab_combined$TESTCD_CAT` (e.g. `"HGB_HEMATOLOGY"`) into two columns: `LBTESTCD` and `LBCAT`.
+**Forward-fill** (LOCF) or back-fill missing values:
+
+```r
+df |>
+  group_by(USUBJID) |>
+  fill(TRT01A, .direction = "downup") |>
+  ungroup()
+```
+
+All four arise constantly in SDTM derivation, BDS analysis, and TLG production.
+
+### Exercise 4a — split TESTCD_CAT into test code and category
+
+Split `lab_combined$TESTCD_CAT` (e.g. `"ALT_CHEMISTRY"`) into two columns:
+`LBTESTCD` and `LBCAT`.
 
 ```{r separate-ex, exercise=TRUE, exercise.lines=8}
 lab_combined |>
@@ -436,9 +610,11 @@ lab_combined |>
   )
 ```
 
-### Exercise 4b — unite year/month/day into ISO 8601 date string
+### Exercise 4b — unite year/month/day back into ISO 8601
 
-Combine the `YEAR`, `MONTH`, and `DAY` columns in `dates_split` into a single `AESTDTC` column in `YYYY-MM-DD` format.
+`dates_split` contains `YEAR`, `MONTH`, `DAY` as separate character columns
+(sourced from `adae$AESTDTC`). Combine them into a single `AESTDTC` column
+in `YYYY-MM-DD` format.
 
 ```{r unite-ex, exercise=TRUE, exercise.lines=8}
 dates_split |>
@@ -454,166 +630,339 @@ dates_split |>
   unite("AESTDTC", c(YEAR, MONTH, DAY), sep = "-")
 ```
 
+### Exercise 4c — complete() to expose missing visit records
+
+A TLG requires every subject in the safety population to appear at every scheduled
+visit, even if no lab result was recorded. Starting from `adlb`, filter to
+`PARAMCD == "HGB"` and the safety population (`SAFFL == "Y"`), then use `complete()`
+to ensure all `(USUBJID, AVISIT)` combinations exist. Keep only scheduled visits
+(`!is.na(AVISIT)`).
+
+```{r complete-ex, exercise=TRUE, exercise.lines=14}
+adlb |>
+  filter(PARAMCD == "HGB", SAFFL == "Y", !is.na(AVISIT)) |>
+  select(USUBJID, TRT01A, AVISIT, AVISITN, AVAL) |>
+  complete(___, ___) |>
+  arrange(USUBJID, AVISITN) |>
+  slice_head(n = 15)
+```
+
+```{r complete-ex-hint-1}
+# complete(USUBJID, AVISIT)
+# After complete(), rows for missing visits have NA for AVAL, TRT01A, AVISITN.
+# Notice that AVISITN and TRT01A become NA for the gap rows.
+```
+
+```{r complete-ex-solution}
+adlb |>
+  filter(PARAMCD == "HGB", SAFFL == "Y", !is.na(AVISIT)) |>
+  select(USUBJID, TRT01A, AVISIT, AVISITN, AVAL) |>
+  complete(USUBJID, AVISIT) |>
+  arrange(USUBJID, AVISITN) |>
+  slice_head(n = 15)
+```
+
+### Exercise 4d — fill() to propagate TRT01A into gap rows
+
+Extend 4c: after `complete()`, use `fill()` to propagate `TRT01A` and `AVISITN`
+downward within each subject so the gap rows are labelled correctly.
+
+```{r fill-ex, exercise=TRUE, exercise.lines=18}
+visit_order <- adlb |>
+  filter(!is.na(AVISIT)) |>
+  distinct(AVISIT, AVISITN) |>
+  arrange(AVISITN)
+
+adlb |>
+  filter(PARAMCD == "HGB", SAFFL == "Y", !is.na(AVISIT)) |>
+  select(USUBJID, TRT01A, AVISIT, AVISITN, AVAL) |>
+  complete(USUBJID, AVISIT) |>
+  group_by(USUBJID) |>
+  fill(___, ___, .direction = "___") |>
+  ungroup() |>
+  left_join(visit_order |> select(AVISIT, AVISITN), by = "AVISIT") |>
+  arrange(USUBJID, AVISITN.y) |>
+  slice_head(n = 15)
+```
+
+```{r fill-ex-hint-1}
+# fill(TRT01A, AVISITN, .direction = "downup")
+# "downup" fills forward first, then fills any remaining NAs at the top
+# backward — so both leading and trailing gaps are covered.
+```
+
+```{r fill-ex-solution}
+visit_order <- adlb |>
+  filter(!is.na(AVISIT)) |>
+  distinct(AVISIT, AVISITN) |>
+  arrange(AVISITN)
+
+adlb |>
+  filter(PARAMCD == "HGB", SAFFL == "Y", !is.na(AVISIT)) |>
+  select(USUBJID, TRT01A, AVISIT, AVISITN, AVAL) |>
+  complete(USUBJID, AVISIT) |>
+  group_by(USUBJID) |>
+  fill(TRT01A, .direction = "downup") |>
+  ungroup() |>
+  left_join(visit_order |> select(AVISIT, AVISITN_NUM = AVISITN),
+            by = "AVISIT") |>
+  arrange(USUBJID, AVISITN_NUM) |>
+  slice_head(n = 15)
+```
+
+```{r quiz-tidyr, echo=FALSE}
+quiz(
+  caption = "tidyr check",
+  question(
+    "After calling complete(USUBJID, AVISIT) on an adlb subset, rows added for
+     missing visits have NA in columns that were not listed in complete().
+     How would you fill TRT01A (which is constant per subject) into those gaps?",
+    answer("mutate(TRT01A = coalesce(TRT01A, first(TRT01A)))"),
+    answer("group_by(USUBJID) |> fill(TRT01A, .direction = 'downup') |> ungroup()",
+           correct = TRUE),
+    answer("replace_na(list(TRT01A = 'Unknown'))"),
+    answer("pivot_wider(names_from = TRT01A, values_from = AVAL)"),
+    allow_retry = TRUE
+  ),
+  question(
+    "separate_wider_delim() fails with 'Expected 2 pieces. Additional pieces
+     discarded.' What is the most likely cause for CDISC lab data?",
+    answer("The delimiter appears more than once in some values — for example,
+           a LBCAT containing an underscore", correct = TRUE),
+    answer("The column has missing values"),
+    answer("The names argument has too many elements"),
+    answer("delim must be a single character only"),
+    allow_retry = TRUE
+  )
+)
+```
+
 ---
 
 ## 5  lubridate — CDISC ISO 8601 dates
 
 ### Concept
 
-CDISC stores dates as ISO 8601 character strings (`YYYY-MM-DD`). You must convert them to R `Date` objects for arithmetic.
+CDISC stores raw dates as ISO 8601 character strings (`YYYY-MM-DD`). You must convert
+them to R `Date` objects for arithmetic. In `{pharmaverseadam}`, source-domain date
+character columns (e.g. `RFSTDTC`, `AESTDTC`) co-exist with pre-parsed `Date` columns
+(e.g. `TRTSDT`, `ASTDT`, `ADT`) — you need both skills.
 
 ```r
 library(lubridate)
 
-ymd("2024-03-15")           # Date from ISO 8601 string
-ymd_hms("2024-03-15 14:30:00")  # POSIXct datetime
-dmy("15/03/2024")           # European format
-mdy("3/15/2024")            # American format
+ymd("2014-01-05")          # Date from ISO 8601 string → 2014-01-05
+year(d); month(d); yday(d) # extract parts
+d + days(7)                # 2014-01-12
+d + months(1)              # 2014-02-05  (use %m+% months(1) to stay in-bounds)
+as.numeric(d2 - d1)        # integer days between two Dates
 ```
 
-**Extracting parts:**
-```r
-d <- ymd("2024-03-15")
-year(d)   # 2024
-month(d)  # 3
-day(d)    # 15
-yday(d)   # 75 (day of year)
-```
+### Exercise 5a — parse ISO 8601 strings from RFSTDTC
 
-**Arithmetic:**
-```r
-d + days(7)      # 2024-03-22
-d + months(1)    # 2024-04-15
-as.numeric(ymd("2024-09-01") - d)   # 170 days
-```
+`adsl$RFSTDTC` is the date of first study treatment as a character string
+(`"YYYY-MM-DD"`). Parse it into a proper R `Date` column called `RFSTDT`.
+Show `USUBJID`, `RFSTDTC`, and `RFSTDT`, and confirm the class of the new column.
 
-### Exercise 5a — parse ISO 8601 strings
-
-Parse the `AESTDTC` column in `adae` into proper R `Date` objects. Name the new column `AESTDT`. Show `USUBJID`, `AESTDTC`, and `AESTDT`.
-
-```{r lubridate-parse, exercise=TRUE, exercise.lines=8}
-adae |>
-  mutate(AESTDT = ___(AESTDTC)) |>
-  select(USUBJID, AESTDTC, AESTDT)
+```{r lubridate-parse, exercise=TRUE, exercise.lines=10}
+adsl |>
+  mutate(RFSTDT = ___(RFSTDTC)) |>
+  select(USUBJID, RFSTDTC, RFSTDT) |>
+  slice_head(n = 5) |>
+  mutate(col_class = class(RFSTDT))
 ```
 
 ```{r lubridate-parse-hint-1}
-# ymd(AESTDTC) converts an ISO 8601 character column to Date
+# ymd(RFSTDTC) converts an ISO 8601 character column to a Date object
 ```
 
 ```{r lubridate-parse-solution}
-adae |>
-  mutate(AESTDT = ymd(AESTDTC)) |>
-  select(USUBJID, AESTDTC, AESTDT)
+adsl |>
+  mutate(RFSTDT = ymd(RFSTDTC)) |>
+  select(USUBJID, RFSTDTC, RFSTDT) |>
+  slice_head(n = 5) |>
+  mutate(col_class = class(RFSTDT))
 ```
 
-### Exercise 5b — date arithmetic: days from first dose
+### Exercise 5b — manually compute study day and verify against ASTDY
 
-Join `adae` to `adsl` (to get `TRTSDT`), parse both dates, and compute `DAYS_FROM_DOSE` — the number of days between first dose (`TRTSDT`) and AE start (`AESTDTC`). Show `USUBJID`, `AESTDTC`, `TRTSDT`, and `DAYS_FROM_DOSE`.
+In `adae`, `AESTDTC` is the ISO 8601 AE start date character string.
+The CDISC ADaM study-day formula is:
 
-```{r lubridate-arith, exercise=TRUE, exercise.lines=14}
+```
+ASTDY = AESTDT − TRTSDT + 1   (if AESTDT ≥ TRTSDT)
+ASTDY = AESTDT − TRTSDT       (if AESTDT < TRTSDT)
+```
+
+Parse `AESTDTC`, join `TRTSDT` from `adsl`, compute `ASTDY_CALC` using the
+formula above, then compare it to the pre-computed `ASTDY` column in `adae`.
+
+```{r lubridate-arith, exercise=TRUE, exercise.lines=18}
 adae |>
+  mutate(AESTDT = ymd(___)) |>
   left_join(adsl |> select(USUBJID, TRTSDT), by = "USUBJID") |>
   mutate(
-    AESTDT        = ymd(___),
-    TRTSDT_D      = ymd(___),
-    DAYS_FROM_DOSE = as.numeric(___ - ___)
+    DIFF       = as.numeric(AESTDT - TRTSDT),
+    ASTDY_CALC = if_else(DIFF >= 0, DIFF + 1L, DIFF)
   ) |>
-  select(USUBJID, AESTDTC, TRTSDT, DAYS_FROM_DOSE)
+  select(USUBJID, AESTDTC, TRTSDT, ASTDY, ASTDY_CALC) |>
+  filter(!is.na(ASTDY)) |>
+  slice_head(n = 8)
 ```
 
 ```{r lubridate-arith-hint-1}
-# ymd(AESTDTC), ymd(TRTSDT)
-# as.numeric(AESTDT - TRTSDT_D)
+# ymd(AESTDTC) — parse the character column
+# as.numeric(AESTDT - TRTSDT) gives the numeric day difference
+# CDISC: if diff >= 0 add 1 (no day 0); if diff < 0 keep as is (pre-dose)
 ```
 
 ```{r lubridate-arith-solution}
 adae |>
+  mutate(AESTDT = ymd(AESTDTC)) |>
   left_join(adsl |> select(USUBJID, TRTSDT), by = "USUBJID") |>
   mutate(
-    AESTDT         = ymd(AESTDTC),
-    TRTSDT_D       = ymd(TRTSDT),
-    DAYS_FROM_DOSE = as.numeric(AESTDT - TRTSDT_D)
+    DIFF       = as.numeric(AESTDT - TRTSDT),
+    ASTDY_CALC = if_else(DIFF >= 0, DIFF + 1L, DIFF)
   ) |>
-  select(USUBJID, AESTDTC, TRTSDT, DAYS_FROM_DOSE)
+  select(USUBJID, AESTDTC, TRTSDT, ASTDY, ASTDY_CALC) |>
+  filter(!is.na(ASTDY)) |>
+  slice_head(n = 8)
 ```
 
-### Exercise 5c — extract date parts
+### Exercise 5c — extract date parts from the ADT column in adlb
 
-From `adsl$TRTSDT`, extract the **year**, **month**, and **day of year** as separate columns.
+`adlb$ADT` is already an R `Date` object. For the `ALT` parameter, extract the
+**year**, **calendar month as an abbreviated label** (`label = TRUE`), and
+**day of year** from `ADT`. Show `USUBJID`, `AVISIT`, `ADT`, and the three new columns.
 
-```{r lubridate-parts, exercise=TRUE, exercise.lines=10}
-adsl |>
+```{r lubridate-parts, exercise=TRUE, exercise.lines=12}
+adlb |>
+  filter(PARAMCD == "ALT", !is.na(ADT), !is.na(AVISIT)) |>
   mutate(
-    TRTSDT_D   = ymd(TRTSDT),
-    TRTYR      = ___(TRTSDT_D),
-    TRTMON     = ___(TRTSDT_D),
-    TRTDOY     = ___(TRTSDT_D)   # day of year
+    YEAR   = ___(ADT),
+    MON    = ___(ADT, label = TRUE),
+    DOY    = ___(ADT)
   ) |>
-  select(USUBJID, TRTSDT, TRTYR, TRTMON, TRTDOY)
+  select(USUBJID, AVISIT, ADT, YEAR, MON, DOY) |>
+  distinct() |>
+  slice_head(n = 8)
 ```
 
 ```{r lubridate-parts-hint-1}
-# year(), month(), yday()
+# year(ADT), month(ADT, label = TRUE), yday(ADT)
 ```
 
 ```{r lubridate-parts-solution}
-adsl |>
+adlb |>
+  filter(PARAMCD == "ALT", !is.na(ADT), !is.na(AVISIT)) |>
   mutate(
-    TRTSDT_D = ymd(TRTSDT),
-    TRTYR    = year(TRTSDT_D),
-    TRTMON   = month(TRTSDT_D),
-    TRTDOY   = yday(TRTSDT_D)
+    YEAR = year(ADT),
+    MON  = month(ADT, label = TRUE),
+    DOY  = yday(ADT)
   ) |>
-  select(USUBJID, TRTSDT, TRTYR, TRTMON, TRTDOY)
+  select(USUBJID, AVISIT, ADT, YEAR, MON, DOY) |>
+  distinct() |>
+  slice_head(n = 8)
 ```
 
-### Exercise 5d — age at study start (a classic clinical derivation)
+### Exercise 5d — verify treatment duration vs TRTDURD
 
-Using `adsl$BRTHDT` and `adsl$TRTSDT`, compute each subject's age in **completed years** at the start of treatment. Use `floor(as.numeric(TRTSDT_D - BRTHDT_D) / 365.25)`.
+`adsl` contains pre-computed `TRTDURD` (treatment duration in days, integer).
+Using `TRTSDT` and `TRTEDT` (both already `Date` objects), manually compute
+`TRTDURD_CALC = TRTEDT − TRTSDT + 1` and compare to `TRTDURD`. Flag any
+mismatches.
 
-```{r lubridate-age, exercise=TRUE, exercise.lines=12}
+```{r lubridate-trtdur, exercise=TRUE, exercise.lines=12}
 adsl |>
+  filter(!is.na(TRTEDT)) |>
   mutate(
-    TRTSDT_D = ymd(TRTSDT),
-    BRTHDT_D = ymd(BRTHDT),
-    AGE_CALC = floor(as.numeric(___ - ___) / 365.25)
+    TRTDURD_CALC = as.numeric(___ - ___) + 1L,
+    MISMATCH     = TRTDURD != TRTDURD_CALC
   ) |>
-  select(USUBJID, BRTHDT, TRTSDT, AGE, AGE_CALC)
-  # AGE and AGE_CALC should match!
+  select(USUBJID, TRT01A, TRTSDT, TRTEDT, TRTDURD, TRTDURD_CALC, MISMATCH) |>
+  slice_head(n = 8)
 ```
 
-```{r lubridate-age-hint-1}
-# as.numeric(TRTSDT_D - BRTHDT_D) / 365.25
+```{r lubridate-trtdur-hint-1}
+# as.numeric(TRTEDT - TRTSDT) + 1L
+# CDISC: duration = end_date - start_date + 1 (inclusive of both endpoints)
 ```
 
-```{r lubridate-age-solution}
+```{r lubridate-trtdur-solution}
 adsl |>
+  filter(!is.na(TRTEDT)) |>
   mutate(
-    TRTSDT_D = ymd(TRTSDT),
-    BRTHDT_D = ymd(BRTHDT),
-    AGE_CALC = floor(as.numeric(TRTSDT_D - BRTHDT_D) / 365.25)
+    TRTDURD_CALC = as.numeric(TRTEDT - TRTSDT) + 1L,
+    MISMATCH     = TRTDURD != TRTDURD_CALC
   ) |>
-  select(USUBJID, BRTHDT, TRTSDT, AGE, AGE_CALC)
+  select(USUBJID, TRT01A, TRTSDT, TRTEDT, TRTDURD, TRTDURD_CALC, MISMATCH) |>
+  slice_head(n = 8)
+```
+
+### Exercise 5e — month arithmetic: follow-up window from TRTEDT
+
+Calculate each subject's 30-day and 90-day post-treatment follow-up end dates from
+`TRTEDT`. Use `%m+%` (safe month arithmetic that clamps to month-end) instead of
+`+ months()` to avoid an impossible date like February 30.
+
+```{r lubridate-followup, exercise=TRUE, exercise.lines=10}
+adsl |>
+  filter(!is.na(TRTEDT)) |>
+  mutate(
+    FU30D  = TRTEDT + ___,     # +30 days
+    FU3MO  = TRTEDT %m+% ___   # +3 calendar months (safe)
+  ) |>
+  select(USUBJID, TRTEDT, FU30D, FU3MO) |>
+  slice_head(n = 6)
+```
+
+```{r lubridate-followup-hint-1}
+# TRTEDT + days(30)
+# TRTEDT %m+% months(3)  — %m+% clamps to the last day of the month if needed
+```
+
+```{r lubridate-followup-solution}
+adsl |>
+  filter(!is.na(TRTEDT)) |>
+  mutate(
+    FU30D = TRTEDT + days(30),
+    FU3MO = TRTEDT %m+% months(3)
+  ) |>
+  select(USUBJID, TRTEDT, FU30D, FU3MO) |>
+  slice_head(n = 6)
 ```
 
 ```{r quiz-lubridate, echo=FALSE}
 quiz(
   caption = "lubridate check",
   question(
-    "Which lubridate function parses the CDISC standard ISO 8601 date string '2024-03-15'?",
-    answer("mdy('2024-03-15')"),
-    answer("dmy('2024-03-15')"),
-    answer("ymd('2024-03-15')", correct = TRUE),
-    answer("parse_date('2024-03-15')"),
+    "Which lubridate function parses the CDISC standard ISO 8601 date string
+     '2014-03-15'?",
+    answer("mdy('2014-03-15')"),
+    answer("dmy('2014-03-15')"),
+    answer("ymd('2014-03-15')", correct = TRUE),
+    answer("parse_date('2014-03-15')"),
     allow_retry = TRUE
   ),
   question(
-    "What does as.numeric(date2 - date1) return when date1 and date2 are R Date objects?",
-    answer("A character string like '170 days'"),
-    answer("The number of weeks between the dates"),
-    answer("The number of days between the dates as a plain number", correct = TRUE),
-    answer("A POSIXct difftime object"),
+    "You compute as.numeric(TRTEDT - TRTSDT) for a subject and get 167.
+     But TRTDURD in the CDISC ADaM dataset is 168. Why the difference?",
+    answer("lubridate uses 0-based indexing for dates"),
+    answer("CDISC ADaM defines duration as end_date - start_date + 1
+           (both endpoints inclusive), so the difference is always 1 more
+           than simple subtraction", correct = TRUE),
+    answer("There is a bug in the pharmaverseadam dataset"),
+    answer("TRTEDT is stored in UTC and TRTSDT in local time"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What is the risk of using + months(1) instead of %m+% months(1) in
+     lubridate?",
+    answer("It rounds to the nearest month boundary"),
+    answer("It adds 30 days instead of 1 calendar month"),
+    answer("It can produce an invalid date — e.g. January 31 + 1 month becomes
+           NA or March 3 depending on platform", correct = TRUE),
+    answer("It only works on POSIXct, not Date objects"),
     allow_retry = TRUE
   )
 )
@@ -625,7 +974,8 @@ quiz(
 
 ### Concept
 
-`{stringr}` gives every base R string function a consistent `str_*` prefix and puts the string as the first argument — making pipes natural.
+`{stringr}` gives every base R string function a consistent `str_*` prefix and
+puts the string as the first argument — making pipes natural.
 
 | Task | base R | stringr |
 |---|---|---|
@@ -636,132 +986,235 @@ quiz(
 | Trim whitespace | `trimws()` | `str_trim()` |
 | Collapse interior spaces | — | `str_squish()` |
 | Pad with zeros | `formatC()` | `str_pad()` |
-| Upper/lower | `toupper()` | `str_to_upper()` |
+| Upper/lower/title | `toupper()` | `str_to_upper()` / `str_to_title()` |
 | Concatenate | `paste0()` | `str_c()` |
+| Count matches | `lengths(gregexpr())` | `str_count()` |
 
-### Exercise 6a — detect a pattern
+### Exercise 6a — detect a body-system pattern in adae
 
-Filter `adae` to rows where `AEDECOD` contains the word `"SITE"` (case-insensitive). Use `str_detect()` with `regex(..., ignore_case = TRUE)`.
+Filter `adae` (treatment-emergent AEs only: `TRTEMFL == "Y"`) to rows where
+`AEBODSYS` contains the word `"skin"` (case-insensitive). Count how many such
+AEs there are per treatment arm (`TRT01A`).
 
-```{r stringr-detect, exercise=TRUE, exercise.lines=7}
+```{r stringr-detect, exercise=TRUE, exercise.lines=10}
 library(stringr)
 
 adae |>
-  filter(str_detect(AEDECOD, regex("___", ignore_case = TRUE))) |>
-  select(USUBJID, AEDECOD, AESEV)
+  filter(TRTEMFL == "Y",
+         str_detect(AEBODSYS, regex("___", ignore_case = TRUE))) |>
+  count(TRT01A, AEBODSYS, sort = TRUE)
 ```
 
 ```{r stringr-detect-hint-1}
-# regex("SITE", ignore_case = TRUE)
+# regex("skin", ignore_case = TRUE)
+# The Xanomeline arms should show many skin/subcutaneous AEs from patch application
 ```
 
 ```{r stringr-detect-solution}
 library(stringr)
 
 adae |>
-  filter(str_detect(AEDECOD, regex("SITE", ignore_case = TRUE))) |>
-  select(USUBJID, AEDECOD, AESEV)
+  filter(TRTEMFL == "Y",
+         str_detect(AEBODSYS, regex("skin", ignore_case = TRUE))) |>
+  count(TRT01A, AEBODSYS, sort = TRUE)
 ```
 
-### Exercise 6b — str_sub: extract year from a date string
+### Exercise 6b — str_sub: extract site and subject number from USUBJID
 
-Without parsing to a Date, extract just the **year** (first 4 characters) from the `AESTDTC` column in `adae`. Use `str_sub()`.
+`adsl$USUBJID` follows the pattern `"01-SSS-NNNN"` (study-site-subject).
+Use `str_sub()` to extract:
 
-```{r stringr-sub, exercise=TRUE, exercise.lines=7}
-adae |>
-  mutate(AE_YEAR = str_sub(AESTDTC, ___, ___)) |>
-  select(USUBJID, AESTDTC, AE_YEAR)
+- `SITEID_CALC`: characters 4–6 (the 3-digit site code)
+- `SUBJID_CALC`: characters 8–11 (the 4-digit subject number)
+
+Verify `SITEID_CALC` matches the pre-existing `SITEID` column.
+
+```{r stringr-sub, exercise=TRUE, exercise.lines=10}
+adsl |>
+  mutate(
+    SITEID_CALC  = str_sub(USUBJID, ___, ___),
+    SUBJID_CALC  = str_sub(USUBJID, ___, ___)
+  ) |>
+  select(USUBJID, SITEID, SITEID_CALC, SUBJID, SUBJID_CALC) |>
+  slice_head(n = 6)
 ```
 
 ```{r stringr-sub-hint-1}
-# str_sub(string, start, end) — characters are 1-indexed
-# str_sub(AESTDTC, 1, 4) extracts the first 4 characters (the year)
+# USUBJID = "01-701-1015"
+# Characters:  1234567890123...
+# Site code starts at position 4, ends at 6: str_sub(USUBJID, 4, 6)
+# Subject number starts at 8, ends at 11:  str_sub(USUBJID, 8, 11)
 ```
 
 ```{r stringr-sub-solution}
-adae |>
-  mutate(AE_YEAR = str_sub(AESTDTC, 1, 4)) |>
-  select(USUBJID, AESTDTC, AE_YEAR)
+adsl |>
+  mutate(
+    SITEID_CALC = str_sub(USUBJID, 4, 6),
+    SUBJID_CALC = str_sub(USUBJID, 8, 11)
+  ) |>
+  select(USUBJID, SITEID, SITEID_CALC, SUBJID, SUBJID_CALC) |>
+  slice_head(n = 6)
 ```
 
-### Exercise 6c — str_pad: format subject IDs with leading zeros
+### Exercise 6c — str_extract with regex: pull the numeric subject ID
 
-A raw ID column has values like `"1"`, `"2"`, `"10"`. Pad them with leading zeros to a width of 3 (e.g. `"001"`, `"002"`, `"010"`).
+Use `str_extract()` with a regex to capture the **last numeric segment** of
+`USUBJID` (i.e. the 4-digit subject number after the final dash). This approach
+works even if the format changes — unlike fixed positions.
 
-```{r stringr-pad, exercise=TRUE, exercise.lines=10}
-raw_ids <- tibble(ID = c("1", "2", "10", "42", "100"))
+```{r stringr-extract, exercise=TRUE, exercise.lines=8}
+adsl |>
+  mutate(SUBJ_NUM = str_extract(USUBJID, "___")) |>
+  select(USUBJID, SUBJ_NUM) |>
+  slice_head(n = 6)
+```
 
-raw_ids |>
-  mutate(ID_PADDED = str_pad(ID, width = ___, pad = "___"))
+```{r stringr-extract-hint-1}
+# Regex to match digits at end: "\\d+$"
+# Or more specifically: "(?<=-)[0-9]+$"  (digits after the last dash)
+```
+
+```{r stringr-extract-solution}
+adsl |>
+  mutate(SUBJ_NUM = str_extract(USUBJID, "(?<=-)[0-9]+$")) |>
+  select(USUBJID, SUBJ_NUM) |>
+  slice_head(n = 6)
+```
+
+### Exercise 6d — str_pad: zero-pad the subject number for custom IDs
+
+Suppose a reporting system requires subject IDs in the format `"SUBJ-NNNN"` where
+NNNN is zero-padded to 4 digits. Using `SUBJID` from `adsl` (already a character
+column like `"1015"`), construct this new ID.
+
+```{r stringr-pad, exercise=TRUE, exercise.lines=8}
+adsl |>
+  mutate(
+    SUBJ_PADDED = str_c("SUBJ-", str_pad(SUBJID, width = ___, pad = "___"))
+  ) |>
+  select(USUBJID, SUBJID, SUBJ_PADDED) |>
+  slice_head(n = 6)
 ```
 
 ```{r stringr-pad-hint-1}
-# str_pad(ID, width = 3, pad = "0")
+# str_pad(SUBJID, width = 4, pad = "0")
+# str_c("SUBJ-", ...) concatenates the prefix
 ```
 
 ```{r stringr-pad-solution}
-raw_ids <- tibble(ID = c("1", "2", "10", "42", "100"))
-
-raw_ids |>
-  mutate(ID_PADDED = str_pad(ID, width = 3, pad = "0"))
+adsl |>
+  mutate(
+    SUBJ_PADDED = str_c("SUBJ-", str_pad(SUBJID, width = 4, pad = "0"))
+  ) |>
+  select(USUBJID, SUBJID, SUBJ_PADDED) |>
+  slice_head(n = 6)
 ```
 
-### Exercise 6d — chained string cleaning pipeline
+### Exercise 6e — title case and squish for display-ready AE terms
 
-The `AEDECOD` column in `adae` has inconsistent casing and the `AESEV` value for subject `CDIS-001-005` has extra whitespace. Write a `mutate()` call that:
-
-1. Converts `AEDECOD` to title case (`str_to_title()`)
-2. Squishes all extra whitespace from `AEDECOD` (`str_squish()`)
-3. Trims `AESEV` of leading/trailing whitespace (`str_trim()`)
+`adae$AEDECOD` contains MedDRA Preferred Terms in **ALL CAPS**.
+For a TLG, convert to title case with `str_to_title()`. Then apply
+`str_squish()` to collapse any irregular whitespace. Count the top 10
+treatment-emergent preferred terms per treatment arm.
 
 ```{r stringr-pipeline, exercise=TRUE, exercise.lines=12}
 adae |>
+  filter(TRTEMFL == "Y") |>
   mutate(
-    AEDECOD = AEDECOD |> ___ () |> ___(),
-    AESEV   = str_trim(___)
+    AEDECOD_DISPLAY = AEDECOD |> ___() |> ___()
   ) |>
-  select(USUBJID, AEDECOD, AESEV)
+  count(TRT01A, AEDECOD_DISPLAY, sort = TRUE) |>
+  group_by(TRT01A) |>
+  slice_max(n, n = 5) |>
+  ungroup()
 ```
 
 ```{r stringr-pipeline-hint-1}
 # str_to_title() then str_squish()
 # AEDECOD |> str_to_title() |> str_squish()
-# str_trim(AESEV)
 ```
 
 ```{r stringr-pipeline-solution}
 adae |>
+  filter(TRTEMFL == "Y") |>
   mutate(
-    AEDECOD = AEDECOD |> str_to_title() |> str_squish(),
-    AESEV   = str_trim(AESEV)
+    AEDECOD_DISPLAY = AEDECOD |> str_to_title() |> str_squish()
   ) |>
-  select(USUBJID, AEDECOD, AESEV)
+  count(TRT01A, AEDECOD_DISPLAY, sort = TRUE) |>
+  group_by(TRT01A) |>
+  slice_max(n, n = 5) |>
+  ungroup()
 ```
 
-### Exercise 6e — str_replace_all: fix a typo
+### Exercise 6f — str_replace_all and str_count across multiple columns
 
-A common QC task: replace all occurrences of `"HEADACE"` with `"HEADACHE"` in `AEDECOD`.
+Using `across()`, apply `str_to_upper()` to every character column in
+`adsl` that starts with `"TRT"`. Then use `str_count()` to count how many
+subjects have a treatment arm name containing the word `"DOSE"`.
 
-```{r stringr-replace, exercise=TRUE, exercise.lines=8}
-ae_typo <- adae |>
-  mutate(AEDECOD = if_else(AEDECOD == "HEADACHE", "HEADACE", AEDECOD))  # introduce typo
+```{r stringr-across, exercise=TRUE, exercise.lines=12}
+# Part 1: uppercase all TRT* character columns
+adsl |>
+  mutate(across(starts_with("TRT") & where(is.character),
+                ___ )) |>
+  select(USUBJID, TRT01A, TRT01P) |>
+  slice_head(n = 4)
 
-ae_typo |>
-  mutate(AEDECOD = str_replace_all(AEDECOD, "___", "___")) |>
-  select(USUBJID, AEDECOD)
+# Part 2: count subjects whose TRT01A contains "DOSE"
+adsl |>
+  summarise(n_dose_arms = sum(str_count(TRT01A, "___") > 0))
 ```
 
-```{r stringr-replace-hint-1}
-# str_replace_all(AEDECOD, "HEADACE", "HEADACHE")
+```{r stringr-across-hint-1}
+# across(starts_with("TRT") & where(is.character), str_to_upper)
+# str_count(TRT01A, "DOSE") > 0  — TRUE when "DOSE" appears at least once
 ```
 
-```{r stringr-replace-solution}
-ae_typo <- adae |>
-  mutate(AEDECOD = if_else(AEDECOD == "HEADACHE", "HEADACE", AEDECOD))
+```{r stringr-across-solution}
+adsl |>
+  mutate(across(starts_with("TRT") & where(is.character),
+                str_to_upper)) |>
+  select(USUBJID, TRT01A, TRT01P) |>
+  slice_head(n = 4)
 
-ae_typo |>
-  mutate(AEDECOD = str_replace_all(AEDECOD, "HEADACE", "HEADACHE")) |>
-  select(USUBJID, AEDECOD)
+adsl |>
+  summarise(n_dose_arms = sum(str_count(TRT01A, "DOSE") > 0))
+```
+
+```{r quiz-stringr, echo=FALSE}
+quiz(
+  caption = "stringr check",
+  question(
+    "What is the difference between str_trim() and str_squish()?",
+    answer("str_trim() is faster; str_squish() is more accurate"),
+    answer("str_trim() removes only leading/trailing whitespace;
+           str_squish() also collapses multiple interior spaces to one",
+           correct = TRUE),
+    answer("str_squish() removes all whitespace including inside words"),
+    answer("They are identical — str_squish() is just an alias"),
+    allow_retry = TRUE
+  ),
+  question(
+    "str_extract(USUBJID, '(?<=-)[0-9]+$') returns '1015' for '01-701-1015'.
+     What does the (?<=-) part of the regex do?",
+    answer("It matches only digits"),
+    answer("It anchors the match to the end of the string"),
+    answer("It is a lookbehind assertion: matches digits that are immediately
+           preceded by a dash, without including the dash in the result",
+           correct = TRUE),
+    answer("It matches the entire string after the first dash"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Translate SAS: tranwrd(AEDECOD, 'NOS', 'not otherwise specified') to R:",
+    answer("str_detect(AEDECOD, 'NOS')"),
+    answer("str_extract(AEDECOD, 'NOS')"),
+    answer("str_replace_all(AEDECOD, 'NOS', 'not otherwise specified')",
+           correct = TRUE),
+    answer("str_sub(AEDECOD, 1, 3)"),
+    allow_retry = TRUE
+  )
+)
 ```
 
 ---
@@ -770,22 +1223,22 @@ ae_typo |>
 
 ### Concept
 
-A **factor** is R's categorical type — values stored as integers with a labels lookup, like a permanent SAS format.
+A **factor** is R's categorical type — values stored as integers with a labels lookup,
+like a permanent SAS format. Two reasons factors matter in clinical work:
 
-Factors matter for clinical work for two reasons:
+1. **Column/row order in TLGs** — without a factor, `"High Dose"`, `"Low Dose"`,
+   `"Placebo"` sort alphabetically. As a factor with explicit levels, you control the order.
+2. **Model reference categories** — the first factor level is the reference in regression.
 
-1. **Column/row order in TLGs** — Without a factor, `"High Dose"`, `"Low Dose"`, `"Placebo"` sort alphabetically. As a factor with explicit levels, you control the order.
-2. **Model reference categories** — The first factor level is the reference in regression.
+**The rule:** Keep columns as **character** in ADaM datasets (XPT doesn't have factors).
+Convert to **factor with explicit levels** immediately before building a TLG or model.
 
-**The rule:**
-- Keep columns as **character** in your ADaM datasets (XPT doesn't have a factor type)
-- Convert to **factor with explicit levels** immediately before building a TLG or fitting a model
+### Exercise 7a — ordered treatment levels with fct()
 
-### Exercise 7a — create a factor with ordered levels
+Convert `TRT01A` in `adsl` to a factor with the correct clinical order:
+Placebo → Low Dose → High Dose. Verify with `levels()` and `table()`.
 
-Convert `TRT01A` in `adsl` to a factor with levels in the correct clinical order: Placebo → Low Dose → High Dose. Then use `table()` to verify the order.
-
-```{r factor-create, exercise=TRUE, exercise.lines=12}
+```{r factor-create, exercise=TRUE, exercise.lines=14}
 adsl_fct <- adsl |>
   mutate(
     TRT01A = fct(TRT01A,
@@ -795,7 +1248,7 @@ adsl_fct <- adsl |>
   )
 
 levels(adsl_fct$TRT01A)
-table(adsl_fct$TRT01A)   # should display in Placebo → Low → High order
+table(adsl_fct$TRT01A)
 ```
 
 ```{r factor-create-hint-1}
@@ -815,87 +1268,182 @@ levels(adsl_fct$TRT01A)
 table(adsl_fct$TRT01A)
 ```
 
-### Exercise 7b — fct_relevel: move a level to first position
+### Exercise 7b — ordered severity with fct() and cross-tabulation
 
-Starting from the same `adsl`, use `fct_relevel()` to move `"Placebo"` to the first position after the factor has already been created.
+Severity (`AESEV`) in `adae` is a character with three values: `"MILD"`,
+`"MODERATE"`, `"SEVERE"`. Create a factor with the correct clinical order and
+produce a cross-tabulation of severity vs. treatment arm for treatment-emergent AEs.
 
-```{r factor-relevel, exercise=TRUE, exercise.lines=10}
-adsl_fct2 <- adsl |>
-  mutate(TRT01A = factor(TRT01A))  # default alphabetical levels
-
-levels(adsl_fct2$TRT01A)   # see the default order
-
-adsl_fct2 <- adsl_fct2 |>
-  mutate(TRT01A = fct_relevel(TRT01A, "___"))
-
-levels(adsl_fct2$TRT01A)   # Placebo should now be first
+```{r factor-aesev, exercise=TRUE, exercise.lines=16}
+adae |>
+  filter(TRTEMFL == "Y") |>
+  mutate(
+    AESEV_F  = fct(AESEV,  levels = c("___", "___", "___")),
+    TRT01A_F = fct(TRT01A, levels = c("Placebo",
+                                      "Xanomeline Low Dose",
+                                      "Xanomeline High Dose"))
+  ) |>
+  count(TRT01A_F, AESEV_F) |>
+  pivot_wider(names_from = AESEV_F, values_from = n, values_fill = 0)
 ```
 
-```{r factor-relevel-hint-1}
-# fct_relevel(TRT01A, "Placebo")
+```{r factor-aesev-hint-1}
+# levels = c("MILD", "MODERATE", "SEVERE")
+# The pivot_wider at the end creates a severity-by-treatment cross-tab
 ```
 
-```{r factor-relevel-solution}
-adsl_fct2 <- adsl |>
-  mutate(TRT01A = factor(TRT01A))
-
-levels(adsl_fct2$TRT01A)
-
-adsl_fct2 <- adsl_fct2 |>
-  mutate(TRT01A = fct_relevel(TRT01A, "Placebo"))
-
-levels(adsl_fct2$TRT01A)
+```{r factor-aesev-solution}
+adae |>
+  filter(TRTEMFL == "Y") |>
+  mutate(
+    AESEV_F  = fct(AESEV,  levels = c("MILD", "MODERATE", "SEVERE")),
+    TRT01A_F = fct(TRT01A, levels = c("Placebo",
+                                      "Xanomeline Low Dose",
+                                      "Xanomeline High Dose"))
+  ) |>
+  count(TRT01A_F, AESEV_F) |>
+  pivot_wider(names_from = AESEV_F, values_from = n, values_fill = 0)
 ```
 
-### Exercise 7c — fct_recode: rename a level
+### Exercise 7c — fct_recode: shorten labels for TLG column headers
 
-Use `fct_recode()` to rename `"Xanomeline Low Dose"` → `"Low Dose"` and `"Xanomeline High Dose"` → `"High Dose"` (for a shorter table header).
+Rename the treatment levels so they fit in a narrow table column:
 
-```{r factor-recode, exercise=TRUE, exercise.lines=12}
+- `"Xanomeline Low Dose"` → `"Low Dose"`
+- `"Xanomeline High Dose"` → `"High Dose"`
+- `"Placebo"` stays as-is
+
+```{r factor-recode, exercise=TRUE, exercise.lines=14}
 adsl |>
   mutate(
-    TRT01A = factor(TRT01A),
-    TRT01A = fct_recode(TRT01A,
-      "___" = "Xanomeline Low Dose",
-      "___" = "Xanomeline High Dose"
-    )
+    TRT01A_SHORT = factor(TRT01A) |>
+      fct_recode(
+        "___" = "Xanomeline Low Dose",
+        "___" = "Xanomeline High Dose"
+      )
   ) |>
-  count(TRT01A)
+  count(TRT01A, TRT01A_SHORT)
 ```
 
 ```{r factor-recode-hint-1}
-# fct_recode(TRT01A, "Low Dose" = "Xanomeline Low Dose", "High Dose" = "Xanomeline High Dose")
+# fct_recode(TRT01A, "Low Dose" = "Xanomeline Low Dose",
+#                    "High Dose" = "Xanomeline High Dose")
 ```
 
 ```{r factor-recode-solution}
 adsl |>
   mutate(
-    TRT01A = factor(TRT01A),
-    TRT01A = fct_recode(TRT01A,
-      "Low Dose"  = "Xanomeline Low Dose",
-      "High Dose" = "Xanomeline High Dose"
-    )
+    TRT01A_SHORT = factor(TRT01A) |>
+      fct_recode(
+        "Low Dose"  = "Xanomeline Low Dose",
+        "High Dose" = "Xanomeline High Dose"
+      )
   ) |>
-  count(TRT01A)
+  count(TRT01A, TRT01A_SHORT)
+```
+
+### Exercise 7d — fct_lump_n: collapse rare AE body systems
+
+An AE summary table should show the **top 5 body systems** by frequency and lump
+all others into `"Other"`. Use `fct_lump_n()` on `AEBODSYS` and then order by
+decreasing frequency with `fct_infreq()`.
+
+```{r factor-lump, exercise=TRUE, exercise.lines=12}
+adae |>
+  filter(TRTEMFL == "Y") |>
+  mutate(
+    SOC = AEBODSYS |>
+            fct_lump_n(n = ___, other_level = "Other") |>
+            fct_infreq() |>
+            fct_rev()
+  ) |>
+  count(SOC, sort = FALSE) |>
+  print(n = Inf)
+```
+
+```{r factor-lump-hint-1}
+# fct_lump_n(AEBODSYS, n = 5, other_level = "Other") keeps top 5 by frequency
+# fct_infreq() orders levels by frequency (most frequent first)
+# fct_rev() reverses so the most frequent appears at the top when plotted
+```
+
+```{r factor-lump-solution}
+adae |>
+  filter(TRTEMFL == "Y") |>
+  mutate(
+    SOC = AEBODSYS |>
+            fct_lump_n(n = 5, other_level = "Other") |>
+            fct_infreq() |>
+            fct_rev()
+  ) |>
+  count(SOC, sort = FALSE) |>
+  print(n = Inf)
+```
+
+### Exercise 7e — fct_collapse: merge active arms into a single category
+
+For an exposure-adjusted analysis, you want to compare any-active treatment versus
+placebo. Collapse `"Xanomeline Low Dose"` and `"Xanomeline High Dose"` into a
+single level `"Active"`.
+
+```{r factor-collapse, exercise=TRUE, exercise.lines=12}
+adsl |>
+  mutate(
+    TRTGRP = factor(TRT01A) |>
+      fct_collapse(
+        "Active" = c("___", "___")
+      )
+  ) |>
+  count(TRTGRP) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+```{r factor-collapse-hint-1}
+# fct_collapse("Active" = c("Xanomeline Low Dose", "Xanomeline High Dose"))
+# "Placebo" is not listed so it keeps its original name
+```
+
+```{r factor-collapse-solution}
+adsl |>
+  mutate(
+    TRTGRP = factor(TRT01A) |>
+      fct_collapse(
+        "Active" = c("Xanomeline Low Dose", "Xanomeline High Dose")
+      )
+  ) |>
+  count(TRTGRP) |>
+  mutate(pct = round(100 * n / sum(n), 1))
 ```
 
 ```{r quiz-factors, echo=FALSE}
 quiz(
-  caption = "Factor check",
+  caption = "forcats check",
   question(
-    "Why do you typically NOT store factors in exported ADaM datasets (.xpt files)?",
+    "Why do you typically NOT store factors in exported ADaM datasets (.xpt)?",
     answer("Factors are too slow for large datasets"),
-    answer("XPT/SAS transport files don't have a factor type — everything is character or numeric", correct = TRUE),
+    answer("XPT/SAS transport files don't have a factor type — everything is
+           character or numeric", correct = TRUE),
     answer("admiral functions don't accept factor columns"),
     answer("Factors lose their levels when you use filter()"),
     allow_retry = TRUE
   ),
   question(
-    "What does fct_collapse(x, 'Active' = c('Low Dose', 'High Dose')) do?",
-    answer("Keeps only Low Dose and High Dose rows, dropping all others"),
-    answer("Combines the Low Dose and High Dose levels into a single level called Active", correct = TRUE),
-    answer("Renames both levels but keeps them separate"),
-    answer("Reorders the levels so Active comes first"),
+    "You apply fct_infreq(AEBODSYS) before building a frequency table. What does
+     this do?",
+    answer("Sorts rows of the data frame by frequency"),
+    answer("Reorders the factor levels so the most frequent level comes first",
+           correct = TRUE),
+    answer("Removes levels with frequency below a threshold"),
+    answer("Converts the factor back to a character column"),
+    allow_retry = TRUE
+  ),
+  question(
+    "fct_lump_n(x, n = 5) keeps the top 5 levels. What happens to the rest?",
+    answer("They are dropped from the data frame"),
+    answer("They are converted to NA"),
+    answer("They are merged into an 'Other' level (name configurable via
+           other_level)", correct = TRUE),
+    answer("They remain as individual levels at the end of the factor"),
     allow_retry = TRUE
   )
 )
@@ -903,67 +1451,119 @@ quiz(
 
 ---
 
-## 8  End-to-end CDISC exercise — from raw strings to analysis flags
+## 8  End-to-end CDISC pipeline — safety summary with multiple datasets
 
 ### The task
 
-Starting from `adae` and `adsl`:
+Build a treatment-emergent AE safety summary that:
 
-1. Parse `AESTDTC` → `AESTDT` (Date)
-2. Join first-dose date `TRTSDT` from `adsl`
-3. Compute `DAYS_FROM_DOSE`
-4. Flag `AE_WITHIN_30D` as `"Y"` when 0 ≤ days ≤ 30, else `"N"`
-5. Clean `AEDECOD` to title case with squished whitespace
+1. Filter `adae` to treatment-emergent AEs (`TRTEMFL == "Y"`)
+2. Join treatment arm and duration from `adsl`
+3. Compute per-subject AE counts and flag **serious early-onset** AEs
+   (`AESER == "Y"` and `ASTDY <= 30`)
+4. Summarise by treatment arm: count of AEs, count of serious AEs, count of
+   subjects with ≥1 serious early-onset AE
+5. Clean `AEDECOD` to title case for display
+6. Order treatment arm as a factor in clinical order
 
-```{r cdisc-pipeline, exercise=TRUE, exercise.lines=25}
+```{r cdisc-pipeline, exercise=TRUE, exercise.lines=40}
 library(lubridate)
 library(stringr)
+library(forcats)
 
-adae |>
-  # Step 1 & 2: parse dates and join TRTSDT
-  mutate(AESTDT = ymd(___)) |>
-  left_join(adsl |> select(USUBJID, TRTSDT), by = "USUBJID") |>
-  mutate(TRTSDT_D = ymd(TRTSDT)) |>
-
-  # Step 3: days from first dose
-  mutate(DAYS_FROM_DOSE = as.numeric(___ - ___)) |>
-
-  # Step 4: within-30-day flag
-  mutate(
-    AE_WITHIN_30D = if_else(
-      DAYS_FROM_DOSE >= 0 & DAYS_FROM_DOSE <= 30,
-      "Y", "N", missing = "N"
-    )
+# Step 1 & 2 — filter TE AEs and join adsl
+ae_base <- adae |>
+  filter(TRTEMFL == "___") |>
+  left_join(
+    adsl |> select(USUBJID, TRT01A, TRTDURD),
+    by = "USUBJID"
   ) |>
+  mutate(
+    # Step 3a — clean AE term
+    AEDECOD_DISPLAY = AEDECOD |> ___() |> ___(),
+    # Step 3b — flag serious early-onset
+    SER_EARLY_FL = if_else(AESER == "Y" & !is.na(ASTDY) & ASTDY <= 30,
+                           "Y", "N")
+  )
 
-  # Step 5: clean AEDECOD
-  mutate(AEDECOD = AEDECOD |> str_to_title() |> str_squish()) |>
+# Step 4 — subject-level: did they have ≥1 serious early-onset AE?
+subj_ser_early <- ae_base |>
+  group_by(USUBJID, TRT01A) |>
+  summarise(ANY_SER_EARLY = if_else(any(SER_EARLY_FL == "Y"), "Y", "N"),
+            .groups = "drop")
 
-  select(USUBJID, AEDECOD, AESTDTC, TRTSDT, DAYS_FROM_DOSE, AE_WITHIN_30D)
+# Step 5 — treatment-arm summary
+ae_base |>
+  group_by(TRT01A) |>
+  summarise(
+    N_AE      = n(),
+    N_SER_AE  = sum(AESER == "Y", na.rm = TRUE),
+    .groups   = "drop"
+  ) |>
+  left_join(
+    subj_ser_early |>
+      group_by(TRT01A) |>
+      summarise(N_SUBJ_SER_EARLY = sum(ANY_SER_EARLY == "Y"), .groups = "drop"),
+    by = "TRT01A"
+  ) |>
+  # Step 6 — order treatment arm
+  mutate(
+    TRT01A = fct(TRT01A,
+                 levels = c("Placebo",
+                            "Xanomeline Low Dose",
+                            "Xanomeline High Dose"))
+  ) |>
+  arrange(TRT01A)
 ```
 
 ```{r cdisc-pipeline-hint-1}
-# ymd(AESTDTC), ymd(TRTSDT)
-# as.numeric(AESTDT - TRTSDT_D)
+# TRTEMFL == "Y"
+# str_to_title() |> str_squish() for AEDECOD_DISPLAY
+# fct(TRT01A, levels = c("Placebo","Xanomeline Low Dose","Xanomeline High Dose"))
 ```
 
 ```{r cdisc-pipeline-solution}
 library(lubridate)
 library(stringr)
+library(forcats)
 
-adae |>
-  mutate(AESTDT = ymd(AESTDTC)) |>
-  left_join(adsl |> select(USUBJID, TRTSDT), by = "USUBJID") |>
-  mutate(TRTSDT_D = ymd(TRTSDT)) |>
-  mutate(DAYS_FROM_DOSE = as.numeric(AESTDT - TRTSDT_D)) |>
-  mutate(
-    AE_WITHIN_30D = if_else(
-      DAYS_FROM_DOSE >= 0 & DAYS_FROM_DOSE <= 30,
-      "Y", "N", missing = "N"
-    )
+ae_base <- adae |>
+  filter(TRTEMFL == "Y") |>
+  left_join(
+    adsl |> select(USUBJID, TRT01A, TRTDURD),
+    by = "USUBJID"
   ) |>
-  mutate(AEDECOD = AEDECOD |> str_to_title() |> str_squish()) |>
-  select(USUBJID, AEDECOD, AESTDTC, TRTSDT, DAYS_FROM_DOSE, AE_WITHIN_30D)
+  mutate(
+    AEDECOD_DISPLAY = AEDECOD |> str_to_title() |> str_squish(),
+    SER_EARLY_FL    = if_else(AESER == "Y" & !is.na(ASTDY) & ASTDY <= 30,
+                              "Y", "N")
+  )
+
+subj_ser_early <- ae_base |>
+  group_by(USUBJID, TRT01A) |>
+  summarise(ANY_SER_EARLY = if_else(any(SER_EARLY_FL == "Y"), "Y", "N"),
+            .groups = "drop")
+
+ae_base |>
+  group_by(TRT01A) |>
+  summarise(
+    N_AE     = n(),
+    N_SER_AE = sum(AESER == "Y", na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  left_join(
+    subj_ser_early |>
+      group_by(TRT01A) |>
+      summarise(N_SUBJ_SER_EARLY = sum(ANY_SER_EARLY == "Y"), .groups = "drop"),
+    by = "TRT01A"
+  ) |>
+  mutate(
+    TRT01A = fct(TRT01A,
+                 levels = c("Placebo",
+                            "Xanomeline Low Dose",
+                            "Xanomeline High Dose"))
+  ) |>
+  arrange(TRT01A)
 ```
 
 ---
@@ -972,59 +1572,170 @@ adae |>
 
 ```{r final-quiz-06, echo=FALSE}
 quiz(
-  caption = "Lesson 06 — self-check",
+  caption = "Lesson 06 — comprehensive self-check",
 
+  # ── tidyr ────────────────────────────────────────────────────────────────────
   question(
-    "You have columns LBTEST1, LBTEST2, LBTEST3. Which call reshapes to long format with a TESTNUM column and a RESULT column?",
-    answer("pivot_wider(names_from=TESTNUM, values_from=RESULT)"),
-    answer("pivot_longer(cols=starts_with('LBTEST'), names_to='TESTNUM', values_to='RESULT')", correct = TRUE),
-    answer("pivot_longer(cols=RESULT, names_to='TESTNUM')"),
-    answer("gather(LBTEST1:LBTEST3, TESTNUM, RESULT)"),
+    "You have adlb in long format and call pivot_wider(names_from = PARAMCD,
+     values_from = c(AVAL, BASE)). For three PARAMCDs, how many new columns are
+     produced?",
+    answer("3 — one per PARAMCD"),
+    answer("6 — two per PARAMCD (AVAL_ALT, BASE_ALT, AVAL_HGB, …)",
+           correct = TRUE),
+    answer("2 — AVAL and BASE"),
+    answer("Depends on the number of visits"),
     allow_retry = TRUE
   ),
 
   question(
-    "What is the difference between str_trim() and str_squish()?",
-    answer("str_trim() is faster; str_squish() is more accurate"),
-    answer("str_trim() removes leading/trailing whitespace only; str_squish() also collapses multiple interior spaces to one", correct = TRUE),
-    answer("str_squish() removes all whitespace including inside words"),
-    answer("They are identical — str_squish() is just an alias"),
+    "What does values_fill = list(AVAL = 0) do in pivot_wider()?",
+    answer("Replaces missing values in the original AVAL column with 0"),
+    answer("Fills the newly created wide-format cells that have no matching
+           long-format row with 0", correct = TRUE),
+    answer("Rounds all AVAL values to 0 decimal places"),
+    answer("Sets the default AVAL for all rows before pivoting"),
     allow_retry = TRUE
   ),
 
+  question(
+    "complete(USUBJID, AVISIT) adds rows for all subject-visit combinations that
+     were absent. What does fill() do AFTER complete()?",
+    answer("Removes the rows that complete() just added"),
+    answer("Fills NA values in other columns by propagating the last
+           (or next) observed value within a group", correct = TRUE),
+    answer("Fills missing AVAL values by linear interpolation"),
+    answer("It is equivalent to replace_na()"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "In pivot_longer(), you set names_to = c('.value', 'VISIT') and
+     names_pattern = '^(AVAL|CHG)_(\\\\d+)$'. What does .value do?",
+    answer("It creates a literal column called '.value'"),
+    answer("It signals that the matched piece should determine WHICH output
+           column the data goes into — producing separate AVAL and CHG columns",
+           correct = TRUE),
+    answer("It drops the column name prefix entirely"),
+    answer("It stores the column names in a metadata attribute"),
+    allow_retry = TRUE
+  ),
+
+  # ── lubridate ────────────────────────────────────────────────────────────────
   question(
     "Translate SAS: intck('day', trtsdt, aestdt) to R:",
     answer("days(aestdt, trtsdt)"),
-    answer("difftime(aestdt, trtsdt, units='days')"),
+    answer("difftime(aestdt, trtsdt, units = 'days')"),
     answer("as.numeric(ymd(aestdt) - ymd(trtsdt))", correct = TRUE),
     answer("interval(trtsdt, aestdt) / days(1)"),
     allow_retry = TRUE
   ),
 
   question(
-    "When should you convert a character column to a factor in pharmaverse workflows?",
+    "You need to compute the 30-day follow-up date after treatment end for every
+     subject, and some treatment end dates fall on January 31. What is the safest
+     R expression?",
+    answer("TRTEDT + 30"),
+    answer("TRTEDT + days(30)", correct = TRUE),
+    answer("TRTEDT %m+% months(1)"),
+    answer("ymd(TRTEDT) + month(1)"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "adsl$TRTSDT is already an R Date. Which of the following correctly computes
+     treatment duration in completed days (inclusive of both endpoints)?",
+    answer("as.numeric(TRTEDT - TRTSDT)"),
+    answer("difftime(TRTEDT, TRTSDT)"),
+    answer("as.numeric(TRTEDT - TRTSDT) + 1", correct = TRUE),
+    answer("interval(TRTSDT, TRTEDT) / ddays(1)"),
+    allow_retry = TRUE
+  ),
+
+  # ── stringr ──────────────────────────────────────────────────────────────────
+  question(
+    "What is the difference between str_trim() and str_squish()?",
+    answer("str_trim() is faster; str_squish() is more accurate"),
+    answer("str_trim() removes leading/trailing whitespace only; str_squish()
+           also collapses multiple interior spaces to one", correct = TRUE),
+    answer("str_squish() removes all whitespace including inside words"),
+    answer("They are identical — str_squish() is just an alias"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "str_detect(AEBODSYS, regex('skin', ignore_case = TRUE)) returns TRUE for
+     which of these values?",
+    answer("'Nervous system disorders'", correct = TRUE),
+    answer("'Gastrointestinal disorders'"),
+    answer("'Musculoskeletal and connective tissue disorders'"),
+    answer("'Blood and lymphatic system disorders'"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "You want to apply str_to_upper() to every character column in adsl whose
+     name starts with 'TRT'. What is the correct dplyr call?",
+    answer("mutate(TRT01A = str_to_upper(TRT01A), TRT01P = str_to_upper(TRT01P))"),
+    answer("mutate(across(starts_with('TRT') & where(is.character),
+           str_to_upper))", correct = TRUE),
+    answer("rename_with(str_to_upper, starts_with('TRT'))"),
+    answer("transform(adsl, TRT = str_to_upper)"),
+    allow_retry = TRUE
+  ),
+
+  # ── forcats ──────────────────────────────────────────────────────────────────
+  question(
+    "When should you convert a character column to a factor in pharmaverse
+     workflows?",
     answer("As early as possible, right after reading the data"),
     answer("Never — all pharmaverse packages require character columns"),
-    answer("Immediately before building a TLG or fitting a model, not in stored ADaM datasets", correct = TRUE),
+    answer("Immediately before building a TLG or fitting a model, not in stored
+           ADaM datasets", correct = TRUE),
     answer("Only when the column has more than 5 unique values"),
     allow_retry = TRUE
   ),
 
   question(
-    "What does pivot_wider() do if the same (USUBJID, AVISITN, PARAMCD) combination appears more than once?",
-    answer("It silently keeps the last value"),
-    answer("It errors immediately"),
-    answer("It warns and creates list-columns — a sign you should aggregate first", correct = TRUE),
-    answer("It averages the duplicate values"),
+    "fct_collapse(TRT01A, 'Active' = c('Xanomeline Low Dose',
+     'Xanomeline High Dose')) produces a factor with how many levels?",
+    answer("2 — Active and Placebo", correct = TRUE),
+    answer("3 — unchanged"),
+    answer("1 — everything is collapsed"),
+    answer("It errors because 'Active' was not an existing level"),
     allow_retry = TRUE
   ),
 
   question(
-    "Which lubridate function correctly parses a European date string '15/03/2024'?",
-    answer("ymd('15/03/2024')"),
-    answer("mdy('15/03/2024')"),
-    answer("dmy('15/03/2024')", correct = TRUE),
-    answer("parse_date_time('15/03/2024', orders='dmy')"),
+    "You call fct_lump_n(AEBODSYS, n = 5) on a column with 22 distinct SOC
+     values. What is the maximum number of distinct levels in the result?",
+    answer("5"),
+    answer("6 — the top 5 plus 'Other'", correct = TRUE),
+    answer("22 — lump_n only reorders, it does not reduce"),
+    answer("Depends on whether ties exist at the 5th position"),
+    allow_retry = TRUE
+  ),
+
+  # ── cross-cutting / CDISC ────────────────────────────────────────────────────
+  question(
+    "In pharmaverseadam ADLB and ADVS, some rows have non-missing DTYPE values
+     (e.g. 'MINIMUM', 'LOCF'). What should you do before most analyses?",
+    answer("Keep them — they represent the primary analysis records"),
+    answer("Filter them out with filter(is.na(DTYPE)) to retain only observed
+           records", correct = TRUE),
+    answer("Replace their AVAL with NA"),
+    answer("Pivot them to a separate wide dataset"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "Which of the following tidyverse verbs is the R equivalent of the SAS
+     RETAIN statement when filling in a subject's treatment arm across newly
+     added visit rows after complete()?",
+    answer("mutate(TRT01A = lag(TRT01A))"),
+    answer("group_by(USUBJID) |> fill(TRT01A, .direction = 'downup') |>
+           ungroup()", correct = TRUE),
+    answer("replace_na(list(TRT01A = 'Placebo'))"),
+    answer("coalesce(TRT01A, first(TRT01A))"),
     allow_retry = TRUE
   )
 )
@@ -1042,6 +1753,8 @@ quiz(
 | `PROC TRANSPOSE id= var= out=` | `pivot_wider(names_from=, values_from=)` |
 | `scan(var, 1, '_')` | `separate_wider_delim(col, delim='_', names=c(...))` |
 | Build ISO date from parts | `unite('AESTDTC', c(YEAR,MONTH,DAY), sep='-')` |
+| Ensure all category combinations | `complete(USUBJID, AVISIT)` |
+| `RETAIN` (carry forward) | `group_by(id) |> fill(col) |> ungroup()` |
 
 ### Dates
 
@@ -1050,10 +1763,12 @@ quiz(
 | `input(var, yymmdd10.)` | `ymd(var)` |
 | `put(date, date9.)` | `format(date, "%d%b%Y")` |
 | `intck('day', d1, d2)` | `as.numeric(d2 - d1)` |
+| `intck('day', d1, d2) + 1` (inclusive) | `as.numeric(d2 - d1) + 1` |
 | `intnx('month', d, 3)` | `d %m+% months(3)` |
-| `year(date)` (SAS function) | `year(date)` (lubridate — same name!) |
+| `intnx('day',  d, 30)` | `d + days(30)` |
+| `year(date)` | `year(date)` |
 | `month(date)` | `month(date)` |
-| Age in years | `floor(as.numeric(ref - birth) / 365.25)` |
+| `day(date)` | `day(date)` |
 
 ### Strings
 
@@ -1066,30 +1781,34 @@ quiz(
 | `propcase(s)` | `str_to_title(s)` |
 | `compbl(s)` | `str_squish(s)` |
 | `strip(s)` | `str_trim(s)` |
-| `put(n, z3.)` (zero-pad) | `str_pad(n, width=3, pad='0')` |
+| `put(n, z4.)` (zero-pad) | `str_pad(n, width=4, pad='0')` |
 | `catx('-', a, b)` | `str_c(a, b, sep='-')` |
+| `prxmatch('/pat/i', s) > 0` | `str_detect(s, regex('pat', ignore_case=TRUE))` |
+| Apply to multiple columns | `mutate(across(where(is.character), str_squish))` |
 
 ### Factors
 
 | SAS | R (forcats) |
 |---|---|
-| `PROC FORMAT` value statement | `factor(x, levels=c(...), labels=c(...))` |
+| `PROC FORMAT` value statement | `fct(x, levels=c(...))` |
 | Change format order | `fct_relevel(x, 'first_level')` |
 | Rename a level | `fct_recode(x, 'new'='old')` |
 | Merge levels | `fct_collapse(x, 'merged'=c('a','b'))` |
 | Keep top N, lump rest | `fct_lump_n(x, n=5)` |
+| Order by frequency | `fct_infreq(x)` |
+| Reverse level order | `fct_rev(x)` |
 
 ---
 
 ## Key Takeaways
 
 1. **Tidy data** — one row per observation, one column per variable. CDISC BDS is tidy (long format).
-2. **`pivot_longer()`** = PROC TRANSPOSE wide→long; **`pivot_wider()`** = PROC TRANSPOSE long→wide.
-3. **`separate_wider_delim()`** splits combined columns; **`unite()`** assembles ISO 8601 dates from parts.
-4. **`lubridate::ymd()`** parses CDISC ISO 8601 strings; date subtraction gives days directly.
-5. **`stringr`** gives consistent `str_*` functions — always use instead of scattered base R equivalents.
-6. **Factors** control TLG column/row order — convert character → factor at the TLG step, not in stored ADaMs.
+2. **`pivot_longer()`** = PROC TRANSPOSE wide→long; **`pivot_wider()`** = PROC TRANSPOSE long→wide. Always pre-filter DTYPE records before pivoting pharmaverseadam BDS datasets.
+3. **`separate_wider_delim()`** splits combined codes; **`unite()`** assembles ISO 8601 dates from parts; **`complete()`** + **`fill()`** handle sparse visit structures — the R equivalent of SAS RETAIN and format-driven templates.
+4. **`lubridate::ymd()`** parses CDISC ISO 8601 strings; Date subtraction gives days directly. CDISC duration = difference + 1 (inclusive endpoints). Use `%m+%` for safe month arithmetic.
+5. **`stringr`** gives consistent `str_*` functions. Use `across()` to apply them to many columns at once.
+6. **Factors** control TLG column/row order — convert character → factor at the TLG step, not in stored ADaMs. Use `fct_lump_n()` + `fct_infreq()` for frequency-ordered summaries.
 
-**R foundations are complete!** Module 2 begins with `{pharmaverseraw}` and `{sdtm.oak}`.
+**R foundations complete!** Module 2 begins with `{pharmaverseraw}` and `{sdtm.oak}`.
 
 (`rmarkdown::run("07_pharmaverseraw_sdtm_intro.Rmd")`)

@@ -20,6 +20,7 @@ library(tibble)
 library(lubridate)
 library(stringr)
 library(rlang)
+library(pharmaversesdtm)
 
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 tutorial_options(exercise.timelimit = 90)
@@ -197,6 +198,56 @@ study_ct <- tribble(
   "C66768",       "AE Outcome",    "RECO",     "RECOVERED/RESOLVED",          "RECOVERED/RESOLVED",
   "C66768",       "AE Outcome",    "NREC",     "NOT RECOVERED/NOT RESOLVED",  "NOT RECOVERED/NOT RESOLVED"
 )
+
+# ── Real pharmaversesdtm data (for comparison exercises) ─────────────────────
+vs_sdtm_real <- pharmaversesdtm::vs
+ae_sdtm_real <- pharmaversesdtm::ae
+
+# ── Pre-built VS domain (Steps 1–5) — used by vs-study-day and vs-blfl exercises
+# USUBJID format = "STUDYID-SITEID-PATNUM" (matches dm_ref)
+.vs_id_pre <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
+
+.bb_pre <- function(rows, rc, tc, tt, u) {
+  hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
+    left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
+    left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                   by = oak_id_vars()) |>
+    left_join(.vs_id_pre |> select(all_of(oak_id_vars()), VISIT, VISDAT, SITEID), by = oak_id_vars())
+}
+
+vs <- bind_rows(
+  .bb_pre(.vs_id_pre |> filter(!is.na(SYS_BP)), "SYS_BP","SYSBP","Systolic Blood Pressure","mmHg"),
+  .bb_pre(.vs_id_pre |> filter(!is.na(DIA_BP)), "DIA_BP","DIABP","Diastolic Blood Pressure","mmHg"),
+  .bb_pre(.vs_id_pre |> filter(!is.na(PULSE)),  "PULSE", "PULSE","Pulse Rate","beats/min")
+) |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "VS",
+    USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-"),
+    VSDTC   = as.character(dmy(VISDAT))
+  ) |>
+  select(-VISDAT) |>
+  derive_seq("VSSEQ", c("USUBJID", "VSTESTCD", "VISIT"))
+
+vs_with_dy <- derive_study_day(vs, dm_ref, "VSDTC", "RFXSTDTC", "VSDY")
+
+# ── Pre-built AE column-mapped object — used by ae-keys-seq exercise ──────────
+# SITEID is joined so USUBJID can be built correctly in the exercise.
+.ae_id_pre <- generate_oak_id_vars(ae_raw, "PATNUM", "ae_raw")
+
+ae <- assign_no_ct(.ae_id_pre, "AETERM",  "AETERM") |>
+  left_join(assign_ct(.ae_id_pre, "AESEV",  "AESEV",  study_ct, "C66742"), by = oak_id_vars()) |>
+  left_join(assign_ct(.ae_id_pre, "AESER",  "AESER",  study_ct, "NY"),     by = oak_id_vars()) |>
+  left_join(assign_no_ct(.ae_id_pre, "AESTDT", "AESTDTC"),                 by = oak_id_vars()) |>
+  left_join(assign_no_ct(.ae_id_pre, "AEENDT", "AEENDTC"),                 by = oak_id_vars()) |>
+  left_join(assign_ct(.ae_id_pre, "AEOUT",  "AEOUT",  study_ct, "C66768"), by = oak_id_vars()) |>
+  left_join(.ae_id_pre |> select(all_of(oak_id_vars()), SITEID),            by = oak_id_vars())
+
+ae_full <- ae |>
+  mutate(STUDYID = "TEST_STUDY", DOMAIN = "AE",
+         USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-")) |>
+  derive_seq("AESEQ", c("USUBJID", "AESTDTC", "AETERM")) |>
+  derive_study_day(dm_ref, "AESTDTC", "RFSTDTC", "AESTDY")
 ```
 
 ## Overview
@@ -484,12 +535,13 @@ vs <- bind_rows(
   build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE",  "PULSE", "Pulse Rate", "beats/min")
 )
 
-# Add domain-wide keys
+# Bring SITEID back from vs_id (it's not in oak_id_vars, so re-join it)
 vs <- vs |>
+  left_join(vs_id |> select(all_of(oak_id_vars()), SITEID), by = oak_id_vars()) |>
   mutate(
     STUDYID = "TEST_STUDY",
     DOMAIN  = "___",
-    USUBJID = paste("TEST_STUDY", patient_number, sep = "___")
+    USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "___")
   )
 
 vs |> select(STUDYID, DOMAIN, USUBJID, VSTESTCD, VSORRES) |> head(8)
@@ -497,7 +549,8 @@ vs |> select(STUDYID, DOMAIN, USUBJID, VSTESTCD, VSORRES) |> head(8)
 
 ```{r vs-domain-keys-hint-1}
 # DOMAIN = "VS"
-# sep = "-"  →  USUBJID = paste("TEST_STUDY", patient_number, sep = "-")
+# sep = "-"  →  USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-")
+# USUBJID format follows dm_ref: "TEST_STUDY-701-1015" (STUDYID-SITEID-PATNUM)
 ```
 
 ```{r vs-domain-keys-solution}
@@ -512,12 +565,12 @@ vs <- bind_rows(
   build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP", "SYSBP", "Systolic Blood Pressure", "mmHg"),
   build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP", "DIABP", "Diastolic Blood Pressure","mmHg"),
   build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE",  "PULSE", "Pulse Rate", "beats/min")
-)
-vs <- vs |>
+) |>
+  left_join(vs_id |> select(all_of(oak_id_vars()), SITEID), by = oak_id_vars()) |>
   mutate(
     STUDYID = "TEST_STUDY",
     DOMAIN  = "VS",
-    USUBJID = paste("TEST_STUDY", patient_number, sep = "-")
+    USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-")
   )
 vs |> select(STUDYID, DOMAIN, USUBJID, VSTESTCD, VSORRES) |> head(8)
 ```
@@ -536,8 +589,8 @@ build_block <- function(rows, rc, tc, tt, u) {
   hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
     left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
     left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
-    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                    by = oak_id_vars()) |>
-    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT), by = oak_id_vars())
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                   by = oak_id_vars()) |>
+    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT, SITEID),     by = oak_id_vars())
 }
 vs <- bind_rows(
   build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP", "SYSBP", "Systolic Blood Pressure", "mmHg"),
@@ -545,7 +598,7 @@ vs <- bind_rows(
   build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE",  "PULSE", "Pulse Rate", "beats/min")
 ) |>
   mutate(STUDYID = "TEST_STUDY", DOMAIN = "VS",
-         USUBJID = paste("TEST_STUDY", patient_number, sep = "-"))
+         USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-"))
 
 # Add VSSEQ
 vs <- derive_seq(vs, tgt_var = "___", rec_vars = c("USUBJID", "VSTESTCD", "VISIT"))
@@ -556,24 +609,25 @@ vs |> select(USUBJID, VSTESTCD, VISIT, VSSEQ, VSORRES)
 ```{r vs-seq-hint-1}
 # tgt_var = "VSSEQ"
 # derive_seq() numbers rows 1, 2, 3 ... within each USUBJID
+# USUBJID format "TEST_STUDY-SITEID-PATNUM" matches dm_ref for the later derive_study_day join
 ```
 
 ```{r vs-seq-solution}
 vs_id <- generate_oak_id_vars(vs_raw, "PATNUM", "vs_raw")
 build_block <- function(rows, rc, tc, tt, u) {
   hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
-    left_join(hardcode_ct(rows, rc, "VSTEST", tt, study_ct, "C67153"), by = oak_id_vars()) |>
-    left_join(assign_no_ct(rows, rc, "VSORRES"),  by = oak_id_vars()) |>
-    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u), by = oak_id_vars()) |>
-    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT), by = oak_id_vars())
+    left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
+    left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                   by = oak_id_vars()) |>
+    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT, SITEID),     by = oak_id_vars())
 }
 vs <- bind_rows(
   build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP","SYSBP","Systolic Blood Pressure","mmHg"),
   build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP","DIABP","Diastolic Blood Pressure","mmHg"),
   build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE", "PULSE","Pulse Rate","beats/min")
 ) |>
-  mutate(STUDYID="TEST_STUDY", DOMAIN="VS",
-         USUBJID=paste("TEST_STUDY", patient_number, sep="-"))
+  mutate(STUDYID = "TEST_STUDY", DOMAIN = "VS",
+         USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-"))
 
 vs <- derive_seq(vs, tgt_var = "VSSEQ", rec_vars = c("USUBJID", "VSTESTCD", "VISIT"))
 vs |> select(USUBJID, VSTESTCD, VISIT, VSSEQ, VSORRES)
@@ -587,21 +641,16 @@ vs |> select(USUBJID, VSTESTCD, VISIT, VSSEQ, VSORRES)
 
 `derive_study_day()` computes days from a reference date (first dose, `RFXSTDTC` in DM) to the observation date, applying the **no-Day-0 convention**: the reference day itself is Day 1; days before it are negative.
 
-```{r vs-study-day, exercise=TRUE, exercise.lines=22}
-# Add VSDTC from raw VISDAT (simplified parse for tutorial)
-vs_with_dtc <- vs |>   # using vs built in Exercise 6 — re-run below if needed
-  left_join(vs_raw |>
-              mutate(USUBJID = paste("TEST_STUDY", SITEID, PATNUM, sep="-"),
-                     VSDTC = as.character(dmy(VISDAT))) |>
-              select(USUBJID, VISIT, VSDTC),
-            by = c("USUBJID", "VISIT"))
+```{r vs-study-day, exercise=TRUE, exercise.lines=18}
+# `vs` is pre-built in the setup chunk through Step 5 (VSSEQ). It already has
+# VSDTC from dmy(VISDAT). Apply derive_study_day() to compute VSDY.
+# dm_ref provides the first-dose date (RFXSTDTC) for each USUBJID.
 
-# Derive VSDY using dm_ref for reference dates
 vs_with_dy <- derive_study_day(
-  data        = vs_with_dtc,
-  dm_domain   = dm_ref,
-  tgdt        = "VSDTC",
-  refdt       = "___",          # first-dose date column in dm_ref
+  data          = vs,          # pre-built; has VSDTC and correct USUBJID
+  dm_domain     = dm_ref,
+  tgdt          = "VSDTC",
+  refdt         = "___",       # first-dose date column in dm_ref
   study_day_var = "VSDY"
 )
 
@@ -609,21 +658,15 @@ vs_with_dy |> select(USUBJID, VSTESTCD, VISIT, VSDTC, VSDY)
 ```
 
 ```{r vs-study-day-hint-1}
-# refdt = "RFXSTDTC"  (the first-dose date column in dm_ref)
-# SCREENING rows should be negative VSDY (before first dose on 2020-07-15)
-# WEEK 4 rows should be positive VSDY
+# refdt = "RFXSTDTC"  (the first-dose date in dm_ref)
+# dm_ref is joined on USUBJID — that's why the USUBJID format must match exactly.
+# SCREENING visits (before 2020-07-15) → negative VSDY
+# WEEK 4 visits (after first dose) → positive VSDY
 ```
 
 ```{r vs-study-day-solution}
-vs_with_dtc <- vs |>
-  left_join(vs_raw |>
-              mutate(USUBJID = paste("TEST_STUDY", SITEID, PATNUM, sep="-"),
-                     VSDTC = as.character(dmy(VISDAT))) |>
-              select(USUBJID, VISIT, VSDTC),
-            by = c("USUBJID", "VISIT"))
-
 vs_with_dy <- derive_study_day(
-  data          = vs_with_dtc,
+  data          = vs,
   dm_domain     = dm_ref,
   tgdt          = "VSDTC",
   refdt         = "RFXSTDTC",
@@ -665,13 +708,17 @@ quiz(
 - The visit is in a list of qualifying baseline visits
 - Among qualifying rows, the chronologically last one gets `"Y"`
 
-```{r vs-blfl, exercise=TRUE, exercise.lines=18}
+```{r vs-blfl, exercise=TRUE, exercise.lines=22}
+# `vs_with_dy` is pre-built in the setup chunk (Steps 1–6, includes VSDY).
+# derive_blfl() flags the LAST pre-dose observation per subject per VSTESTCD.
+# "Last" = the observation with the latest date that is still <= first-dose date.
+
 vs_blfl <- derive_blfl(
   data             = vs_with_dy,
   dm_domain        = dm_ref,
   tgt_var          = "VSBLFL",
-  ref_var          = "RFXSTDTC",
-  baseline_visits  = c("SCREENING"),
+  ref_var          = "RFXSTDTC",        # first-dose date in dm_ref
+  baseline_visits  = c("SCREENING"),    # only this visit qualifies as baseline
   date_var         = "VSDTC",
   test_var         = "VSTESTCD"
 )
@@ -679,11 +726,16 @@ vs_blfl <- derive_blfl(
 vs_blfl |>
   select(USUBJID, VSTESTCD, VISIT, VSDTC, VSDY, VSBLFL) |>
   arrange(USUBJID, VSTESTCD, VISIT)
+
+# How many rows have VSBLFL = "Y"?
+vs_blfl |> filter(VSBLFL == "Y") |> count(VSTESTCD)
 ```
 
 ```{r vs-blfl-hint-1}
-# Only SCREENING visits (before first dose) should get VSBLFL = "Y"
-# WEEK 4 and WEEK 8 visits (after first dose) should be NA
+# Only SCREENING visits (before or on first dose) should get VSBLFL = "Y".
+# Each subject has one SCREENING row per parameter → 3 subjects × 3 parameters = 9 "Y" rows.
+# WEEK 4 and WEEK 8 visits (after first dose) get NA.
+# If a subject had two qualifying pre-dose visits, only the chronologically later one gets "Y".
 ```
 
 ---
@@ -694,17 +746,18 @@ vs_blfl |>
 
 This exercise brings together all 8 steps. Fill in the blanks to complete the pipeline.
 
-```{r vs-capstone, exercise=TRUE, exercise.lines=55}
+```{r vs-capstone, exercise=TRUE, exercise.lines=58}
 # ── Step 1: OAK IDs ──────────────────────────────────────────────────────────
 vs_id <- generate_oak_id_vars(vs_raw, pat_var = "___", raw_src = "vs_raw")
 
 # ── Step 2–3: Topic blocks + bind_rows ───────────────────────────────────────
+# SITEID is carried through so we can build the correct 3-part USUBJID
 build_block <- function(rows, rc, tc, tt, u) {
   hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
     left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
     left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
-    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                    by = oak_id_vars()) |>
-    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT, VISDAT),      by = oak_id_vars())
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                   by = oak_id_vars()) |>
+    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT, VISDAT, SITEID), by = oak_id_vars())
 }
 
 vs <- bind_rows(
@@ -718,7 +771,7 @@ vs <- vs |>
   mutate(
     STUDYID = "TEST_STUDY",
     DOMAIN  = "VS",
-    USUBJID = paste("TEST_STUDY", patient_number, sep = "-"),
+    USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-"),
     VSDTC   = as.character(dmy(VISDAT))
   ) |>
   select(-VISDAT)
@@ -746,6 +799,8 @@ vs_final
 
 ```{r vs-capstone-hint-1}
 # Step 1: pat_var = "PATNUM"
+# Step 4: USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-")
+#         This gives "TEST_STUDY-701-1015" — matching dm_ref exactly.
 # Step 5: rec_vars = c("USUBJID", "VSTESTCD", "VISIT")
 ```
 
@@ -755,17 +810,17 @@ build_block <- function(rows, rc, tc, tt, u) {
   hardcode_ct(rows, rc, "VSTESTCD", tc, study_ct, "C66741") |>
     left_join(hardcode_ct(rows, rc, "VSTEST",   tt, study_ct, "C67153"), by = oak_id_vars()) |>
     left_join(assign_no_ct(rows, rc, "VSORRES"),                          by = oak_id_vars()) |>
-    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                    by = oak_id_vars()) |>
-    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT, VISDAT),      by = oak_id_vars())
+    left_join(hardcode_no_ct(rows, rc, "VSORRESU", u),                   by = oak_id_vars()) |>
+    left_join(vs_id |> select(all_of(oak_id_vars()), VISIT, VISDAT, SITEID), by = oak_id_vars())
 }
 vs <- bind_rows(
   build_block(vs_id |> filter(!is.na(SYS_BP)), "SYS_BP","SYSBP","Systolic Blood Pressure","mmHg"),
   build_block(vs_id |> filter(!is.na(DIA_BP)), "DIA_BP","DIABP","Diastolic Blood Pressure","mmHg"),
   build_block(vs_id |> filter(!is.na(PULSE)),  "PULSE", "PULSE","Pulse Rate","beats/min")
 ) |>
-  mutate(STUDYID="TEST_STUDY", DOMAIN="VS",
-         USUBJID=paste("TEST_STUDY", patient_number, sep="-"),
-         VSDTC=as.character(dmy(VISDAT))) |>
+  mutate(STUDYID = "TEST_STUDY", DOMAIN = "VS",
+         USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-"),
+         VSDTC   = as.character(dmy(VISDAT))) |>
   select(-VISDAT)
 
 vs <- derive_seq(vs, "VSSEQ", c("USUBJID","VSTESTCD","VISIT"))
@@ -850,21 +905,23 @@ ae
 
 ### Exercise 10b — domain keys, AESEQ, and AESTDY
 
-Add `STUDYID`, `DOMAIN`, `USUBJID`, `AESEQ`, and `AESTDY` to the AE domain.
+`ae` is pre-built in the setup chunk (all column mappings applied, SITEID joined). Add `STUDYID`, `DOMAIN`, `USUBJID`, `AESEQ`, and `AESTDY`.
 
-```{r ae-keys-seq, exercise=TRUE, exercise.lines=20}
+```{r ae-keys-seq, exercise=TRUE, exercise.lines=22}
+# `ae` from setup has: oak_id_vars(), AETERM, AESEV, AESER, AESTDTC, AEENDTC, AEOUT, SITEID
+
 ae_full <- ae |>
   mutate(
     STUDYID = "TEST_STUDY",
     DOMAIN  = "AE",
-    USUBJID = paste("TEST_STUDY", patient_number, sep = "-")
+    USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-")
   ) |>
   derive_seq(tgt_var = "AESEQ",
-             rec_vars = c("USUBJID", "AETERM", "AESTDTC")) |>
+             rec_vars = c("USUBJID", "AESTDTC", "AETERM")) |>
   derive_study_day(
     dm_domain     = dm_ref,
     tgdt          = "AESTDTC",
-    refdt         = "___",
+    refdt         = "___",        # reference start date column in dm_ref
     study_day_var = "AESTDY"
   )
 
@@ -873,7 +930,10 @@ ae_full |>
 ```
 
 ```{r ae-keys-seq-hint-1}
-# refdt = "RFSTDTC"  (reference start date in dm_ref)
+# refdt = "RFSTDTC"  (reference start date in dm_ref, used for Events domains)
+# dm_ref has both RFXSTDTC (first dose) and RFSTDTC (reference start).
+# For AE study day, the convention is RFSTDTC.
+# USUBJID format: "TEST_STUDY-SITEID-PATNUM" (e.g. "TEST_STUDY-701-1015")
 ```
 
 ```{r ae-keys-seq-solution}
@@ -881,10 +941,10 @@ ae_full <- ae |>
   mutate(
     STUDYID = "TEST_STUDY",
     DOMAIN  = "AE",
-    USUBJID = paste("TEST_STUDY", patient_number, sep = "-")
+    USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-")
   ) |>
   derive_seq(tgt_var = "AESEQ",
-             rec_vars = c("USUBJID", "AETERM", "AESTDTC")) |>
+             rec_vars = c("USUBJID", "AESTDTC", "AETERM")) |>
   derive_study_day(
     dm_domain     = dm_ref,
     tgdt          = "AESTDTC",
@@ -895,6 +955,83 @@ ae_full |>
   select(STUDYID, DOMAIN, USUBJID, AESEQ, AETERM, AESTDTC, AESTDY, AESEV, AESER)
 ```
 
+### Exercise 10c — AE capstone: full pipeline from scratch
+
+Build the complete AE domain end-to-end without any scaffolding. The final dataset should have: STUDYID, DOMAIN, USUBJID, AESEQ, AETERM, AESEV, AESER, AEOUT, AESTDTC, AEENDTC, AESTDY.
+
+```{r ae-capstone, exercise=TRUE, exercise.lines=40}
+# ── Step 1: OAK IDs ──────────────────────────────────────────────────────────
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "___", raw_src = "ae_raw")
+
+# ── Step 2: Map all AE columns ───────────────────────────────────────────────
+ae_term  <- assign_no_ct(ae_id, "AETERM",  "AETERM")
+ae_sev   <- assign_ct(ae_id,   "AESEV",   "AESEV",   study_ct, "___")   # AE Severity codelist
+ae_ser   <- assign_ct(ae_id,   "AESER",   "AESER",   study_ct, "NY")
+ae_out   <- assign_ct(ae_id,   "AEOUT",   "AEOUT",   study_ct, "C66768")
+ae_stdt  <- assign_no_ct(ae_id, "AESTDT",  "AESTDTC")
+ae_endt  <- assign_no_ct(ae_id, "___",     "AEENDTC") # raw end date column
+
+# ── Step 3: Join all mapped columns ──────────────────────────────────────────
+ae_mapped <- ae_term |>
+  left_join(ae_sev,  by = oak_id_vars()) |>
+  left_join(ae_ser,  by = oak_id_vars()) |>
+  left_join(ae_out,  by = oak_id_vars()) |>
+  left_join(ae_stdt, by = oak_id_vars()) |>
+  left_join(ae_endt, by = oak_id_vars()) |>
+  left_join(ae_id |> select(all_of(oak_id_vars()), SITEID), by = oak_id_vars())
+
+# ── Step 4: Domain keys + seq + study day ────────────────────────────────────
+ae_final <- ae_mapped |>
+  mutate(
+    STUDYID = "TEST_STUDY",
+    DOMAIN  = "AE",
+    USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-")
+  ) |>
+  derive_seq("AESEQ", c("USUBJID", "AESTDTC", "AETERM")) |>
+  derive_study_day(dm_ref, "AESTDTC", "RFSTDTC", "AESTDY") |>
+  select(STUDYID, DOMAIN, USUBJID, AESEQ, AETERM, AESEV, AESER, AEOUT,
+         AESTDTC, AEENDTC, AESTDY)
+
+ae_final
+```
+
+```{r ae-capstone-hint-1}
+# Step 1: pat_var = "PATNUM"
+# Step 2: AE Severity codelist = "C66742"
+#         raw end date column = "AEENDT"
+# Steps 3-4 follow the same USUBJID-SITEID-PATNUM format
+# Expected: 5 rows, one per AE record in ae_raw
+```
+
+```{r ae-capstone-solution}
+ae_id <- generate_oak_id_vars(ae_raw, pat_var = "PATNUM", raw_src = "ae_raw")
+
+ae_term  <- assign_no_ct(ae_id, "AETERM",  "AETERM")
+ae_sev   <- assign_ct(ae_id,   "AESEV",   "AESEV",   study_ct, "C66742")
+ae_ser   <- assign_ct(ae_id,   "AESER",   "AESER",   study_ct, "NY")
+ae_out   <- assign_ct(ae_id,   "AEOUT",   "AEOUT",   study_ct, "C66768")
+ae_stdt  <- assign_no_ct(ae_id, "AESTDT",  "AESTDTC")
+ae_endt  <- assign_no_ct(ae_id, "AEENDT",  "AEENDTC")
+
+ae_mapped <- ae_term |>
+  left_join(ae_sev,  by = oak_id_vars()) |>
+  left_join(ae_ser,  by = oak_id_vars()) |>
+  left_join(ae_out,  by = oak_id_vars()) |>
+  left_join(ae_stdt, by = oak_id_vars()) |>
+  left_join(ae_endt, by = oak_id_vars()) |>
+  left_join(ae_id |> select(all_of(oak_id_vars()), SITEID), by = oak_id_vars())
+
+ae_final <- ae_mapped |>
+  mutate(STUDYID = "TEST_STUDY", DOMAIN = "AE",
+         USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-")) |>
+  derive_seq("AESEQ", c("USUBJID", "AESTDTC", "AETERM")) |>
+  derive_study_day(dm_ref, "AESTDTC", "RFSTDTC", "AESTDY") |>
+  select(STUDYID, DOMAIN, USUBJID, AESEQ, AETERM, AESEV, AESER, AEOUT,
+         AESTDTC, AEENDTC, AESTDY)
+
+ae_final
+```
+
 ---
 
 ## 11  Multiple raw sources → one domain
@@ -903,18 +1040,20 @@ ae_full |>
 
 Some studies collect AEs on a main CRF and serious AEs on a separate SAE CRF. Each source gets its own `generate_oak_id_vars()` with a different `raw_src` label.
 
-```{r multi-source, exercise=TRUE, exercise.lines=28}
+```{r multi-source, exercise=TRUE, exercise.lines=32}
 # Source 1: main AE
 ae_main_id <- generate_oak_id_vars(ae_raw,  "PATNUM", raw_src = "ae_main")
 # Source 2: SAE supplement
 sae_id     <- generate_oak_id_vars(sae_raw, "PATNUM", raw_src = "ae_sae")
 
-# Build each source (AETERM only for brevity)
+# Build each source (AETERM + SITEID for USUBJID construction)
 ae_from_main <- assign_no_ct(ae_main_id, "AETERM", "AETERM") |>
-  mutate(USUBJID = paste("TEST_STUDY", ae_main_id$SITEID, ae_main_id$PATNUM, sep="-"))
+  left_join(ae_main_id |> select(all_of(oak_id_vars()), SITEID), by = oak_id_vars()) |>
+  mutate(USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-"))
 
-ae_from_sae  <- assign_no_ct(sae_id,    "AETERM", "AETERM") |>
-  mutate(USUBJID = paste("TEST_STUDY", sae_id$SITEID, sae_id$PATNUM, sep="-"))
+ae_from_sae  <- assign_no_ct(sae_id, "AETERM", "AETERM") |>
+  left_join(sae_id |> select(all_of(oak_id_vars()), SITEID), by = oak_id_vars()) |>
+  mutate(USUBJID = paste("TEST_STUDY", SITEID, patient_number, sep = "-"))
 
 # Combine — raw_source tells us which CRF each row came from
 ae_combined <- bind_rows(ae_from_main, ae_from_sae)
@@ -922,49 +1061,79 @@ ae_combined <- bind_rows(ae_from_main, ae_from_sae)
 ae_combined |>
   select(raw_source, patient_number, USUBJID, AETERM) |>
   arrange(USUBJID)
+
+# Which AETERM appears twice (once from each source)?
+ae_combined |>
+  count(USUBJID, AETERM) |>
+  filter(n > 1)
 ```
 
 ```{r multi-source-hint-1}
 # raw_source distinguishes "ae_main" from "ae_sae" rows
-# After bind_rows(), derive_seq() would renumber AESEQ across both sources together
-# The SAE row for PATNUM 1034 appears twice: once from ae_main, once from ae_sae
-# In production you'd deduplicate before deriving AESEQ
+# The SAE row for PATNUM 1034 (FALL) appears twice — once from each CRF.
+# After bind_rows(), you must deduplicate (e.g. distinct(USUBJID, AETERM, AESTDTC))
+# BEFORE calling derive_seq(), otherwise FALL would get two different AESEQ values.
 ```
 
 ---
 
 ## 12  Comparing to pharmaversesdtm
 
-### Validate your output against the canonical SDTM
+### Validate your output against the real SDTM
 
-```{r vs-canonical-compare, exercise=TRUE, exercise.lines=20}
-# ae_full is our derived AE; ae_sdtm_ref mirrors pharmaversesdtm::ae
-my_cols      <- names(ae_full)
-canonical_cols <- names(ae_sdtm_ref)
+```{r ae-real-compare, exercise=TRUE, exercise.lines=22}
+# ae_full is our derived AE; ae_sdtm_real is the genuine pharmaversesdtm::ae
+# from the full CDISCPILOT01 Alzheimer's study (much larger).
 
-cat("In canonical but NOT in our output (still to derive):\n")
-print(setdiff(canonical_cols, my_cols))
+# Column gap analysis
+cat("In real AE but NOT in our output (need MedDRA coding or additional derivations):\n")
+print(setdiff(names(ae_sdtm_real), names(ae_full)))
 
-cat("\nIn our output but NOT in canonical (OAK-internal columns):\n")
-print(setdiff(my_cols, canonical_cols))
+cat("\nIn our output but NOT in real AE (OAK internal tracking columns):\n")
+print(setdiff(names(ae_full), names(ae_sdtm_real)))
 
-# Row count match?
-cat("\nOur rows:", nrow(ae_full), "  Canonical rows:", nrow(ae_sdtm_ref), "\n")
+# How many subjects and AEs are in the real domain vs ours?
+cat("\nReal domain: ", n_distinct(ae_sdtm_real$USUBJID), "subjects,",
+    nrow(ae_sdtm_real), "AE records\n")
+cat("Our domain: ", n_distinct(ae_full$USUBJID), "subjects,",
+    nrow(ae_full), "AE records\n")
 
-# AESEQ and AETERM values match?
-inner_join(
-  ae_full      |> select(USUBJID, AESEQ, AETERM),
-  ae_sdtm_ref  |> select(USUBJID, AESEQ, AETERM),
-  by = c("USUBJID", "AESEQ"),
-  suffix = c("_ours", "_canonical")
-) |>
-  mutate(MATCH = AETERM_ours == AETERM_canonical)
+# AESEV distribution in the real domain
+ae_sdtm_real |> count(AESEV, sort = TRUE)
 ```
 
-```{r vs-canonical-compare-hint-1}
-# Columns in canonical not in ours: likely AEDECOD, AEBODSYS, AESOC (need MedDRA)
-# OAK-internal cols in ours: oak_id, raw_source, patient_number
-# Row counts and AETERM/AESEQ should align perfectly
+```{r ae-real-compare-hint-1}
+# Variables in the real domain but not in ours:
+#   AEDECOD, AEBODSYS, AESOC — need MedDRA external coding
+#   AETOXGR — NCI CTCAE grading (not always present)
+# OAK-internal cols in ours: oak_id, raw_source, patient_number, SITEID
+# The real domain has ~1200 AE records across 254 subjects — much bigger than our 5.
+```
+
+### Exercise 12b — compare VS column coverage
+
+```{r vs-real-compare, exercise=TRUE, exercise.lines=16}
+# vs_blfl is our derived VS (from Exercise 8 — pre-built in setup as vs_with_dy)
+# vs_sdtm_real is pharmaversesdtm::vs from the full study.
+
+# Variables still needed to reach the real domain's column set
+setdiff(names(vs_sdtm_real), names(vs_with_dy))
+
+# What VSTESTCD values exist in the real domain that we didn't map?
+setdiff(
+  vs_sdtm_real |> distinct(VSTESTCD) |> pull(),
+  c("SYSBP", "DIABP", "PULSE")
+)
+
+# How many records per VSTESTCD in the real domain?
+vs_sdtm_real |> count(VSTESTCD, sort = TRUE)
+```
+
+```{r vs-real-compare-hint-1}
+# Additional VSTESTCD values in the real domain: HEIGHT, WEIGHT, TEMP, etc.
+# Each would be a separate topic variable block in the full OAK pipeline.
+# Missing columns like EPOCH, VISITNUM, VSSTRESC, VSSTRESN would require
+# additional assign/hardcode calls and a reference visit schedule dataset.
 ```
 
 ---
@@ -1025,6 +1194,7 @@ quiz(
     answer("Each topic block maps a different subject"),
     allow_retry = TRUE
   ),
+
   question(
     "In derive_seq(), rec_vars = c('USUBJID', 'VSTESTCD', 'VISIT') means the sequence number resets to 1 when:",
     answer("Any column in rec_vars changes — i.e. for each unique USUBJID (regardless of test or visit)"),
@@ -1033,6 +1203,7 @@ quiz(
     answer("VSTESTCD changes"),
     allow_retry = TRUE
   ),
+
   question(
     "An AE starts on 2020-07-14 and the reference start date (RFSTDTC) is 2020-07-16. AESTDY =",
     answer("-1"),
@@ -1041,6 +1212,7 @@ quiz(
     answer("0"),
     allow_retry = TRUE
   ),
+
   question(
     "AEDECOD and AEBODSYS are absent from your OAK AE pipeline. Why?",
     answer("They are optional SDTM variables not required for submissions"),
@@ -1049,12 +1221,58 @@ quiz(
     answer("sdtm.oak does not support Events domains yet"),
     allow_retry = TRUE
   ),
+
   question(
     "The raw_source column set by generate_oak_id_vars() is most useful when:",
     answer("Validating CT spec conformance"),
     answer("Two raw datasets feed one SDTM domain — raw_source identifies which CRF each row came from for provenance and QC", correct = TRUE),
     answer("Computing study day"),
     answer("Deriving USUBJID from PATNUM"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "derive_blfl() flags the 'last pre-dose observation'. If a subject has two SCREENING visits (Day -7 and Day -1) for the same VSTESTCD, which one gets VSBLFL = 'Y'?",
+    answer("The first SCREENING visit (Day -7) — baseline is always the earliest qualifying observation"),
+    answer("Both get VSBLFL = 'Y' — all pre-dose visits are flagged"),
+    answer("The last SCREENING visit (Day -1) — derive_blfl() flags the chronologically latest pre-dose record", correct = TRUE),
+    answer("Neither — only visits explicitly named 'SCREENING' in baseline_visits are flagged"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "A raw VS dataset has PATNUM as the subject key. After generate_oak_id_vars(pat_var = 'PATNUM'), the USUBJID is constructed as paste(STUDYID, SITEID, patient_number, sep = '-'). Why must SITEID be joined back separately rather than relying on patient_number alone?",
+    answer("SITEID is required by the CDISC SDTM Findings model"),
+    answer("patient_number (PATNUM) is not globally unique — the same PATNUM can appear at different sites, so SITEID is required to form a globally unique USUBJID", correct = TRUE),
+    answer("patient_number is always NA after generate_oak_id_vars()"),
+    answer("SITEID carries the unit information for the measurement"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "After bind_rows() combines ae_main and ae_sae into ae_combined, a serious AE appears twice (once from each source). The correct way to handle this BEFORE derive_seq() is:",
+    answer("Call derive_seq() with duplicates present — it deduplicates automatically"),
+    answer("Apply distinct(USUBJID, AETERM, AESTDTC) or equivalent deduplication logic first, preserving the row from the more authoritative source", correct = TRUE),
+    answer("Filter using filter(raw_source == 'ae_main') to always keep the main CRF row"),
+    answer("Use anti_join() to remove all SAE rows from ae_combined"),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "The standard 8-step OAK build order for Findings domains lists derive_blfl() AFTER derive_study_day(). What would go wrong if derive_blfl() ran BEFORE derive_study_day()?",
+    answer("derive_blfl() would fail with a missing column error"),
+    answer("Nothing — derive_blfl() does not depend on VSDY"),
+    answer("VSBLFL would be correctly set but VSDY would overwrite it"),
+    answer("derive_blfl() uses the observation date column directly; derive_study_day() has no effect on it, so order does not matter here", correct = TRUE),
+    allow_retry = TRUE
+  ),
+
+  question(
+    "You compare your derived AE domain to pharmaversesdtm::ae using setdiff(names(ae_sdtm_real), names(ae_full)). The result includes 'AEDECOD', 'AEBODSYS', 'AESOC', and 'oak_id'. Which of these is actually an OAK-internal column that should NOT appear in the final SDTM submission dataset?",
+    answer("AEDECOD"),
+    answer("AEBODSYS"),
+    answer("AESOC"),
+    answer("oak_id — it is an internal row-tracing identifier from generate_oak_id_vars() and must be dropped before submission", correct = TRUE),
     allow_retry = TRUE
   )
 )
