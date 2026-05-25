@@ -8,6 +8,31 @@ runtime: shiny_prerendered
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 17_admiral_part4_occds.Rmd
+# PURPOSE       : admiral Part 4 — OCCDS datasets: ADAE derivation including serious AE
+#                 flags, treatment-emergent AE (TEAE) criteria, AE
+#                 severity grading, and duration calculations.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tidyr)
@@ -118,7 +143,8 @@ derive_vars_dy <- function(dataset, reference_date, source_vars) {
 }
 
 derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "first") {
-  new_nm  <- deparse(substitute(new_var))
+  # Accept bare name (direct call) or string (via do.call from params())
+  .e <- substitute(new_var); new_nm <- if (is.character(.e)) .e else deparse(.e)
   by_nm   <- sapply(by_vars, deparse)
   ord_nms <- sapply(order, function(x) { d <- deparse(x); gsub("desc\\(|\\)","",d) })
   desc_fl <- sapply(order, function(x) grepl("^desc\\(", deparse(x)))
@@ -153,7 +179,15 @@ restrict_derivation <- function(dataset, derivation, args = list(), filter = NUL
   bind_rows(derived, dataset[out_rows, , drop = FALSE])
 }
 
-params <- function(...) list(...)
+params <- function(...) {
+  # Bare names (e.g. new_var = AOCCFL) are captured as strings.
+  # Everything else (exprs() calls, strings, numbers) is evaluated normally.
+  parent_env <- parent.frame()
+  dots <- as.list(substitute(list(...)))[-1]
+  lapply(dots, function(x) {
+    if (is.symbol(x)) deparse(x) else eval(x, envir = parent_env)
+  })
+}
 
 # ── OCCDS-specific mocks ─────────────────────────────────────────────────────
 derive_var_trtemfl <- function(dataset, start_date, end_date = NULL,
@@ -216,26 +250,18 @@ derive_vars_joined <- function(dataset, dataset_add, by_vars, order,
                                 join_type = "all", ...) {
   by_nm  <- sapply(by_vars, deparse)
   fj_sub <- substitute(filter_join)
-  merged <- left_join(dataset, dataset_add, by = intersect(by_nm, names(dataset_add)),
+
+  # Tag each original row so we can select best dataset_add row per original row
+  dataset$.ROW_ID <- seq_len(nrow(dataset))
+
+  merged <- left_join(dataset, dataset_add,
+                      by = intersect(by_nm, names(dataset_add)),
                       suffix = c("", ".add"))
   if (!is.null(fj_sub)) {
     merged <- tryCatch(filter(merged, !!fj_sub), error = function(e) merged)
   }
-  if (!is.null(new_vars)) {
-    old_nms <- sapply(new_vars, function(x) {
-      d <- deparse(x); if (grepl("=",d)) trimws(strsplit(d,"=")[[1]][2]) else d
-    })
-    new_nms <- sapply(new_vars, function(x) {
-      d <- deparse(x); if (grepl("=",d)) trimws(strsplit(d,"=")[[1]][1]) else d
-    })
-    for (i in seq_along(old_nms)) {
-      if (old_nms[i] %in% names(merged))
-        merged <- rename(merged, !!new_nms[i] := !!old_nms[i])
-    }
-    keep_extra <- new_nms
-  } else {
-    keep_extra <- setdiff(names(dataset_add), c(by_nm, names(dataset)))
-  }
+
+  # Sort by order before slicing
   ord_nms <- sapply(order, function(x) { d <- deparse(x); gsub("desc\\(|\\)","",d) })
   desc_fl <- sapply(order, function(x) grepl("^desc\\(", deparse(x)))
   for (i in rev(seq_along(ord_nms))) {
@@ -243,17 +269,36 @@ derive_vars_joined <- function(dataset, dataset_add, by_vars, order,
       merged <- if (desc_fl[i]) arrange(merged, desc(.data[[ord_nms[i]]]))
                 else arrange(merged, .data[[ord_nms[i]]])
   }
-  by_present <- intersect(by_nm, names(merged))
-  if (mode == "first")
-    merged <- merged |> group_by(across(all_of(by_present))) |> slice(1) |> ungroup()
+
+  # Select first or last dataset_add match per original dataset row
+  best <- if (mode == "first")
+    merged |> group_by(.ROW_ID) |> slice(1) |> ungroup()
   else
-    merged <- merged |> group_by(across(all_of(by_present))) |> slice(n()) |> ungroup()
-  keep_cols <- intersect(keep_extra, names(merged))
-  extra <- merged |> select(all_of(c(by_present, keep_cols)))
+    merged |> group_by(.ROW_ID) |> slice(n()) |> ungroup()
+
+  # Rename new_vars — names(new_vars) holds the NEW name; deparse(value) holds the OLD name
+  if (!is.null(new_vars)) {
+    old_nms <- unname(sapply(new_vars, deparse))
+    raw_nms <- names(new_vars)
+    new_nms <- ifelse(!is.null(raw_nms) & raw_nms != "", raw_nms, old_nms)
+    for (i in seq_along(old_nms)) {
+      if (old_nms[i] %in% names(best))
+        best <- rename(best, !!new_nms[i] := !!old_nms[i])
+    }
+    keep_extra <- new_nms
+  } else {
+    keep_extra <- setdiff(names(dataset_add), c(by_nm, names(dataset)))
+  }
+
+  keep_cols <- intersect(keep_extra, names(best))
+  extra     <- best |> select(all_of(c(".ROW_ID", keep_cols)))
+
   if (any(keep_cols %in% names(dataset))) {
     for (nm in keep_cols[keep_cols %in% names(dataset)]) dataset[[nm]] <- NULL
   }
-  left_join(dataset, extra, by = by_present)
+  result          <- left_join(dataset, extra, by = ".ROW_ID")
+  result$.ROW_ID  <- NULL
+  result
 }
 
 derive_vars_query <- function(dataset, dataset_queries) {
@@ -340,6 +385,11 @@ queries_df <- tribble(
   "CQ02",  "GI Disorders (Customized)", NA,      NA,      "NAUSEA",
   "CQ02",  "GI Disorders (Customized)", NA,      NA,      "VOMITING"
 )
+
+# ── Real pharmaverseadam datasets (for exploration and validation exercises) ───
+library(pharmaverseadam)
+adae_real  <- pharmaverseadam::adae
+adsl_real  <- pharmaverseadam::adsl
 ```
 
 ## Welcome
@@ -566,6 +616,68 @@ list(
 )
 ```
 
+### Exercise: Explore real ADAE from pharmaverseadam
+
+The toy `ae` dataset has 5 records and 3 subjects. The real `adae_real` from pharmaverseadam has 1200+ AE records from 254 subjects — a realistic CDISCPILOT01 submission ADAE. Use it to understand the scale and content of a real treatment-emergent AE analysis.
+
+```{r adae-real-explore, exercise=TRUE, exercise.lines=38}
+# Q1: Total treatment-emergent AE records
+cat("Total TEAE (TRTEMFL = 'Y'):",
+    sum(adae_real$TRTEMFL == "Y", na.rm = TRUE), "\n")
+cat("Total AE records:           ", nrow(adae_real), "\n\n")
+
+# Q2: Most frequent treatment-emergent preferred terms
+adae_real |>
+  filter(TRTEMFL == "Y") |>
+  count(AEDECOD, name = "n_events") |>
+  arrange(desc(n_events)) |>
+  head(10) |>
+  print()
+
+# Q3: Breakdown of severity among TEAEs
+adae_real |>
+  filter(TRTEMFL == "Y") |>
+  count(AESEV, name = "n") |>
+  arrange(desc(n)) |>
+  print()
+
+# Q4: How many subjects had at least one TEAE? (AOCCFL = "Y")
+n_subj_with_teae <- adae_real |>
+  filter(!is.na(AOCCFL) & AOCCFL == "Y") |>
+  n_distinct("USUBJID")
+cat("\nSubjects with ≥1 TEAE (AOCCFL = 'Y'):", n_subj_with_teae, "\n")
+```
+
+```{r adae-real-explore-hint-1}
+# filter(TRTEMFL == "Y") selects treatment-emergent AEs
+# count(AEDECOD) tallies by preferred term
+# AOCCFL = "Y" marks the first TEAE per subject — one row per subject with ≥1 TEAE
+```
+
+```{r adae-real-explore-solution}
+cat("Total TEAE (TRTEMFL = 'Y'):",
+    sum(adae_real$TRTEMFL == "Y", na.rm = TRUE), "\n")
+cat("Total AE records:           ", nrow(adae_real), "\n\n")
+
+adae_real |>
+  filter(TRTEMFL == "Y") |>
+  count(AEDECOD, name = "n_events") |>
+  arrange(desc(n_events)) |>
+  head(10) |>
+  print()
+
+adae_real |>
+  filter(TRTEMFL == "Y") |>
+  count(AESEV, name = "n") |>
+  arrange(desc(n)) |>
+  print()
+
+n_subj_with_teae <- adae_real |>
+  filter(!is.na(AOCCFL) & AOCCFL == "Y") |>
+  n_distinct("USUBJID")
+cat("\nSubjects with ≥1 TEAE (AOCCFL = 'Y'):", n_subj_with_teae, "\n")
+```
+
 ---
 
 ## 5 — Occurrence flags: AOCCFL and AOCCSFL
@@ -597,7 +709,7 @@ adae <- adae |>
     filter = TRTEMFL == "Y"
   )
 
-adae |> select(USUBJID, AETERM, AESOC, TRTEMFL, AOCCFL, AOCCSFL) |> arrange(USUBJID, ASTDT)
+adae |> arrange(USUBJID, ASTDT) |> select(USUBJID, AETERM, AESOC, TRTEMFL, AOCCFL, AOCCSFL)
 ```
 
 ```{r quiz-occ-flags, echo=FALSE}
@@ -849,40 +961,307 @@ adae_full |>
 
 ---
 
+## 9.5 — P21 Derivation Diagnostics
+
+ADAE is the most scrutinized ADaM dataset in any submission — regulators check TRTEMFL rates, AOCCFL counts, and study day derivations closely. The three diagnostics below each come with a define.xml spec and a Pinnacle 21 error message.
+
+---
+
+### Diagnostic 1 — AOCCFL: Wrong mode flags last event instead of first
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *AOCCFL = 'Y' for the FIRST treatment-emergent adverse event per subject (ordered by ASTDT, then AESEQ). Used in incidence analyses where "subject with ≥1 TEAE" is the unit. Only one row per subject should have AOCCFL = 'Y'. Source: TRTEMFL, ASTDT, AESEQ.*
+
+The programmer submitted:
+
+```r
+adae_draft <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCFL,
+      mode    = "last"    # ← bug: should be "first"
+    ),
+    filter = TRTEMFL == "Y"
+  )
+```
+
+**P21 report:** *"AOCCFL = 'Y' is assigned to the last chronological TEAE for each subject, not the earliest onset. Subject 01-001 has two TEAEs; AOCCFL = 'Y' is on the later AE (AESEQ = 2). Expected: AOCCFL marks earliest onset per subject."*
+
+```{r p21-bug-aoccfl, exercise=TRUE, exercise.lines=22}
+# Fix: AOCCFL = first (earliest onset) TEAE per subject.
+# With order = exprs(ASTDT, AESEQ), mode = "first" picks the row with the smallest ADT.
+
+adae_fixed_aoccfl <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCFL,
+      mode    = "___"    # fix this
+    ),
+    filter = TRTEMFL == "Y"
+  )
+
+# Verify: exactly one AOCCFL = "Y" per subject, on the earliest ASTDT
+adae_fixed_aoccfl |>
+  filter(!is.na(AOCCFL)) |>
+  select(USUBJID, AETERM, ASTDT, AESEQ, AOCCFL) |>
+  arrange(USUBJID, ASTDT)
+```
+
+```{r p21-bug-aoccfl-hint-1}
+# mode = "first" — after sorting by ASTDT ascending, "first" gives the earliest AE onset
+# mode = "last" would give the most recent AE — wrong for AOCCFL
+```
+
+```{r p21-bug-aoccfl-solution}
+adae_fixed_aoccfl <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCFL,
+      mode    = "first"
+    ),
+    filter = TRTEMFL == "Y"
+  )
+
+adae_fixed_aoccfl |>
+  filter(!is.na(AOCCFL)) |>
+  select(USUBJID, AETERM, ASTDT, AESEQ, AOCCFL) |>
+  arrange(USUBJID, ASTDT)
+```
+
+---
+
+### Diagnostic 2 — TRTEMFL: Using the AE end date instead of the start date
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *TRTEMFL = 'Y' if the AE STARTED on or after the first treatment date (TRTSDT) and on or before TRTEDT + 30 days. The onset date (ASTDT) determines treatment-emergence — not the resolution date. Source: ASTDT, TRTSDT, TRTEDT.*
+
+The programmer submitted:
+
+```r
+adae_draft2 <- adae |>
+  derive_var_trtemfl(
+    start_date     = AENDT,    # ← bug: should be ASTDT (AE start, not end)
+    end_date       = AENDT,
+    trt_start_date = TRTSDT,
+    trt_end_date   = TRTEDT,
+    end_window     = 30
+  )
+```
+
+**P21 report:** *"TRTEMFL = NA for AE 'ANAPHYLACTIC SHOCK' (USUBJID 01-002, AEENDTC missing). An ongoing serious AE with missing end date cannot be flagged because AENDT is NA. Additionally, AEs that started on-treatment but resolved pre-treatment are incorrectly excluded. Onset date (ASTDT) must drive TRTEMFL."*
+
+```{r p21-bug-trtemfl-startdate, exercise=TRUE, exercise.lines=18}
+# Fix: use ASTDT (AE start date) as start_date — the AE onset drives treatment-emergence.
+
+adae_fixed_trtemfl <- adae |>
+  derive_var_trtemfl(
+    start_date     = ___,      # fix this — should be the AE START date
+    end_date       = AENDT,
+    trt_start_date = TRTSDT,
+    trt_end_date   = TRTEDT,
+    end_window     = 30
+  )
+
+# Verify: the SEVERE/SERIOUS AE for 01-002 (AEENDTC missing) should still get TRTEMFL = "Y"
+adae_fixed_trtemfl |>
+  select(USUBJID, AETERM, AESTDTC, AEENDTC, ASTDT, AENDT, TRTEMFL) |>
+  filter(USUBJID == "01-002")
+```
+
+```{r p21-bug-trtemfl-startdate-hint-1}
+# start_date = ASTDT  (the analysis AE START date, not AENDT)
+# TRTEMFL checks: did the AE ONSET occur during the treatment window?
+# Using AENDT as start_date means missing-end AEs (ongoing) can never be flagged.
+```
+
+```{r p21-bug-trtemfl-startdate-solution}
+adae_fixed_trtemfl <- adae |>
+  derive_var_trtemfl(
+    start_date     = ASTDT,
+    end_date       = AENDT,
+    trt_start_date = TRTSDT,
+    trt_end_date   = TRTEDT,
+    end_window     = 30
+  )
+
+adae_fixed_trtemfl |>
+  select(USUBJID, AETERM, AESTDTC, AEENDTC, ASTDT, AENDT, TRTEMFL) |>
+  filter(USUBJID == "01-002")
+```
+
+---
+
+### Diagnostic 3 — ASTDY: Study day off-by-one (missing Day 1 convention)
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *ASTDY = study day of AE onset, relative to first treatment date (TRTSDT). Follows CDISC ADaM IG §4.4.7 study day convention: TRTSDT = Day 1; the day before TRTSDT = Day −1 (no Day 0 exists for positive days). For positive study days: ASTDY = ASTDT − TRTSDT + 1. Use admiral's derive_vars_dy() which implements this convention automatically. Source: ASTDT, TRTSDT.*
+
+The programmer submitted:
+
+```r
+adae_draft3 <- adae |>
+  mutate(ASTDY = ASTDT - TRTSDT)    # ← bug: missing the +1 for Day 1 convention
+```
+
+**P21 report:** *"AD0214 — ASTDY = 0 detected for subjects where ASTDT = TRTSDT. CDISC ADaM IG prohibits study day 0 — the reference date is Day 1. All positive ASTDY values are exactly 1 less than expected."*
+
+```{r p21-bug-astdy, exercise=TRUE, exercise.lines=20}
+# Fix: use derive_vars_dy() which automatically applies the CDISC Day 1 convention.
+# Positive days: ASTDY = ASTDT - TRTSDT + 1
+# Negative days: ASTDY = ASTDT - TRTSDT      (no adjustment — Day -1 before treatment start)
+
+# Broken version for comparison:
+adae_broken_astdy <- adae |>
+  mutate(ASTDY_wrong = ASTDT - TRTSDT)
+
+# Fixed version:
+adae_fixed_astdy <- adae |>
+  derive_vars_dy(
+    reference_date = ___,          # reference date for study day calculation
+    source_vars    = exprs(___)    # compute ASTDY from ASTDT
+  )
+
+# Compare: ASTDY_wrong should be exactly 1 less than ASTDY for all on/post-treatment rows
+left_join(
+  adae_broken_astdy |> select(USUBJID, AETERM, ASTDT, TRTSDT, ASTDY_wrong),
+  adae_fixed_astdy  |> select(USUBJID, AETERM, ASTDY),
+  by = c("USUBJID", "AETERM")
+) |>
+  mutate(diff = ASTDY - ASTDY_wrong) |>
+  select(USUBJID, AETERM, ASTDY_wrong, ASTDY, diff)
+```
+
+```{r p21-bug-astdy-hint-1}
+# reference_date = TRTSDT
+# source_vars    = exprs(ASTDT)   → produces ASTDY
+# derive_vars_dy() strips the suffix to name the result: AST-DT → AST-DY → ASTDY
+```
+
+```{r p21-bug-astdy-solution}
+adae_broken_astdy <- adae |>
+  mutate(ASTDY_wrong = ASTDT - TRTSDT)
+
+adae_fixed_astdy <- adae |>
+  derive_vars_dy(
+    reference_date = TRTSDT,
+    source_vars    = exprs(ASTDT)
+  )
+
+left_join(
+  adae_broken_astdy |> select(USUBJID, AETERM, ASTDT, TRTSDT, ASTDY_wrong),
+  adae_fixed_astdy  |> select(USUBJID, AETERM, ASTDY),
+  by = c("USUBJID", "AETERM")
+) |>
+  mutate(diff = ASTDY - ASTDY_wrong) |>
+  select(USUBJID, AETERM, ASTDY_wrong, ASTDY, diff)
+```
+
+---
+
 ## Quiz — final
 
 ```{r quiz-final-17, echo=FALSE}
 quiz(
   question(
-    "What does TRTEMFL stand for, and what does 'Y' mean?",
-    answer("Treatment Exposure Flag; subject received treatment"),
-    answer("Treatment-Emergent Flag; the AE was new or worsened during the treatment window", correct = TRUE),
-    answer("Time-resolved event flag"),
-    answer("Tolerability flag"),
+    "A programmer sets AOCCFL using `mode = 'last'` in restrict_derivation. P21 flags that AOCCFL does not mark the earliest TEAE onset per subject. What does mode = 'last' produce, and what is the fix?",
+    answer("mode = 'last' marks the most recent TEAE per subject — fix: use mode = 'first' so the earliest onset (smallest ASTDT) is flagged", correct = TRUE),
+    answer("mode = 'last' marks the most severe AE — fix: use mode = 'first'"),
+    answer("mode = 'last' is correct for AOCCFL — only AOCCSFL uses 'first'"),
+    answer("mode = 'last' and 'first' produce identical results when there is only one TEAE per subject"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   ),
   question(
-    "ADCM differs from ADAE mainly in:",
-    answer("It uses OCCDS structure like ADAE, but maps ATC codes from WHODrug instead of MedDRA terms", correct = TRUE),
+    "A programmer writes `start_date = AENDT` in derive_var_trtemfl(). An ongoing SAE with AEENDTC missing gets TRTEMFL = NA. What is the root cause?",
+    answer("derive_var_trtemfl() requires a non-missing end date for all AEs"),
+    answer("AENDT is NA when AEENDTC is missing — using it as the 'start_date' makes the on-treatment comparison NA, so no TRTEMFL is assigned. Fix: use ASTDT (AE onset) as start_date", correct = TRUE),
+    answer("Missing AEENDTC always results in TRTEMFL = NA regardless of which date argument is used"),
+    answer("TRTEMFL can never be 'Y' for serious AEs with missing end dates"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "P21 rule AD0214 flags ASTDY = 0 in ADAE. The programmer used `mutate(ASTDY = ASTDT - TRTSDT)`. What is the CDISC convention and the correct formula?",
+    answer("CDISC study day has no Day 0 — the reference date is Day 1. For on/post-treatment days: ASTDY = ASTDT − TRTSDT + 1. Use derive_vars_dy() which implements this automatically", correct = TRUE),
+    answer("ASTDY = 0 is valid — it represents the treatment start date"),
+    answer("The formula is correct; ASTDY = 0 is only flagged for labs, not AEs"),
+    answer("CDISC requires ASTDY to be 1-indexed but the +1 is only for BDS datasets"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "AOCCFL differs from AOCCSFL in which key respect?",
+    answer("AOCCFL flags the first TEAE per subject; AOCCSFL flags the first TEAE per subject per system organ class (AESOC), enabling SOC-level incidence counting", correct = TRUE),
+    answer("AOCCSFL flags the most severe AE per subject; AOCCFL flags the first"),
+    answer("AOCCSFL uses AEDECOD (PT) instead of AESOC (SOC)"),
+    answer("They are identical — both use the same by_vars"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "Why does `date_imputation = 'last'` apply to AEENDTC (AE end date) while `date_imputation = 'first'` applies to AESTDTC (AE start date)?",
+    answer("'last' and 'first' are interchangeable — admiral chooses the appropriate value"),
+    answer("'first' for start dates minimises false treatment-emergent classifications (partial start pushed earlier); 'last' for end dates is conservative — assumes the AE lasted as long as possible within the period", correct = TRUE),
+    answer("'last' for end dates is required by CDISC; 'first' for start dates is optional"),
+    answer("End dates must always use 'last'; start dates have no imputation in ADAE"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "`end_window = 30` in derive_var_trtemfl() means an AE starting up to 30 days after TRTEDT is still treatment-emergent. Why is a post-treatment window important clinically?",
+    answer("Many drug effects (hypersensitivity, delayed toxicity) manifest after the last dose — excluding them would under-count safety events attributable to treatment", correct = TRUE),
+    answer("It prevents missing AEs with partial start dates"),
+    answer("It is required by ICH E3 for all AE analyses"),
+    answer("It converts non-treatment-emergent AEs into treatment-emergent ones for imputation"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "derive_vars_joined() is used for last-dose linkage instead of derive_vars_merged(). What capability does derive_vars_joined() have that derive_vars_merged() lacks?",
+    answer("derive_vars_joined() can rename variables; derive_vars_merged() cannot"),
+    answer("derive_vars_joined() accepts a filter_join condition that references both the primary and the added dataset simultaneously (e.g., ASTDT >= EXSTDT), enabling temporal filtering across two datasets", correct = TRUE),
+    answer("derive_vars_joined() is faster on large EX datasets"),
+    answer("derive_vars_merged() cannot operate on exposure datasets"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "derive_vars_query() adds a column named SMQ01NAM. Where does 'SMQ01' come from?",
+    answer("It is derived from the GRPNAME field in the queries dataset"),
+    answer("It is derived from the PREFIX column of the queries dataset — each unique PREFIX generates a {PREFIX}NAM variable", correct = TRUE),
+    answer("It is a fixed admiral naming convention for MedDRA queries"),
+    answer("The programmer must specify the output column name explicitly"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "ASEQ is derived with order = exprs(ASTDT, AESEQ). A programmer uses only order = exprs(AESEQ). What is wrong?",
+    answer("AESEQ alone is fine — it is always in chronological order"),
+    answer("AESEQ is the source SDTM sequence number, not necessarily chronological by onset date. Using ASTDT first ensures analysis sequence matches clinical timeline; AESEQ breaks ties only", correct = TRUE),
+    answer("order requires at least three variables in ADAE"),
+    answer("AESEQ is not available in the ADAE dataset"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "ADCM (Concomitant Medications) uses the same OCCDS structure as ADAE but maps a different coding dictionary. What is the key difference?",
+    answer("ADCM uses OCCDS like ADAE, but maps WHODrug ATC codes (anatomical therapeutic chemical hierarchy) instead of MedDRA preferred terms and SOCs", correct = TRUE),
+    answer("ADCM uses BDS structure — one row per medication per subject per visit"),
     answer("ADCM has PARAMCD; ADAE does not"),
-    answer("ADCM has no treatment-emergent flag"),
-    answer("ADCM uses BDS structure"),
-    allow_retry = TRUE
-  ),
-  question(
-    "The function for ATC class hierarchy derivation in ADCM is:",
-    answer("derive_vars_query()"),
-    answer("derive_vars_transposed()"),
-    answer("derive_vars_atc()", correct = TRUE),
-    answer("create_single_dose_dataset()"),
-    allow_retry = TRUE
-  ),
-  question(
-    "ASEQ provides:",
-    answer("The sequence number of AE records per subject", correct = TRUE),
-    answer("The severity sequence"),
-    answer("The chronological position of TRTEMFL"),
-    answer("A link to ADTTE"),
+    answer("ADCM has no treatment-emergent flag equivalent"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   )
 )

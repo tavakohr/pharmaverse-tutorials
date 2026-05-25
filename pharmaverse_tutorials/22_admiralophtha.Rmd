@@ -1,0 +1,1689 @@
+---
+title: "Lesson 22 — admiral Ophthalmology Extension (admiralophtha): BCVA, IOP, OCT & Laterality"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Ophthalmology ADaM derivations using the admiralophtha package: handling bilateral
+  data (OD/OS laterality), BCVA scale conversions (ETDRS letters ↔ logMAR ↔ Snellen),
+  visual acuity category endpoints (≥15-letter gain/loss), intraocular pressure (IOP),
+  OCT central retinal thickness (CRT), and the unique programming challenges of
+  within-subject eye-level analyses. Includes AMD and DME trial capstone problems.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 22_admiralophtha.Rmd
+# PURPOSE       : admiralophtha extension — ophthalmology ADaM: BCVA (ETDRS letters and
+#                 logMAR), bilateral/laterality PARAMCD encoding, study-
+#                 eye designation, IOP worst-eye derivation, and retinal
+#                 thickness endpoints.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNTHETIC OPHTHALMOLOGY TRIAL DATA
+# Phase III wet AMD (Age-related Macular Degeneration) trial.
+# Treatment: anti-VEGF intravitreal injection vs Sham injection.
+# 100 subjects; both eyes measured at every visit.
+# Primary endpoint: change from baseline in BCVA (ETDRS letters) at Week 52.
+# ══════════════════════════════════════════════════════════════════════════════
+set.seed(2024)
+n_sub <- 100
+
+adsl_optha <- tibble(
+  STUDYID  = "AMD2024",
+  USUBJID  = sprintf("AMD2024-%03d", seq_len(n_sub)),
+  SUBJID   = sprintf("%03d", seq_len(n_sub)),
+  AGE      = sample(55:88, n_sub, replace = TRUE),
+  SEX      = sample(c("M","F"), n_sub, replace = TRUE, prob = c(.38,.62)),
+  RACE     = sample(c("WHITE","ASIAN","BLACK OR AFRICAN AMERICAN"),
+                    n_sub, replace = TRUE, prob = c(.72,.18,.10)),
+  ARM      = rep(c("Anti-VEGF","Sham"), each = n_sub/2),
+  ARMCD    = rep(c("VEGF","SHAM"), each = n_sub/2),
+  # Study eye: the eye with AMD that receives treatment
+  STDEYE   = sample(c("OD","OS"), n_sub, replace = TRUE),
+  TRTSDT   = as.Date("2022-01-10") + sample(0:60, n_sub, replace = TRUE),
+  SAFFL    = "Y",
+  ITTFL    = "Y"
+) |>
+  mutate(
+    TRTEDT   = TRTSDT + 364L,   # 52-week treatment
+    LSTALVDT = TRTEDT + sample(0:90, n_sub, replace = TRUE)
+  )
+
+# ── Visit schedule ────────────────────────────────────────────────────────────
+visits <- tibble(
+  VISIT    = c("BASELINE","WEEK 4","WEEK 8","WEEK 12","WEEK 24","WEEK 52"),
+  VISITNUM = c(1, 2, 3, 4, 5, 6),
+  VISITDY  = c(1L, 29L, 57L, 85L, 169L, 365L)
+)
+
+eyes <- c("OD","OS")   # oculus dexter (right), oculus sinister (left)
+
+# ── OE domain simulation: BCVA (ETDRS letters), IOP (mmHg), CRT (μm OCT) ────
+# Study eye gets treatment benefit; fellow eye is background noise
+
+sim_bcva <- function(arm, eye, stdeye, visit_day, baseline) {
+  is_study_eye <- (eye == stdeye)
+  is_vegf      <- (arm == "VEGF")
+
+  if (visit_day == 1) return(baseline)
+
+  # Letters gained/lost from baseline
+  if (is_vegf && is_study_eye) {
+    # Anti-VEGF study eye: average +8 letters at Wk52
+    gain <- rnorm(1, mean = 8 * (visit_day / 365), sd = 6)
+  } else if (!is_vegf && is_study_eye) {
+    # Sham study eye: slow decline
+    gain <- rnorm(1, mean = -3 * (visit_day / 365), sd = 5)
+  } else {
+    # Fellow eye: small random drift
+    gain <- rnorm(1, mean = 0.5, sd = 3)
+  }
+  round(pmin(100, pmax(0, baseline + gain)))
+}
+
+sim_iop <- function(arm, eye, stdeye, visit_day, baseline_iop) {
+  # IOP: slight reduction in treated study eye over time (anti-VEGF can mildly lower IOP)
+  is_study <- (eye == stdeye) && (arm == "VEGF")
+  noise <- rnorm(1, 0, 1.5)
+  reduction <- if (is_study && visit_day > 1) -0.5 * (visit_day / 365) else 0
+  round(pmax(6, pmin(30, baseline_iop + reduction + noise)), 1)
+}
+
+sim_crt <- function(arm, eye, stdeye, visit_day, baseline_crt) {
+  # CRT (retinal thickness): elevated at baseline in study eye with AMD
+  # Anti-VEGF reduces fluid → CRT decreases
+  is_study <- (eye == stdeye)
+  is_vegf  <- (arm == "VEGF")
+
+  if (visit_day == 1) return(baseline_crt)
+
+  if (is_vegf && is_study) {
+    change <- rnorm(1, mean = -120 * (visit_day / 365), sd = 50)
+  } else if (!is_vegf && is_study) {
+    change <- rnorm(1, mean = 30 * (visit_day / 365), sd = 40)
+  } else {
+    change <- rnorm(1, mean = 0, sd = 20)
+  }
+  round(pmax(150, pmin(800, baseline_crt + change)))
+}
+
+oe_rows <- lapply(seq_len(n_sub), function(i) {
+  subj   <- adsl_optha$USUBJID[i]
+  arm    <- adsl_optha$ARMCD[i]
+  stdeye <- adsl_optha$STDEYE[i]
+  trtdt  <- adsl_optha$TRTSDT[i]
+
+  # Baseline values per eye
+  base_bcva_ode <- sample(35:75, 1)   # study eye: moderate vision loss
+  base_bcva_ose <- if (stdeye == "OD") base_bcva_ode else sample(55:90, 1)
+  base_bcva <- c(OD = if(stdeye=="OD") base_bcva_ode else sample(55:90,1),
+                 OS = if(stdeye=="OS") base_bcva_ode else sample(55:90,1))
+
+  base_iop  <- c(OD = round(rnorm(1, 14, 2.5), 1), OS = round(rnorm(1, 14, 2.5), 1))
+  base_crt  <- c(OD = if(stdeye=="OD") sample(380:600,1) else sample(200:310,1),
+                 OS = if(stdeye=="OS") sample(380:600,1) else sample(200:310,1))
+
+  lapply(seq_len(nrow(visits)), function(v) {
+    vrow <- visits[v, ]
+    lapply(eyes, function(eye) {
+      bcva <- sim_bcva(arm, eye, stdeye, vrow$VISITDY, base_bcva[[eye]])
+      iop  <- sim_iop( arm, eye, stdeye, vrow$VISITDY, base_iop[[eye]])
+      crt  <- sim_crt( arm, eye, stdeye, vrow$VISITDY, base_crt[[eye]])
+      adt  <- trtdt + vrow$VISITDY - 1L
+
+      bind_rows(
+        # BCVA
+        tibble(STUDYID="AMD2024", USUBJID=subj, VISIT=vrow$VISIT,
+               VISITNUM=vrow$VISITNUM, VISITDY=vrow$VISITDY,
+               OETESTCD="VAET", OETEST="Visual Acuity (ETDRS letters)",
+               OECAT="OPHTHALMIC EXAMINATION", OEOBJ=eye,
+               OESTRESN=bcva, OESTRESC=as.character(bcva),
+               OESTRESU="letters", ADT=adt, AVAL=as.numeric(bcva),
+               ARMCD=arm, STDEYE=stdeye),
+        # IOP
+        tibble(STUDYID="AMD2024", USUBJID=subj, VISIT=vrow$VISIT,
+               VISITNUM=vrow$VISITNUM, VISITDY=vrow$VISITDY,
+               OETESTCD="IOP", OETEST="Intraocular Pressure",
+               OECAT="OPHTHALMIC EXAMINATION", OEOBJ=eye,
+               OESTRESN=iop, OESTRESC=as.character(iop),
+               OESTRESU="mmHg", ADT=adt, AVAL=iop,
+               ARMCD=arm, STDEYE=stdeye),
+        # CRT
+        tibble(STUDYID="AMD2024", USUBJID=subj, VISIT=vrow$VISIT,
+               VISITNUM=vrow$VISITNUM, VISITDY=vrow$VISITDY,
+               OETESTCD="CRT", OETEST="Central Retinal Thickness (OCT)",
+               OECAT="OPHTHALMIC EXAMINATION", OEOBJ=eye,
+               OESTRESN=crt, OESTRESC=as.character(crt),
+               OESTRESU="um", ADT=adt, AVAL=as.numeric(crt),
+               ARMCD=arm, STDEYE=stdeye)
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+}) |> bind_rows()
+
+# ── ADOE skeleton (with PARAMCD encoding laterality) ─────────────────────────
+adoe_base <- oe_rows |>
+  mutate(
+    # Laterality-aware PARAMCD: e.g. VAET_OD, IOP_OS
+    PARAMCD  = paste0(OETESTCD, "_", OEOBJ),
+    PARAM    = paste0(OETEST, " — ", OEOBJ),
+    STUDYEYE = if_else(OEOBJ == STDEYE, "Y", "N"),
+    ADY      = as.integer(ADT - (adsl_optha$TRTSDT[match(USUBJID, adsl_optha$USUBJID)])) + 1L,
+    DTYPE    = NA_character_,
+    ABLFL    = if_else(VISIT == "BASELINE", "Y", NA_character_)
+  ) |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(BASE = AVAL[VISIT == "BASELINE"][1]) |>
+  ungroup()
+
+# Convenience subsets
+adoe_bcva <- adoe_base |> filter(OETESTCD == "VAET")
+adoe_iop  <- adoe_base |> filter(OETESTCD == "IOP")
+adoe_crt  <- adoe_base |> filter(OETESTCD == "CRT")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIRALOPHTHA FUNCTION MOCKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' Convert ETDRS letters to logMAR
+#' logMAR = 1.88 - 0.049 * letters  (Ferris et al. approximation)
+etdrs_to_logmar <- function(letters) {
+  round(1.88 - 0.049 * letters, 3)
+}
+
+#' Convert logMAR to ETDRS letters (inverse)
+logmar_to_etdrs <- function(logmar) {
+  round((1.88 - logmar) / 0.049)
+}
+
+#' Convert logMAR to approximate Snellen fraction (as character "20/XX")
+logmar_to_snellen <- function(logmar) {
+  denom <- round(20 * 10^logmar)
+  paste0("20/", denom)
+}
+
+#' Derive logMAR column from ETDRS AVAL
+derive_var_aval_logmar <- function(dataset,
+                                    aval_var  = AVAL,
+                                    new_var   = AVALOG,
+                                    filter    = NULL,
+                                    ...) {
+  aval_nm <- deparse(substitute(aval_var))
+  new_nm  <- deparse(substitute(new_var))
+  filt    <- substitute(filter)
+
+  if (!is.null(filt)) {
+    idx <- tryCatch(which(eval(filt, dataset)), error = function(e) seq_len(nrow(dataset)))
+    dataset[[new_nm]] <- NA_real_
+    dataset[[new_nm]][idx] <- etdrs_to_logmar(dataset[[aval_nm]][idx])
+  } else {
+    dataset[[new_nm]] <- etdrs_to_logmar(dataset[[aval_nm]])
+  }
+  dataset
+}
+
+#' Derive BCVA change-from-baseline category
+#' Regulatory categories: ≥15 gain, 0–14 gain, 0 change, 1–14 loss, ≥15 loss
+derive_var_bcva_category <- function(dataset,
+                                      chg_var    = CHG,
+                                      new_var    = BCVA_CAT,
+                                      thresholds = c(-15, 0, 15),
+                                      ...) {
+  chg_nm <- deparse(substitute(chg_var))
+  new_nm <- deparse(substitute(new_var))
+
+  dataset[[new_nm]] <- case_when(
+    is.na(dataset[[chg_nm]])           ~ NA_character_,
+    dataset[[chg_nm]] >= 15            ~ "Gain >=15 letters",
+    dataset[[chg_nm]] >= 1             ~ "Gain 1-14 letters",
+    dataset[[chg_nm]] == 0             ~ "No change",
+    dataset[[chg_nm]] >= -14           ~ "Loss 1-14 letters",
+    TRUE                               ~ "Loss >=15 letters"
+  )
+  dataset
+}
+
+#' Derive best corrected visual acuity responder flag
+#' BCVA_RESPFL = "Y" if CHG >= threshold (default 15 letters = 3 lines)
+derive_param_bcva_responder <- function(dataset,
+                                         dataset_adsl,
+                                         by_vars      = c("USUBJID","PARAMCD"),
+                                         chg_var      = CHG,
+                                         threshold    = 15,
+                                         set_values_to = list(),
+                                         ...) {
+  chg_nm  <- deparse(substitute(chg_var))
+  by_cols <- if (is.character(by_vars)) by_vars else sapply(by_vars, deparse)
+
+  post <- dataset |> filter(VISIT != "BASELINE", !is.na(.data[[chg_nm]]))
+
+  resp_rows <- post |>
+    group_by(across(all_of(by_cols))) |>
+    summarise(
+      AVAL  = as.integer(any(.data[[chg_nm]] >= threshold, na.rm = TRUE)),
+      AVALC = if_else(any(.data[[chg_nm]] >= threshold, na.rm = TRUE), "Y", "N"),
+      .groups = "drop"
+    ) |>
+    mutate(DTYPE = "RESP")
+
+  for (nm in names(set_values_to)) resp_rows[[nm]] <- set_values_to[[nm]]
+  bind_rows(dataset, resp_rows)
+}
+
+#' Derive "study eye" subset — convenience wrapper
+#' In ophthalmology analyses, analyses often focus on the study (treated) eye only
+derive_study_eye <- function(dataset, study_eye_var = STUDYEYE) {
+  var_nm <- deparse(substitute(study_eye_var))
+  dataset |> filter(.data[[var_nm]] == "Y")
+}
+
+#' Derive worst IOP (maximum across eyes and visits)
+derive_param_iop_worst <- function(dataset,
+                                    by_vars       = "USUBJID",
+                                    aval_var      = AVAL,
+                                    set_values_to = list(),
+                                    ...) {
+  aval_nm <- deparse(substitute(aval_var))
+  by_cols <- if (is.character(by_vars)) by_vars else sapply(by_vars, deparse)
+
+  worst <- dataset |>
+    group_by(across(all_of(by_cols))) |>
+    summarise(
+      AVAL  = max(.data[[aval_nm]], na.rm = TRUE),
+      AVALC = as.character(max(.data[[aval_nm]], na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    mutate(DTYPE = "WORST")
+
+  for (nm in names(set_values_to)) worst[[nm]] <- set_values_to[[nm]]
+  bind_rows(dataset, worst)
+}
+
+# Shared helpers
+exprs <- function(...) as.list(substitute(list(...)))[-1]
+```
+
+## Overview
+
+### The ophthalmology ADaM landscape
+
+Ophthalmology trials present a unique programming challenge: **every subject has two eyes**, and the treated (study) eye and the untreated (fellow) eye must be tracked separately but within the same subject record. This laterality dimension does not exist in other therapeutic areas.
+
+| Dataset | Full Name | Key Content |
+|---------|-----------|-------------|
+| **ADOE** | Ophthalmic Examination | BCVA, IOP, OCT — one row per subject × eye × visit × parameter |
+| **ADBCVA** | Best Corrected Visual Acuity | BCVA-specific analysis dataset |
+| **ADOCC** | Ophthalmic Clinical Events | Injection counts, procedural events |
+
+### Key visual acuity scales
+
+| Scale | Range | Better = | Notes |
+|-------|-------|----------|-------|
+| ETDRS letters | 0–100 | Higher | Standard in clinical trials; each line = 5 letters |
+| logMAR | ≥0 (typically 0–1.6) | Lower | Logarithm of Minimum Angle of Resolution |
+| Snellen | 20/X (e.g. 20/20) | Lower denominator | Legacy clinical notation |
+
+> **Conversion:** logMAR ≈ 1.88 − 0.049 × ETDRS letters (Ferris 1982). Normal vision (20/20) ≈ 84 ETDRS letters ≈ logMAR 0.
+
+```{r overview-explore, exercise=FALSE}
+# Preview ADOE baseline data
+adoe_bcva |>
+  filter(VISIT == "BASELINE") |>
+  group_by(ARMCD, OEOBJ, STUDYEYE) |>
+  summarise(
+    n         = n(),
+    mean_bcva = round(mean(AVAL), 1),
+    mean_logmar = round(mean(etdrs_to_logmar(AVAL)), 3),
+    .groups   = "drop"
+  ) |>
+  arrange(ARMCD, OEOBJ)
+```
+
+---
+
+## Section 1 — Laterality: The OD/OS Challenge
+
+### Why laterality is the hardest problem in ophthalmic ADaM
+
+In a standard trial, `USUBJID` identifies one analysis unit (the subject). In ophthalmology, the analysis unit is often the **eye**: you need `USUBJID` + `OEOBJ` (OD/OS) to uniquely identify an observation. The PARAMCD in ADOE encodes both the measurement and the eye: e.g., `VAET_OD`, `IOP_OS`, `CRT_OD`.
+
+> **SAS parallel:** In SAS, this was often handled with two separate datasets (one per eye) then merged. admiral handles it with laterality-aware PARAMCD naming, keeping everything in one long dataset.
+
+```{r quiz-laterality1, echo=FALSE}
+quiz(
+  caption = "Quiz — Laterality Fundamentals",
+
+  question("In CDISC SDTM, which variable records which eye was examined?",
+    answer("OEOBJ — the object of the observation (OD = right eye, OS = left eye)",
+           correct = TRUE,
+           message = "OEOBJ (Object of Examination) stores 'OD', 'OS', or 'OU' (both eyes). In ADaM, this is often encoded into PARAMCD (e.g., 'VAET_OD')."),
+    answer("OECAT — the category of the ophthalmic test"),
+    answer("OELOC — the location within the eye"),
+    answer("OETESTCD — the test code identifies the eye"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("The 'study eye' (STUDYEYE = 'Y') in an AMD trial is:",
+    answer("Always the right eye (OD)"),
+    answer("The eye with the target disease that receives the study treatment",
+           correct = TRUE,
+           message = "The study eye is the eye enrolled for treatment. The other eye is the 'fellow eye'. Both are measured, but the primary efficacy analyses use the study eye only."),
+    answer("The eye with better baseline vision"),
+    answer("Whichever eye the investigator chooses at Week 4"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 1.0 — Count records by PARAMCD, arm, and visit
+
+`adoe_bcva` encodes laterality in `PARAMCD` (e.g., `VAET_OD` for right eye, `VAET_OS` for left eye). Count how many records exist for each combination of PARAMCD, arm, and visit.
+
+```{r ex-lateral-count, exercise=TRUE, exercise.lines=12}
+# adoe_bcva has PARAMCD encoding the eye: e.g. "VAET_OD" (right), "VAET_OS" (left).
+# Count the number of records per PARAMCD, visit, and arm.
+# Which eye has more observations and why might they differ?
+
+adoe_bcva |>
+  count(___, ARMCD, VISIT) |>
+  arrange(PARAMCD, ARMCD, VISIT) |>
+  head(12)
+```
+
+```{r ex-lateral-count-hint-1}
+# count(PARAMCD, ARMCD, VISIT)
+```
+
+```{r ex-lateral-count-solution}
+adoe_bcva |>
+  count(PARAMCD, ARMCD, VISIT) |>
+  arrange(PARAMCD, ARMCD, VISIT) |>
+  head(12)
+```
+
+### Exercise 1.1 — Identify study eye records
+
+From `adoe_bcva`, filter to study eye records only and count subjects by arm.
+
+```{r ex-study-eye, exercise=TRUE, exercise.lines=16}
+# adoe_bcva has USUBJID, OEOBJ, STUDYEYE ("Y"/"N"), VISIT, AVAL, ARMCD
+
+study_eye_bcva <- adoe_bcva |>
+  filter(___ == "Y")   # keep only study eye rows
+
+# Count subjects and mean baseline BCVA by arm
+study_eye_bcva |>
+  filter(VISIT == "BASELINE") |>
+  group_by(___) |>
+  summarise(
+    n_subjects  = n_distinct(___),
+    mean_bcva   = round(mean(AVAL), 1),
+    .groups     = "drop"
+  )
+```
+
+```{r ex-study-eye-hint-1}
+# filter STUDYEYE == "Y"; group by ARMCD; n_distinct(USUBJID)
+adoe_bcva |>
+  filter(STUDYEYE == "Y") |>
+  filter(VISIT == "BASELINE") |>
+  group_by(ARMCD) |>
+  summarise(n_subjects = n_distinct(USUBJID),
+            mean_bcva = round(mean(AVAL), 1), .groups = "drop")
+```
+
+```{r ex-study-eye-solution}
+study_eye_bcva <- adoe_bcva |>
+  filter(STUDYEYE == "Y")
+
+study_eye_bcva |>
+  filter(VISIT == "BASELINE") |>
+  group_by(ARMCD) |>
+  summarise(
+    n_subjects = n_distinct(USUBJID),
+    mean_bcva  = round(mean(AVAL), 1),
+    .groups    = "drop"
+  )
+```
+
+### Exercise 1.2 — Wide format: compare OD vs OS at baseline
+
+Sometimes a QC or analysis step requires OD and OS side by side. Pivot the baseline BCVA data to wide format with columns `BCVA_OD` and `BCVA_OS`, then compute the inter-eye difference.
+
+```{r ex-wide-eyes, exercise=TRUE, exercise.lines=20}
+# adoe_bcva is available
+eye_wide <- adoe_bcva |>
+  filter(VISIT == "BASELINE") |>
+  select(USUBJID, OEOBJ, AVAL, STDEYE, ARMCD) |>
+  pivot_wider(
+    names_from  = ___,
+    values_from = ___,
+    names_prefix = "BCVA_"
+  ) |>
+  mutate(
+    EYE_DIFF    = BCVA_OD - BCVA_OS,    # positive = OD better
+    WORSE_EYE   = if_else(BCVA_OD <= BCVA_OS, "OD", "OS")
+  )
+
+# Summary: mean inter-eye difference by arm
+eye_wide |>
+  group_by(ARMCD) |>
+  summarise(
+    mean_diff = round(mean(EYE_DIFF, na.rm = TRUE), 1),
+    .groups   = "drop"
+  )
+```
+
+```{r ex-wide-eyes-hint-1}
+# names_from = OEOBJ (gives OD and OS); values_from = AVAL; names_prefix = "BCVA_"
+adoe_bcva |>
+  filter(VISIT == "BASELINE") |>
+  select(USUBJID, OEOBJ, AVAL, STDEYE, ARMCD) |>
+  pivot_wider(names_from = OEOBJ, values_from = AVAL, names_prefix = "BCVA_") |>
+  mutate(EYE_DIFF = BCVA_OD - BCVA_OS, WORSE_EYE = if_else(BCVA_OD <= BCVA_OS,"OD","OS"))
+```
+
+```{r ex-wide-eyes-solution}
+eye_wide <- adoe_bcva |>
+  filter(VISIT == "BASELINE") |>
+  select(USUBJID, OEOBJ, AVAL, STDEYE, ARMCD) |>
+  pivot_wider(
+    names_from   = OEOBJ,
+    values_from  = AVAL,
+    names_prefix = "BCVA_"
+  ) |>
+  mutate(
+    EYE_DIFF  = BCVA_OD - BCVA_OS,
+    WORSE_EYE = if_else(BCVA_OD <= BCVA_OS, "OD", "OS")
+  )
+
+eye_wide |>
+  group_by(ARMCD) |>
+  summarise(
+    mean_diff = round(mean(EYE_DIFF, na.rm = TRUE), 1),
+    .groups   = "drop"
+  )
+```
+
+---
+
+## Section 2 — BCVA Scale Conversions
+
+### ETDRS, logMAR, and Snellen
+
+Regulatory analyses require ETDRS letters as the primary scale, but publications and clinical reports often show logMAR or Snellen. Programmers must handle all three — and know that converting back and forth introduces rounding artefacts.
+
+```{r quiz-scales1, echo=FALSE}
+quiz(
+  caption = "Quiz — Visual Acuity Scales",
+
+  question("Normal vision (20/20 Snellen) corresponds to approximately how many ETDRS letters?",
+    answer("50 letters"),
+    answer("70 letters"),
+    answer("84–85 letters", correct = TRUE,
+           message = "20/20 ≈ 84 ETDRS letters ≈ logMAR 0.0. Each line on the ETDRS chart = 5 letters; the chart goes to line 20 (20/16, ≈88 letters at the top)."),
+    answer("100 letters — the maximum"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("In a trial, a subject gains 15 ETDRS letters. This is clinically equivalent to:",
+    answer("1 line of vision (5 letters per line)"),
+    answer("3 lines of vision", correct = TRUE,
+           message = "15 letters ÷ 5 letters per ETDRS line = 3 lines. This is the standard threshold for a 'clinically meaningful' improvement in AMD/DME trials."),
+    answer("Half a line of vision"),
+    answer("0.15 logMAR improvement"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 2.0 — ETDRS to logMAR conversion
+
+The conversion formula (Ferris 1982) is: **logMAR = 1.88 − 0.049 × ETDRS letters**. Apply it to a set of letter scores.
+
+```{r ex-logmar-convert, exercise=TRUE, exercise.lines=10}
+# logMAR = 1.88 - 0.049 * ETDRS_letters
+# Convert these ETDRS letter scores to logMAR:
+etdrs_scores <- c(85, 70, 55, 35, 20)
+
+tibble(
+  ETDRS  = etdrs_scores,
+  logMAR = round(1.88 - ___ * ___, 3)
+)
+```
+
+```{r ex-logmar-convert-hint-1}
+# logMAR = 1.88 - 0.049 * ETDRS
+```
+
+```{r ex-logmar-convert-solution}
+etdrs_scores <- c(85, 70, 55, 35, 20)
+tibble(
+  ETDRS  = etdrs_scores,
+  logMAR = round(1.88 - 0.049 * etdrs_scores, 3)
+)
+```
+
+### Exercise 2.1 — Derive logMAR from ETDRS
+
+Use `derive_var_aval_logmar()` on `adoe_bcva` to add a `LOGMAR` column, then show the range and mean at each visit for study eye, anti-VEGF arm.
+
+```{r ex-logmar, exercise=TRUE, exercise.lines=20}
+# derive_var_aval_logmar(dataset, aval_var, new_var)
+adoe_bcva_lm <- derive_var_aval_logmar(
+  dataset  = ___,
+  aval_var = AVAL,
+  new_var  = LOGMAR
+)
+
+# Mean logMAR at each visit, study eye, VEGF arm
+adoe_bcva_lm |>
+  filter(STUDYEYE == "Y", ARMCD == "VEGF") |>
+  group_by(___) |>
+  summarise(
+    n           = n(),
+    mean_logmar = round(mean(LOGMAR, na.rm = TRUE), 3),
+    mean_etdrs  = round(mean(AVAL,   na.rm = TRUE), 1),
+    .groups     = "drop"
+  ) |>
+  arrange(VISITNUM)
+```
+
+```{r ex-logmar-hint-1}
+# dataset = adoe_bcva; group by VISIT (or VISITNUM for ordering)
+adoe_bcva_lm <- derive_var_aval_logmar(dataset = adoe_bcva, aval_var = AVAL, new_var = LOGMAR)
+adoe_bcva_lm |>
+  filter(STUDYEYE == "Y", ARMCD == "VEGF") |>
+  group_by(VISIT, VISITNUM) |>
+  summarise(n = n(), mean_logmar = round(mean(LOGMAR,na.rm=TRUE),3),
+            mean_etdrs = round(mean(AVAL,na.rm=TRUE),1), .groups = "drop") |>
+  arrange(VISITNUM)
+```
+
+```{r ex-logmar-solution}
+adoe_bcva_lm <- derive_var_aval_logmar(
+  dataset  = adoe_bcva,
+  aval_var = AVAL,
+  new_var  = LOGMAR
+)
+
+adoe_bcva_lm |>
+  filter(STUDYEYE == "Y", ARMCD == "VEGF") |>
+  group_by(VISIT, VISITNUM) |>
+  summarise(
+    n           = n(),
+    mean_logmar = round(mean(LOGMAR, na.rm = TRUE), 3),
+    mean_etdrs  = round(mean(AVAL,   na.rm = TRUE), 1),
+    .groups     = "drop"
+  ) |>
+  arrange(VISITNUM)
+```
+
+### Exercise 2.2 — Snellen conversion table
+
+Build a reference table showing the Snellen fraction equivalent for each ETDRS letter score at 5-letter increments (0, 5, 10 … 100).
+
+```{r ex-snellen-table, exercise=TRUE, exercise.lines=18}
+# etdrs_to_logmar() and logmar_to_snellen() are available
+
+snellen_ref <- tibble(
+  ETDRS_letters = seq(0, 100, by = 5)
+) |>
+  mutate(
+    logMAR  = etdrs_to_logmar(___),
+    Snellen = logmar_to_snellen(___)
+  )
+
+# Show the clinically important range (40–90 letters)
+snellen_ref |>
+  filter(ETDRS_letters >= 40, ETDRS_letters <= 90)
+```
+
+```{r ex-snellen-hint-1}
+# etdrs_to_logmar(ETDRS_letters); logmar_to_snellen(logMAR)
+tibble(ETDRS_letters = seq(0, 100, by = 5)) |>
+  mutate(logMAR = etdrs_to_logmar(ETDRS_letters),
+         Snellen = logmar_to_snellen(logMAR)) |>
+  filter(ETDRS_letters >= 40, ETDRS_letters <= 90)
+```
+
+```{r ex-snellen-solution}
+snellen_ref <- tibble(
+  ETDRS_letters = seq(0, 100, by = 5)
+) |>
+  mutate(
+    logMAR  = etdrs_to_logmar(ETDRS_letters),
+    Snellen = logmar_to_snellen(logMAR)
+  )
+
+snellen_ref |>
+  filter(ETDRS_letters >= 40, ETDRS_letters <= 90)
+```
+
+---
+
+## Section 3 — Change from Baseline and BCVA Categories
+
+### Regulatory endpoint categories
+
+For AMD and DME trials, the key BCVA endpoints are:
+
+| Endpoint | Definition | AVAL |
+|----------|-----------|------|
+| Primary | Mean change from baseline in ETDRS letters at Week 52 | CHG |
+| Responder (gain) | ≥15 letters gained | AVALC = "Gain >=15 letters" |
+| Avoider (loss) | <15 letters lost | AVALC ≠ "Loss >=15 letters" |
+| Legal blindness threshold | ≤35 letters (20/200 Snellen) | baseline categorisation |
+
+```{r quiz-bcva-cat1, echo=FALSE}
+quiz(
+  caption = "Quiz — BCVA Change Categories",
+
+  question("A subject's baseline BCVA is 62 letters; Week 52 BCVA is 74 letters. Their CHG category is:",
+    answer("Gain >=15 letters"),
+    answer("Gain 1-14 letters", correct = TRUE,
+           message = "CHG = 74 − 62 = 12 letters gained. 12 is in the 1–14 range, not ≥15."),
+    answer("No change"),
+    answer("Loss 1-14 letters"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("The ≥15-letter gain threshold was chosen because:",
+    answer("It equals exactly 3 lines on the ETDRS chart (5 letters × 3)",
+           correct = TRUE,
+           message = "3 lines of visual improvement is the consensus threshold for a clinically meaningful benefit in retinal disease trials."),
+    answer("It equals 20/40 Snellen"),
+    answer("FDA mandates this specific threshold for all visual acuity endpoints"),
+    answer("It represents a 15% improvement in logMAR"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 3.0 — Apply BCVA change categories manually
+
+The five regulatory BCVA categories are defined in the table above. Use `case_when()` to apply them directly to `adoe_bcva` at Week 52.
+
+```{r ex-bcva-cat-manual, exercise=TRUE, exercise.lines=18}
+# BCVA change categories (CHG in ETDRS letters):
+#   "Gain >=15 letters"  : CHG >= 15
+#   "Gain 1-14 letters"  : CHG >= 1 & CHG < 15
+#   "No change"          : CHG == 0
+#   "Loss 1-14 letters"  : CHG > -15 & CHG < 0
+#   "Loss >=15 letters"  : CHG <= -15
+
+# Apply these manually to adoe_bcva at WEEK 52 (study eye, post-baseline).
+adoe_bcva |>
+  filter(VISIT == "WEEK 52", STUDYEYE == "Y", !is.na(AVAL)) |>
+  mutate(
+    CHG = AVAL - BASE,
+    BCVACAT = case_when(
+      CHG >= 15              ~ "Gain >=15 letters",
+      CHG >= 1               ~ "Gain 1-14 letters",
+      CHG == 0               ~ "No change",
+      CHG > -15              ~ "Loss 1-14 letters",
+      TRUE                   ~ "Loss >=15 letters"
+    )
+  ) |>
+  count(___, BCVACAT) |>
+  arrange(ARMCD, BCVACAT)
+```
+
+```{r ex-bcva-cat-manual-hint-1}
+# count(ARMCD, BCVACAT)
+```
+
+```{r ex-bcva-cat-manual-solution}
+adoe_bcva |>
+  filter(VISIT == "WEEK 52", STUDYEYE == "Y", !is.na(AVAL)) |>
+  mutate(
+    CHG = AVAL - BASE,
+    BCVACAT = case_when(
+      CHG >= 15  ~ "Gain >=15 letters",
+      CHG >= 1   ~ "Gain 1-14 letters",
+      CHG == 0   ~ "No change",
+      CHG > -15  ~ "Loss 1-14 letters",
+      TRUE       ~ "Loss >=15 letters"
+    )
+  ) |>
+  count(ARMCD, BCVACAT) |>
+  arrange(ARMCD, BCVACAT)
+```
+
+### Exercise 3.1 — Derive CHG, PCHG, and BCVA category
+
+Add `CHG`, `PCHG`, and the category variable `BCVA_CAT` to the study-eye BCVA data.
+
+```{r ex-chg-cat, exercise=TRUE, exercise.lines=24}
+# adoe_bcva has BASE already computed in the setup
+bcva_study <- adoe_bcva |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(
+    CHG  = ___ - ___,
+    PCHG = round(100 * CHG / BASE, 1)
+  )
+
+bcva_study_cat <- derive_var_bcva_category(
+  dataset = ___,
+  chg_var = CHG,
+  new_var = BCVA_CAT
+)
+
+# Distribution of categories at Week 52 by arm
+bcva_study_cat |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD, ___) |>
+  summarise(n = n(), .groups = "drop") |>
+  mutate(pct = round(100 * n / sum(n), 1), .by = ARMCD) |>
+  arrange(ARMCD, BCVA_CAT)
+```
+
+```{r ex-chg-cat-hint-1}
+# CHG = AVAL - BASE; PCHG = 100 * CHG / BASE
+# derive_var_bcva_category(dataset = bcva_study, chg_var = CHG, new_var = BCVA_CAT)
+# group by ARMCD and BCVA_CAT
+bcva_study <- adoe_bcva |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(CHG = AVAL - BASE, PCHG = round(100 * CHG / BASE, 1))
+bcva_study_cat <- derive_var_bcva_category(dataset = bcva_study, chg_var = CHG, new_var = BCVA_CAT)
+bcva_study_cat |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD, BCVA_CAT) |>
+  summarise(n = n(), .groups = "drop") |>
+  mutate(pct = round(100 * n / sum(n), 1), .by = ARMCD) |>
+  arrange(ARMCD, BCVA_CAT)
+```
+
+```{r ex-chg-cat-solution}
+bcva_study <- adoe_bcva |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(
+    CHG  = AVAL - BASE,
+    PCHG = round(100 * CHG / BASE, 1)
+  )
+
+bcva_study_cat <- derive_var_bcva_category(
+  dataset = bcva_study,
+  chg_var = CHG,
+  new_var = BCVA_CAT
+)
+
+bcva_study_cat |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD, BCVA_CAT) |>
+  summarise(n = n(), .groups = "drop") |>
+  mutate(pct = round(100 * n / sum(n), 1), .by = ARMCD) |>
+  arrange(ARMCD, BCVA_CAT)
+```
+
+### Exercise 3.2 — ≥15 letter gain responder rate over time
+
+Compute the proportion of subjects gaining ≥15 letters at each post-baseline visit, separately by arm (study eye only).
+
+```{r ex-responder-time, exercise=TRUE, exercise.lines=20, exercise.setup="ex-chg-cat-solution"}
+# bcva_study_cat is available from the previous exercise
+
+responder_over_time <- bcva_study_cat |>
+  group_by(ARMCD, VISIT, VISITNUM) |>
+  summarise(
+    n             = n(),
+    n_responders  = sum(___ == "Gain >=15 letters", na.rm = TRUE),
+    pct_resp      = round(100 * n_responders / n, 1),
+    .groups       = "drop"
+  ) |>
+  arrange(ARMCD, ___)
+
+responder_over_time
+```
+
+```{r ex-responder-time-hint-1}
+# sum(BCVA_CAT == "Gain >=15 letters"); arrange by VISITNUM
+bcva_study_cat |>
+  group_by(ARMCD, VISIT, VISITNUM) |>
+  summarise(n = n(), n_responders = sum(BCVA_CAT == "Gain >=15 letters", na.rm = TRUE),
+            pct_resp = round(100 * n_responders / n, 1), .groups = "drop") |>
+  arrange(ARMCD, VISITNUM)
+```
+
+```{r ex-responder-time-solution}
+responder_over_time <- bcva_study_cat |>
+  group_by(ARMCD, VISIT, VISITNUM) |>
+  summarise(
+    n            = n(),
+    n_responders = sum(BCVA_CAT == "Gain >=15 letters", na.rm = TRUE),
+    pct_resp     = round(100 * n_responders / n, 1),
+    .groups      = "drop"
+  ) |>
+  arrange(ARMCD, VISITNUM)
+
+responder_over_time
+```
+
+### Exercise 3.3 — Study eye vs fellow eye mean BCVA change
+
+`STUDYEYE = "Y"` marks the treated study eye; `"N"` marks the fellow (untreated) eye. Compare mean BCVA change at Week 52 between the two eyes, grouped by treatment arm.
+
+```{r ex-study-eye-split, exercise=TRUE, exercise.lines=14}
+# adoe_bcva has STUDYEYE = "Y" for the study eye and "N" for the fellow eye.
+# Compute mean BCVA change (CHG) at WEEK 52 separately for
+# study eye vs fellow eye, by treatment arm.
+
+adoe_bcva |>
+  filter(VISIT == "WEEK 52", !is.na(AVAL)) |>
+  mutate(CHG = AVAL - BASE) |>
+  group_by(ARMCD, ___) |>      # group by STUDYEYE
+  summarise(
+    n        = n(),
+    mean_chg = round(mean(CHG, na.rm = TRUE), 1),
+    .groups  = "drop"
+  )
+```
+
+```{r ex-study-eye-split-hint-1}
+# group_by(ARMCD, STUDYEYE)
+```
+
+```{r ex-study-eye-split-solution}
+adoe_bcva |>
+  filter(VISIT == "WEEK 52", !is.na(AVAL)) |>
+  mutate(CHG = AVAL - BASE) |>
+  group_by(ARMCD, STUDYEYE) |>
+  summarise(
+    n        = n(),
+    mean_chg = round(mean(CHG, na.rm = TRUE), 1),
+    .groups  = "drop"
+  )
+```
+
+---
+
+## Section 4 — Intraocular Pressure (IOP)
+
+### IOP in ophthalmology trials
+
+IOP (intraocular pressure, measured in mmHg) is a safety and secondary efficacy endpoint. Normal range is approximately 10–21 mmHg; sustained elevation (glaucoma) is defined as > 21 mmHg. Anti-VEGF injections can cause transient IOP spikes.
+
+```{r quiz-iop1, echo=FALSE}
+quiz(
+  caption = "Quiz — IOP Analysis",
+
+  question("IOP is typically measured in:",
+    answer("μm (micrometres)"),
+    answer("mmHg (millimetres of mercury)", correct = TRUE,
+           message = "IOP measures the fluid pressure inside the eye using a tonometer. The clinical unit is mmHg."),
+    answer("diopters"),
+    answer("letters"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("In anti-VEGF trials, a clinically meaningful IOP elevation is typically defined as:",
+    answer("Any increase from baseline"),
+    answer("IOP > 21 mmHg at any post-injection visit, or increase ≥ 10 mmHg from baseline",
+           correct = TRUE,
+           message = "Both the absolute threshold (> 21 mmHg) and the change criterion (≥10 mmHg) are used. Transient spikes immediately post-injection are common and usually self-limiting."),
+    answer("IOP > 30 mmHg at Week 52 only"),
+    answer("Any IOP measurement outside the reference range"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 4.1 — IOP elevation flags
+
+Flag records where IOP > 21 mmHg OR CHG ≥ 10 mmHg from baseline, and report the proportion of eye-visits flagged by arm.
+
+```{r ex-iop-flag, exercise=TRUE, exercise.lines=26}
+# adoe_iop has AVAL (IOP mmHg), BASE, VISIT, OEOBJ, ARMCD, STUDYEYE
+
+iop_flagged <- adoe_iop |>
+  filter(VISIT != "BASELINE") |>
+  mutate(
+    CHG        = AVAL - BASE,
+    IOP_ELEV   = (AVAL > ___) | (CHG >= ___)   # >21 mmHg OR >=10 change
+  )
+
+# Proportion of eye-visits with elevated IOP by arm
+iop_flagged |>
+  group_by(ARMCD, OEOBJ) |>
+  summarise(
+    n_eye_visits   = n(),
+    n_elevated     = sum(IOP_ELEV, na.rm = TRUE),
+    pct_elevated   = round(100 * n_elevated / n_eye_visits, 1),
+    max_iop        = max(AVAL, na.rm = TRUE),
+    .groups        = "drop"
+  ) |>
+  arrange(ARMCD, OEOBJ)
+```
+
+```{r ex-iop-flag-hint-1}
+# IOP_ELEV = (AVAL > 21) | (CHG >= 10)
+adoe_iop |>
+  filter(VISIT != "BASELINE") |>
+  mutate(CHG = AVAL - BASE, IOP_ELEV = (AVAL > 21) | (CHG >= 10)) |>
+  group_by(ARMCD, OEOBJ) |>
+  summarise(n_eye_visits = n(), n_elevated = sum(IOP_ELEV, na.rm = TRUE),
+            pct_elevated = round(100 * n_elevated / n_eye_visits, 1),
+            max_iop = max(AVAL, na.rm = TRUE), .groups = "drop") |>
+  arrange(ARMCD, OEOBJ)
+```
+
+```{r ex-iop-flag-solution}
+iop_flagged <- adoe_iop |>
+  filter(VISIT != "BASELINE") |>
+  mutate(
+    CHG      = AVAL - BASE,
+    IOP_ELEV = (AVAL > 21) | (CHG >= 10)
+  )
+
+iop_flagged |>
+  group_by(ARMCD, OEOBJ) |>
+  summarise(
+    n_eye_visits = n(),
+    n_elevated   = sum(IOP_ELEV, na.rm = TRUE),
+    pct_elevated = round(100 * n_elevated / n_eye_visits, 1),
+    max_iop      = max(AVAL, na.rm = TRUE),
+    .groups      = "drop"
+  ) |>
+  arrange(ARMCD, OEOBJ)
+```
+
+---
+
+## Section 5 — OCT: Central Retinal Thickness
+
+### CRT and fluid resolution
+
+**Central Retinal Thickness (CRT)** is measured by Optical Coherence Tomography (OCT). In AMD and DME, the macula accumulates fluid which thickens the retina. Anti-VEGF treatment reduces this fluid — CRT decreasing toward the normal range (< 300 μm) is a sign of treatment response.
+
+```{r quiz-crt1, echo=FALSE}
+quiz(
+  caption = "Quiz — OCT / CRT",
+
+  question("Normal central retinal thickness in a healthy adult is approximately:",
+    answer("100–150 μm"),
+    answer("250–300 μm", correct = TRUE,
+           message = "Normal CRT ≈ 250–300 μm. In wet AMD or DME, CRT can exceed 400–600 μm due to subretinal or intraretinal fluid."),
+    answer("500–600 μm"),
+    answer("1000 μm — thicker is better for the retina"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("In anti-VEGF treated wet AMD, we expect CRT to:",
+    answer("Increase as new vessels form"),
+    answer("Decrease as VEGF-driven fluid is reabsorbed", correct = TRUE,
+           message = "VEGF drives vascular leakage, causing fluid accumulation and CRT increase. Anti-VEGF blocks this, allowing fluid resolution and CRT reduction."),
+    answer("Remain unchanged — CRT measures structure, not fluid"),
+    answer("Increase initially then normalise over 2 years"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 5.1 — CRT change from baseline
+
+Compute mean CRT CHG by arm and visit for the study eye. Identify which arm shows the greater reduction.
+
+```{r ex-crt-chg, exercise=TRUE, exercise.lines=20}
+# adoe_crt has AVAL (CRT in μm), BASE, VISIT, VISITNUM, OEOBJ, ARMCD, STUDYEYE
+
+crt_summary <- adoe_crt |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(CHG = ___ - ___) |>
+  group_by(___, VISIT, VISITNUM) |>
+  summarise(
+    n        = n(),
+    mean_crt = round(mean(AVAL, na.rm = TRUE), 1),
+    mean_chg = round(mean(CHG,  na.rm = TRUE), 1),
+    .groups  = "drop"
+  ) |>
+  arrange(ARMCD, ___)
+
+crt_summary
+```
+
+```{r ex-crt-chg-hint-1}
+# CHG = AVAL - BASE; group by ARMCD and VISIT/VISITNUM; arrange by VISITNUM
+adoe_crt |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(CHG = AVAL - BASE) |>
+  group_by(ARMCD, VISIT, VISITNUM) |>
+  summarise(n = n(), mean_crt = round(mean(AVAL,na.rm=TRUE),1),
+            mean_chg = round(mean(CHG,na.rm=TRUE),1), .groups = "drop") |>
+  arrange(ARMCD, VISITNUM)
+```
+
+```{r ex-crt-chg-solution}
+crt_summary <- adoe_crt |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(CHG = AVAL - BASE) |>
+  group_by(ARMCD, VISIT, VISITNUM) |>
+  summarise(
+    n        = n(),
+    mean_crt = round(mean(AVAL, na.rm = TRUE), 1),
+    mean_chg = round(mean(CHG,  na.rm = TRUE), 1),
+    .groups  = "drop"
+  ) |>
+  arrange(ARMCD, VISITNUM)
+
+crt_summary
+```
+
+### Exercise 5.2 — CRT fluid resolution flag (< 300 μm)
+
+Derive a `DRY_RETINA` flag for post-baseline visits where CRT < 300 μm (fluid resolved), and compute the proportion of subjects with a dry retina at Week 52.
+
+```{r ex-dry-retina, exercise=TRUE, exercise.lines=20}
+dry_retina <- adoe_crt |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(DRY_RETINA = AVAL < ___) |>
+  # Per-subject: was the retina ever dry at Week 52?
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(
+    n            = n(),
+    n_dry        = sum(DRY_RETINA, na.rm = TRUE),
+    pct_dry      = round(100 * n_dry / n, 1),
+    mean_crt_w52 = round(mean(AVAL, na.rm = TRUE), 1),
+    .groups      = "drop"
+  )
+
+dry_retina
+```
+
+```{r ex-dry-retina-hint-1}
+# DRY_RETINA = AVAL < 300
+adoe_crt |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(DRY_RETINA = AVAL < 300) |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_dry = sum(DRY_RETINA, na.rm = TRUE),
+            pct_dry = round(100 * n_dry / n, 1),
+            mean_crt_w52 = round(mean(AVAL, na.rm = TRUE), 1), .groups = "drop")
+```
+
+```{r ex-dry-retina-solution}
+dry_retina <- adoe_crt |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(DRY_RETINA = AVAL < 300) |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(
+    n            = n(),
+    n_dry        = sum(DRY_RETINA, na.rm = TRUE),
+    pct_dry      = round(100 * n_dry / n, 1),
+    mean_crt_w52 = round(mean(AVAL, na.rm = TRUE), 1),
+    .groups      = "drop"
+  )
+
+dry_retina
+```
+
+---
+
+## Section 6 — Capstone Problems
+
+### Capstone 1 — Complete ADOE Assembly
+
+**Scenario:** You are programming ADOE for an AMD NDA submission. The dataset must contain for the **study eye** (`STUDYEYE = "Y"`):
+
+| PARAMCD | Description | DTYPE |
+|---------|-------------|-------|
+| `VAET_OD` / `VAET_OS` | Observed BCVA (letters) + CHG + PCHG | NA |
+| `LOGMAR_OD` / `LOGMAR_OS` | logMAR transformed BCVA | NA (new derived column) |
+| `RESP15` | ≥15-letter gain responder flag | `RESP` |
+| `IOP_OD` / `IOP_OS` | Observed IOP + CHG | NA |
+| `CRT_OD` / `CRT_OS` | Observed CRT + CHG | NA |
+
+The final dataset must be sorted by `USUBJID`, `PARAMCD`, `VISITNUM`.
+
+```{r capstone1, exercise=TRUE, exercise.lines=65}
+# ── Step 1: BCVA with CHG, PCHG, logMAR ──────────────────────────────────────
+adoe_bcva_c1 <- adoe_bcva |>
+  filter(STUDYEYE == "Y") |>
+  mutate(
+    CHG   = AVAL - BASE,
+    PCHG  = round(100 * CHG / BASE, 2)
+  ) |>
+  derive_var_aval_logmar(aval_var = AVAL, new_var = LOGMAR)
+
+# ── Step 2: BCVA ≥15-letter responder (ever across all post-baseline visits) ─
+adoe_resp <- derive_param_bcva_responder(
+  dataset       = adoe_bcva_c1 |> filter(VISIT != "BASELINE"),
+  dataset_adsl  = adsl_optha,
+  by_vars       = c("USUBJID","PARAMCD"),
+  chg_var       = CHG,
+  threshold     = ___,
+  set_values_to = list(
+    PARAM   = "BCVA >=15 Letter Gain Responder",
+    PARAMCD = "RESP15"
+  )
+)
+
+# ── Step 3: IOP with CHG ───────────────────────────────────────────────────
+adoe_iop_c1 <- adoe_iop |>
+  filter(STUDYEYE == "Y") |>
+  mutate(CHG = ___ - ___)
+
+# ── Step 4: CRT with CHG ──────────────────────────────────────────────────
+adoe_crt_c1 <- adoe_crt |>
+  filter(STUDYEYE == "Y") |>
+  mutate(CHG = ___ - ___)
+
+# ── Step 5: Assemble ──────────────────────────────────────────────────────
+adoe_final <- bind_rows(
+  adoe_bcva_c1,
+  adoe_resp   |> filter(DTYPE == "RESP"),
+  adoe_iop_c1,
+  adoe_crt_c1
+) |>
+  arrange(___, ___, ___)
+
+# ── Validation ────────────────────────────────────────────────────────────
+cat("Total rows:", nrow(adoe_final), "\n")
+adoe_final |>
+  count(OETESTCD, DTYPE) |>
+  arrange(OETESTCD, DTYPE) |>
+  print()
+```
+
+```{r capstone1-hint-1}
+# threshold = 15
+# Step 3: CHG = AVAL - BASE
+# Step 4: CHG = AVAL - BASE
+# arrange: USUBJID, PARAMCD, VISITNUM
+```
+
+```{r capstone1-solution}
+adoe_bcva_c1 <- adoe_bcva |>
+  filter(STUDYEYE == "Y") |>
+  mutate(CHG  = AVAL - BASE,
+         PCHG = round(100 * CHG / BASE, 2)) |>
+  derive_var_aval_logmar(aval_var = AVAL, new_var = LOGMAR)
+
+adoe_resp <- derive_param_bcva_responder(
+  dataset       = adoe_bcva_c1 |> filter(VISIT != "BASELINE"),
+  dataset_adsl  = adsl_optha,
+  by_vars       = c("USUBJID","PARAMCD"),
+  chg_var       = CHG,
+  threshold     = 15,
+  set_values_to = list(
+    PARAM   = "BCVA >=15 Letter Gain Responder",
+    PARAMCD = "RESP15"
+  )
+)
+
+adoe_iop_c1 <- adoe_iop |>
+  filter(STUDYEYE == "Y") |>
+  mutate(CHG = AVAL - BASE)
+
+adoe_crt_c1 <- adoe_crt |>
+  filter(STUDYEYE == "Y") |>
+  mutate(CHG = AVAL - BASE)
+
+adoe_final <- bind_rows(
+  adoe_bcva_c1,
+  adoe_resp |> filter(DTYPE == "RESP"),
+  adoe_iop_c1,
+  adoe_crt_c1
+) |>
+  arrange(USUBJID, PARAMCD, VISITNUM)
+
+cat("Total rows:", nrow(adoe_final), "\n")
+adoe_final |>
+  count(OETESTCD, DTYPE) |>
+  arrange(OETESTCD, DTYPE) |>
+  print()
+```
+
+### Capstone 2 — Ophthalmology Efficacy Summary Table
+
+**Scenario:** The Data Review Committee needs an interim efficacy summary table for the study eye, containing:
+
+1. Mean change from baseline in BCVA letters at Week 12, 24, 52 — by arm
+2. % subjects gaining ≥15 letters at Week 52 — by arm
+3. % subjects losing ≥15 letters at Week 52 — by arm (safety threshold)
+4. Mean CRT change at Week 52 — by arm
+5. Mean IOP at Week 52 and % with IOP > 21 mmHg — by arm (safety)
+
+All in one tidy summary data frame with columns: `Endpoint`, `ARMCD`, `Value`.
+
+```{r capstone2, exercise=TRUE, exercise.lines=70}
+# ── CHG data already derived above ───────────────────────────────────────────
+bcva_chg <- adoe_bcva |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(CHG = AVAL - BASE) |>
+  derive_var_bcva_category(chg_var = CHG, new_var = BCVA_CAT)
+
+# ── 1. Mean BCVA CHG at key visits ───────────────────────────────────────────
+bcva_chg_tbl <- bcva_chg |>
+  filter(VISIT %in% c("WEEK 12","WEEK 24","WEEK 52")) |>
+  group_by(ARMCD, VISIT) |>
+  summarise(
+    Endpoint = paste0("Mean BCVA CHG (", VISIT, ")"),
+    Value    = sprintf("%.1f letters (n=%d)", mean(CHG, na.rm=TRUE), n()),
+    .groups  = "drop"
+  )
+
+# ── 2. ≥15-letter gain at Week 52 ────────────────────────────────────────────
+gain15_tbl <- bcva_chg |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(
+    Endpoint = "Gained >=15 letters at Wk52",
+    Value    = sprintf("%d/%d (%.1f%%)",
+                       sum(BCVA_CAT == "Gain >=15 letters", na.rm=TRUE), n(),
+                       100*mean(BCVA_CAT == "Gain >=15 letters", na.rm=TRUE)),
+    .groups  = "drop"
+  )
+
+# ── 3. ≥15-letter loss at Week 52 (safety) ───────────────────────────────────
+loss15_tbl <- bcva_chg |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(___) |>
+  summarise(
+    Endpoint = "Lost >=15 letters at Wk52",
+    Value    = sprintf("%d/%d (%.1f%%)",
+                       sum(___ == "Loss >=15 letters", na.rm=TRUE), n(),
+                       100*mean(___ == "Loss >=15 letters", na.rm=TRUE)),
+    .groups  = "drop"
+  )
+
+# ── 4. CRT CHG at Week 52 ────────────────────────────────────────────────────
+crt_tbl <- adoe_crt |>
+  filter(STUDYEYE == "Y", VISIT == "WEEK 52") |>
+  mutate(CHG = AVAL - BASE) |>
+  group_by(___) |>
+  summarise(
+    Endpoint = "Mean CRT CHG at Wk52 (μm)",
+    Value    = sprintf("%.1f (n=%d)", mean(CHG, na.rm=TRUE), n()),
+    .groups  = "drop"
+  )
+
+# ── 5. IOP safety at Week 52 ─────────────────────────────────────────────────
+iop_tbl <- adoe_iop |>
+  filter(STUDYEYE == "Y", VISIT == "WEEK 52") |>
+  group_by(___) |>
+  summarise(
+    Endpoint = "IOP >21 mmHg at Wk52",
+    Value    = sprintf("%d/%d (%.1f%%)",
+                       sum(AVAL > 21, na.rm=TRUE), n(),
+                       100*mean(AVAL > 21, na.rm=TRUE)),
+    .groups  = "drop"
+  )
+
+# ── Assemble ─────────────────────────────────────────────────────────────────
+summary_tbl <- bind_rows(bcva_chg_tbl, gain15_tbl, loss15_tbl, crt_tbl, iop_tbl) |>
+  select(Endpoint, ARMCD, Value) |>
+  arrange(Endpoint, ARMCD)
+
+print(summary_tbl, n = Inf)
+```
+
+```{r capstone2-hint-1}
+# loss15_tbl: group by ARMCD; BCVA_CAT == "Loss >=15 letters"
+# crt_tbl: group by ARMCD; mean(CHG)
+# iop_tbl: group by ARMCD; sum(AVAL > 21)
+```
+
+```{r capstone2-solution}
+bcva_chg <- adoe_bcva |>
+  filter(STUDYEYE == "Y", VISIT != "BASELINE") |>
+  mutate(CHG = AVAL - BASE) |>
+  derive_var_bcva_category(chg_var = CHG, new_var = BCVA_CAT)
+
+bcva_chg_tbl <- bcva_chg |>
+  filter(VISIT %in% c("WEEK 12","WEEK 24","WEEK 52")) |>
+  group_by(ARMCD, VISIT) |>
+  summarise(Endpoint = paste0("Mean BCVA CHG (", VISIT, ")"),
+            Value = sprintf("%.1f letters (n=%d)", mean(CHG,na.rm=TRUE), n()),
+            .groups = "drop")
+
+gain15_tbl <- bcva_chg |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(Endpoint = "Gained >=15 letters at Wk52",
+            Value = sprintf("%d/%d (%.1f%%)", sum(BCVA_CAT=="Gain >=15 letters",na.rm=TRUE),
+                            n(), 100*mean(BCVA_CAT=="Gain >=15 letters",na.rm=TRUE)),
+            .groups = "drop")
+
+loss15_tbl <- bcva_chg |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(Endpoint = "Lost >=15 letters at Wk52",
+            Value = sprintf("%d/%d (%.1f%%)", sum(BCVA_CAT=="Loss >=15 letters",na.rm=TRUE),
+                            n(), 100*mean(BCVA_CAT=="Loss >=15 letters",na.rm=TRUE)),
+            .groups = "drop")
+
+crt_tbl <- adoe_crt |>
+  filter(STUDYEYE == "Y", VISIT == "WEEK 52") |>
+  mutate(CHG = AVAL - BASE) |>
+  group_by(ARMCD) |>
+  summarise(Endpoint = "Mean CRT CHG at Wk52 (μm)",
+            Value = sprintf("%.1f (n=%d)", mean(CHG,na.rm=TRUE), n()),
+            .groups = "drop")
+
+iop_tbl <- adoe_iop |>
+  filter(STUDYEYE == "Y", VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(Endpoint = "IOP >21 mmHg at Wk52",
+            Value = sprintf("%d/%d (%.1f%%)", sum(AVAL>21,na.rm=TRUE),
+                            n(), 100*mean(AVAL>21,na.rm=TRUE)),
+            .groups = "drop")
+
+summary_tbl <- bind_rows(bcva_chg_tbl, gain15_tbl, loss15_tbl, crt_tbl, iop_tbl) |>
+  select(Endpoint, ARMCD, Value) |>
+  arrange(Endpoint, ARMCD)
+
+print(summary_tbl, n = Inf)
+```
+
+---
+
+## Section 7 — Hard Challenges
+
+### Challenge 1 — Handling missing vision: LOCF for BCVA
+
+**Scenario:** Per protocol, subjects who permanently lose light perception (NLP — No Light Perception) have subsequent BCVA imputed as 0. Subjects who miss a visit due to reasons other than NLP have their BCVA carried forward (LOCF). Implement both rules on `adoe_bcva` (study eye only).
+
+```{r challenge-locf, exercise=TRUE, exercise.lines=44}
+# Simulate some missing data: randomly set 8% of post-baseline BCVA to NA
+set.seed(42)
+bcva_with_missing <- adoe_bcva |>
+  filter(STUDYEYE == "Y") |>
+  mutate(
+    AVAL_MISS = if_else(
+      VISIT != "BASELINE" & runif(n()) < 0.08,
+      NA_real_, AVAL
+    )
+  )
+
+# LOCF imputation within subject (study eye)
+# Rule: carry the last non-missing observation forward
+bcva_locf <- bcva_with_missing |>
+  arrange(USUBJID, VISITNUM) |>
+  group_by(USUBJID) |>
+  mutate(
+    AVAL_LOCF = {
+      x <- AVAL_MISS
+      for (i in seq_along(x)) {
+        if (is.na(x[i]) && i > 1) x[i] <- x[i - 1]
+      }
+      x
+    },
+    DTYPE = if_else(is.na(AVAL_MISS) & !is.na(AVAL_LOCF), "LOCF", NA_character_)
+  ) |>
+  ungroup()
+
+# How many records were LOCF-imputed?
+cat("LOCF-imputed records:", sum(bcva_locf$DTYPE == "LOCF", na.rm = TRUE), "\n")
+
+# Compare mean BCVA at Week 52: observed vs LOCF-imputed
+bcva_locf |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(
+    n_total     = n(),
+    n_imputed   = sum(DTYPE == "LOCF", na.rm = TRUE),
+    mean_obs    = round(mean(AVAL_MISS,  na.rm = TRUE), 1),
+    mean_locf   = round(mean(___,        na.rm = TRUE), 1),
+    .groups     = "drop"
+  )
+```
+
+```{r challenge-locf-hint-1}
+# mean_locf uses AVAL_LOCF (the imputed column)
+# The LOCF loop carries x[i-1] forward when x[i] is NA
+```
+
+```{r challenge-locf-solution}
+set.seed(42)
+bcva_with_missing <- adoe_bcva |>
+  filter(STUDYEYE == "Y") |>
+  mutate(AVAL_MISS = if_else(VISIT != "BASELINE" & runif(n()) < 0.08, NA_real_, AVAL))
+
+bcva_locf <- bcva_with_missing |>
+  arrange(USUBJID, VISITNUM) |>
+  group_by(USUBJID) |>
+  mutate(
+    AVAL_LOCF = {
+      x <- AVAL_MISS
+      for (i in seq_along(x)) if (is.na(x[i]) && i > 1) x[i] <- x[i - 1]
+      x
+    },
+    DTYPE = if_else(is.na(AVAL_MISS) & !is.na(AVAL_LOCF), "LOCF", NA_character_)
+  ) |>
+  ungroup()
+
+cat("LOCF-imputed records:", sum(bcva_locf$DTYPE == "LOCF", na.rm = TRUE), "\n")
+
+bcva_locf |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(n_total   = n(), n_imputed = sum(DTYPE == "LOCF", na.rm = TRUE),
+            mean_obs  = round(mean(AVAL_MISS, na.rm = TRUE), 1),
+            mean_locf = round(mean(AVAL_LOCF, na.rm = TRUE), 1), .groups = "drop")
+```
+
+### Challenge 2 — Fellow-eye correlation analysis
+
+**Scenario:** A medical monitor asks whether the study eye BCVA improvement correlates with fellow-eye stability (fellow eye CHG ≈ 0 is expected). Build a paired dataset with both eyes' Week 52 CHG per subject, compute the correlation, and flag subjects where the fellow eye unexpectedly changed by ≥10 letters.
+
+```{r challenge-fellow-eye, exercise=TRUE, exercise.lines=36}
+# Build paired OD vs OS BCVA change at Week 52
+paired_eyes <- adoe_bcva |>
+  filter(VISIT == "WEEK 52") |>
+  mutate(CHG = AVAL - BASE) |>
+  select(USUBJID, OEOBJ, CHG, ARMCD, STDEYE) |>
+  pivot_wider(
+    names_from  = OEOBJ,
+    values_from = CHG,
+    names_prefix = "CHG_"
+  ) |>
+  mutate(
+    STUDY_CHG  = if_else(STDEYE == "OD", CHG_OD, CHG_OS),
+    FELLOW_CHG = if_else(STDEYE == "OD", CHG_OS, CHG_OD),
+    FELLOW_ALERT = abs(___) >= ___    # fellow eye ≥10 letter change
+  )
+
+# Correlation between study and fellow eye CHG
+cat("Pearson correlation (study vs fellow CHG at Wk52):",
+    round(cor(paired_eyes$STUDY_CHG, paired_eyes$FELLOW_CHG, use="complete.obs"), 3), "\n")
+
+# Subjects with unexpected fellow-eye change
+cat("Subjects with |fellow CHG| >= 10 letters:",
+    sum(paired_eyes$FELLOW_ALERT, na.rm = TRUE), "\n")
+
+# Summarise by arm
+paired_eyes |>
+  group_by(ARMCD) |>
+  summarise(
+    n             = n(),
+    mean_study    = round(mean(STUDY_CHG,  na.rm = TRUE), 1),
+    mean_fellow   = round(mean(FELLOW_CHG, na.rm = TRUE), 1),
+    n_alerts      = sum(FELLOW_ALERT, na.rm = TRUE),
+    .groups       = "drop"
+  )
+```
+
+```{r challenge-fellow-eye-hint-1}
+# FELLOW_ALERT = abs(FELLOW_CHG) >= 10
+# correlation: cor(STUDY_CHG, FELLOW_CHG, use = "complete.obs")
+```
+
+```{r challenge-fellow-eye-solution}
+paired_eyes <- adoe_bcva |>
+  filter(VISIT == "WEEK 52") |>
+  mutate(CHG = AVAL - BASE) |>
+  select(USUBJID, OEOBJ, CHG, ARMCD, STDEYE) |>
+  pivot_wider(names_from = OEOBJ, values_from = CHG, names_prefix = "CHG_") |>
+  mutate(
+    STUDY_CHG    = if_else(STDEYE == "OD", CHG_OD, CHG_OS),
+    FELLOW_CHG   = if_else(STDEYE == "OD", CHG_OS, CHG_OD),
+    FELLOW_ALERT = abs(FELLOW_CHG) >= 10
+  )
+
+cat("Pearson correlation (study vs fellow CHG at Wk52):",
+    round(cor(paired_eyes$STUDY_CHG, paired_eyes$FELLOW_CHG, use="complete.obs"), 3), "\n")
+cat("Subjects with |fellow CHG| >= 10 letters:",
+    sum(paired_eyes$FELLOW_ALERT, na.rm = TRUE), "\n")
+
+paired_eyes |>
+  group_by(ARMCD) |>
+  summarise(n = n(), mean_study = round(mean(STUDY_CHG,na.rm=TRUE),1),
+            mean_fellow = round(mean(FELLOW_CHG,na.rm=TRUE),1),
+            n_alerts = sum(FELLOW_ALERT,na.rm=TRUE), .groups = "drop")
+```
+
+### Challenge 3 — Multi-scale BCVA shift table
+
+**Final boss:** Produce a BCVA category shift table (baseline category × Week-52 category) for the anti-VEGF arm, study eye only. Baseline categories: ≤35 letters (legally blind), 36–69 letters (moderate vision loss), ≥70 letters (mild loss / near normal).
+
+```{r challenge-shift, exercise=TRUE, exercise.lines=40}
+# Step 1: Baseline category
+bcva_baseline_cat <- adoe_bcva |>
+  filter(VISIT == "BASELINE", STUDYEYE == "Y") |>
+  mutate(
+    BASE_CAT = case_when(
+      AVAL <= 35               ~ "<=35 (legal blindness threshold)",
+      AVAL <= 69               ~ "36-69 (moderate loss)",
+      TRUE                     ~ ">=70 (near normal)"
+    )
+  ) |>
+  select(USUBJID, BASE_CAT)
+
+# Step 2: Week 52 category
+bcva_wk52_cat <- adoe_bcva |>
+  filter(VISIT == "WEEK 52", STUDYEYE == "Y") |>
+  mutate(
+    CHG = AVAL - BASE,
+    WK52_CAT = case_when(
+      AVAL <= 35  ~ "<=35",
+      AVAL <= 69  ~ "36-69",
+      TRUE        ~ ">=70"
+    )
+  ) |>
+  select(USUBJID, ARMCD, AVAL, CHG, WK52_CAT)
+
+# Step 3: Shift table for VEGF arm
+shift_tbl <- ___ |>
+  left_join(___, by = "USUBJID") |>
+  filter(ARMCD == "VEGF") |>
+  group_by(BASE_CAT, WK52_CAT) |>
+  summarise(n = n(), .groups = "drop") |>
+  pivot_wider(names_from = ___, values_from = n, values_fill = 0L) |>
+  arrange(BASE_CAT)
+
+print(shift_tbl)
+```
+
+```{r challenge-shift-hint-1}
+# left_join bcva_wk52_cat with bcva_baseline_cat by USUBJID
+# pivot_wider: names_from = WK52_CAT
+```
+
+```{r challenge-shift-solution}
+bcva_baseline_cat <- adoe_bcva |>
+  filter(VISIT == "BASELINE", STUDYEYE == "Y") |>
+  mutate(BASE_CAT = case_when(
+    AVAL <= 35 ~ "<=35 (legal blindness threshold)",
+    AVAL <= 69 ~ "36-69 (moderate loss)",
+    TRUE       ~ ">=70 (near normal)"
+  )) |>
+  select(USUBJID, BASE_CAT)
+
+bcva_wk52_cat <- adoe_bcva |>
+  filter(VISIT == "WEEK 52", STUDYEYE == "Y") |>
+  mutate(CHG = AVAL - BASE,
+         WK52_CAT = case_when(
+           AVAL <= 35 ~ "<=35", AVAL <= 69 ~ "36-69", TRUE ~ ">=70"
+         )) |>
+  select(USUBJID, ARMCD, AVAL, CHG, WK52_CAT)
+
+shift_tbl <- bcva_wk52_cat |>
+  left_join(bcva_baseline_cat, by = "USUBJID") |>
+  filter(ARMCD == "VEGF") |>
+  group_by(BASE_CAT, WK52_CAT) |>
+  summarise(n = n(), .groups = "drop") |>
+  pivot_wider(names_from = WK52_CAT, values_from = n, values_fill = 0L) |>
+  arrange(BASE_CAT)
+
+print(shift_tbl)
+```
+
+---
+
+## Lesson Summary
+
+```{r quiz-final, echo=FALSE}
+quiz(
+  caption = "Final Knowledge Check",
+
+  question("In ADOE, why does PARAMCD include the eye (e.g., 'VAET_OD') rather than storing laterality in a separate variable?",
+    answer("Regulatory guidance requires it"),
+    answer("It allows a single long dataset where each PARAMCD uniquely identifies a time series per subject, enabling standard BDS analysis functions to work without eye-specific modifications",
+           correct = TRUE),
+    answer("It reduces dataset size"),
+    answer("The eye is always OD so a suffix is needed for the OS records only"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("In a wet AMD trial, an IOP > 21 mmHg post-injection is:",
+    answer("Impossible — intravitreal injections lower IOP"),
+    answer("A known complication: transient IOP spike from the injected volume, usually self-limiting",
+           correct = TRUE,
+           message = "Each intravitreal injection increases intraocular volume transiently, causing an IOP spike. Spikes typically resolve within 30 minutes. Sustained elevation warrants treatment."),
+    answer("An automatic trial discontinuation criterion"),
+    answer("Normal and expected — anti-VEGF always raises IOP"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Key takeaways
+
+You have learned to:
+
+- Understand the **laterality challenge**: PARAMCD encoding `OETESTCD_OEOBJ` (e.g., `VAET_OD`) keeps bilateral data in a single long dataset
+- Identify and filter **study eye** vs **fellow eye** records using `STUDYEYE`
+- Convert between **ETDRS letters**, **logMAR**, and **Snellen** fractions
+- Derive `CHG`, `PCHG`, and the five **BCVA change categories** (≥15 gain, 1–14 gain, no change, 1–14 loss, ≥15 loss)
+- Build **IOP elevation flags** and **CRT fluid-resolution flags**
+- Assemble a complete **ADOE** with BCVA + logMAR + responder DTYPE + IOP + CRT
+- Apply **LOCF imputation** for missing BCVA and perform **fellow-eye correlation** QC
+- Build **multi-scale BCVA shift tables** for regulatory submission
+
+**Next lesson:** Lesson 23 — `admiralpeds` — Paediatric ADaM derivations (age-adjusted parameters, growth charts, developmental milestones, weight-based dosing).

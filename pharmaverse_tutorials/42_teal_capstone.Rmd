@@ -1,0 +1,1041 @@
+---
+title: "Lesson 42 — teal Capstone: Full Clinical Data Review App"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Build a complete, production-quality CDISCPILOT01 clinical data review
+  application from scratch using teal. Covers custom modules, teal.data
+  connectors, filter panel configuration, teal.reporter integration,
+  deployment packaging, and end-to-end testing patterns.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 42_teal_capstone.Rmd
+# PURPOSE       : teal Capstone — full CDISCPILOT01 clinical data review app with
+#                 4 custom modules (BMI scatter, AE severity, lab over
+#                 time, shift table), unit tests, and debug challenges.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+library(learnr)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(shiny)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.eval = FALSE)
+
+# ── Pharmaverseadam datasets ────────────────────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+adsl <- adsl_raw |> mutate(
+  ITTFL  = SAFFL,
+  DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"))
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw)) {
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+}
+adae <- adae_raw |> mutate(AESEVN = case_when(
+  AESEV == "MILD"     ~ 1L, AESEV == "MODERATE" ~ 2L,
+  AESEV == "SEVERE"   ~ 3L, TRUE ~ NA_integer_))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+advs <- pharmaverseadam::advs
+
+# ── Full teal mock infrastructure ────────────────────────────────────────────
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# teal.data
+cdisc_dataset <- function(dataname, x, keys=character(0), label=NULL, code=NULL) {
+  structure(list(dataname=dataname,data=x,keys=keys,
+                 label=label%||%dataname,code=code),
+            class=c("cdisc_dataset","teal_dataset"))
+}
+cdisc_data <- function(...,check=FALSE,code=NULL) {
+  datasets <- list(...)
+  names(datasets) <- vapply(datasets,function(d)d$dataname,character(1))
+  structure(list(datasets=datasets,check=check,code=code),
+            class=c("cdisc_data","teal_data"))
+}
+join_key <- function(d1,d2,keys)
+  structure(list(dataset_1=d1,dataset_2=d2,keys=keys),class="join_key")
+join_keys <- function(...) structure(list(keys=list(...)),class="join_keys")
+teal_data <- function(...,code=NULL,join_keys=NULL) {
+  datasets <- list(...)
+  call_names <- tryCatch(names(match.call(expand.dots=FALSE)$`...`),error=function(e)NULL)
+  if (!is.null(call_names) && length(call_names)==length(datasets))
+    names(datasets) <- call_names
+  structure(list(datasets=datasets,code=code,join_keys=join_keys),
+            class=c("teal_data","list"))
+}
+verify <- function(tdata) {
+  cat("── teal_data verified ─────────────────────────────────\n")
+  cat("  Datasets:", paste(names(tdata$datasets),collapse=", "),"\n")
+  invisible(tdata)
+}
+
+# teal modules
+teal_slice  <- function(dataname,varname,selected=NULL,keep_na=FALSE,...)
+  structure(list(dataname=dataname,varname=varname,selected=selected,keep_na=keep_na),class="teal_slice")
+teal_slices <- function(...,exclude_varnames=NULL)
+  structure(list(slices=list(...),exclude_varnames=exclude_varnames),class="teal_slices")
+modules <- function(...,label="root") {
+  mods <- list(...)
+  structure(list(modules=mods,label=label),class="teal_modules")
+}
+tab_group <- function(label,...) structure(list(label=label,children=list(...)),class=c("tab_group","teal_module"))
+tm_data_table       <- function(label="Data Table",...)      structure(list(label=label,type="data_table"),class=c("tm_data_table","teal_module"))
+tm_variable_browser <- function(label="Variable Browser",...) structure(list(label=label,type="var_browser"),class=c("tm_variable_browser","teal_module"))
+tm_t_summary        <- function(label="Summary",...)          structure(list(label=label,type="t_summary"),class=c("tm_t_summary","teal_module"))
+tm_t_events         <- function(label="AE Events",...)        structure(list(label=label,type="t_events"),class=c("tm_t_events","teal_module"))
+tm_t_shift_by_grade <- function(label="Shift Table",...)      structure(list(label=label,type="t_shift"),class=c("tm_t_shift","teal_module"))
+tm_g_km             <- function(label="Kaplan-Meier",...)     structure(list(label=label,type="km"),class=c("tm_g_km","teal_module"))
+tm_g_scatterplot    <- function(label="Scatter",...)          structure(list(label=label,type="scatter"),class=c("tm_g_scatter","teal_module"))
+tm_missing_data     <- function(label="Missing Data",...)     structure(list(label=label,type="missing"),class=c("tm_missing_data","teal_module"))
+
+# Custom module constructor
+teal_module <- function(label,ui,server,datanames="all",
+                        ui_args=list(),server_args=list(),...) {
+  structure(list(label=label,ui=ui,server=server,datanames=datanames,
+                 ui_args=ui_args,server_args=server_args),
+            class=c("teal_module_custom","teal_module"))
+}
+
+# teal app
+teal <- function(data,modules,title="teal app",filter=NULL,header=NULL,footer=NULL,...) {
+  structure(list(data=data,modules=modules,title=title,
+                 filter=filter,header=header,footer=footer),
+            class=c("teal_app","shiny.appobj"))
+}
+print.teal_app <- function(x,...) {
+  cat("╔══════════════════════════════════════════════════════╗\n")
+  cat("║  teal Application:", x$title, "\n")
+  cat("╠══════════════════════════════════════════════════════╣\n")
+  ds <- if (!is.null(x$data$datasets)) names(x$data$datasets) else "?"
+  cat("║  Datasets:", paste(ds,collapse=", "),"\n")
+  mods <- if (inherits(x$modules,"teal_modules")) x$modules$modules else list()
+  cat("║  Modules:\n")
+  for (m in mods) {
+    if (inherits(m,"tab_group")) {
+      cat("║    [group]",m$label,"\n")
+      for (c in m$children) cat("║      •",c$label,"\n")
+    } else {
+      cat("║    •",m$label,"\n")
+    }
+  }
+  if (!is.null(x$filter)) cat("║  Pre-filters:",length(x$filter$slices),"slice(s)\n")
+  cat("╚══════════════════════════════════════════════════════╝\n")
+  invisible(x)
+}
+
+# qenv mock
+qenv <- function() {
+  env <- new.env(parent=baseenv())
+  env$.log <- character(0)
+  env$eval <- function(expr_str) {
+    env$.log <- c(env$.log, expr_str)
+    eval(parse(text=expr_str), envir=env)
+    invisible(env)
+  }
+  env$get_code <- function() paste(env$.log, collapse="\n")
+  class(env) <- c("qenv","environment")
+  env
+}
+```
+
+## Overview
+
+This capstone brings together every concept from Lessons 39–41 into a single, production-quality CDISCPILOT01 clinical data review application. You will build all layers from scratch: the data connector, join keys, three custom modules, the filter panel, and the deployment package.
+
+The finished app will have four tab groups covering demographics, safety, lab data, and a patient profile, using both ready-made modules from `teal.modules.clinical` and custom modules written to the `teal_module()` API.
+
+---
+
+## 1 — App Design
+
+### 1.1 Scope
+
+| Tab Group | Modules | Datasets |
+|-----------|---------|---------|
+| Explorer | Data Table, Variable Browser | ADSL, ADAE, ADLB |
+| Demographics | Summary Table (ADSL), BMI scatter | ADSL |
+| Safety | AE events table, AE severity bar chart | ADSL, ADAE |
+| Lab Data | Lab by visit (line), Lab toxicity shift table | ADSL, ADLB |
+
+### 1.2 App file structure
+
+```
+cdiscpilot_review/
+├── app.R                  ← main entry point
+├── R/
+│   ├── data_loader.R      ← load_study_data()
+│   ├── tm_ae_severity.R   ← custom AE severity module
+│   ├── tm_lab_line.R      ← custom lab mean-over-time module
+│   └── tm_bmi_scatter.R   ← custom BMI scatter module
+├── renv.lock
+└── renv/activate.R
+```
+
+In this lesson we write everything in-line for clarity; in production, split into the `R/` files shown.
+
+---
+
+## 2 — Data Layer
+
+### 2.1 Build the production data connector
+
+```{r data-layer-ex, exercise=TRUE, exercise.lines=50}
+# ── Load & prepare ──────────────────────────────────────────────────────────
+load_study_data <- function(dataname) {
+  adam_dir <- Sys.getenv("ADAM_DIR", unset = "")
+  fname    <- paste0(tolower(dataname), ".xpt")
+  full     <- file.path(adam_dir, fname)
+
+  if (nchar(adam_dir) > 0 && file.exists(full)) {
+    haven::read_xpt(full)
+  } else {
+    get(tolower(dataname), envir = asNamespace("pharmaverseadam"))
+  }
+}
+
+adsl_app <- load_study_data("adsl") |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N")
+  )
+
+adae_app <- load_study_data("adae") |>
+  { d <- .
+    if ("TRTA" %in% names(d) && !"TRT01A" %in% names(d)) rename(d, TRT01A=TRTA)
+    else d
+  }() |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb_app <- load_study_data("adlb") |>
+  { d <- .; if ("DTYPE" %in% names(d)) filter(d, is.na(DTYPE)) else d }() |>
+  mutate(ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+
+# ── teal_data with join keys ─────────────────────────────────────────────────
+app_data <- teal_data(
+  ADSL = adsl_app,
+  ADAE = adae_app,
+  ADLB = adlb_app,
+  join_keys = join_keys(
+    join_key("ADSL","ADSL", c("STUDYID","USUBJID")),
+    join_key("ADAE","ADAE", c("STUDYID","USUBJID","AESEQ")),
+    join_key("ADLB","ADLB", c("STUDYID","USUBJID","PARAMCD","ADT")),
+    join_key("ADSL","ADAE", c("STUDYID"="STUDYID","USUBJID"="USUBJID")),
+    join_key("ADSL","ADLB", c("STUDYID"="STUDYID","USUBJID"="USUBJID"))
+  )
+)
+
+verify(app_data)
+```
+
+---
+
+## 3 — Custom Module 1: BMI Scatter
+
+This module shows a BMI vs. Age scatter plot coloured by treatment arm.
+
+```{r bmi-module, exercise=TRUE, exercise.lines=40}
+tm_bmi_scatter <- function(label    = "BMI vs Age",
+                            dataname = "ADSL") {
+  teal_module(
+    label      = label,
+    datanames  = dataname,
+    server_args = list(dataname = dataname),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        fluidRow(
+          column(4, checkboxGroupInput(ns("arms"), "Treatment Arms",
+                                       choices = c("Placebo",
+                                                   "Xanomeline Low Dose",
+                                                   "Xanomeline High Dose"),
+                                       selected = c("Placebo",
+                                                    "Xanomeline Low Dose",
+                                                    "Xanomeline High Dose")))
+        ),
+        plotOutput(ns("bmi_plot"), height = "450px")
+      )
+    },
+
+    server = function(id, data, reporter, dataname, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[[dataname]])
+
+        output$bmi_plot <- renderPlot({
+          req(adsl_r(), input$arms)
+          d <- adsl_r() |>
+            filter(TRT01P %in% input$arms, !is.na(BMIBL), !is.na(AGE))
+
+          if (nrow(d) == 0) {
+            plot.new()
+            text(0.5, 0.5, "No data for selected arms", cex=1.4, col="grey50")
+            return(invisible(NULL))
+          }
+
+          ggplot(d, aes(x=AGE, y=BMIBL, colour=TRT01P)) +
+            geom_point(alpha=0.7, size=2.5) +
+            geom_smooth(method="lm", se=TRUE, linewidth=1, alpha=0.2) +
+            labs(title="BMI vs Age by Treatment Arm",
+                 x="Age (years)", y="BMI at Baseline (kg/m²)",
+                 colour="Treatment") +
+            theme_minimal(base_size=14) +
+            theme(legend.position="bottom")
+        })
+      })
+    }
+  )
+}
+
+mod <- tm_bmi_scatter()
+cat("Module:", mod$label, "| Datanames:", mod$datanames, "\n")
+```
+
+---
+
+## 4 — Custom Module 2: AE Severity Bar
+
+```{r ae-module, exercise=TRUE, exercise.lines=50}
+tm_ae_severity <- function(label   = "AE Severity Distribution",
+                            arm_var = "TRT01A") {
+  teal_module(
+    label       = label,
+    datanames   = c("ADSL","ADAE"),
+    server_args = list(arm_var = arm_var),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        fluidRow(
+          column(4,
+            selectInput(ns("soc"), "System Organ Class",
+                        choices = c("All SOCs" = "ALL"), selected = "ALL")
+          ),
+          column(4,
+            radioButtons(ns("count_type"), "Count by",
+                         choices = c("Number of AEs"     = "ae",
+                                     "Number of Subjects" = "subj"),
+                         selected = "ae")
+          )
+        ),
+        plotOutput(ns("sev_plot"), height = "450px")
+      )
+    },
+
+    server = function(id, data, reporter, arm_var, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[["ADSL"]])
+        adae_r <- reactive(data()[["ADAE"]])
+
+        # Populate SOC choices
+        observe({
+          req(adae_r())
+          socs <- c("All SOCs" = "ALL", sort(unique(adae_r()$AESOC)))
+          updateSelectInput(session, "soc", choices = socs)
+        })
+
+        plot_data <- reactive({
+          req(adae_r(), adsl_r())
+          d <- adae_r() |>
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by="USUBJID")
+          if (input$soc != "ALL")
+            d <- filter(d, AESOC == input$soc)
+          if (input$count_type == "subj")
+            d <- distinct(d, USUBJID, TRT01P, AESEV)
+          d
+        })
+
+        output$sev_plot <- renderPlot({
+          req(plot_data())
+          d <- plot_data()
+
+          if (nrow(d) == 0) {
+            plot.new()
+            text(0.5, 0.5, "No AEs for selected filters", cex=1.4, col="grey50")
+            return(invisible(NULL))
+          }
+
+          y_label <- if (input$count_type == "ae") "Number of AEs"
+                     else "Number of Subjects with AE"
+
+          d |>
+            count(TRT01P, AESEV) |>
+            mutate(AESEV = factor(AESEV,
+                                  levels = c("MILD","MODERATE","SEVERE"))) |>
+            ggplot(aes(x=TRT01P, y=n, fill=AESEV)) +
+            geom_col(position="dodge") +
+            scale_fill_manual(values=c(MILD="#3498db", MODERATE="#e67e22",
+                                       SEVERE="#e74c3c")) +
+            labs(title = if (input$soc == "ALL") "AE Severity — All SOCs"
+                         else paste("AE Severity —", input$soc),
+                 x = NULL, y = y_label, fill = "Severity") +
+            theme_minimal(base_size=14) +
+            theme(axis.text.x = element_text(angle=30, hjust=1))
+        })
+      })
+    }
+  )
+}
+
+mod <- tm_ae_severity()
+cat("Module:", mod$label, "\n")
+```
+
+---
+
+## 5 — Custom Module 3: Lab Mean-Over-Time
+
+```{r lab-module, exercise=TRUE, exercise.lines=55}
+tm_lab_over_time <- function(label          = "Lab Values Over Time",
+                              default_param  = "ALT") {
+  teal_module(
+    label       = label,
+    datanames   = c("ADSL","ADLB"),
+    server_args = list(default_param = default_param),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        fluidRow(
+          column(3, selectInput(ns("param"), "Parameter", choices=NULL)),
+          column(3, checkboxInput(ns("show_ci"), "Show 95% CI", value=TRUE)),
+          column(3, checkboxInput(ns("log_y"),   "Log Y-axis",  value=FALSE))
+        ),
+        plotOutput(ns("lab_plot"), height="450px"),
+        hr(),
+        h5("Summary by Visit"),
+        tableOutput(ns("visit_table"))
+      )
+    },
+
+    server = function(id, data, reporter, default_param, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[["ADSL"]])
+        adlb_r <- reactive(data()[["ADLB"]])
+
+        observe({
+          req(adlb_r())
+          params <- sort(unique(adlb_r()$PARAMCD))
+          updateSelectInput(session, "param", choices=params,
+                            selected=default_param)
+        })
+
+        merged <- reactive({
+          req(adsl_r(), adlb_r(), input$param)
+          adlb_r() |>
+            filter(PARAMCD == input$param, !is.na(AVAL), !is.na(AVISITN)) |>
+            filter(AVISITN < 900) |>        # exclude sentinel visits
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by="USUBJID") |>
+            filter(!is.na(TRT01P))
+        })
+
+        summary_data <- reactive({
+          req(merged())
+          merged() |>
+            group_by(TRT01P, AVISIT, AVISITN) |>
+            summarise(
+              N    = n(),
+              Mean = mean(AVAL, na.rm=TRUE),
+              SD   = sd(AVAL,   na.rm=TRUE),
+              SE   = SD / sqrt(N),
+              LCI  = Mean - 1.96 * SE,
+              UCI  = Mean + 1.96 * SE,
+              .groups = "drop"
+            ) |>
+            arrange(TRT01P, AVISITN)
+        })
+
+        output$lab_plot <- renderPlot({
+          req(summary_data())
+          d <- summary_data()
+
+          if (nrow(d) == 0) {
+            plot.new()
+            text(0.5, 0.5, "No data after filtering", cex=1.4, col="grey50")
+            return(invisible(NULL))
+          }
+
+          # Order visits by AVISITN
+          visit_order <- d |> distinct(AVISIT, AVISITN) |> arrange(AVISITN) |> pull(AVISIT)
+          d <- mutate(d, AVISIT = factor(AVISIT, levels=visit_order))
+
+          p <- ggplot(d, aes(x=AVISIT, y=Mean, colour=TRT01P, group=TRT01P)) +
+            geom_line(linewidth=1) +
+            geom_point(size=3) +
+            labs(title = paste("Mean", input$param, "over Time"),
+                 subtitle = "Vertical bars = 95% CI",
+                 x="Visit", y=paste(input$param, "[mean]"),
+                 colour="Treatment") +
+            theme_minimal(base_size=14) +
+            theme(axis.text.x = element_text(angle=45, hjust=1),
+                  legend.position="bottom")
+
+          if (input$show_ci)
+            p <- p + geom_errorbar(aes(ymin=LCI, ymax=UCI),
+                                   width=0.3, alpha=0.6)
+          if (input$log_y)
+            p <- p + scale_y_log10()
+
+          p
+        })
+
+        output$visit_table <- renderTable({
+          req(summary_data())
+          summary_data() |>
+            mutate(across(c(Mean,SD,SE,LCI,UCI), ~round(.x,2))) |>
+            rename(`Treatment` = TRT01P, `Visit` = AVISIT,
+                   `Mean`=Mean, `SD`=SD, `95% LCI`=LCI, `95% UCI`=UCI) |>
+            select(Treatment, Visit, N, Mean, SD, `95% LCI`, `95% UCI`)
+        }, striped=TRUE, hover=TRUE, bordered=TRUE)
+      })
+    }
+  )
+}
+
+mod <- tm_lab_over_time()
+cat("Module:", mod$label, "\n")
+```
+
+---
+
+## 6 — Custom Module 4: Lab Toxicity Shift Table
+
+```{r shift-module, exercise=TRUE, exercise.lines=40}
+tm_lab_shift_table <- function(label         = "Lab Toxicity Shift",
+                                default_param = "ALT") {
+  teal_module(
+    label       = label,
+    datanames   = "ADLB",
+    server_args = list(default_param = default_param),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        fluidRow(
+          column(3, selectInput(ns("param"), "Parameter", choices=NULL)),
+          column(3, selectInput(ns("arm"),   "Treatment Arm",
+                                choices=NULL))
+        ),
+        h5("Baseline Grade → Post-Baseline Grade Shift"),
+        tableOutput(ns("shift_tbl"))
+      )
+    },
+
+    server = function(id, data, reporter, default_param, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adlb_r <- reactive(data()[["ADLB"]])
+
+        observe({
+          req(adlb_r())
+          params <- sort(unique(adlb_r()$PARAMCD))
+          arms   <- sort(unique(adlb_r()$TRT01P))
+          updateSelectInput(session, "param", choices=params,
+                            selected=default_param)
+          updateSelectInput(session, "arm",   choices=arms,
+                            selected=arms[1])
+        })
+
+        output$shift_tbl <- renderTable({
+          req(adlb_r(), input$param, input$arm)
+          adlb_r() |>
+            filter(PARAMCD == input$param,
+                   TRT01P  == input$arm,
+                   !is.na(BTOXGR), !is.na(ATOXGR)) |>
+            count(BTOXGR, ATOXGR) |>
+            mutate(
+              BTOXGR = paste("Baseline Grade", BTOXGR),
+              ATOXGR = paste("Post Grade", ATOXGR)
+            ) |>
+            pivot_wider(names_from=ATOXGR, values_from=n, values_fill=0L) |>
+            rename(`Baseline / Post-Baseline` = BTOXGR)
+        }, striped=TRUE, hover=TRUE, bordered=TRUE)
+      })
+    }
+  )
+}
+
+mod <- tm_lab_shift_table()
+cat("Module:", mod$label, "\n")
+```
+
+---
+
+## 7 — Assemble the Full App
+
+Now wire everything together into the complete application.
+
+```{r full-app, exercise=TRUE, exercise.eval=FALSE, exercise.lines=80}
+# ── Data ──────────────────────────────────────────────────────────────────────
+full_app_data <- teal_data(
+  ADSL = adsl,
+  ADAE = adae,
+  ADLB = adlb,
+  join_keys = join_keys(
+    join_key("ADSL","ADSL", c("STUDYID","USUBJID")),
+    join_key("ADAE","ADAE", c("STUDYID","USUBJID","AESEQ")),
+    join_key("ADLB","ADLB", c("STUDYID","USUBJID","PARAMCD","ADT")),
+    join_key("ADSL","ADAE", c("STUDYID"="STUDYID","USUBJID"="USUBJID")),
+    join_key("ADSL","ADLB", c("STUDYID"="STUDYID","USUBJID"="USUBJID"))
+  )
+)
+
+# ── Modules ───────────────────────────────────────────────────────────────────
+full_app_modules <- modules(
+
+  # Data Explorer
+  tab_group("Data Explorer",
+    tm_data_table("Raw Data Tables"),
+    tm_variable_browser("Variable Distributions"),
+    tm_missing_data("Missingness Report")
+  ),
+
+  # Demographics
+  tab_group("Demographics",
+    tm_t_summary("Summary Table",
+                 dataname="ADSL"),
+    tm_bmi_scatter("BMI vs Age")
+  ),
+
+  # Safety
+  tab_group("Safety",
+    tm_t_events("AE Frequency Table",
+                dataname="ADAE"),
+    tm_ae_severity("AE Severity Distribution")
+  ),
+
+  # Lab Data
+  tab_group("Lab Data",
+    tm_lab_over_time("Lab Values Over Time",    default_param="ALT"),
+    tm_lab_over_time("Creatinine Over Time",    default_param="CREAT"),
+    tm_lab_shift_table("Toxicity Shift — ALT",  default_param="ALT"),
+    tm_lab_shift_table("Toxicity Shift — CREAT",default_param="CREAT")
+  )
+)
+
+# ── Filters ───────────────────────────────────────────────────────────────────
+full_app_filters <- teal_slices(
+  teal_slice("ADSL", "SAFFL",   selected = "Y"),
+  teal_slice("ADLB", "PARAMCD", selected = c("ALT","CREAT","WBC","CA")),
+  exclude_varnames = list(
+    ADSL = c("STUDYID","USUBJID","SUBJID","RFSTDTC","RFENDTC"),
+    ADAE = c("STUDYID","USUBJID"),
+    ADLB = c("STUDYID","USUBJID")
+  )
+)
+
+# ── Build app ─────────────────────────────────────────────────────────────────
+full_app <- teal(
+  data    = full_app_data,
+  modules = full_app_modules,
+  filter  = full_app_filters,
+  title   = "CDISCPILOT01 — Xanomeline Clinical Data Review",
+  header  = tags$div(
+    style = "background:#2c3e50; padding:8px 16px; color:white;",
+    tags$strong("CDISCPILOT01 — Xanomeline Study "),
+    tags$span("| Internal Use Only",
+              style="font-size:12px; color:#bdc3c7;")
+  ),
+  footer  = tags$p(
+    sprintf("Pharmaverse tutorial | Data: pharmaverseadam | %s",
+            format(Sys.Date(), "%Y-%m-%d")),
+    style="font-size:11px; color:#7f8c8d; text-align:center; padding:4px;"
+  )
+)
+
+print(full_app)
+```
+
+---
+
+## 8 — Deployment Package
+
+### 8.1 Complete `app.R` for production
+
+```{r prod-app-r, eval=FALSE}
+# ── app.R — CDISCPILOT01 Clinical Data Review ─────────────────────────────
+# Deploy to Posit Connect via rsconnect::deployApp()
+
+library(shiny)
+library(teal)
+library(teal.data)
+library(teal.modules.general)
+library(teal.modules.clinical)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Source custom modules
+source("R/data_loader.R")
+source("R/tm_bmi_scatter.R")
+source("R/tm_ae_severity.R")
+source("R/tm_lab_over_time.R")
+source("R/tm_lab_shift_table.R")
+
+# ── Load data ─────────────────────────────────────────────────────────────
+adsl <- load_study_data("adsl") |>
+  mutate(ITTFL=SAFFL,
+         DIABFL=if_else(!is.na(BMIBL)&BMIBL>=30,"Y","N",missing="N"))
+adae <- load_study_data("adae") |>
+  (\(d) if("TRTA"%in%names(d)&&!"TRT01A"%in%names(d)) rename(d,TRT01A=TRTA) else d)() |>
+  mutate(AESEVN=case_when(AESEV=="MILD"~1L,AESEV=="MODERATE"~2L,
+                           AESEV=="SEVERE"~3L,TRUE~NA_integer_))
+adlb <- load_study_data("adlb") |>
+  (\(d) if("DTYPE"%in%names(d)) filter(d,is.na(DTYPE)) else d)() |>
+  mutate(ATOXGR=as.integer(ATOXGR),BTOXGR=as.integer(BTOXGR))
+
+# ── teal_data ─────────────────────────────────────────────────────────────
+app_data <- teal_data(
+  ADSL=adsl, ADAE=adae, ADLB=adlb,
+  join_keys=join_keys(
+    join_key("ADSL","ADSL",c("STUDYID","USUBJID")),
+    join_key("ADAE","ADAE",c("STUDYID","USUBJID","AESEQ")),
+    join_key("ADLB","ADLB",c("STUDYID","USUBJID","PARAMCD","ADT")),
+    join_key("ADSL","ADAE",c("STUDYID"="STUDYID","USUBJID"="USUBJID")),
+    join_key("ADSL","ADLB",c("STUDYID"="STUDYID","USUBJID"="USUBJID"))
+  )
+)
+
+# ── Modules ───────────────────────────────────────────────────────────────
+app <- teal(
+  data    = app_data,
+  modules = modules(
+    tab_group("Data Explorer",
+      tm_data_table("Raw Data"),
+      tm_variable_browser("Variables"),
+      tm_missing_data("Missingness")
+    ),
+    tab_group("Demographics",
+      tm_t_summary("Summary Table", dataname="ADSL"),
+      tm_bmi_scatter("BMI vs Age")
+    ),
+    tab_group("Safety",
+      tm_t_events("AE Frequency", dataname="ADAE"),
+      tm_ae_severity("AE Severity")
+    ),
+    tab_group("Lab Data",
+      tm_lab_over_time("Lab Values Over Time"),
+      tm_lab_shift_table("Toxicity Shift")
+    )
+  ),
+  filter=teal_slices(
+    teal_slice("ADSL","SAFFL",selected="Y"),
+    exclude_varnames=list(
+      ADSL=c("STUDYID","USUBJID"),
+      ADAE=c("STUDYID","USUBJID"),
+      ADLB=c("STUDYID","USUBJID")
+    )
+  ),
+  title="CDISCPILOT01 Clinical Review"
+)
+
+shinyApp(ui=app$ui, server=app$server)
+```
+
+### 8.2 Deploy commands
+
+```{r deploy-ex, eval=FALSE}
+# 1. Lock dependencies
+renv::snapshot()
+
+# 2. Deploy to Posit Connect
+rsconnect::deployApp(
+  appDir      = "cdiscpilot_review/",
+  appName     = "cdiscpilot01-review",
+  server      = "connect.company.com",
+  account     = "htavakoli",
+  appFiles    = c("app.R", "R/", "renv.lock", "renv/activate.R"),
+  forceUpdate = TRUE
+)
+```
+
+---
+
+## 9 — End-to-End Testing
+
+### 9.1 Module unit tests with `testServer()`
+
+```{r e2e-tests, exercise=TRUE, exercise.lines=45}
+# Test custom BMI scatter module
+bmi_mod <- tm_bmi_scatter()
+
+# Simulate teal's filtered data delivery
+mock_data_fn <- function() list(ADSL = adsl)
+
+testServer(
+  bmi_mod$server,
+  args = list(
+    data     = mock_data_fn,
+    reporter = list(),
+    dataname = "ADSL"
+  ),
+  {
+    # Check the output renders without error
+    session$setInputs(arms = c("Placebo", "Xanomeline High Dose"))
+    expect_silent(output$bmi_plot)
+    cat("✓ BMI scatter renders with selected arms\n")
+
+    # Test empty-data guard
+    session$setInputs(arms = character(0))
+    expect_silent(output$bmi_plot)
+    cat("✓ BMI scatter handles empty arm selection\n")
+  }
+)
+```
+
+### 9.2 Lab module tests
+
+```{r lab-module-test, exercise=TRUE, exercise.lines=35}
+# Test lab over time module
+lab_mod <- tm_lab_over_time(default_param = "ALT")
+
+mock_data_fn <- function() list(ADSL = adsl, ADLB = adlb)
+
+testServer(
+  lab_mod$server,
+  args = list(
+    data          = mock_data_fn,
+    reporter      = list(),
+    default_param = "ALT"
+  ),
+  {
+    session$setInputs(param="ALT", show_ci=TRUE, log_y=FALSE)
+
+    # Plot renders
+    expect_silent(output$lab_plot)
+    cat("✓ Lab plot renders for ALT\n")
+
+    # Summary table renders
+    expect_silent(output$visit_table)
+    cat("✓ Visit summary table renders\n")
+
+    # Switch to log scale
+    session$setInputs(log_y = TRUE)
+    expect_silent(output$lab_plot)
+    cat("✓ Lab plot renders on log scale\n")
+  }
+)
+```
+
+### 9.3 Data integrity test
+
+```{r data-integrity-test, exercise=TRUE, exercise.lines=30}
+# Verify no .x/.y column collisions in merged data
+test_join_integrity <- function(adsl_df, adlb_df, param="ALT") {
+
+  merged <- adlb_df |>
+    filter(PARAMCD == param) |>
+    select(-any_of("TRT01P")) |>
+    left_join(select(adsl_df, USUBJID, TRT01P), by="USUBJID")
+
+  # No duplicate column names
+  dups <- names(merged)[duplicated(names(merged))]
+  if (length(dups) > 0) {
+    stop(sprintf("Duplicate columns after join: %s", paste(dups, collapse=", ")))
+  }
+
+  # TRT01P exists and is not all NA
+  if (!"TRT01P" %in% names(merged)) stop("TRT01P missing after join")
+  na_trt <- mean(is.na(merged$TRT01P))
+  if (na_trt > 0.5) stop(sprintf("%.0f%% NA in TRT01P — join may have failed", na_trt*100))
+
+  cat(sprintf("✓ ALT data: %d rows, %d cols, %.0f%% matched to TRT01P\n",
+              nrow(merged), ncol(merged), 100*(1-na_trt)))
+  invisible(merged)
+}
+
+test_join_integrity(adsl, adlb)
+```
+
+---
+
+## 10 — Final Challenge: Fix the Module
+
+The module below has three bugs. Identify and fix them all.
+
+```{r debug-challenge, exercise=TRUE, exercise.lines=45}
+# BUGGY MODULE — find and fix 3 bugs
+tm_ae_count_buggy <- function(label = "AE Counts") {
+  teal_module(
+    label      = label,
+    datanames  = c("ADSL", "ADAE"),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        tableOutput(ns("ae_table"))
+      )
+    },
+
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        # Bug 1: data used without ()
+        adsl_r <- reactive(data[["ADSL"]])
+
+        # Bug 2: TRT01P already exists in adae — no guard before join
+        adae_r <- reactive({
+          data()[["ADAE"]] |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID")
+        })
+
+        output$ae_table <- renderTable({
+          req(adae_r())
+
+          # Bug 3: group_by uses wrong column name (should be TRT01P)
+          adae_r() |>
+            group_by(TRT01A) |>
+            summarise(N_AEs = n(), .groups = "drop") |>
+            arrange(desc(N_AEs))
+        })
+      })
+    }
+  )
+}
+
+# Write the fixed version here:
+tm_ae_count_fixed <- function(label = "AE Counts (Fixed)") {
+  teal_module(
+    label     = label,
+    datanames = c("ADSL","ADAE"),
+    ui = function(id,...) { ns <- NS(id); tableOutput(ns("ae_table")) },
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+        adsl_r <- reactive(___)      # Fix 1
+        adae_r <- reactive({
+          ___[["ADAE"]] |>           # Fix 2a: use data()
+            select(-any_of(___)) |>  # Fix 2b: guard before join
+            left_join(select(adsl_r(), USUBJID, TRT01P), by="USUBJID")
+        })
+        output$ae_table <- renderTable({
+          req(adae_r())
+          adae_r() |>
+            group_by(___) |>         # Fix 3
+            summarise(N_AEs=n(), .groups="drop") |>
+            arrange(desc(N_AEs))
+        })
+      })
+    }
+  )
+}
+
+mod_fixed <- tm_ae_count_fixed()
+cat("Fixed module compiled:", mod_fixed$label, "\n")
+```
+
+```{r debug-challenge-solution}
+tm_ae_count_fixed <- function(label = "AE Counts (Fixed)") {
+  teal_module(
+    label     = label,
+    datanames = c("ADSL","ADAE"),
+    ui = function(id,...) { ns <- NS(id); tableOutput(ns("ae_table")) },
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+        # Fix 1: data() with parentheses
+        adsl_r <- reactive(data()[["ADSL"]])
+        adae_r <- reactive({
+          # Fix 2a: data() with parentheses
+          # Fix 2b: guard with select(-any_of("TRT01P")) before join
+          data()[["ADAE"]] |>
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by="USUBJID")
+        })
+        output$ae_table <- renderTable({
+          req(adae_r())
+          adae_r() |>
+            group_by(TRT01P) |>    # Fix 3: TRT01P not TRT01A
+            summarise(N_AEs=n(), .groups="drop") |>
+            arrange(desc(N_AEs))
+        })
+      })
+    }
+  )
+}
+
+mod_fixed <- tm_ae_count_fixed()
+cat("Fixed module compiled:", mod_fixed$label, "\n")
+```
+
+---
+
+## Summary
+
+You have built a complete, production-quality clinical data review application:
+
+**Architecture:**
+- `teal_data()` with `join_keys()` for a fully connected three-dataset layer
+- Environment-variable-based data loader for flexible dev/prod switching
+- Four custom `teal_module()` modules with full reactive server logic
+
+**Patterns mastered:**
+- `data()[[\"DATANAME\"]]` — the reactive data accessor (always with `()`)
+- `select(-any_of(...))` — the collision guard before every join
+- Empty-data guard (`nrow(d) == 0`) — prevents cryptic render errors
+- Dynamic `updateSelectInput()` driven by actual filtered data
+- `testServer()` — unit testing reactive server logic without launching Shiny
+
+**Deployment:**
+- `renv::snapshot()` / `renv::restore()` for reproducible environments
+- `Sys.getenv()` for all credentials and paths
+- `rsconnect::deployApp()` for Posit Connect publishing
+
+---
+
+## What's Next — Pharmaverse10
+
+The next module (Lessons 43–48) covers the submission and quality layer of the pharmaverse:
+
+| Lesson | Topic |
+|--------|-------|
+| 43 | **xportr** — exporting ADaM datasets as submission-ready XPT files with metadata |
+| 44 | **datasetjson** — CDISC Dataset-JSON format for modern submissions |
+| 45 | **logrx** — automated R session logging for 21 CFR Part 11 compliance |
+| 46 | **diffdf / riskmetric** — dataset diffing and package risk scoring |
+| 47 | **Capstone Part 1** — full SDTM-to-ADaM pipeline |
+| 48 | **Capstone Part 2** — ADaM-to-TLF-to-submission package |

@@ -8,6 +8,32 @@ runtime: shiny_prerendered
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 19_admiral_part6_advanced.Rmd
+# PURPOSE       : admiral Part 6 — Advanced patterns: period datasets, expected record
+#                 derivation, LOCF imputation, derive_extreme_event(),
+#                 slice_derivation and restrict_derivation combinations,
+#                 and custom extension functions.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tidyr)
@@ -16,7 +42,16 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # ── shared mocks ─────────────────────────────────────────────────────────────
 exprs <- function(...) { dots <- as.list(substitute(list(...)))[-1]; dots }
-params <- function(...) list(...)
+params <- function(...) {
+  parent_env <- parent.frame()
+  dots <- as.list(substitute(list(...)))[-1]
+  lapply(dots, function(x) {
+    if (is.symbol(x)) {
+      tryCatch(eval(x, envir = parent_env), error = function(e) deparse(x))
+    } else eval(x, envir = parent_env)
+  })
+}
+`%||%` <- function(a, b) if (!is.null(a)) a else b
 
 .impute_dtc <- function(dtc, date_imputation = "first") {
   sapply(dtc, function(d) {
@@ -74,7 +109,8 @@ derive_vars_dy <- function(dataset, reference_date, source_vars) {
 }
 
 derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode="first") {
-  new_nm  <- deparse(substitute(new_var))
+  .e <- substitute(new_var)
+  new_nm  <- if (is.character(.e)) .e else deparse(.e)
   by_nm   <- sapply(by_vars, deparse)
   ord_nms <- sapply(order, function(x) gsub("desc\\(|\\)","",deparse(x)))
   desc_fl <- sapply(order, function(x) grepl("^desc\\(",deparse(x)))
@@ -117,6 +153,8 @@ slice_derivation <- function(dataset, derivation, args=list(), ...) {
     merged_args <- modifyList(args, sl$args)
     sub <- result[idx,, drop=FALSE]
     drv <- tryCatch(do.call(derivation, c(list(dataset=sub), merged_args)), error=function(e) sub)
+    new_cols <- setdiff(names(drv), names(result))
+    for (nc in new_cols) result[[nc]] <- NA
     result[idx, names(drv)] <- drv[seq_len(length(idx)), names(drv)]
     covered <- c(covered, idx)
   }
@@ -276,6 +314,25 @@ build_from_derived <- function(metacore_obj, ds_list, predecessor_only=FALSE, ke
   bind_rows(ds_list)
 }
 
+# ── Real pharmaverseadam data ─────────────────────────────────────────────────
+library(pharmaverseadam)
+
+adae_real <- pharmaverseadam::adae
+adae_real <- if ("AETOXGR" %in% names(adae_real)) {
+  adae_real |> mutate(AETOXGR = suppressWarnings(as.integer(AETOXGR)))
+} else {
+  adae_real |> mutate(AETOXGR = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+}
+
+advs_real <- pharmaverseadam::advs
+
+adsl_real <- pharmaverseadam::adsl
+
 # ── Sample datasets ───────────────────────────────────────────────────────────
 adsl_adv <- tribble(
   ~STUDYID, ~USUBJID, ~TRTSDT, ~TRTEDT, ~TRT01A,
@@ -314,13 +371,13 @@ mc <- list(
 class(mc) <- c("Metacore","list")
 ```
 
-## Welcome
+## Overview
 
 This lesson covers **advanced admiral patterns**: period datasets for crossover studies, expected-record insertion, LOCF imputation, `derive_extreme_event()`, `restrict_derivation()` + `slice_derivation()` combinations, metacore integration, custom function authoring, and package-level options.
 
 ---
 
-## 1 — Period datasets
+## Section 1 — Period Datasets
 
 ```{r period-demo}
 # adsl_adv has AP01SDT, AP01EDT, AP02SDT, AP02EDT
@@ -415,7 +472,7 @@ adae_pfl |> filter(!is.na(AOCCPRFL)) |>
 
 ---
 
-## 2 — Expected records: derive_expected_records()
+## Section 2 — Expected Records: derive_expected_records()
 
 ```{r expected-demo}
 # advs_adv has a missing Week 8 row for 01-003
@@ -503,7 +560,7 @@ list(
 
 ---
 
-## 3 — LOCF imputation
+## Section 3 — LOCF Imputation
 
 ```{r locf-demo}
 # advs_adv has NA AVAL at Week 8 for 01-001
@@ -512,15 +569,14 @@ advs_adv |> select(USUBJID, AVISITN, AVAL)
 
 ```{r locf-run-demo}
 # LOCF: carry last non-NA AVAL forward for each (USUBJID × PARAMCD)
-# Note: requires zoo package (installed) — mock uses simpler logic for exercises
+# Using base dplyr lag() — fills one step of NA with the immediately preceding value.
+# For the demo data (a single NA at Week 8 for 01-001) this is sufficient.
 advs_locf <- advs_adv |>
   arrange(USUBJID, PARAMCD, AVISITN) |>
   group_by(USUBJID, PARAMCD) |>
   mutate(
-    AVAL_LOCF = ifelse(is.na(AVAL),
-                       dplyr::lag(AVAL[!is.na(AVAL)], default=NA),
-                       AVAL),
-    DTYPE     = ifelse(is.na(AVAL) & !is.na(lag(AVAL)), "LOCF", DTYPE %||% NA_character_)
+    AVAL_LOCF = ifelse(is.na(AVAL) & !is.na(lag(AVAL)), lag(AVAL), AVAL),
+    DTYPE     = ifelse(is.na(AVAL) & !is.na(lag(AVAL)), "LOCF",    NA_character_)
   ) |>
   ungroup()
 
@@ -552,7 +608,7 @@ quiz(
 
 ---
 
-## 4 — derive_extreme_event(): priority-based worst-event
+## Section 4 — derive_extreme_event(): Priority-Based Worst-Event
 
 ```{r extreme-event-demo}
 # Flag the worst AE per subject using priority-ordered conditions
@@ -641,7 +697,7 @@ adae_wc |> select(USUBJID, AETERM, AETOXGR, AESER, WORSTCAT)
 
 ---
 
-## 5 — slice_derivation + restrict_derivation combined
+## Section 5 — slice_derivation + restrict_derivation
 
 ```{r combined-demo}
 # Different ABLFL baseline rules per parameter family
@@ -679,7 +735,106 @@ quiz(
 
 ---
 
-## 6 — Admiral options and metacore integration
+### Real Data: Advanced Patterns on CDISCPILOT01
+
+```{r real-data-explore-demo}
+# Real CDISCPILOT01 ADAE — apply derive_extreme_event to flag each subject's
+# most severe treatment-emergent AE category, using AETOXGR from real data
+
+# How many real TEAEs are there, and how are AETOXGR grades distributed?
+adae_real |>
+  filter(!is.na(TRTEMFL) & TRTEMFL == "Y") |>
+  count(AETOXGR, sort = TRUE)
+```
+
+```{r real-worst-cat-demo}
+# Derive WORSTCAT on real data: HIGH GRADE (3+) > SERIOUS > ANY GRADE
+adae_real_wc <- adae_real |>
+  filter(!is.na(TRTEMFL) & TRTEMFL == "Y") |>
+  derive_extreme_event(
+    by_vars  = exprs(STUDYID, USUBJID),
+    events   = list(
+      event(condition = !is.na(AETOXGR) & AETOXGR >= 3,
+            set_values_to = exprs(WORSTCAT = "HIGH GRADE")),
+      event(condition = AESER == "Y",
+            set_values_to = exprs(WORSTCAT = "SERIOUS")),
+      event(condition = !is.na(AETOXGR) & AETOXGR >= 1,
+            set_values_to = exprs(WORSTCAT = "ANY GRADE"))
+    ),
+    new_vars = exprs(WORSTCAT),
+    mode     = "first",
+    order    = exprs(ASTDT, AESEQ)
+  )
+
+adae_real_wc |>
+  distinct(USUBJID, WORSTCAT) |>
+  count(WORSTCAT)
+```
+
+```{r real-data-ex, exercise=TRUE, exercise.lines=26}
+# Exercise: using adae_real, build a subject-level worst AE severity table.
+# Step 1: filter to treatment-emergent AEs (TRTEMFL == "Y")
+# Step 2: use derive_extreme_event to assign WORST_GRADE_CAT:
+#   - AETOXGR >= 4 → "GRADE 4-5"
+#   - AETOXGR == 3 → "GRADE 3"
+#   - AETOXGR >= 1 → "GRADE 1-2"
+# Step 3: count subjects per WORST_GRADE_CAT × TRT01A (treatment arm)
+
+adae_worst_subj <- adae_real |>
+  filter(!is.na(TRTEMFL) & TRTEMFL == "Y") |>
+  derive_extreme_event(
+    by_vars  = exprs(STUDYID, USUBJID),
+    events   = list(
+      event(condition = !is.na(AETOXGR) & AETOXGR >= ___,
+            set_values_to = exprs(WORST_GRADE_CAT = "GRADE 4-5")),
+      event(condition = !is.na(AETOXGR) & AETOXGR == ___,
+            set_values_to = exprs(WORST_GRADE_CAT = "GRADE 3")),
+      event(condition = !is.na(AETOXGR) & AETOXGR >= ___,
+            set_values_to = exprs(WORST_GRADE_CAT = "GRADE 1-2"))
+    ),
+    new_vars = exprs(WORST_GRADE_CAT),
+    mode     = "first",
+    order    = exprs(ASTDT, AESEQ)
+  )
+
+adae_worst_subj |>
+  distinct(USUBJID, TRT01A, WORST_GRADE_CAT) |>
+  count(TRT01A, WORST_GRADE_CAT) |>
+  arrange(TRT01A, WORST_GRADE_CAT)
+```
+
+```{r real-data-ex-hint-1}
+# Thresholds in order (high to low): >= 4, == 3, >= 1
+# Use TRT01A for the treatment arm variable in adae_real
+```
+
+```{r real-data-ex-solution}
+adae_worst_subj <- adae_real |>
+  filter(!is.na(TRTEMFL) & TRTEMFL == "Y") |>
+  derive_extreme_event(
+    by_vars  = exprs(STUDYID, USUBJID),
+    events   = list(
+      event(condition = !is.na(AETOXGR) & AETOXGR >= 4,
+            set_values_to = exprs(WORST_GRADE_CAT = "GRADE 4-5")),
+      event(condition = !is.na(AETOXGR) & AETOXGR == 3,
+            set_values_to = exprs(WORST_GRADE_CAT = "GRADE 3")),
+      event(condition = !is.na(AETOXGR) & AETOXGR >= 1,
+            set_values_to = exprs(WORST_GRADE_CAT = "GRADE 1-2"))
+    ),
+    new_vars = exprs(WORST_GRADE_CAT),
+    mode     = "first",
+    order    = exprs(ASTDT, AESEQ)
+  )
+
+adae_worst_subj |>
+  distinct(USUBJID, TRT01A, WORST_GRADE_CAT) |>
+  count(TRT01A, WORST_GRADE_CAT) |>
+  arrange(TRT01A, WORST_GRADE_CAT)
+```
+
+---
+
+## Section 6 — Admiral Options and metacore Integration
 
 ```{r admiral-options-demo}
 # Get the default subject keys
@@ -740,7 +895,7 @@ quiz(
 
 ---
 
-## 7 — Custom extension functions
+## Section 7 — Custom Extension Functions
 
 ```{r custom-function-demo}
 # Writing sponsor-specific helpers in admiral style
@@ -756,17 +911,23 @@ derive_var_serafl <- function(dataset,
   new_nm <- deparse(substitute(new_var))
   fe     <- substitute(filter)
 
-  dataset |>
-    restrict_derivation(
-      derivation = derive_var_extreme_flag,
-      args = params(
-        by_vars = by_vars,
-        order   = exprs(ASTDT, AESEQ),
-        new_var = !!as.name(new_nm),
-        mode    = mode
-      ),
-      filter = !!fe
-    )
+  # Inline restriction: avoid passing an unevaluated expression via !!
+  in_rows  <- if (!is.null(fe))
+    tryCatch(which(eval(fe, dataset, parent.frame())), error = function(e) seq_len(nrow(dataset)))
+  else seq_len(nrow(dataset))
+  out_rows <- setdiff(seq_len(nrow(dataset)), in_rows)
+
+  sub     <- dataset[in_rows, , drop = FALSE]
+  derived <- tryCatch(
+    do.call(derive_var_extreme_flag,
+            c(list(dataset = sub),
+              params(by_vars = by_vars,
+                     order   = exprs(ASTDT, AESEQ),
+                     new_var = new_nm,
+                     mode    = mode))),
+    error = function(e) sub
+  )
+  bind_rows(derived, dataset[out_rows, , drop = FALSE])
 }
 
 # Use the custom function
@@ -841,7 +1002,191 @@ adae_adv |>
 
 ---
 
-## 8 — Performance and vignettes
+### P21 Derivation Diagnostics
+
+Each exercise below presents a define.xml-style derivation method spec, a programmer's broken implementation, and the exact Pinnacle 21 rule that fires. Your job is to fix the code so it matches the spec.
+
+---
+
+### Bug 1 — Period filter: open-ended window
+
+> **Define.xml derivation method (APERIOD):**
+> "APERIOD is assigned by joining AE records to the period dataset on USUBJID
+> where ASTDT falls within the period window (ASTDT ≥ APERSDT **and** ASTDT ≤ APEREDT).
+> AEs that do not fall in any period receive APERIOD = NA."
+>
+> **P21 rule AD0512 — APERIOD out of range:**
+> "APERIOD value does not correspond to a valid study period for this subject.
+> AEs appear assigned to a period that has already ended or has not yet begun."
+
+```{r p21-bug-period-filter, exercise=TRUE, exercise.lines=22}
+# The programmer forgot the upper bound on the period window.
+# Fix the filter_join so only AEs that START within the period are assigned.
+
+adperiods_bug <- create_period_dataset(
+  dataset  = adsl_adv,
+  new_vars = exprs(APERSDT = APxxSDT, APEREDT = APxxEDT)
+)
+
+adae_period_bug <- adae_adv |>
+  derive_vars_joined(
+    dataset_add = adperiods_bug,
+    by_vars     = exprs(USUBJID),
+    order       = exprs(APERSDT),
+    # BUG: only checks ASTDT >= APERSDT — no upper bound
+    filter_join = ASTDT >= APERSDT,
+    mode        = "first"
+  )
+
+adae_period_bug |> select(USUBJID, AETERM, ASTDT, APERIOD, APERSDT, APEREDT)
+```
+
+```{r p21-bug-period-filter-hint-1}
+# The spec requires ASTDT to fall within [APERSDT, APEREDT].
+# Add: & ASTDT <= APEREDT to the filter_join
+```
+
+```{r p21-bug-period-filter-solution}
+adperiods_bug <- create_period_dataset(
+  dataset  = adsl_adv,
+  new_vars = exprs(APERSDT = APxxSDT, APEREDT = APxxEDT)
+)
+
+adae_period_bug <- adae_adv |>
+  derive_vars_joined(
+    dataset_add = adperiods_bug,
+    by_vars     = exprs(USUBJID),
+    order       = exprs(APERSDT),
+    filter_join = ASTDT >= APERSDT & ASTDT <= APEREDT,
+    mode        = "first"
+  )
+
+adae_period_bug |> select(USUBJID, AETERM, ASTDT, APERIOD, APERSDT, APEREDT)
+```
+
+---
+
+### Bug 2 — Expected records: by_vars missing AVISIT
+
+> **Define.xml derivation method (DTYPE = "EXPECTED"):**
+> "An expected record is inserted for each (STUDYID, USUBJID, PARAMCD, AVISITN, AVISIT)
+> combination that is present in the study schedule but absent from the observed data.
+> The cartesian product of safety-population subjects and all scheduled
+> (PARAMCD × AVISITN × AVISIT) combinations defines the expected grid."
+>
+> **P21 rule AD0407 — unexpected AVISIT value:**
+> "AVISIT label does not match the expected value for AVISITN = {value}.
+> Inserted expected records carry a blank AVISIT, contradicting the visit schedule."
+
+```{r p21-bug-expected-byvars, exercise=TRUE, exercise.lines=22}
+# The programmer omitted AVISIT from by_vars.
+# As a result, inserted rows have a correct AVISITN but NA AVISIT.
+# Fix by_vars to include both AVISITN and AVISIT.
+
+ref_pop <- adsl_adv |> filter(SAFFL == "Y") |> select(STUDYID, USUBJID)
+
+advs_exp_bug <- advs_adv |>
+  derive_expected_records(
+    dataset_ref   = ref_pop,
+    # BUG: AVISIT omitted — inserted rows will have NA AVISIT
+    by_vars       = exprs(STUDYID, USUBJID, PARAMCD, AVISITN),
+    set_values_to = exprs(DTYPE = "EXPECTED")
+  )
+
+# Inspect: do inserted rows have AVISIT populated?
+advs_exp_bug |>
+  filter(DTYPE == "EXPECTED") |>
+  select(USUBJID, PARAMCD, AVISITN, AVISIT, AVAL, DTYPE)
+```
+
+```{r p21-bug-expected-byvars-hint-1}
+# Add AVISIT to by_vars: exprs(STUDYID, USUBJID, PARAMCD, AVISITN, AVISIT)
+# This ensures AVISIT is propagated from the observed data into the inserted rows.
+```
+
+```{r p21-bug-expected-byvars-solution}
+ref_pop <- adsl_adv |> filter(SAFFL == "Y") |> select(STUDYID, USUBJID)
+
+advs_exp_bug <- advs_adv |>
+  derive_expected_records(
+    dataset_ref   = ref_pop,
+    by_vars       = exprs(STUDYID, USUBJID, PARAMCD, AVISITN, AVISIT),
+    set_values_to = exprs(DTYPE = "EXPECTED")
+  )
+
+advs_exp_bug |>
+  filter(DTYPE == "EXPECTED") |>
+  select(USUBJID, PARAMCD, AVISITN, AVISIT, AVAL, DTYPE)
+```
+
+---
+
+### Bug 3 — derive_extreme_event: priority order reversed
+
+> **Define.xml derivation method (WORSTCAT):**
+> "WORSTCAT is the worst adverse event category per subject, determined by the following
+> priority (highest to lowest): Grade ≥ 3 → 'HIGH GRADE'; AESER = 'Y' → 'SERIOUS';
+> Grade ≥ 1 → 'ANY GRADE'. Conditions are evaluated in priority order; the first
+> matching condition wins."
+>
+> **P21 rule AD0610 — WORSTCAT inconsistency:**
+> "WORSTCAT = 'ANY GRADE' for subject(s) who have at least one Grade 3+ TEAE.
+> Expected value: 'HIGH GRADE'. Derivation priority order may be incorrect."
+
+```{r p21-bug-extreme-event-order, exercise=TRUE, exercise.lines=28}
+# The programmer listed conditions from LEAST to MOST severe — so every subject
+# with any TEAE gets "ANY GRADE" even if they had a Grade 3+ event.
+# Fix by restoring correct priority: HIGH GRADE first, then SERIOUS, then ANY GRADE.
+
+adae_wc_bug <- adae_adv |>
+  derive_extreme_event(
+    by_vars  = exprs(STUDYID, USUBJID),
+    events   = list(
+      # BUG: least-severe condition listed first — wins for every subject with any AE
+      event(condition = AETOXGR >= 1,
+            set_values_to = exprs(WORSTCAT = "ANY GRADE")),
+      event(condition = AESER == "Y",
+            set_values_to = exprs(WORSTCAT = "SERIOUS")),
+      event(condition = AETOXGR >= 3,
+            set_values_to = exprs(WORSTCAT = "HIGH GRADE"))
+    ),
+    new_vars = exprs(WORSTCAT),
+    mode     = "first",
+    order    = exprs(ASTDT)
+  )
+
+adae_wc_bug |> select(USUBJID, AETERM, AETOXGR, AESER, WORSTCAT)
+# Expected: 01-001 should be HIGH GRADE (has Grade 4 SEVERE RASH)
+```
+
+```{r p21-bug-extreme-event-order-hint-1}
+# Re-order the events list: Grade >= 3 first, then AESER == "Y", then Grade >= 1.
+# derive_extreme_event() assigns the value from the FIRST matching condition.
+```
+
+```{r p21-bug-extreme-event-order-solution}
+adae_wc_bug <- adae_adv |>
+  derive_extreme_event(
+    by_vars  = exprs(STUDYID, USUBJID),
+    events   = list(
+      event(condition = AETOXGR >= 3,
+            set_values_to = exprs(WORSTCAT = "HIGH GRADE")),
+      event(condition = AESER == "Y",
+            set_values_to = exprs(WORSTCAT = "SERIOUS")),
+      event(condition = AETOXGR >= 1,
+            set_values_to = exprs(WORSTCAT = "ANY GRADE"))
+    ),
+    new_vars = exprs(WORSTCAT),
+    mode     = "first",
+    order    = exprs(ASTDT)
+  )
+
+adae_wc_bug |> select(USUBJID, AETERM, AETOXGR, AESER, WORSTCAT)
+```
+
+---
+
+## Section 8 — Performance and Vignettes
 
 ```{r quiz-performance, echo=FALSE}
 quiz(
@@ -866,7 +1211,7 @@ quiz(
 
 ---
 
-## Quiz — final
+## Lesson Summary
 
 ```{r quiz-final-19, echo=FALSE}
 quiz(
@@ -876,7 +1221,7 @@ quiz(
     answer("When the study is a simple parallel-arm design with a single treatment window per subject", correct = TRUE),
     answer("When ADSL has APxxSDT variables"),
     answer("When the study has an extension phase"),
-    allow_retry = TRUE
+    random_answer_order = TRUE, allow_retry = TRUE
   ),
   question(
     "DTYPE = 'LOCF' and DTYPE = 'EXPECTED' both serve what common purpose?",
@@ -884,7 +1229,7 @@ quiz(
     answer("They distinguish derived/imputed rows from observed ones, enabling SAP-controlled inclusion/exclusion", correct = TRUE),
     answer("They indicate PARAMCD is missing"),
     answer("They are required by CDISC"),
-    allow_retry = TRUE
+    random_answer_order = TRUE, allow_retry = TRUE
   ),
   question(
     "A sponsor-internal admiral extension package should:",
@@ -892,7 +1237,7 @@ quiz(
     answer("Depend on admiral and add sponsor-specific derive_var_*() helpers following admiral conventions", correct = TRUE),
     answer("Replace metatools"),
     answer("Skip admiraldev checks to reduce dependencies"),
-    allow_retry = TRUE
+    random_answer_order = TRUE, allow_retry = TRUE
   ),
   question(
     "After Module 4, the next module covers:",
@@ -900,7 +1245,55 @@ quiz(
     answer("Therapeutic area admiral extensions: admiralonco, admiralvaccine, etc.", correct = TRUE),
     answer("SDTM validation with sdtmchecks"),
     answer("xportr and final transport"),
-    allow_retry = TRUE
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "P21 rule AD0512 fires when APERIOD is out of range. Which `derive_vars_joined()` argument directly controls which events are assigned to which period?",
+    answer("mode"),
+    answer("order"),
+    answer("filter_join — it defines the join condition referencing both dataset variables (ASTDT) and period variables (APERSDT, APEREDT)", correct = TRUE),
+    answer("by_vars"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "A programmer uses `by_vars = exprs(STUDYID, USUBJID, PARAMCD, AVISITN)` in `derive_expected_records()` but omits AVISIT. What is the P21 consequence?",
+    answer("No rows are inserted"),
+    answer("All rows are duplicated"),
+    answer("Inserted expected rows carry NA in AVISIT, causing AD0407 — AVISIT/AVISITN inconsistency", correct = TRUE),
+    answer("PARAMCD is also blank"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "In `derive_extreme_event()`, conditions are checked in list order and the first match wins. If AETOXGR >= 1 is listed BEFORE AETOXGR >= 3, what happens to a subject with a Grade 4 AE?",
+    answer("They correctly receive HIGH GRADE because Grade 4 satisfies >= 3"),
+    answer("They receive ANY GRADE — the >= 1 condition fires first, blocking the >= 3 condition", correct = TRUE),
+    answer("They receive NA — duplicate conditions cancel"),
+    answer("They receive both HIGH GRADE and ANY GRADE"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "What is the key functional difference between `restrict_derivation()` and `slice_derivation()`?",
+    answer("restrict_derivation() applies to all rows; slice_derivation() applies only to a subset"),
+    answer("restrict_derivation() applies a single derivation to a filtered subset and leaves other rows untouched; slice_derivation() partitions rows into non-overlapping slices each processed with potentially different arguments", correct = TRUE),
+    answer("slice_derivation() is used only for LOCF"),
+    answer("They are interchangeable"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "The admiral naming convention distinguishes `derive_var_*()` from `derive_vars_*()`. What does the plural form signal?",
+    answer("It is slower"),
+    answer("It works only with character variables"),
+    answer("The function adds multiple new variables to the dataset in one call", correct = TRUE),
+    answer("It requires a metacore object"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "When a custom admiral extension function accepts `filter` as an argument and passes it to `restrict_derivation()`, which R technique is required to forward an unevaluated expression correctly?",
+    answer("Quoting with `quote()` and evaluating with `eval()`"),
+    answer("Capturing with `substitute()` and forwarding with `!!` (bang-bang unquoting) inside the call", correct = TRUE),
+    answer("Converting to a string with `deparse()` and reparsing"),
+    answer("Wrapping in `tryCatch()`"),
+    random_answer_order = TRUE, allow_retry = TRUE
   )
 )
 ```

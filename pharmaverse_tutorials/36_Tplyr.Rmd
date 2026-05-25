@@ -1,0 +1,1315 @@
+---
+title: "Lesson 36 — Tplyr: Layered Clinical Summary Table Pipeline"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Build clinical summary tables with Tplyr's layered API: group_count() for
+  categorical variables, group_desc() for continuous variables, group_shift()
+  for shift tables, f_str() format strings, ordering, and a demographic + AE
+  capstone table.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 36_Tplyr.Rmd
+# PURPOSE       : Teach Tplyr's layered table-building API: tplyr_table(),
+#                 group_count(), group_desc(), group_shift(), f_str(),
+#                 set_format_strings(), ordering, set_pop_data(), and build().
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.blanks = TRUE)
+
+# ── Tplyr mock — complete implementation ─────────────────────────────────────
+
+# Internal layer constructors
+new_count_layer <- function(target, by = NULL) {
+  structure(list(type = "count", target = target, by = by,
+                 formats = NULL, order = "byvar", distinct_by = "USUBJID",
+                 missing_count = FALSE, pop_data = NULL),
+            class = "tplyr_layer")
+}
+
+new_desc_layer <- function(target, by = NULL) {
+  structure(list(type = "desc", target = target, by = by,
+                 formats = NULL),
+            class = "tplyr_layer")
+}
+
+new_shift_layer <- function(target, by = NULL) {
+  structure(list(type = "shift", target = target, by = by),
+            class = "tplyr_layer")
+}
+
+# f_str: format string helper
+f_str <- function(fmt, ...) {
+  vars <- sapply(substitute(list(...))[-1], deparse)
+  structure(list(fmt = fmt, vars = vars), class = "f_str")
+}
+
+# tplyr_table constructor
+tplyr_table <- function(dataset, treat_var, where = TRUE, cols = NULL) {
+  tv <- deparse(substitute(treat_var))
+  structure(
+    list(
+      dataset   = dataset,
+      treat_var = tv,
+      layers    = list(),
+      cols      = cols,
+      pop_data  = NULL,
+      pop_treat_var = tv
+    ),
+    class = "tplyr_table"
+  )
+}
+
+# Fluent layer adder
+add_layer <- function(table, layer) {
+  table$layers <- c(table$layers, list(layer))
+  table
+}
+
+# Layer factory functions
+group_count <- function(target, by = NULL, where = TRUE) {
+  tgt <- deparse(substitute(target))
+  by_str <- if (!missing(by)) deparse(substitute(by)) else NULL
+  new_count_layer(target = tgt, by = by_str)
+}
+
+group_desc <- function(target, by = NULL, where = TRUE) {
+  tgt <- deparse(substitute(target))
+  by_str <- if (!missing(by)) deparse(substitute(by)) else NULL
+  new_desc_layer(target = tgt, by = by_str)
+}
+
+group_shift <- function(target, by = NULL, where = TRUE) {
+  tgt <- deparse(substitute(target))
+  by_str <- if (!missing(by)) deparse(substitute(by)) else NULL
+  new_shift_layer(target = tgt, by = by_str)
+}
+
+# Layer customisation helpers
+set_format_strings <- function(layer, ...) {
+  layer$formats <- list(...)
+  layer
+}
+
+set_order_count_method <- function(layer, method = "byvarn") {
+  layer$order <- method
+  layer
+}
+
+set_result_order_var <- function(layer, var) {
+  layer$result_order_var <- deparse(substitute(var))
+  layer
+}
+
+set_distinct_by <- function(layer, ...) {
+  vars <- sapply(substitute(list(...))[-1], deparse)
+  layer$distinct_by <- vars
+  layer
+}
+
+set_missing_count <- function(layer, ...) {
+  layer$missing_count <- TRUE
+  layer
+}
+
+set_pop_data <- function(table, pop_data, treat_var = NULL) {
+  table$pop_data <- pop_data
+  if (!is.null(treat_var))
+    table$pop_treat_var <- deparse(substitute(treat_var))
+  table
+}
+
+set_pop_treat_var <- function(table, treat_var) {
+  table$pop_treat_var <- deparse(substitute(treat_var))
+  table
+}
+
+# build(): execute all layers and bind results
+build <- function(table, ...) {
+  dataset   <- table$dataset
+  treat_var <- table$treat_var
+
+  # Denominator population for % calculations
+  pop_data <- if (!is.null(table$pop_data)) table$pop_data else dataset
+  pop_tv   <- table$pop_treat_var %||% treat_var
+
+  treat_lvls <- sort(unique(dataset[[treat_var]]))
+  # Subject counts per arm for denominator
+  arm_N <- pop_data |>
+    group_by(.data[[pop_tv]]) |>
+    summarise(N = n_distinct(USUBJID), .groups = "drop") |>
+    rename(treat_arm = !!pop_tv)
+
+  layer_idx <- 0L
+
+  all_rows <- lapply(table$layers, function(layer) {
+    layer_idx <<- layer_idx + 1L
+    var <- gsub('^"|"$|^\'|\'$', "", layer$target)
+    if (var == "NULL" || !(var %in% names(dataset))) return(NULL)
+
+    if (layer$type == "count") {
+      # Subject-level counts per treatment × category
+      raw <- dataset |>
+        group_by(.data[[treat_var]], .data[[var]]) |>
+        summarise(n = n_distinct(USUBJID), .groups = "drop")
+
+      # Attach denominator
+      raw <- raw |>
+        rename(treat_arm = !!treat_var) |>
+        left_join(arm_N, by = "treat_arm") |>
+        mutate(pct = round(100 * n / N, 1))
+
+      # Ordering
+      if (!is.null(layer$order) && layer$order == "bycount") {
+        cat_order <- raw |>
+          group_by(.data[[var]]) |>
+          summarise(total_n = sum(n), .groups = "drop") |>
+          arrange(desc(total_n)) |>
+          mutate(ord = seq_len(n()))
+        raw <- left_join(raw, cat_order, by = var)
+      } else {
+        cat_order <- raw |>
+          distinct(.data[[var]]) |>
+          mutate(ord = seq_len(n()))
+        raw <- left_join(raw, cat_order, by = var)
+      }
+
+      out <- raw |>
+        pivot_wider(
+          id_cols     = c(all_of(var), "ord"),
+          names_from  = treat_arm,
+          values_from = c(n, pct),
+          values_fill = 0
+        ) |>
+        rename(row_label_1 = !!var) |>
+        arrange(ord) |>
+        mutate(
+          ord_layer_index = layer_idx,
+          ord_layer_1     = row_label_1
+        ) |>
+        select(-ord)
+
+    } else if (layer$type == "desc") {
+      stat_names <- c("n", "mean", "sd", "median", "min", "max")
+
+      out <- dataset |>
+        group_by(.data[[treat_var]]) |>
+        summarise(
+          n      = n(),
+          mean   = round(mean(.data[[var]], na.rm = TRUE), 1),
+          sd     = round(sd(.data[[var]],   na.rm = TRUE), 1),
+          median = round(median(.data[[var]], na.rm = TRUE), 1),
+          min    = min(.data[[var]], na.rm = TRUE),
+          max    = max(.data[[var]], na.rm = TRUE),
+          .groups = "drop"
+        ) |>
+        pivot_longer(cols = -!!treat_var,
+                     names_to  = "stat_name",
+                     values_to = "value") |>
+        pivot_wider(names_from  = !!treat_var,
+                    values_from = value) |>
+        rename(row_label_1 = stat_name) |>
+        mutate(
+          row_label_1     = factor(row_label_1, levels = stat_names),
+          ord_layer_index = layer_idx,
+          ord_layer_1     = as.character(row_label_1)
+        ) |>
+        arrange(row_label_1) |>
+        mutate(row_label_1 = as.character(row_label_1))
+
+    } else {
+      # shift — return placeholder
+      out <- tibble(
+        row_label_1     = character(),
+        ord_layer_index = integer(),
+        ord_layer_1     = character()
+      )
+    }
+
+    out
+  })
+
+  bind_rows(all_rows)
+}
+
+# Null-coalesce
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ── Real pharmaverseadam data ─────────────────────────────────────────────────
+
+adsl <- pharmaverseadam::adsl
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw
+
+# Synthetic shift dataset for Section 7
+set.seed(2014)
+shift_demo <- tibble(
+  USUBJID  = rep(paste0("SUBJ-", sprintf("%03d", 1:60)), each = 2),
+  TRT01P   = rep(c(rep("Placebo", 40), rep("Xanomeline High Dose", 80)), length.out = 120),
+  VISIT    = rep(c("BASELINE", "WEEK 12"), 60),
+  ATOXGR_C = sample(c("0","1","2","3"), 120, replace = TRUE, prob = c(0.5,0.3,0.15,0.05))
+) |>
+  mutate(ATOXGR = as.integer(ATOXGR_C)) |>
+  select(-ATOXGR_C)
+
+shift_wide <- shift_demo |>
+  pivot_wider(names_from = VISIT, values_from = ATOXGR,
+              names_prefix = "GR_") |>
+  rename(BASELINE_GR = `GR_BASELINE`, WEEK12_GR = `GR_WEEK 12`)
+```
+
+## Overview
+
+### What is Tplyr?
+
+**Tplyr** (from Atorus Research) is a tidyverse-based package for building
+clinical summary tables using a **layered approach**. It handles the most
+common clinical table patterns — count/%, mean/SD, and shift tables — with
+minimal code, while keeping the output as a plain R tibble that you can pass
+to any downstream tool (r2rtf, gt, flextable, etc.).
+
+The SAS equivalents are `PROC FREQ`, `PROC MEANS`, and custom shift-table
+macros. Tplyr replaces all three with a consistent pipe-friendly API.
+
+### Core Tplyr workflow
+
+```r
+tplyr_table(dataset, treat_var) |>   # 1. Define the base table
+  add_layer(group_count(SEX)) |>     # 2. Add a count layer (Sex)
+  add_layer(group_desc(AGE))  |>     # 3. Add a descriptive stats layer (Age)
+  build()                            # 4. Execute and return a tibble
+```
+
+### What you will learn
+
+- The layered mental model: each `add_layer()` = one block of rows
+- `group_count()` for categorical variables (demographics, AEs)
+- `group_desc()` for continuous variables (age, lab values)
+- `f_str()` format strings to control how statistics are displayed
+- `set_pop_data()` for correct AE percentage denominators
+- `set_order_count_method()` to sort rows
+- `group_shift()` for baseline vs. post-baseline category shift tables
+- Post-build: the result is a plain tibble you can `filter()` and `arrange()`
+
+> **Note:** This tutorial uses a mock implementation of Tplyr so exercises run
+> inside learnr. The API mirrors the real package.
+
+---
+
+## Section 1 — Tplyr Philosophy
+
+### The layered mental model
+
+Tplyr's core idea is that a clinical summary table is made up of **blocks of
+rows**. Each block covers one variable:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Age (years)   n = 86      n = 84      n = 84              │  ← group_desc(AGE)
+│                Mean 75.2   Mean 75.7   Mean 74.4            │
+│                SD   8.6    SD   8.3    SD   7.9             │
+├────────────────────────────────────────────────────────────┤
+│  Sex     Male  37 (43%)   35 (42%)   35 (42%)              │  ← group_count(SEX)
+│         Female 49 (57%)   49 (58%)   49 (58%)              │
+└────────────────────────────────────────────────────────────┘
+```
+
+You add layers in the order you want them to appear in the final table. Tplyr
+stacks them vertically when you call `build()`.
+
+### Tplyr vs gtsummary
+
+| Feature | Tplyr | gtsummary |
+|---------|-------|-----------|
+| Mental model | Explicit layers | Infers from variable type |
+| Output | Plain tibble | Formatted gt object |
+| AE tables | Native with `set_pop_data()` | Requires extra steps |
+| Customisation | Fine-grained via `set_*()` | Via `modify_*()` helpers |
+| Downstream use | Any package (r2rtf, gt, flextable) | Primarily gt / Word |
+
+### Demo: minimal two-layer table
+
+```{r demo-two-layer}
+tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  add_layer(group_count(SEX)) |>
+  build()
+```
+
+### Exercise 1.1 — Count rows returned by build()
+
+Run the demo table above and capture the result. How many total rows does
+`build()` return? (6 rows from `group_desc` — n, mean, sd, median, min, max —
+plus 2 rows from `group_count` for SEX categories.)
+
+```{r layer-row-count, exercise=TRUE, exercise.lines=10}
+result <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  add_layer(group_count(SEX)) |>
+  build()
+
+# How many rows?
+nrow(___)
+```
+
+```{r layer-row-count-hint-1}
+# Replace ___ with the name of your result object
+```
+
+```{r layer-row-count-solution}
+result <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  add_layer(group_count(SEX)) |>
+  build()
+
+nrow(result)
+```
+
+### Exercise 1.2 — Inspect column names
+
+Build a simple `group_count(SEX)` table and check its column names. Identify
+the treatment-arm count columns and the ordering columns.
+
+```{r inspect-cols, exercise=TRUE, exercise.lines=8}
+tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_count(SEX)) |>
+  build()
+
+names(tbl)
+```
+
+```{r inspect-cols-solution}
+tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_count(SEX)) |>
+  build()
+
+names(tbl)
+```
+
+> Tplyr output always includes `row_label_1` (the category label),
+> `ord_layer_index` (which layer the row came from), and `ord_layer_1`
+> (sort key within the layer), plus n\_ and pct\_ columns for each arm.
+
+---
+
+## Section 2 — group_count() for Categorical Variables
+
+### Basic count layer
+
+`group_count(variable)` produces subject counts and percentages for each level
+of a categorical variable:
+
+```r
+tplyr_table(adsl, TRT01P) |>
+  add_layer(group_count(SEX)) |>
+  build()
+```
+
+Each category of `SEX` becomes one row. The output has `n_<arm>` and
+`pct_<arm>` columns for each treatment arm.
+
+### set_distinct_by() — subject-level counts
+
+By default the mock counts distinct subjects. In the real Tplyr package, you
+must explicitly request subject-level counting with `set_distinct_by(USUBJID)`.
+This is **critical for AE tables** — without it you count AE records, not subjects:
+
+```r
+# Wrong for AEs: counts records
+group_count(AEBODSYS)
+
+# Correct for AEs: counts distinct subjects with that AE
+group_count(AEBODSYS) |>
+  set_distinct_by(USUBJID)
+```
+
+### set_format_strings() with f_str()
+
+`f_str()` controls how multiple statistics are combined into one display cell.
+For count layers:
+
+```r
+group_count(SEX) |>
+  set_format_strings(f_str("xx (xx.x%)", n, pct))
+# Result: "42 (50.0%)"
+```
+
+> In this mock, `set_format_strings()` stores the format for reference — the
+> `build()` output still returns separate `n_` and `pct_` columns. The real
+> Tplyr applies the format string and merges them.
+
+### Exercise 2.1 — Count RACE
+
+Build a count table for `RACE` using `adsl` with `TRT01P` as the treatment
+variable. Print the result.
+
+```{r count-race, exercise=TRUE, exercise.lines=8}
+tplyr_table(adsl, TRT01P) |>
+  add_layer(group_count(___)) |>
+  build()
+```
+
+```{r count-race-hint-1}
+# Replace ___ with the variable name: RACE
+```
+
+```{r count-race-solution}
+tplyr_table(adsl, TRT01P) |>
+  add_layer(group_count(RACE)) |>
+  build()
+```
+
+### Exercise 2.2 — Subject count for WHITE in Placebo
+
+Using the RACE count table, filter to the "WHITE" row and inspect the Placebo
+subject count.
+
+```{r count-white, exercise=TRUE, exercise.lines=10}
+race_tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_count(RACE)) |>
+  build()
+
+# Filter to WHITE and check n_Placebo
+race_tbl |>
+  filter(row_label_1 == ___) |>
+  select(row_label_1, starts_with("n_"))
+```
+
+```{r count-white-hint-1}
+# The category value is "WHITE" (all caps in pharmaverseadam)
+```
+
+```{r count-white-solution}
+race_tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_count(RACE)) |>
+  build()
+
+race_tbl |>
+  filter(row_label_1 == "WHITE") |>
+  select(row_label_1, starts_with("n_"))
+```
+
+### Exercise 2.3 — Apply set_distinct_by and set_format_strings
+
+Build a SEX count table with `set_distinct_by(USUBJID)` and a format string
+`f_str("xx (xx.x%)", n, pct)`. Print the result.
+
+```{r count-sex-fmt, exercise=TRUE, exercise.lines=10}
+tplyr_table(adsl, TRT01P) |>
+  add_layer(
+    group_count(SEX) |>
+      set_distinct_by(___) |>
+      set_format_strings(f_str(___, n, pct))
+  ) |>
+  build()
+```
+
+```{r count-sex-fmt-hint-1}
+# set_distinct_by(USUBJID)
+# f_str format for count/percent: "xx (xx.x%)"
+```
+
+```{r count-sex-fmt-solution}
+tplyr_table(adsl, TRT01P) |>
+  add_layer(
+    group_count(SEX) |>
+      set_distinct_by(USUBJID) |>
+      set_format_strings(f_str("xx (xx.x%)", n, pct))
+  ) |>
+  build()
+```
+
+---
+
+## Section 3 — group_desc() for Continuous Variables
+
+### What group_desc() produces
+
+`group_desc(variable)` produces one row per summary statistic per treatment
+arm — specifically: n, mean, sd, median, min, max. Each statistic becomes a
+row with `row_label_1` equal to the statistic name:
+
+```
+row_label_1  Placebo  Xanomeline Low Dose  Xanomeline High Dose
+n             86        84                   84
+mean          75.2      75.7                 74.4
+sd             8.6       8.3                  7.9
+median        76.0      77.5                 76.0
+min           52        56                   56
+max           89        88                   88
+```
+
+### set_format_strings() for desc layers
+
+```r
+group_desc(AGE) |>
+  set_format_strings(
+    f_str("xx.x (xx.x)", mean, sd)   # "75.2 (8.6)"
+  )
+```
+
+You can provide multiple format strings to control different rows.
+
+### Demo
+
+```{r demo-desc}
+tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  build()
+```
+
+### Exercise 3.1 — Descriptive stats for AGE
+
+Build a `group_desc(AGE)` table and identify the mean AGE for the
+`"Xanomeline High Dose"` arm.
+
+```{r desc-age, exercise=TRUE, exercise.lines=10}
+age_desc <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(___)) |>
+  build()
+
+# Filter to the 'mean' row
+age_desc |>
+  filter(row_label_1 == ___) |>
+  select(row_label_1, `Xanomeline High Dose`)
+```
+
+```{r desc-age-hint-1}
+# group_desc takes the variable name: AGE
+# Filter row_label_1 == "mean"
+```
+
+```{r desc-age-solution}
+age_desc <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  build()
+
+age_desc |>
+  filter(row_label_1 == "mean") |>
+  select(row_label_1, `Xanomeline High Dose`)
+```
+
+### Exercise 3.2 — Add a format string
+
+Rebuild the AGE descriptive table with a format string that shows mean and SD
+as `"xx.x (xx.x)"`. Print the resulting layer (note the formats are stored in
+the layer object before `build()` is called).
+
+```{r desc-fmt, exercise=TRUE, exercise.lines=10}
+tplyr_table(adsl, TRT01P) |>
+  add_layer(
+    group_desc(AGE) |>
+      set_format_strings(f_str(___, mean, sd))
+  ) |>
+  build()
+```
+
+```{r desc-fmt-hint-1}
+# The format string for "75.2 (8.6)" is "xx.x (xx.x)"
+```
+
+```{r desc-fmt-solution}
+tplyr_table(adsl, TRT01P) |>
+  add_layer(
+    group_desc(AGE) |>
+      set_format_strings(f_str("xx.x (xx.x)", mean, sd))
+  ) |>
+  build()
+```
+
+---
+
+## Section 4 — Format Strings with f_str()
+
+### What f_str() does
+
+`f_str()` is Tplyr's compact way to specify how multiple statistics combine
+into a single display cell. The first argument is a display format template;
+subsequent arguments name which statistics to slot in.
+
+```r
+f_str("xx (xx.x%)", n, pct)     # "42 (50.0%)"
+f_str("xx.x (xx.x)", mean, sd)  # "75.2 (8.6)"
+f_str("xx.x, xx.x", min, max)   # "52.0, 89.0"
+```
+
+The `xx` placeholder means integer; `xx.x` means one decimal place; `xx.xx`
+means two decimal places.
+
+### Common clinical f_str patterns
+
+| Display | f_str call | Example output |
+|---------|------------|----------------|
+| Count (%) | `f_str("xx (xx.x%)", n, pct)` | `42 (50.0%)` |
+| Mean (SD) | `f_str("xx.x (xx.x)", mean, sd)` | `75.2 (8.6)` |
+| Median [Min, Max] | `f_str("xx.x [xx.x, xx.x]", median, min, max)` | `76.0 [52.0, 89.0]` |
+| Range only | `f_str("xx.x, xx.x", min, max)` | `52.0, 89.0` |
+| n only | `f_str("xx", n)` | `42` |
+
+### Exercise 4.1 — f_str for Mean (SD)
+
+Write an `f_str()` that produces `"75.2 (8.6)"` — i.e., mean to one decimal
+place, followed by SD in parentheses.
+
+```{r fstr-mean-sd, exercise=TRUE, exercise.lines=6}
+# Write the f_str and store it — inspect its structure
+fs <- f_str(___, mean, sd)
+str(fs)
+```
+
+```{r fstr-mean-sd-hint-1}
+# Template for "75.2 (8.6)": "xx.x (xx.x)"
+```
+
+```{r fstr-mean-sd-solution}
+fs <- f_str("xx.x (xx.x)", mean, sd)
+str(fs)
+```
+
+### Exercise 4.2 — f_str for Median [Q1, Q3]
+
+Write an `f_str()` that would display median with [Q1, Q3] in the format
+`"75.0 [70.0, 81.0]"`. Use `median`, `min`, and `max` as placeholders for Q1
+and Q3 (we use min/max here as stand-ins).
+
+```{r fstr-median-iqr, exercise=TRUE, exercise.lines=6}
+fs_median <- f_str(___, median, min, max)
+str(fs_median)
+```
+
+```{r fstr-median-iqr-hint-1}
+# Pattern: "xx.x [xx.x, xx.x]"  — three placeholders in order: median, min, max
+```
+
+```{r fstr-median-iqr-solution}
+fs_median <- f_str("xx.x [xx.x, xx.x]", median, min, max)
+str(fs_median)
+```
+
+### Exercise 4.3 — f_str for range only
+
+Write an `f_str()` that produces `"52, 89"` (integer display for min and max,
+comma-separated, no brackets).
+
+```{r fstr-range, exercise=TRUE, exercise.lines=6}
+fs_range <- f_str(___, min, max)
+str(fs_range)
+```
+
+```{r fstr-range-hint-1}
+# Integer display: xx  (no decimal); pattern: "xx, xx"
+```
+
+```{r fstr-range-solution}
+fs_range <- f_str("xx, xx", min, max)
+str(fs_range)
+```
+
+### Quiz
+
+```{r quiz-fstr}
+quiz(
+  question(
+    "Which f_str template produces '42 (50.0%)'?",
+    answer("`f_str(\"xx (xx.x)\", n, pct)`"),
+    answer("`f_str(\"xx (xx.x%)\", n, pct)`", correct = TRUE),
+    answer("`f_str(\"xx.x (xx.x)\", n, pct)`"),
+    answer("`f_str(\"xx%\", pct)`"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 5 — AE Tables with group_count() and set_pop_data()
+
+### The AE denominator problem
+
+For an AE table, the percentage denominator should be the **number of subjects
+randomised to each arm** (from ADSL), not the number of AE records in ADAE.
+
+Without `set_pop_data()`, Tplyr would use the ADAE dataset to compute
+denominators — which undercounts subjects who had no AEs.
+
+```r
+# Wrong: denominator = subjects who had at least one AE
+tplyr_table(adae, TRT01A) |>
+  add_layer(group_count(AEBODSYS)) |>
+  build()
+
+# Correct: denominator = all randomised subjects (from ADSL)
+tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID)
+  ) |>
+  build()
+```
+
+### set_pop_data() arguments
+
+- **First argument:** the population dataset (e.g., `adsl`)
+- **Second argument:** the treatment variable in *that* population dataset
+  (e.g., `TRT01P` — note: ADSL uses `TRT01P`, ADAE uses `TRT01A`)
+
+### set_distinct_by() for AE subject counts
+
+For AE tables, you always want to count distinct subjects, not AE records. A
+subject who had 3 SKIN events should count as 1, not 3:
+
+```r
+group_count(AEBODSYS) |>
+  set_distinct_by(USUBJID)
+```
+
+### Exercise 5.1 — AE body system count table
+
+Build an AE body-system count table using `adae` as the primary dataset and
+`adsl` as the population denominator. Use `set_distinct_by(USUBJID)`.
+
+```{r ae-count, exercise=TRUE, exercise.lines=12}
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(___, ___) |>
+  add_layer(
+    group_count(___) |>
+      set_distinct_by(___)
+  ) |>
+  build()
+
+ae_tbl
+```
+
+```{r ae-count-hint-1}
+# set_pop_data(adsl, TRT01P)  — population dataset + treatment var in that dataset
+# group_count(AEBODSYS)
+# set_distinct_by(USUBJID)
+```
+
+```{r ae-count-solution}
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID)
+  ) |>
+  build()
+
+ae_tbl
+```
+
+### Exercise 5.2 — Highest body system in Placebo
+
+From the AE table you just built, find the body system with the highest
+subject count in the Placebo arm.
+
+```{r ae-top, exercise=TRUE, exercise.lines=12}
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID)
+  ) |>
+  build()
+
+ae_tbl |>
+  select(row_label_1, n_Placebo) |>
+  arrange(desc(___))
+```
+
+```{r ae-top-hint-1}
+# arrange(desc(n_Placebo)) to sort highest first
+```
+
+```{r ae-top-solution}
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID)
+  ) |>
+  build()
+
+ae_tbl |>
+  select(row_label_1, n_Placebo) |>
+  arrange(desc(n_Placebo))
+```
+
+---
+
+## Section 6 — Ordering
+
+### set_order_count_method()
+
+By default, Tplyr preserves the order in which categories appear in the data
+(`"byvar"`). You can change this with `set_order_count_method()`:
+
+| Method | Behaviour |
+|--------|-----------|
+| `"byvar"` | Preserve data order (default) |
+| `"byvarn"` | Sort by the underlying numeric coding of the variable |
+| `"bycount"` | Sort by descending total count across all arms |
+
+For AE tables, `"bycount"` is the most common choice — it puts the most
+frequent body systems at the top, matching regulatory expectations.
+
+### set_result_order_var()
+
+For more control, `set_result_order_var()` sorts by a specific column in the
+built result — typically the count in the reference arm:
+
+```r
+group_count(AEBODSYS) |>
+  set_order_count_method("bycount") |>
+  set_result_order_var(n_Placebo)
+```
+
+### Exercise 6.1 — Sort RACE by descending Placebo count
+
+Build a RACE count table sorted by descending Placebo count. Check that the
+first row is `"WHITE"`.
+
+```{r sort-race, exercise=TRUE, exercise.lines=10}
+race_sorted <- tplyr_table(adsl, TRT01P) |>
+  add_layer(
+    group_count(RACE) |>
+      set_order_count_method(___)
+  ) |>
+  build()
+
+# Show row_label_1 and n_Placebo in order
+race_sorted |>
+  select(row_label_1, n_Placebo) |>
+  arrange(desc(n_Placebo))
+```
+
+```{r sort-race-hint-1}
+# set_order_count_method("bycount") sorts by total count descending
+```
+
+```{r sort-race-solution}
+race_sorted <- tplyr_table(adsl, TRT01P) |>
+  add_layer(
+    group_count(RACE) |>
+      set_order_count_method("bycount")
+  ) |>
+  build()
+
+race_sorted |>
+  select(row_label_1, n_Placebo) |>
+  arrange(desc(n_Placebo))
+```
+
+### Exercise 6.2 — Sort AE body systems by bycount
+
+Apply `"bycount"` ordering to the AE body system table and print the top 5
+body systems by total count.
+
+```{r sort-ae, exercise=TRUE, exercise.lines=14}
+ae_sorted <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID) |>
+      set_order_count_method(___)
+  ) |>
+  build()
+
+ae_sorted |>
+  select(row_label_1, starts_with("n_")) |>
+  slice_head(n = 5)
+```
+
+```{r sort-ae-hint-1}
+# set_order_count_method("bycount")
+```
+
+```{r sort-ae-solution}
+ae_sorted <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID) |>
+      set_order_count_method("bycount")
+  ) |>
+  build()
+
+ae_sorted |>
+  select(row_label_1, starts_with("n_")) |>
+  slice_head(n = 5)
+```
+
+---
+
+## Section 7 — group_shift() for Shift Tables
+
+### What is a shift table?
+
+A **shift table** cross-tabulates where subjects started (baseline category)
+against where they ended up (post-baseline category). It is most commonly used
+for CTCAE toxicity grades:
+
+```
+                    Post-baseline toxicity grade
+Baseline grade   Grade 0  Grade 1  Grade 2  Grade 3+
+Grade 0           n        n        n        n
+Grade 1           n        n        n        n
+Grade 2           n        n        n        n
+```
+
+This is much more informative than a simple "worst grade" summary because it
+captures worsening, improvement, and stability at the same time.
+
+### group_shift() in Tplyr
+
+```r
+tplyr_table(dataset, treat_var) |>
+  add_layer(
+    group_shift(vars(row = BASELINE_GR, column = WEEK12_GR), by = PARAM)
+  ) |>
+  build()
+```
+
+The `vars()` argument specifies which variable drives the *rows* (baseline)
+and which drives the *columns* (post-baseline) within each treatment arm.
+
+### When would you use this?
+
+- Lab toxicity grades: `BTOXGR` (baseline) vs `ATOXGR` (worst on-treatment)
+- Vital signs: normal/abnormal at baseline vs post-baseline
+- Cardiac: QTc category at baseline vs worst post-baseline
+
+### The `by` argument
+
+Use `by` to produce a separate shift table for each value of a grouping
+variable. For lab data, `by = PARAM` gives one block per lab parameter:
+
+```r
+group_shift(vars(row = BTOXGR, column = ATOXGR), by = PARAM)
+```
+
+### Demo: inspect shift_wide structure
+
+The setup chunk created `shift_wide` — a synthetic dataset with one row per
+subject containing `BASELINE_GR` and `WEEK12_GR`:
+
+```{r show-shift-wide}
+head(shift_wide)
+```
+
+### Exercise 7.1 — Define a shift layer
+
+Using `shift_demo` (the long-format version), describe (in words) how you
+would structure the data before passing it to `group_shift()`. What format
+does the dataset need to be in?
+
+```{r shift-structure, exercise=TRUE, exercise.lines=6}
+# Inspect shift_demo structure — what variables does it have?
+glimpse(shift_demo)
+```
+
+```{r shift-structure-solution}
+glimpse(shift_demo)
+# shift_demo is in long format with VISIT column.
+# For group_shift(), you need wide format: one column for baseline grade,
+# one column for post-baseline grade, per subject.
+# shift_wide already has BASELINE_GR and WEEK12_GR as separate columns.
+```
+
+### Exercise 7.2 — Build a shift layer (group_shift)
+
+Use `shift_wide` to build a shift table with `group_shift()`. The row variable
+is `BASELINE_GR` and the result should show how subjects moved between grades.
+
+```{r shift-build, exercise=TRUE, exercise.lines=10}
+# group_shift stores layer metadata; build() returns a placeholder in this mock
+shift_result <- tplyr_table(shift_wide, TRT01P) |>
+  add_layer(
+    group_shift(___)
+  ) |>
+  build()
+
+# Inspect what the layer metadata contains
+shift_result
+```
+
+```{r shift-build-hint-1}
+# group_shift(BASELINE_GR) — pass the baseline grade variable
+```
+
+```{r shift-build-solution}
+shift_result <- tplyr_table(shift_wide, TRT01P) |>
+  add_layer(
+    group_shift(BASELINE_GR)
+  ) |>
+  build()
+
+shift_result
+```
+
+> In the real Tplyr package, `group_shift()` returns a full cross-tabulation.
+> The mock returns a placeholder — the concept and code structure are identical.
+
+### Quiz
+
+```{r quiz-shift}
+quiz(
+  question(
+    "For a lab toxicity shift table, which variable should drive the ROWS?",
+    answer("Worst on-treatment grade (ATOXGR)"),
+    answer("Baseline grade (BTOXGR)", correct = TRUE),
+    answer("The parameter name (PARAM)"),
+    answer("The treatment arm (TRT01A)"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 8 — Capstone: Demographics + AE Table
+
+### The task
+
+Build a single three-layer table combining:
+
+1. **Layer 1:** Age (`group_desc(AGE)`) — continuous demographics
+2. **Layer 2:** Sex (`group_count(SEX)`) — categorical demographics
+3. **Layer 3:** AE body system (`group_count(AEBODSYS)`) — AE summary with
+   correct denominator from ADSL
+
+After building, arrange by `ord_layer_index` so all layer-1 rows come first,
+then layer-2, then layer-3.
+
+### Approach
+
+Because Layer 3 uses a *different* dataset (`adae`) from Layers 1 and 2
+(`adsl`), you build it as a separate table and then `bind_rows()` the results.
+
+This is the standard Tplyr pattern for multi-dataset tables:
+
+```r
+# Demographics layers
+demog_tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  add_layer(group_count(SEX)) |>
+  build()
+
+# AE layer (separate table with its own dataset)
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID) |>
+      set_order_count_method("bycount")
+  ) |>
+  build()
+
+# Combine
+combined <- bind_rows(demog_tbl, ae_tbl)
+```
+
+### Exercise 8.1 — Build the three-layer combined table
+
+Complete the code below to build and combine the demographics and AE layers.
+
+```{r capstone-build, exercise=TRUE, exercise.lines=26}
+# Layer 1 + 2: Demographics
+demog_tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(___)) |>
+  add_layer(group_count(___)) |>
+  build()
+
+# Layer 3: AE body system
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(___, ___) |>
+  add_layer(
+    group_count(___) |>
+      set_distinct_by(___) |>
+      set_order_count_method(___)
+  ) |>
+  build()
+
+# Combine both tables
+combined <- bind_rows(demog_tbl, ae_tbl)
+
+# Arrange by ord_layer_index and show row counts
+combined |>
+  arrange(ord_layer_index) |>
+  select(ord_layer_index, row_label_1) |>
+  print(n = 30)
+
+cat("\nTotal rows in combined table:", nrow(combined), "\n")
+```
+
+```{r capstone-build-hint-1}
+# Layers 1+2: group_desc(AGE), group_count(SEX)
+# AE layer: set_pop_data(adsl, TRT01P), group_count(AEBODSYS),
+#           set_distinct_by(USUBJID), set_order_count_method("bycount")
+```
+
+```{r capstone-build-solution}
+demog_tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  add_layer(group_count(SEX)) |>
+  build()
+
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID) |>
+      set_order_count_method("bycount")
+  ) |>
+  build()
+
+combined <- bind_rows(demog_tbl, ae_tbl)
+
+combined |>
+  arrange(ord_layer_index) |>
+  select(ord_layer_index, row_label_1) |>
+  print(n = 30)
+
+cat("\nTotal rows in combined table:", nrow(combined), "\n")
+```
+
+### Exercise 8.2 — Filter to just the AE rows
+
+From `combined`, filter to only the AE body system rows (those with
+`ord_layer_index` equal to the value set by the AE layer — which will be 1
+since it's the only layer in `ae_tbl`). Show body system and Placebo count.
+
+```{r capstone-filter, exercise=TRUE, exercise.lines=20}
+demog_tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  add_layer(group_count(SEX)) |>
+  build()
+
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID) |>
+      set_order_count_method("bycount")
+  ) |>
+  build()
+
+# The AE table has ord_layer_index = 1 (it's its own table)
+# Filter and display
+ae_tbl |>
+  select(row_label_1, n_Placebo) |>
+  arrange(___)
+```
+
+```{r capstone-filter-hint-1}
+# arrange(desc(n_Placebo)) to show highest AE body systems first
+```
+
+```{r capstone-filter-solution}
+demog_tbl <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  add_layer(group_count(SEX)) |>
+  build()
+
+ae_tbl <- tplyr_table(adae, TRT01A) |>
+  set_pop_data(adsl, TRT01P) |>
+  add_layer(
+    group_count(AEBODSYS) |>
+      set_distinct_by(USUBJID) |>
+      set_order_count_method("bycount")
+  ) |>
+  build()
+
+ae_tbl |>
+  select(row_label_1, n_Placebo) |>
+  arrange(desc(n_Placebo))
+```
+
+---
+
+## Lesson Summary
+
+### Key Tplyr concepts
+
+| Concept | What you learned |
+|---------|-----------------|
+| `tplyr_table()` | Defines the base dataset and treatment variable |
+| `add_layer()` | Stacks a layer; each layer = one row block in the final table |
+| `group_count()` | Subject count + % for categorical variables |
+| `group_desc()` | Descriptive statistics (n, mean, sd, median, min, max) |
+| `group_shift()` | Baseline vs. post-baseline cross-tabulation |
+| `f_str()` | Compact format-string spec: `f_str("xx (xx.x%)", n, pct)` |
+| `set_format_strings()` | Attaches an `f_str` to a layer |
+| `set_distinct_by()` | Count distinct subjects (critical for AE tables) |
+| `set_pop_data()` | Set denominator population for % calculations |
+| `set_order_count_method()` | `"byvar"`, `"byvarn"`, `"bycount"` |
+| `build()` | Executes all layers; returns a plain tibble |
+| `ord_layer_index` | Integer column identifying which layer each row came from |
+
+### Tplyr vs SAS equivalents
+
+| Tplyr | SAS |
+|-------|-----|
+| `group_count(SEX)` | `PROC FREQ DATA=adsl; TABLE SEX * TRT01P;` |
+| `group_desc(AGE)` | `PROC MEANS DATA=adsl N MEAN STD MEDIAN MIN MAX;` |
+| `group_shift(...)` | Custom shift-table macro |
+| `set_pop_data(adsl)` | `PROC FREQ; WEIGHT from denominator dataset;` |
+| `set_order_count_method("bycount")` | `ORDER=FREQ` in PROC FREQ |
+| `build()` | `RUN;` — executes and returns output |
+
+### Typical production workflow
+
+```r
+# 1. Build with Tplyr
+demog <- tplyr_table(adsl, TRT01P) |>
+  add_layer(group_desc(AGE)) |>
+  add_layer(group_count(SEX)) |>
+  add_layer(group_count(RACE)) |>
+  build()
+
+# 2. Post-process with dplyr
+demog_clean <- demog |>
+  arrange(ord_layer_index, ord_layer_1) |>
+  select(row_label_1, starts_with("n_"))
+
+# 3. Format and output with r2rtf
+demog_clean |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title("Table 14.1.2 — Demographics") |>
+  ...
+  rtf_encode() |>
+  rtf_write("t_14_1_2.rtf")
+```
+
+### Next lesson
+
+**Lesson 37 — tidytlg** covers an alternative tidyverse-native table-generation
+framework with a declarative column-definition API, designed for outputs that
+go directly to HTML or PDF.

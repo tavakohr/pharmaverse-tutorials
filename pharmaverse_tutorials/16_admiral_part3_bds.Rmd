@@ -8,6 +8,31 @@ runtime: shiny_prerendered
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 16_admiral_part3_bds.Rmd
+# PURPOSE       : admiral Part 3 — BDS datasets: ADLB (lab) and ADVS (vital signs)
+#                 derivations including PARAMCD/AVAL/BASE/CHG/PCHG,
+#                 toxicity grading, and visit windowing.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tidyr)
@@ -138,7 +163,8 @@ derive_vars_dy <- function(dataset, reference_date, source_vars) {
 }
 
 derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "first") {
-  new_nm  <- deparse(substitute(new_var))
+  # Accept either a bare name (direct call) or a string (via do.call from params())
+  .e <- substitute(new_var); new_nm <- if (is.character(.e)) .e else deparse(.e)
   by_nm   <- sapply(by_vars, deparse)
   ord_nms <- sapply(order, function(x) {
     d <- deparse(x); gsub("desc\\(|\\)", "", d)
@@ -179,7 +205,15 @@ restrict_derivation <- function(dataset, derivation, args = list(), filter = NUL
                   c(in_rows[seq_len(nrow(derived))], out_rows)))
 }
 
-params <- function(...) list(...)
+params <- function(...) {
+  # Bare names (e.g. new_var = ABLFL) are captured as strings.
+  # Everything else (exprs() calls, strings, numbers) is evaluated normally.
+  parent_env <- parent.frame()
+  dots <- as.list(substitute(list(...)))[-1]
+  lapply(dots, function(x) {
+    if (is.symbol(x)) deparse(x) else eval(x, envir = parent_env)
+  })
+}
 
 derivation_slice <- function(filter = NULL, args = list()) {
   list(filter = substitute(filter), args = args)
@@ -200,6 +234,10 @@ slice_derivation <- function(dataset, derivation, args = list(), ...) {
     sub_data    <- result[idx, , drop = FALSE]
     all_args    <- c(list(dataset = sub_data), merged_args)
     derived     <- tryCatch(do.call(derivation, all_args), error = function(e) sub_data)
+    # Initialise any brand-new columns to NA before subset assignment;
+    # R cannot add columns via df[idx, "new_col"] <- x on an existing df.
+    new_cols <- setdiff(names(derived), names(result))
+    for (nc in new_cols) result[[nc]] <- NA
     result[idx, names(derived)] <- derived[seq_len(length(idx)), names(derived)]
     covered <- c(covered, idx)
   }
@@ -381,8 +419,11 @@ vs <- tribble(
 
 adsl_bds <- tribble(
   ~STUDYID,        ~USUBJID, ~TRTSDT, ~TRTEDT, ~TRT01A,    ~TRT01P,    ~SEX, ~AGE, ~SAFFL,
-  "CDISCPILOT01", "01-001",  19367,   19548,   "Xanomeli", "Xanomeli", "F",   52,   "Y",
-  "CDISCPILOT01", "01-002",  19370,   19551,   "Placebo",  "Placebo",  "M",   61,   "Y"
+  # TRTSDT after SCREENING (19727/19730) so SCREENING = baseline (ADT <= TRTSDT)
+  # TRTEDT after WEEK 4 (19758/19761) so WEEK 4 = on-treatment (ONTRTFL = "Y")
+  # 2024-01-10 = 19732; 2024-01-13 = 19735; 2024-03-01 = 19783
+  "CDISCPILOT01", "01-001",  19732,   19783,   "Xanomeli", "Xanomeli", "F",   52,   "Y",
+  "CDISCPILOT01", "01-002",  19735,   19783,   "Placebo",  "Placebo",  "M",   61,   "Y"
 )
 
 param_lookup <- tribble(
@@ -394,6 +435,13 @@ param_lookup <- tribble(
   "WEIGHT",  "WEIGHT", "Weight (kg)",                       10,      "Anthropometric",
   "HEIGHT",  "HEIGHT", "Height (cm)",                       11,      "Anthropometric"
 )
+
+# ── Real pharmaverseadam datasets (for validation and exploration exercises) ───
+library(pharmaverseadam)
+advs_real <- pharmaverseadam::advs
+adlb_real <- pharmaverseadam::adlb |>
+  filter(is.na(DTYPE))            # remove admiral summary rows (AVISITN 9997/9998)
+adsl_real <- pharmaverseadam::adsl
 ```
 
 ## Welcome
@@ -526,6 +574,47 @@ quiz(
     allow_retry = TRUE
   )
 )
+```
+
+### Exercise: Explore real ADVS parameter inventory
+
+The toy dataset has 2 subjects and 6 test codes. The real `advs_real` from pharmaverseadam has the full CDISCPILOT01 study — 254 subjects and many more parameters and visits.
+
+> **Orientation exercise**: before building a new BDS dataset, a programmer always audits the source SDTM to understand its shape. Answer the three questions using `advs_real`.
+
+```{r advs-real-explore, exercise=TRUE, exercise.lines=30}
+# Q1: How many unique PARAMCD values are in advs_real?
+n_params <- advs_real |> distinct(PARAMCD) |> nrow()
+cat("Unique parameters:", n_params, "\n")
+
+# Q2: Which PARAMCDs are present?
+advs_real |> distinct(PARAMCD, PARAM) |> arrange(PARAMCD) |> print()
+
+# Q3: How many ONTRTFL = "Y" rows exist per PARAMCD?
+advs_real |>
+  filter(ONTRTFL == "Y") |>
+  count(PARAMCD, name = "n_ontreatment") |>
+  arrange(desc(n_ontreatment)) |>
+  print()
+```
+
+```{r advs-real-explore-hint-1}
+# distinct(PARAMCD) gives unique parameter codes
+# count(PARAMCD) counts rows per parameter
+# filter(ONTRTFL == "Y") selects on-treatment observations
+```
+
+```{r advs-real-explore-solution}
+n_params <- advs_real |> distinct(PARAMCD) |> nrow()
+cat("Unique parameters:", n_params, "\n\n")
+
+advs_real |> distinct(PARAMCD, PARAM) |> arrange(PARAMCD) |> print()
+
+advs_real |>
+  filter(ONTRTFL == "Y") |>
+  count(PARAMCD, name = "n_ontreatment") |>
+  arrange(desc(n_ontreatment)) |>
+  print()
 ```
 
 ---
@@ -1110,6 +1199,258 @@ quiz(
 )
 ```
 
+### Exercise: Explore real ADLB toxicity grades
+
+Real lab data reveals patterns that toy datasets can't: multiple parameters, sparse missing values, wide toxicity grade distributions. Use `adlb_real` to investigate.
+
+> **Note:** `adlb_real` has admiral summary rows (`DTYPE != NA`) already removed in setup. `ATOXGR` is stored as integer (converted from character in pharmaverseadam).
+
+```{r adlb-real-explore, exercise=TRUE, exercise.lines=35}
+# Ensure ATOXGR is integer (pharmaverseadam stores it as character)
+adlb_work <- adlb_real |>
+  mutate(ATOXGR = suppressWarnings(as.integer(ATOXGR)),
+         BTOXGR = suppressWarnings(as.integer(BTOXGR)))
+
+# Q1: How many unique lab parameters are in this ADLB?
+cat("Unique parameters:", n_distinct(adlb_work$PARAMCD), "\n\n")
+
+# Q2: Count records by ATOXGR grade
+adlb_work |>
+  count(ATOXGR, name = "n_records") |>
+  arrange(ATOXGR) |>
+  print()
+
+# Q3: Which parameters have the most Grade >=3 on-treatment toxicity events?
+adlb_work |>
+  filter(ONTRTFL == "Y" & !is.na(ATOXGR) & ATOXGR >= 3) |>
+  count(PARAMCD, PARAM, name = "n_grade3plus") |>
+  arrange(desc(n_grade3plus)) |>
+  head(10) |>
+  print()
+```
+
+```{r adlb-real-explore-hint-1}
+# filter(ONTRTFL == "Y" & ATOXGR >= 3) selects on-treatment Grade 3+ events
+# count(PARAMCD) then summarises per parameter
+# arrange(desc(n_grade3plus)) puts worst parameters first
+```
+
+```{r adlb-real-explore-solution}
+adlb_work <- adlb_real |>
+  mutate(ATOXGR = suppressWarnings(as.integer(ATOXGR)),
+         BTOXGR = suppressWarnings(as.integer(BTOXGR)))
+
+cat("Unique parameters:", n_distinct(adlb_work$PARAMCD), "\n\n")
+
+adlb_work |>
+  count(ATOXGR, name = "n_records") |>
+  arrange(ATOXGR) |>
+  print()
+
+adlb_work |>
+  filter(ONTRTFL == "Y" & !is.na(ATOXGR) & ATOXGR >= 3) |>
+  count(PARAMCD, PARAM, name = "n_grade3plus") |>
+  arrange(desc(n_grade3plus)) |>
+  head(10) |>
+  print()
+```
+
+---
+
+## 11.5 — P21 Derivation Diagnostics
+
+BDS derivations are particularly prone to subtle errors that slip through code review but surface immediately in Pinnacle 21 validation. Each diagnostic below shows a derivation spec, a broken implementation, and the P21 error received.
+
+---
+
+### Diagnostic 1 — ABLFL: Wrong mode for pre-treatment baseline
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *ABLFL = 'Y' for the LAST non-missing pre-treatment observation per subject per parameter (i.e., the measurement closest in time to first dose, before dosing began). This observation is used as the baseline reference. Rows where AVAL is missing must be excluded. Source: ADT, TRTSDT.*
+
+The programmer submitted:
+
+```r
+advs_draft <- advs |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      order   = exprs(ADT, AVISITN),
+      new_var = ABLFL,
+      mode    = "first"    # ← bug: should be "last"
+    ),
+    filter = !is.na(AVAL) & ADT <= TRTSDT
+  )
+```
+
+**P21 report:** *"ABLFL flagged on earliest screening record rather than the record closest to first dose. For subjects with multiple pre-treatment visits, baseline values do not match expected SCREENING 2 or pre-dose values."*
+
+```{r p21-bug-ablfl, exercise=TRUE, exercise.lines=22}
+# Fix the ABLFL derivation: baseline = LAST non-missing pre-treatment row.
+# With order = exprs(ADT, AVISITN), mode = "last" picks the highest ADT.
+
+advs_fixed_ablfl <- advs |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      order   = exprs(ADT, AVISITN),
+      new_var = ABLFL,
+      mode    = "___"    # fix this
+    ),
+    filter = !is.na(AVAL) & ADT <= TRTSDT
+  )
+
+# Verify: show ABLFL-flagged rows — should be SCREENING (last pre-treatment visit)
+advs_fixed_ablfl |>
+  filter(!is.na(ABLFL)) |>
+  select(USUBJID, PARAMCD, AVISIT, ADT, AVAL, ABLFL)
+```
+
+```{r p21-bug-ablfl-hint-1}
+# mode = "last" — after ordering by ADT ascending, "last" = highest date = closest to first dose
+# With "first" you get the earliest (oldest) pre-treatment record — wrong baseline
+```
+
+```{r p21-bug-ablfl-solution}
+advs_fixed_ablfl <- advs |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+      order   = exprs(ADT, AVISITN),
+      new_var = ABLFL,
+      mode    = "last"
+    ),
+    filter = !is.na(AVAL) & ADT <= TRTSDT
+  )
+
+advs_fixed_ablfl |>
+  filter(!is.na(ABLFL)) |>
+  select(USUBJID, PARAMCD, AVISIT, ADT, AVAL, ABLFL)
+```
+
+---
+
+### Diagnostic 2 — BASE: Missing PARAMCD from by_vars
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *BASE = AVAL at the baseline record (ABLFL = 'Y') for each subject-parameter combination. Every observation for a given subject and parameter receives the same BASE value (the one from the ABLFL = 'Y' row). Source: derived ABLFL, AVAL. By variables: STUDYID, USUBJID, PARAMCD.*
+
+The programmer submitted:
+
+```r
+advs_draft2 <- advs |>
+  derive_var_base(
+    by_vars    = exprs(STUDYID, USUBJID),   # ← PARAMCD missing!
+    source_var = AVAL,
+    new_var    = BASE
+  )
+```
+
+**P21 report:** *"BASE values for DIABP rows match SYSBP baseline values. Multiple parameters share the same BASE within a subject. PARAMCD must be included in the by variables for baseline derivation."*
+
+```{r p21-bug-base-byvars, exercise=TRUE, exercise.lines=18}
+# Fix: PARAMCD must be in by_vars so each parameter gets its own baseline value.
+
+advs_fixed_base <- advs |>
+  derive_var_base(
+    by_vars    = exprs(STUDYID, USUBJID, ___),   # add the missing variable
+    source_var = AVAL,
+    new_var    = BASE
+  )
+
+# Verify: SYSBP and DIABP should have different BASE values for the same subject
+advs_fixed_base |>
+  filter(PARAMCD %in% c("SYSBP", "DIABP") & !is.na(ABLFL)) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, BASE, ABLFL)
+```
+
+```{r p21-bug-base-byvars-hint-1}
+# by_vars = exprs(STUDYID, USUBJID, PARAMCD)
+# Without PARAMCD, derive_var_base() joins only on STUDYID + USUBJID,
+# so the first ABLFL = "Y" row (regardless of PARAMCD) is used as BASE for ALL parameters.
+```
+
+```{r p21-bug-base-byvars-solution}
+advs_fixed_base <- advs |>
+  derive_var_base(
+    by_vars    = exprs(STUDYID, USUBJID, PARAMCD),
+    source_var = AVAL,
+    new_var    = BASE
+  )
+
+advs_fixed_base |>
+  filter(PARAMCD %in% c("SYSBP", "DIABP") & !is.na(ABLFL)) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL, BASE, ABLFL)
+```
+
+---
+
+### Diagnostic 3 — CHG: Sign reversal
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *CHG = AVAL − BASE (change from baseline). Positive CHG indicates an increase relative to baseline. PCHG = (AVAL − BASE) / |BASE| × 100. BASE = 0 must result in PCHG = missing. Source: derived AVAL, BASE.*
+
+The programmer submitted:
+
+```r
+advs_draft3 <- advs |>
+  mutate(
+    CHG  = BASE - AVAL,            # ← sign reversed
+    PCHG = (BASE - AVAL) / abs(AVAL) * 100   # ← two bugs: sign + wrong denominator
+  )
+```
+
+**P21 report:** *"CHG is negative for subjects where AVAL > BASE. Expected positive CHG for elevated post-baseline values. PCHG denominator should be |BASE|, not |AVAL|. Rule: AD0271 — CHG derivation inconsistent with spec."*
+
+```{r p21-bug-chg, exercise=TRUE, exercise.lines=20}
+# Fix both bugs:
+# 1. CHG = AVAL - BASE  (not BASE - AVAL)
+# 2. PCHG = (AVAL - BASE) / abs(BASE) * 100, with NA when BASE == 0
+
+advs_fixed_chg <- advs |>
+  mutate(
+    CHG  = ___ - ___,
+    PCHG = if_else(
+      BASE == 0 | is.na(BASE),
+      NA_real_,
+      (___ - ___) / abs(___) * 100
+    )
+  )
+
+# Verify: for WEEK 4 SYSBP, a higher AVAL than baseline should give positive CHG
+advs_fixed_chg |>
+  filter(PARAMCD == "SYSBP" & !is.na(BASE)) |>
+  select(USUBJID, AVISIT, AVAL, BASE, CHG, PCHG)
+```
+
+```{r p21-bug-chg-hint-1}
+# CHG  = AVAL - BASE
+# PCHG = (AVAL - BASE) / abs(BASE) * 100
+# Denominator is |BASE| — not |AVAL|. If BASE = 0, PCHG = NA (division by zero).
+```
+
+```{r p21-bug-chg-solution}
+advs_fixed_chg <- advs |>
+  mutate(
+    CHG  = AVAL - BASE,
+    PCHG = if_else(
+      BASE == 0 | is.na(BASE),
+      NA_real_,
+      (AVAL - BASE) / abs(BASE) * 100
+    )
+  )
+
+advs_fixed_chg |>
+  filter(PARAMCD == "SYSBP" & !is.na(BASE)) |>
+  select(USUBJID, AVISIT, AVAL, BASE, CHG, PCHG)
+```
+
 ---
 
 ## Quiz — final
@@ -1117,35 +1458,93 @@ quiz(
 ```{r quiz-final-16, echo=FALSE}
 quiz(
   question(
-    "What does ABLFL = 'Y' mark?",
-    answer("Any post-baseline row"),
-    answer("The row used as the baseline reference for that subject and parameter", correct = TRUE),
-    answer("An adverse event flag"),
-    answer("An on-treatment row"),
+    "A programmer flags ABLFL using `mode = 'first'` with `order = exprs(ADT)`. P21 reports baseline values don't match the expected pre-dose visit. What is the consequence of 'first' vs 'last'?",
+    answer("'first' picks the row with the highest ADT — closest to first dose"),
+    answer("'first' picks the row with the lowest ADT — earliest screening visit — not the most recent pre-treatment assessment. Fix: use mode = 'last'", correct = TRUE),
+    answer("'first' and 'last' produce identical results when there is only one pre-treatment visit"),
+    answer("'first' correctly picks the latest date because ADT is stored in descending order"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   ),
   question(
-    "CHG is defined as:",
-    answer("BASE - AVAL"),
-    answer("AVAL / BASE"),
-    answer("AVAL - BASE", correct = TRUE),
-    answer("(AVAL - BASE) / BASE * 100"),
+    "BASE is derived with `by_vars = exprs(STUDYID, USUBJID)` — PARAMCD is omitted. What goes wrong?",
+    answer("The function errors because PARAMCD is a required argument"),
+    answer("All parameters for a subject receive the same BASE value — whichever ABLFL = 'Y' row appears first in the dataset, regardless of PARAMCD", correct = TRUE),
+    answer("BASE is set to NA for all non-SYSBP parameters"),
+    answer("Nothing — BASE joins on USUBJID alone and correctly finds the right row"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   ),
   question(
-    "What does SHIFT1 = 'NORMAL to HIGH' tell you?",
-    answer("AVAL exceeded the reference range"),
-    answer("The subject's reference range category went from NORMAL at baseline to HIGH on-treatment", correct = TRUE),
-    answer("The parameter was flagged as worst"),
-    answer("The baseline was missing"),
+    "P21 rule AD0271 flags CHG values. The programmer coded `CHG = BASE - AVAL`. What is the correct formula and why does the sign matter?",
+    answer("CHG = AVAL - BASE. Sign matters because a positive CHG should indicate an increase post-baseline; the reversed formula reports increases as negative, misleading safety reviewers", correct = TRUE),
+    answer("CHG = BASE - AVAL is correct per ADaM IG — PCHG corrects the sign"),
+    answer("CHG = (AVAL + BASE) / 2 — the average of the two values"),
+    answer("CHG = AVAL / BASE — the ratio from baseline"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   ),
   question(
-    "Which higher-order wrapper lets you apply the same derivation with different argument sets to different data slices?",
-    answer("restrict_derivation()"),
-    answer("call_derivation()"),
-    answer("slice_derivation()", correct = TRUE),
-    answer("derive_vars_merged()"),
+    "PCHG is coded as `(AVAL - BASE) / abs(AVAL) * 100`. P21 flags the denominator. What is the correct denominator and why?",
+    answer("`abs(AVAL)` is correct — the percent change is relative to the current value"),
+    answer("`abs(BASE)` — percent change from baseline is always relative to the baseline value, not the current observation. Using AVAL in the denominator gives a different (and non-standard) metric", correct = TRUE),
+    answer("`(AVAL + BASE) / 2` — the average of baseline and post-baseline"),
+    answer("The denominator does not matter because PCHG is informational only"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "ONTRTFL = 'Y' for a row where ADT = TRTSDT (treatment start date). Is this correct?",
+    answer("No — the treatment start date is pre-treatment, so ONTRTFL should be NA"),
+    answer("Yes — the standard definition is ADT >= TRTSDT AND ADT <= TRTEDT (inclusive on both ends), so the start date itself is on-treatment", correct = TRUE),
+    answer("It depends on the protocol — some studies exclude the start date"),
+    answer("No — ONTRTFL only applies to lab values, not vitals"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "A BDS dataset contains both SYSBP and DIABP records. The programmer filters to `PARAMCD == 'SYSBP'` before calling `derive_param_map()`. What happens?",
+    answer("MAP is computed correctly from the filtered SYSBP rows"),
+    answer("MAP cannot be computed — derive_param_map() needs both SYSBP and DIABP rows in the input dataset to calculate (SYS + 2×DIA) / 3. Filtering to one parameter first removes the data needed for the formula", correct = TRUE),
+    answer("derive_param_map() fetches DIABP rows automatically from adsl"),
+    answer("MAP is derived from SYSBP alone using a built-in reference value for DIA"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "SHIFT1 = 'NORMAL to HIGH' for a subject at Week 12. What does this mean, and which variables produce it?",
+    answer("AVAL > ANRHI at Week 12 AND BNRIND = 'NORMAL' at baseline — SHIFT1 = paste0(BNRIND, ' to ', ANRIND)", correct = TRUE),
+    answer("The subject's AVAL increased by more than the normal reference range"),
+    answer("ANRIND = 'HIGH' at baseline and ANRIND = 'NORMAL' at Week 12 — the order is reversed"),
+    answer("SHIFT1 compares two on-treatment visits, not baseline to on-treatment"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "`constant_by_vars = exprs(USUBJID)` in `derive_param_bmi()` tells admiral to:",
+    answer("Compute BMI once per subject using a single height value (e.g., screening height), carried forward to all visits — rather than requiring a height measurement at every visit", correct = TRUE),
+    answer("Restrict BMI computation to one visit per subject only"),
+    answer("Use a constant height of 170 cm when no height record is found"),
+    answer("Join the height from the ADSL dataset instead of the VS source"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "A lab ADLB has ATOXGR stored as character (e.g., '3', '-1'). The programmer compares `ATOXGR > '2'` without converting. What is the problem?",
+    answer("Character comparison is alphabetic: '3' > '2' is TRUE (correct by accident), but '-1' > '2' is also TRUE because '-' sorts after digits — so below-normal grades appear as high toxicity", correct = TRUE),
+    answer("R coerces character to integer automatically in > comparisons"),
+    answer("The comparison errors immediately with a type mismatch"),
+    answer("Only values with leading zeros are affected"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "Why does `restrict_derivation()` leave non-matching rows unchanged, while applying the derivation only to filtered rows?",
+    answer("It errors on non-matching rows instead of leaving them unchanged"),
+    answer("It applies the derivation to non-matching rows with a NULL result"),
+    answer("It splits the dataset into matching and non-matching subsets, applies the derivation to the matching subset, then recombines — non-matching rows retain their original column values", correct = TRUE),
+    answer("It is identical to filter() followed by the derivation — rows not meeting the filter are dropped permanently"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   )
 )

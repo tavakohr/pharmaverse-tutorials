@@ -8,6 +8,32 @@ runtime: shiny_prerendered
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 18_admiral_part5_adtte.Rmd
+# PURPOSE       : admiral Part 5 — ADTTE time-to-event datasets: derive_param_tte(), event
+#                 and censoring source definitions, Kaplan-Meier
+#                 readiness checks, and common oncology/survival
+#                 endpoints.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tibble)
@@ -56,7 +82,8 @@ derive_param_tte <- function(dataset_adsl = NULL,
                               source_datasets,
                               set_values_to = list(),
                               ...) {
-  start_nm <- deparse(substitute(start_date))
+  .e <- substitute(start_date)
+  start_nm <- if (is.character(.e)) .e else deparse(.e)
   adsl_use <- if (!is.null(dataset_adsl)) dataset_adsl else
               source_datasets[[names(source_datasets)[1]]]
   # helper to evaluate one source condition for all subjects
@@ -189,6 +216,10 @@ adae_tte <- tribble(
   "CDISCPILOT01", "01-001",  "ANAPHYLACTIC SHOCK",  19400,  "Y",     "Y",    19367,
   "CDISCPILOT01", "01-003",  "MYOCARDIAL INFARCTION",19420, "Y",     "Y",    19375
 )
+
+# ── Real pharmaverseadam ADSL for real-data OS exercise ───────────────────────
+library(pharmaverseadam)
+adsl_real <- pharmaverseadam::adsl
 ```
 
 ## Welcome
@@ -378,6 +409,98 @@ adtte_os2 <- derive_param_tte(
 adtte_os2 |> select(USUBJID, PARAMCD, AVAL, CNSR, EVNTDESC)
 ```
 
+### Exercise: Overall Survival on the real CDISCPILOT01 study
+
+Scale up from the 5-subject toy to all 254 real subjects. `adsl_real` from pharmaverseadam contains DTHDT, LSTALVDT, SAFFL, TRTSDT, and TRT01A — everything needed for a submission-quality OS derivation.
+
+> **Note:** In pharmaverseadam, DTHDT and LSTALVDT are Date objects. The mock `derive_param_tte()` handles Date arithmetic correctly (`as.numeric(Date − Date)` = days), so AVAL will be in days as expected.
+
+```{r os-real, exercise=TRUE, exercise.lines=48}
+# Check the death-related columns available in adsl_real
+cat("Key TTE variables in adsl_real:\n")
+cat(intersect(c("DTHDT","LSTALVDT","DTHFL","TRTSDT","RANDDT","SAFFL","TRT01A"),
+              names(adsl_real)), "\n\n")
+
+# Define event and censor sources using real ADSL variables
+death_ev_real <- event_source(
+  dataset_name  = "adsl",
+  filter        = !is.na(DTHDT),
+  date          = DTHDT,
+  set_values_to = exprs(EVNTDESC = "DEATH", SRCDOM = "ADSL", SRCVAR = "DTHDT")
+)
+
+alive_cs_real <- censor_source(
+  dataset_name  = "adsl",
+  date          = LSTALVDT,
+  set_values_to = exprs(EVNTDESC = "LAST DATE KNOWN ALIVE",
+                         SRCDOM = "ADSL", SRCVAR = "LSTALVDT")
+)
+
+# Derive OS for the safety population
+adtte_os_real <- derive_param_tte(
+  dataset_adsl      = adsl_real |> filter(SAFFL == "Y"),
+  start_date        = TRTSDT,
+  event_conditions  = list(death_ev_real),
+  censor_conditions = list(alive_cs_real),
+  source_datasets   = list(adsl = adsl_real),
+  set_values_to     = exprs(PARAMCD = "OS", PARAM = "Overall Survival")
+)
+
+# Summary
+cat("OS subjects:", nrow(adtte_os_real), "\n")
+cat("Events (CNSR = 0):", sum(adtte_os_real$CNSR == 0, na.rm = TRUE), "\n")
+cat("Censored (CNSR = 1):", sum(adtte_os_real$CNSR == 1, na.rm = TRUE), "\n\n")
+
+# Median survival in days by treatment arm
+adtte_os_real |>
+  group_by(TRT01A, CNSR) |>
+  summarise(n = n(), median_aval = median(AVAL, na.rm = TRUE), .groups = "drop") |>
+  arrange(TRT01A, CNSR) |>
+  print()
+```
+
+```{r os-real-hint-1}
+# adsl_real has DTHDT (Date), LSTALVDT (Date), TRTSDT (Date)
+# filter(SAFFL == "Y") restricts to the safety population (~254 subjects)
+# CNSR = 0 → event occurred; CNSR = 1 → censored (alive at last contact)
+# median(AVAL) gives median follow-up in days per arm/event-status group
+```
+
+```{r os-real-solution}
+death_ev_real <- event_source(
+  dataset_name  = "adsl",
+  filter        = !is.na(DTHDT),
+  date          = DTHDT,
+  set_values_to = exprs(EVNTDESC = "DEATH", SRCDOM = "ADSL", SRCVAR = "DTHDT")
+)
+
+alive_cs_real <- censor_source(
+  dataset_name  = "adsl",
+  date          = LSTALVDT,
+  set_values_to = exprs(EVNTDESC = "LAST DATE KNOWN ALIVE",
+                         SRCDOM = "ADSL", SRCVAR = "LSTALVDT")
+)
+
+adtte_os_real <- derive_param_tte(
+  dataset_adsl      = adsl_real |> filter(SAFFL == "Y"),
+  start_date        = TRTSDT,
+  event_conditions  = list(death_ev_real),
+  censor_conditions = list(alive_cs_real),
+  source_datasets   = list(adsl = adsl_real),
+  set_values_to     = exprs(PARAMCD = "OS", PARAM = "Overall Survival")
+)
+
+cat("OS subjects:", nrow(adtte_os_real), "\n")
+cat("Events (CNSR = 0):", sum(adtte_os_real$CNSR == 0, na.rm = TRUE), "\n")
+cat("Censored (CNSR = 1):", sum(adtte_os_real$CNSR == 1, na.rm = TRUE), "\n\n")
+
+adtte_os_real |>
+  group_by(TRT01A, CNSR) |>
+  summarise(n = n(), median_aval = median(AVAL, na.rm = TRUE), .groups = "drop") |>
+  arrange(TRT01A, CNSR) |>
+  print()
+```
+
 ---
 
 ## 4 — PFS: composite events
@@ -556,7 +679,7 @@ adtte_both <- call_derivation(
   ),
   # Shared arguments
   dataset_adsl    = adsl_tte,
-  start_date      = RANDDT,
+  start_date      = "RANDDT",
   source_datasets = list(adsl = adsl_tte, adrs = adrs)
 )
 
@@ -669,40 +792,347 @@ quiz(
 
 ---
 
+## 7.5 — P21 Derivation Diagnostics
+
+ADTTE errors are among the most consequential in a submission: a wrong AVAL or misclassified CNSR can distort Kaplan-Meier curves and median survival estimates. Each diagnostic presents a define.xml derivation spec and the Pinnacle 21 error that revealed the bug.
+
+---
+
+### Diagnostic 1 — PFS: Wrong start date (TRTSDT instead of RANDDT)
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *STARTDT for Progression-Free Survival (PFS) = RANDDT (date of randomization). The analysis clock starts at randomization, not at first dose, to capture dose-delay effects. AVAL = ADT − RANDDT + 1 days. Source: ADSL.RANDDT.*
+
+The programmer submitted:
+
+```r
+adtte_pfs_draft <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = TRTSDT,   # ← bug: should be RANDDT
+  event_conditions  = list(pd_event, death_event),
+  censor_conditions = list(last_assess, last_alive_censor),
+  source_datasets   = list(adsl = adsl_tte, adrs = adrs),
+  set_values_to     = exprs(PARAMCD = "PFS", PARAM = "PFS")
+)
+```
+
+**P21 report:** *"AVAL for PARAMCD = 'PFS' does not align with expected values. STARTDT appears equal to TRTSDT rather than RANDDT. For subjects with dose delays, AVAL is understated. Expected AVAL = ADT − RANDDT + 1."*
+
+```{r p21-bug-pfs-startdate, exercise=TRUE, exercise.lines=22}
+# Fix: PFS uses RANDDT as the start date (randomization date), not TRTSDT.
+
+adtte_pfs_fixed <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = ___,       # fix: randomization date
+  event_conditions  = list(pd_event, death_event),
+  censor_conditions = list(last_assess, last_alive_censor),
+  source_datasets   = list(adsl = adsl_tte, adrs = adrs),
+  set_values_to     = exprs(PARAMCD = "PFS", PARAM = "Progression-Free Survival")
+)
+
+# Compare AVAL from RANDDT vs TRTSDT: subjects 01-001 and 01-002 had
+# RANDDT 7 days before TRTSDT, so AVAL should be 7 days longer with RANDDT.
+adtte_pfs_wrong <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = TRTSDT,
+  event_conditions  = list(pd_event, death_event),
+  censor_conditions = list(last_assess, last_alive_censor),
+  source_datasets   = list(adsl = adsl_tte, adrs = adrs),
+  set_values_to     = exprs(PARAMCD = "PFS", PARAM = "PFS")
+)
+
+left_join(
+  adtte_pfs_fixed |> select(USUBJID, AVAL_correct = AVAL, CNSR),
+  adtte_pfs_wrong |> select(USUBJID, AVAL_wrong   = AVAL),
+  by = "USUBJID"
+) |> mutate(diff = AVAL_correct - AVAL_wrong)
+```
+
+```{r p21-bug-pfs-startdate-hint-1}
+# start_date = RANDDT  (randomization date, not first treatment date)
+# TRTSDT may differ from RANDDT if the subject had a dose delay
+# RANDDT is always the correct clock start for PFS per the statistical analysis plan
+```
+
+```{r p21-bug-pfs-startdate-solution}
+adtte_pfs_fixed <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = RANDDT,
+  event_conditions  = list(pd_event, death_event),
+  censor_conditions = list(last_assess, last_alive_censor),
+  source_datasets   = list(adsl = adsl_tte, adrs = adrs),
+  set_values_to     = exprs(PARAMCD = "PFS", PARAM = "Progression-Free Survival")
+)
+
+adtte_pfs_wrong <- derive_param_tte(
+  dataset_adsl      = adsl_tte,
+  start_date        = TRTSDT,
+  event_conditions  = list(pd_event, death_event),
+  censor_conditions = list(last_assess, last_alive_censor),
+  source_datasets   = list(adsl = adsl_tte, adrs = adrs),
+  set_values_to     = exprs(PARAMCD = "PFS", PARAM = "PFS")
+)
+
+left_join(
+  adtte_pfs_fixed |> select(USUBJID, AVAL_correct = AVAL, CNSR),
+  adtte_pfs_wrong |> select(USUBJID, AVAL_wrong   = AVAL),
+  by = "USUBJID"
+) |> mutate(diff = AVAL_correct - AVAL_wrong)
+```
+
+---
+
+### Diagnostic 2 — TTAESER: Missing TRTEMFL filter includes pre-treatment SAEs
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *TTAESER event = first treatment-emergent serious adverse event. Filter criteria: AESER = 'Y' AND TRTEMFL = 'Y'. AEs that are serious but occurred before first dose (TRTEMFL ≠ 'Y') must be excluded. Only on-treatment SAEs trigger the event. Source: ADAE.AESER, ADAE.TRTEMFL, ADAE.ASTDT.*
+
+The programmer submitted:
+
+```r
+sae_event_draft <- event_source(
+  dataset_name  = "adae",
+  filter        = AESER == "Y",    # ← bug: TRTEMFL == "Y" is missing
+  date          = ASTDT,
+  set_values_to = exprs(EVNTDESC = "FIRST SERIOUS AE",
+                         SRCDOM = "ADAE", SRCVAR = "ASTDT")
+)
+```
+
+**P21 report:** *"TTAESER event date precedes TRTSDT for subject 01-001. A pre-treatment SAE (TRTEMFL = 'N') is counted as the event. Event filter must include TRTEMFL = 'Y'."*
+
+```{r p21-bug-ttaeser-filter, exercise=TRUE, exercise.lines=30}
+# Self-contained: build a small AE dataset with one pre-treatment SAE
+ae_with_pretrt <- tibble(
+  USUBJID = c("01-001", "01-001", "01-002"),
+  AETERM  = c("PRE-STUDY SAE", "ANAPHYLACTIC SHOCK", "CARDIAC ARREST"),
+  ASTDT   = c(19340, 19400, 19400),   # 19340 is before TRTSDT = 19367 for 01-001
+  AESER   = c("Y",   "Y",    "Y"),
+  TRTEMFL = c("N",   "Y",    "Y")     # first row is pre-treatment
+)
+
+# Broken: no TRTEMFL filter → pre-treatment SAE for 01-001 triggers event
+sae_ev_broken <- event_source(
+  dataset_name  = "adae",
+  filter        = AESER == "Y",
+  date          = ASTDT,
+  set_values_to = exprs(EVNTDESC = "FIRST SERIOUS AE", SRCDOM = "ADAE", SRCVAR = "ASTDT")
+)
+
+# Fix: add TRTEMFL == "Y" to the filter
+sae_ev_fixed <- event_source(
+  dataset_name  = "adae",
+  filter        = AESER == "Y" & ___,     # add the missing condition
+  date          = ASTDT,
+  set_values_to = exprs(EVNTDESC = "FIRST SERIOUS AE", SRCDOM = "ADAE", SRCVAR = "ASTDT")
+)
+
+broken <- derive_param_tte(
+  dataset_adsl = adsl_tte, start_date = TRTSDT,
+  event_conditions = list(sae_ev_broken),
+  censor_conditions = list(eot_censor),
+  source_datasets = list(adsl = adsl_tte, adae = ae_with_pretrt),
+  set_values_to = exprs(PARAMCD = "TTAESER", PARAM = "Time to First Serious AE")
+)
+
+fixed <- derive_param_tte(
+  dataset_adsl = adsl_tte, start_date = TRTSDT,
+  event_conditions = list(sae_ev_fixed),
+  censor_conditions = list(eot_censor),
+  source_datasets = list(adsl = adsl_tte, adae = ae_with_pretrt),
+  set_values_to = exprs(PARAMCD = "TTAESER", PARAM = "Time to First Serious AE")
+)
+
+cat("--- Broken (includes pre-treatment SAE for 01-001) ---\n")
+broken |> select(USUBJID, AVAL, CNSR, EVNTDESC) |> print()
+cat("\n--- Fixed (only on-treatment SAEs trigger event) ---\n")
+fixed  |> select(USUBJID, AVAL, CNSR, EVNTDESC) |> print()
+```
+
+```{r p21-bug-ttaeser-filter-hint-1}
+# filter = AESER == "Y" & TRTEMFL == "Y"
+# Without TRTEMFL == "Y", pre-treatment SAEs (TRTEMFL = "N") incorrectly trigger the event
+# For subject 01-001, the event date would be ASTDT = 19340, which is before TRTSDT = 19367
+```
+
+```{r p21-bug-ttaeser-filter-solution}
+ae_with_pretrt <- tibble(
+  USUBJID = c("01-001", "01-001", "01-002"),
+  AETERM  = c("PRE-STUDY SAE", "ANAPHYLACTIC SHOCK", "CARDIAC ARREST"),
+  ASTDT   = c(19340, 19400, 19400),
+  AESER   = c("Y", "Y", "Y"),
+  TRTEMFL = c("N", "Y", "Y")
+)
+
+sae_ev_fixed <- event_source(
+  dataset_name  = "adae",
+  filter        = AESER == "Y" & TRTEMFL == "Y",
+  date          = ASTDT,
+  set_values_to = exprs(EVNTDESC = "FIRST SERIOUS AE", SRCDOM = "ADAE", SRCVAR = "ASTDT")
+)
+
+fixed <- derive_param_tte(
+  dataset_adsl = adsl_tte, start_date = TRTSDT,
+  event_conditions  = list(sae_ev_fixed),
+  censor_conditions = list(eot_censor),
+  source_datasets   = list(adsl = adsl_tte, adae = ae_with_pretrt),
+  set_values_to     = exprs(PARAMCD = "TTAESER", PARAM = "Time to First Serious AE")
+)
+
+fixed |> select(USUBJID, AVAL, CNSR, EVNTDESC) |> print()
+```
+
+---
+
+### Diagnostic 3 — AVAL: Missing +1 in manual duration calculation
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *AVAL = ADT − STARTDT + 1 (days). Follows CDISC ADaM IG §4.4.7 study day convention: AVAL = 1 when ADT = STARTDT (event on Day 1 of follow-up). A subject who dies on the first day of follow-up has AVAL = 1, not 0. derive_param_tte() computes this automatically. Manual computation must include the +1.*
+
+The programmer post-processed the ADTTE dataset:
+
+```r
+adtte_recomputed <- adtte_os |>
+  mutate(AVAL = ADT - STARTDT)    # ← bug: missing +1
+```
+
+**P21 report:** *"AD0214 — AVAL = 0 detected for 2 subjects where ADT = STARTDT. CDISC ADaM IG section 4.4.7: duration of 0 is not permissible for time-to-event variables. Expected AVAL ≥ 1 for all rows."*
+
+```{r p21-bug-aval-plusone, exercise=TRUE, exercise.lines=20}
+# adtte_os was built earlier by derive_param_tte() — it has correct AVAL.
+# Simulate what happens when a programmer recalculates AVAL manually.
+
+# Introduce a subject where ADT = STARTDT to expose the bug clearly
+adtte_test <- adtte_os |>
+  mutate(
+    ADT_orig  = ADT,
+    # Force subject 01-001 to have ADT = STARTDT (event on Day 1)
+    ADT       = if_else(USUBJID == "01-001", STARTDT, ADT),
+    AVAL_wrong  = ADT - STARTDT,           # ← missing +1
+    AVAL_correct = ADT - STARTDT + 1       # ← fix: include +1
+  )
+
+# Show the difference: AVAL_wrong = 0 for 01-001, AVAL_correct = 1
+adtte_test |>
+  select(USUBJID, STARTDT, ADT, AVAL_wrong, AVAL_correct, CNSR)
+```
+
+```{r p21-bug-aval-plusone-hint-1}
+# AVAL = ADT - STARTDT + 1
+# The +1 is mandatory: the reference date (STARTDT) is Day 1, not Day 0
+# derive_param_tte() already applies this: aval = as.numeric(adt - startdt) + 1
+# Only add +1 when computing AVAL manually outside of admiral functions
+```
+
+```{r p21-bug-aval-plusone-solution}
+adtte_test <- adtte_os |>
+  mutate(
+    ADT          = if_else(USUBJID == "01-001", STARTDT, ADT),
+    AVAL_wrong   = ADT - STARTDT,
+    AVAL_correct = ADT - STARTDT + 1
+  )
+
+adtte_test |>
+  select(USUBJID, STARTDT, ADT, AVAL_wrong, AVAL_correct, CNSR)
+```
+
+---
+
 ## Quiz — final
 
 ```{r quiz-final-18, echo=FALSE}
 quiz(
   question(
-    "PFS is a 'composite endpoint' because:",
-    answer("It requires two datasets"),
-    answer("Either progression OR death qualifies as the event — two event_source objects", correct = TRUE),
-    answer("It uses two censor_source objects"),
-    answer("It has two CNSR values"),
+    "A PFS derivation uses `start_date = TRTSDT`. P21 reports AVAL is understated for subjects with dose delays. What is the correct start date for PFS and why?",
+    answer("TRTSDT is correct — PFS always starts at first dose"),
+    answer("RANDDT — PFS follow-up begins at randomization; using TRTSDT shortens AVAL for subjects who started treatment after randomization", correct = TRUE),
+    answer("EOSDT — the study end date anchors the survival clock"),
+    answer("LSTALVDT — the last known alive date defines the PFS clock"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   ),
   question(
-    "EVNTDESC serves what purpose in ADTTE?",
-    answer("It is required by CDISC as a key variable"),
-    answer("It records which specific event or censoring rule fired — providing provenance and auditability", correct = TRUE),
-    answer("It replaces PARAMCD"),
-    answer("It maps to MedDRA terms"),
+    "A TTAESER event_source uses `filter = AESER == 'Y'`. P21 reports an event date before TRTSDT for one subject. What is the missing condition?",
+    answer("AESER == 'Y' is sufficient — pre-treatment SAEs are excluded automatically by the TTE function"),
+    answer("TRTEMFL == 'Y' must be added — without it, pre-treatment serious AEs (which have TRTEMFL = 'N') incorrectly trigger the event", correct = TRUE),
+    answer("ASTDT > TRTSDT must be added as a date filter"),
+    answer("AESER == 'Y' & AESEV == 'SEVERE' is the correct filter"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   ),
   question(
-    "A `censor_source()` with `censor = 2` is useful for:",
-    answer("Marking invalid censorings"),
-    answer("Distinguishing different censoring reasons (e.g., last-alive vs. randomization fallback)", correct = TRUE),
-    answer("Increasing AVAL"),
-    answer("Flagging missing DTHDT"),
+    "P21 rule AD0214 flags AVAL = 0 in ADTTE. A programmer computed `AVAL = ADT - STARTDT`. What is the fix and why?",
+    answer("AVAL = ADT - STARTDT + 1 — CDISC ADaM IG defines the reference date as Day 1 (AVAL = 1 when ADT = STARTDT), so no duration of 0 exists", correct = TRUE),
+    answer("AVAL = ADT - STARTDT is correct; AD0214 only applies to ADSL"),
+    answer("AVAL = ADT - STARTDT + 0.5, rounded up to 1 for Day 1 records"),
+    answer("AVAL = (ADT - STARTDT) / 365.25 converts days to years"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   ),
   question(
-    "What does `{admiralonco}` provide for TTE derivations?",
-    answer("A faster derive_param_tte() for large datasets"),
-    answer("Pre-defined event_source() and censor_source() objects for oncology endpoints (OS, PFS, DOR)", correct = TRUE),
-    answer("A ggplot2 extension for Kaplan-Meier plots"),
-    answer("CTCAE toxicity grades"),
+    "PFS uses two event_source objects (progression and death). When both occur for the same subject, derive_param_tte() selects:",
+    answer("The event listed first in the event_conditions list"),
+    answer("Death always takes priority over progression"),
+    answer("The event with the earliest ADT — the first event to occur determines AVAL and CNSR = 0", correct = TRUE),
+    answer("The last event source in the list"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "CNSR = 0 in ADTTE means the event occurred. A subject is alive at study end with no events. What values should CNSR and EVNTDESC take?",
+    answer("CNSR = 0, EVNTDESC = 'NO EVENT'"),
+    answer("CNSR = 1 (from the censor_source), EVNTDESC = the label defined in the applicable censor_source set_values_to (e.g., 'LAST DATE KNOWN ALIVE')", correct = TRUE),
+    answer("CNSR = NA — missing indicates no event and no censoring"),
+    answer("CNSR = 2 — all censor sources default to censor = 2"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "Multiple censor_source objects are listed. Which censoring date does derive_param_tte() use for a subject with no event?",
+    answer("The latest date across all censor sources — the most recent evidence the subject was event-free", correct = TRUE),
+    answer("The earliest date — conservative censoring"),
+    answer("The censor source listed first in the list"),
+    answer("All censor dates are averaged"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "EVNTDESC is not a required CDISC variable, but it is universally included. What does it provide?",
+    answer("A numeric code for the event type used in regression models"),
+    answer("Traceability — it records exactly which event_source or censor_source rule fired for each subject, enabling auditors to verify each row's derivation", correct = TRUE),
+    answer("The MedDRA preferred term for the event"),
+    answer("A link back to the SDTM source domain"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "call_derivation() builds OS and PFS in one block. What goes in variable_params vs the shared fixed arguments?",
+    answer("variable_params holds shared arguments like start_date and source_datasets; fixed arguments hold per-endpoint event/censor sources"),
+    answer("variable_params holds per-endpoint arguments (event_conditions, censor_conditions, set_values_to); shared arguments (start_date, source_datasets, dataset_adsl) are passed outside variable_params", correct = TRUE),
+    answer("All arguments go in variable_params — the fixed argument list is ignored"),
+    answer("variable_params holds only PARAMCD; all other arguments are fixed"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "A subject has DTHDT = NA and LSTALVDT = 19600 in ADSL. What CNSR and ADT should the OS row have?",
+    answer("CNSR = 0, ADT = NA — missing death date means the event cannot be confirmed"),
+    answer("CNSR = 1, ADT = 19600 — no death event found, so the latest censor date (LSTALVDT) is used", correct = TRUE),
+    answer("CNSR = NA — the subject is excluded from the OS analysis"),
+    answer("CNSR = 2, ADT = EOSDT — a second-level censor is applied"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "The {admiralonco} extension package provides pre-built TTE source objects. What is the primary benefit over coding event_source() from scratch?",
+    answer("Pre-built objects run faster than custom event_source() calls"),
+    answer("Pre-built source objects implement validated, oncology-standard event and censoring rules (RECIST-based PFS, OS per BICR) that reduce the risk of specification deviations across studies", correct = TRUE),
+    answer("admiralonco source objects work without source_datasets — they fetch data automatically"),
+    answer("They eliminate the need for SRCDOM and SRCVAR metadata"),
+    random_answer_order = TRUE,
     allow_retry = TRUE
   )
 )

@@ -12,6 +12,32 @@ description: >
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 12_metacore.Rmd
+# PURPOSE       : metacore package for CDISC metadata management: creating and validating
+#                 metacore specification objects, variable-level and
+#                 dataset-level metadata, and integration with admiral
+#                 and xportr.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tidyr)
@@ -246,6 +272,10 @@ dm_sample <- tibble(
   ACTARM  = c("XANOMELINE HIGH DOSE", "XANOMELINE LOW DOSE",
               "PLACEBO", "XANOMELINE HIGH DOSE")
 )
+
+# ── Real pharmaverseadam data for gap analysis ────────────────────────────────
+library(pharmaverseadam)
+adsl_real <- pharmaverseadam::adsl
 ```
 
 ## Welcome
@@ -448,6 +478,53 @@ md_full$code_list |>
   filter(code_id == trt_code_id)
 ```
 
+### Exercise: Gap analysis — spec variables vs. real data
+
+`adsl_real` is the actual `pharmaverseadam::adsl` dataset. Use `setdiff()` to identify:
+
+1. Variables defined in the spec but absent from the real dataset (planned but not yet derived, or simplified away from the full spec)
+2. Variables present in the real dataset but absent from our simplified spec (columns we didn't document)
+
+This is a standard QC step before every ADaM submission.
+
+```{r query-gap-analysis, exercise=TRUE, exercise.lines=18}
+# Extract ADSL variable list from the spec
+spec_vars <- md_full$ds_vars |>
+  filter(dataset == "ADSL") |>
+  pull(variable)
+
+# 1. In spec but NOT in the real dataset
+in_spec_not_data <- setdiff(___, names(adsl_real))
+cat("In spec, not in real data:\n")
+cat(paste(in_spec_not_data, collapse = ", "), "\n\n")
+
+# 2. In real data but NOT in our simplified spec (show first 15)
+in_data_not_spec <- setdiff(names(adsl_real), ___) |> head(15)
+cat("In real data, not in spec (first 15):\n")
+cat(paste(in_data_not_spec, collapse = ", "), "\n")
+```
+
+```{r query-gap-analysis-hint-1}
+# setdiff(spec_vars, names(adsl_real))   # in spec, missing from data
+# setdiff(names(adsl_real), spec_vars)   # in data, not in spec
+```
+
+```{r query-gap-analysis-solution}
+spec_vars <- md_full$ds_vars |>
+  filter(dataset == "ADSL") |>
+  pull(variable)
+
+in_spec_not_data <- setdiff(spec_vars, names(adsl_real))
+cat("In spec, not in real data:\n")
+cat(paste(in_spec_not_data, collapse = ", "), "\n\n")
+
+in_data_not_spec <- setdiff(names(adsl_real), spec_vars) |> head(15)
+cat("In real data, not in spec (first 15):\n")
+cat(paste(in_data_not_spec, collapse = ", "), "\n")
+```
+
+> **Why this matters**: Variables in the spec but absent from the data are un-derived — a submission risk. Variables in the data but absent from the spec are undocumented. Both should be resolved before data lock.
+
 ---
 
 ## 4 — `select_dataset()`: focusing on one dataset
@@ -621,6 +698,82 @@ tryCatch(
 )
 ```
 
+### Exercise: Fix the validation error — add WEIGHT to `var_spec`
+
+The previous exercise failed because `WEIGHT` was in `ds_vars` but not in `var_spec`. Fix this by adding a `WEIGHT` row to `var_spec` first, then rebuild successfully.
+
+```{r build-extend, exercise=TRUE, exercise.lines=28}
+# Step 1: add WEIGHT to var_spec
+my_var_spec_v2 <- bind_rows(
+  my_var_spec,
+  tibble(
+    variable = ___,
+    label    = "Weight (kg)",
+    type     = "numeric",
+    length   = 8L,
+    format   = NA_character_
+  )
+)
+
+# Step 2: add WEIGHT to ds_vars
+my_ds_vars_v2 <- bind_rows(
+  my_ds_vars,
+  tibble(dataset = "ADSL", variable = "WEIGHT",
+         order = 5L, mandatory = FALSE, core = "Permissible")
+)
+
+# Step 3: build — should succeed now
+md_v2 <- metacore(
+  ds_spec     = my_ds_spec,
+  ds_vars     = ___,
+  var_spec    = ___,
+  value_spec  = my_value_spec,
+  code_list   = my_code_list,
+  derivations = my_derivations
+)
+
+cat("WEIGHT in var_spec:", "WEIGHT" %in% md_v2$var_spec$variable, "\n")
+cat("WEIGHT in ds_vars:", "WEIGHT" %in% md_v2$ds_vars$variable, "\n")
+print(md_v2)
+```
+
+```{r build-extend-hint-1}
+# variable = "WEIGHT"
+# ds_vars = my_ds_vars_v2, var_spec = my_var_spec_v2
+```
+
+```{r build-extend-solution}
+my_var_spec_v2 <- bind_rows(
+  my_var_spec,
+  tibble(
+    variable = "WEIGHT",
+    label    = "Weight (kg)",
+    type     = "numeric",
+    length   = 8L,
+    format   = NA_character_
+  )
+)
+
+my_ds_vars_v2 <- bind_rows(
+  my_ds_vars,
+  tibble(dataset = "ADSL", variable = "WEIGHT",
+         order = 5L, mandatory = FALSE, core = "Permissible")
+)
+
+md_v2 <- metacore(
+  ds_spec     = my_ds_spec,
+  ds_vars     = my_ds_vars_v2,
+  var_spec    = my_var_spec_v2,
+  value_spec  = my_value_spec,
+  code_list   = my_code_list,
+  derivations = my_derivations
+)
+
+cat("WEIGHT in var_spec:", "WEIGHT" %in% md_v2$var_spec$variable, "\n")
+cat("WEIGHT in ds_vars:", "WEIGHT" %in% md_v2$ds_vars$variable, "\n")
+print(md_v2)
+```
+
 ---
 
 ## 7 — The `DatasetMeta` requirement
@@ -689,6 +842,56 @@ md_full$derivations |>
 cat("\n\nTRTDURD derivation:\n")
 md_full$derivations |>
   filter(derivation_id == "DR_TRTDURD") |>
+  pull(derivation) |>
+  cat()
+```
+
+### Exercise: Add a new derivation for `AGEGR1N`
+
+The spec has been updated: `AGEGR1N` (numeric age group companion) needs a derivation entry. Use `bind_rows()` to add it to the derivations table, then confirm it's retrievable.
+
+```{r add-derivation-ex, exercise=TRUE, exercise.lines=20}
+# Add a new derivation row
+updated_derivations <- bind_rows(
+  md_full$derivations,
+  tibble(
+    derivation_id = ___,
+    derivation    = ___
+  )
+)
+
+# Confirm count increased
+cat("Original derivation count:", nrow(md_full$derivations), "\n")
+cat("Updated derivation count: ", nrow(updated_derivations), "\n\n")
+
+# Retrieve the new entry
+cat("AGEGR1N derivation:\n")
+updated_derivations |>
+  filter(derivation_id == "DR_AGEGR1N") |>
+  pull(derivation) |>
+  cat()
+```
+
+```{r add-derivation-ex-hint-1}
+# derivation_id = "DR_AGEGR1N"
+# derivation    = "Numeric companion to AGEGR1: 1 = <65, 2 = >=65"
+```
+
+```{r add-derivation-ex-solution}
+updated_derivations <- bind_rows(
+  md_full$derivations,
+  tibble(
+    derivation_id = "DR_AGEGR1N",
+    derivation    = "Numeric companion to AGEGR1: 1 = <65, 2 = >=65"
+  )
+)
+
+cat("Original derivation count:", nrow(md_full$derivations), "\n")
+cat("Updated derivation count: ", nrow(updated_derivations), "\n\n")
+
+cat("AGEGR1N derivation:\n")
+updated_derivations |>
+  filter(derivation_id == "DR_AGEGR1N") |>
   pull(derivation) |>
   cat()
 ```
@@ -844,6 +1047,55 @@ quiz(
     answer("Has fewer tables than a full metacore"),
     answer("Is restricted to a single dataset — required by metatools functions", correct = TRUE),
     answer("Can only be used with admiral"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The `var_spec` table is shared across all datasets in a metacore object because:",
+    answer("Each dataset must define its own copy of every variable"),
+    answer("Variable definitions (label, type, length) are properties of the variable itself, not of the dataset it appears in — sharing avoids inconsistencies", correct = TRUE),
+    answer("metatools requires all variables to appear in the first dataset alphabetically"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`setdiff(spec_vars, names(my_dataset))` returns variables that are:",
+    answer("In the dataset but undocumented in the spec"),
+    answer("In the spec but not yet present in the derived dataset — a potential submission gap", correct = TRUE),
+    answer("Variables that exist in both the spec and the dataset"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The `code_list` table uses a `code_id` foreign key (e.g., 'SEX_CL') rather than embedding codelist values in `var_spec` directly because:",
+    answer("R can't store lists inside a tibble column"),
+    answer("A single codelist (e.g., RACE) can be reused by multiple variables or datasets without duplication", correct = TRUE),
+    answer("The code_id column must match the SAS format name exactly"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "In a metadata-driven pipeline, the best time to construct the metacore object is:",
+    answer("Inside each individual derivation script, right before it's needed"),
+    answer("Once, in a shared constructor script, saved as .rds and loaded by all downstream scripts", correct = TRUE),
+    answer("After all ADaM datasets have been derived"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The `order` column in `ds_vars` is important because:",
+    answer("It controls the column order in the final delivered dataset, which must match the spec", correct = TRUE),
+    answer("It determines which variables are checked first by Pinnacle 21"),
+    answer("It sets the sort order of subjects within the dataset"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A flag variable like SAFFL (values 'Y' / 'N') does NOT need a codelist entry in `code_list` or `value_spec` because:",
+    answer("Flag variables are always excluded from CDISC codelists"),
+    answer("metatools auto-detects flag variables"),
+    answer("The permissible values are defined by a controlled terminology term (NY codelist) referenced in the submission package, not a study-specific codelist", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "When you call `select_dataset(md_full, 'ADVS')` on a metacore that has no ADVS dataset:",
+    answer("It returns an empty DatasetMeta with zero variables"),
+    answer("It throws an error telling you ADVS is not in the metacore object", correct = TRUE),
+    answer("It returns the full metacore unchanged"),
     random_answer_order = TRUE
   )
 )

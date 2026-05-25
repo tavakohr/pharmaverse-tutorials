@@ -1,0 +1,1104 @@
+---
+title: "Lesson 45 — logrx: Automated R Session Logging"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Master logrx for producing audit-ready logs from R analysis scripts.
+  Covers axecute(), log structure, session metadata capture, error/warning
+  recording, GxP compliance patterns, log review, and integration with
+  CI/CD pipelines for clinical submissions.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 45_logrx.Rmd
+# PURPOSE       : logrx package — GxP-compliant program logging with axecute():
+#                 log structure (HEADER/SESSION/MESSAGES/WARNINGS/
+#                 ERRORS/STATUS), batch execution, CI/CD integration.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+library(learnr)
+library(dplyr)
+library(tibble)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.eval = FALSE)
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ── Pharmaverseadam datasets ────────────────────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+adsl <- adsl_raw |> mutate(
+  ITTFL  = SAFFL,
+  DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"))
+
+# ── Mock logrx infrastructure ────────────────────────────────────────────────
+# logrx wraps R script execution and produces structured log files.
+# Core function: axecute(file) — runs a script and writes a log.
+# We mock the full log generation pipeline for learnr exercises.
+
+# Log section builder
+.log_section <- function(title, ...) {
+  lines <- c(strrep("─", 60),
+             paste0("  ", title),
+             strrep("─", 60),
+             ...)
+  paste(lines, collapse="\n")
+}
+
+# Capture session info for log header
+.log_session_info <- function() {
+  si <- sessionInfo()
+  pkgs <- si$otherPkgs
+  pkg_str <- if (length(pkgs) > 0)
+    paste(vapply(pkgs, function(p) sprintf("%s %s", p$Package, p$Version),
+                 character(1)), collapse=", ")
+  else "(none)"
+  list(
+    r_version  = paste(si$R.version$major, si$R.version$minor, sep="."),
+    platform   = si$platform,
+    locale     = Sys.getlocale("LC_TIME"),
+    packages   = pkg_str,
+    user       = Sys.info()[["user"]] %||% "unknown",
+    node       = Sys.info()[["nodename"]] %||% "unknown",
+    datetime   = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+  )
+}
+
+# Main axecute() mock
+axecute <- function(file,
+                    log_name       = NULL,
+                    log_path       = getwd(),
+                    working_dir    = NULL,
+                    quiet          = FALSE,
+                    show_log       = TRUE,
+                    log_breaks     = TRUE,
+                    remove_log_na  = FALSE) {
+
+  if (!file.exists(file))
+    stop(sprintf("Script not found: %s", file))
+
+  log_name <- log_name %||%
+    paste0(tools::file_path_sans_ext(basename(file)), ".log")
+  log_file  <- file.path(log_path, log_name)
+  script_nm <- basename(file)
+
+  si        <- .log_session_info()
+  start_tm  <- proc.time()
+  start_dt  <- Sys.time()
+
+  # Capture output + errors from script execution
+  msgs <- warnings_caught <- errors_caught <- character(0)
+
+  script_result <- tryCatch({
+    capture.output({
+      withCallingHandlers(
+        source(file, echo = TRUE, local = new.env(parent = globalenv())),
+        message = function(m) { msgs <<- c(msgs, conditionMessage(m)); invokeRestart("muffleMessage") },
+        warning = function(w) { warnings_caught <<- c(warnings_caught, conditionMessage(w)); invokeRestart("muffleWarning") }
+      )
+    })
+  }, error = function(e) conditionMessage(e))
+
+  elapsed   <- (proc.time() - start_tm)[["elapsed"]]
+  end_dt    <- Sys.time()
+  succeeded <- !is.character(script_result) || length(grep("Error", script_result)) == 0
+
+  # Build log lines
+  log_lines <- c(
+    strrep("═", 62),
+    sprintf("  LOG: %s", log_name),
+    sprintf("  Script: %s", script_nm),
+    strrep("═", 62),
+    "",
+    .log_section("HEADER",
+      sprintf("  Script        : %s", file),
+      sprintf("  Log           : %s", log_file),
+      sprintf("  User          : %s", si$user),
+      sprintf("  Node          : %s", si$node),
+      sprintf("  Start time    : %s", format(start_dt, "%Y-%m-%d %H:%M:%S")),
+      sprintf("  End time      : %s", format(end_dt,   "%Y-%m-%d %H:%M:%S")),
+      sprintf("  Elapsed (s)   : %.2f", elapsed)
+    ),
+    "",
+    .log_section("SESSION INFO",
+      sprintf("  R version     : %s", si$r_version),
+      sprintf("  Platform      : %s", si$platform),
+      sprintf("  Attached pkgs : %s", si$packages)
+    ),
+    "",
+    .log_section("MESSAGES",
+      if (length(msgs) > 0) paste0("  ", msgs) else "  (none)"
+    ),
+    "",
+    .log_section("WARNINGS",
+      if (length(warnings_caught) > 0)
+        paste0("  WARNING: ", warnings_caught)
+      else "  (none)"
+    ),
+    "",
+    .log_section("ERRORS",
+      if (!succeeded)
+        paste0("  ERROR: ", tail(script_result, 1))
+      else "  (none)"
+    ),
+    "",
+    .log_section("STATUS",
+      sprintf("  Status : %s", if(succeeded) "SUCCESS" else "FAILURE"),
+      sprintf("  Script : %s", script_nm)
+    ),
+    strrep("═", 62)
+  )
+
+  log_text <- paste(log_lines, collapse = "\n")
+
+  if (show_log) cat(log_text, "\n")
+
+  structure(
+    list(
+      log_file      = log_file,
+      log_text      = log_text,
+      script        = file,
+      start         = start_dt,
+      end           = end_dt,
+      elapsed       = elapsed,
+      succeeded     = succeeded,
+      messages      = msgs,
+      warnings      = warnings_caught,
+      errors        = if (!succeeded) tail(script_result,1) else character(0),
+      session_info  = si
+    ),
+    class = "logrx_log"
+  )
+}
+
+print.logrx_log <- function(x, ...) {
+  cat(x$log_text, "\n")
+  invisible(x)
+}
+
+# log_read() — parse a logrx log file
+log_read <- function(path) {
+  lines <- readLines(path)
+  structure(list(path=path, lines=lines, n_lines=length(lines)),
+            class="logrx_log_file")
+}
+
+# log_select() — extract sections from a log
+log_select <- function(log_obj, section = c("header","session","warnings","errors","status")) {
+  section <- match.arg(section)
+  if (inherits(log_obj, "logrx_log")) {
+    switch(section,
+      header  = list(script=log_obj$script, user=log_obj$session_info$user,
+                     start=log_obj$start, end=log_obj$end,
+                     elapsed=log_obj$elapsed),
+      session = log_obj$session_info,
+      warnings = log_obj$warnings,
+      errors   = log_obj$errors,
+      status   = list(succeeded=log_obj$succeeded,
+                      n_warnings=length(log_obj$warnings),
+                      n_messages=length(log_obj$messages))
+    )
+  }
+}
+
+# log_warn_select() — extract warning messages
+log_warn_select <- function(log_obj) log_obj$warnings
+
+# log_error_select() — extract error messages
+log_error_select <- function(log_obj) log_obj$errors
+
+# log_pkg_select() — extract package versions
+log_pkg_select <- function(log_obj) log_obj$session_info$packages
+
+# Simulate axecute for a script provided as a string (for learnr exercises)
+axecute_string <- function(script_text, script_name = "analysis.R",
+                            show_log = TRUE) {
+  tmp <- tempfile(fileext = ".R")
+  writeLines(script_text, tmp)
+  on.exit(unlink(tmp))
+  result <- axecute(tmp, log_name = sub("\\.R$", ".log", script_name),
+                    show_log = show_log)
+  result$script <- script_name
+  result
+}
+```
+
+## Overview
+
+**logrx** solves a critical compliance challenge: in regulated clinical trial programming (GxP / 21 CFR Part 11), every analysis run must produce an **audit trail** that records who ran the code, when, on which system, with which software versions, and whether any errors or warnings occurred.
+
+In SAS, the log is produced automatically. In R there is no equivalent until logrx.
+
+> **What logrx does:**
+>
+> ```
+> Analyst runs: axecute("adam/derive_adsl.R")
+>                         │
+>                         ▼
+>       Script executes in a clean environment
+>                         │
+>                         ▼
+>       Log written to:   adam/derive_adsl.log
+>
+>       Log contains:
+>         ✓ Script path and MD5 hash
+>         ✓ Analyst user name and node
+>         ✓ Start / end / elapsed time
+>         ✓ R version and all loaded packages with versions
+>         ✓ All messages, warnings, and errors
+>         ✓ Final SUCCESS or FAILURE status
+> ```
+
+---
+
+## 1 — Why Logging Matters in Clinical R
+
+### 1.1 The regulatory requirement
+
+21 CFR Part 11 requires that computer systems used in clinical trials maintain:
+
+1. **Audit trails** — time-stamped records of when data were created, modified, or deleted
+2. **System access controls** — who ran what, when
+3. **Computer environment records** — software versions used to produce results
+
+For SAS submissions, the `.log` file satisfies these requirements automatically. For R, logrx provides the equivalent.
+
+### 1.2 What a logrx log captures
+
+| Log section | Contents |
+|-------------|---------|
+| **HEADER** | Script path, log path, user, node, start/end/elapsed time |
+| **SESSION INFO** | R version, OS/platform, all loaded packages with versions |
+| **MESSAGES** | All `message()` calls emitted during execution |
+| **WARNINGS** | All `warning()` calls — graded from note to critical |
+| **ERRORS** | Any error that halted execution |
+| **STATUS** | `SUCCESS` or `FAILURE` — the most important line for QC reviewers |
+
+### 1.3 Quiz
+
+```{r quiz-logrx-basics, echo=FALSE}
+quiz(
+  question(
+    "Under 21 CFR Part 11, which information is required in a clinical programming audit trail?",
+    answer("Only the final output file"),
+    answer("Time-stamped records of who ran what, when, and the software versions used", correct = TRUE),
+    answer("Only error messages if the run failed"),
+    answer("The analyst's electronic signature on every output"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A QC reviewer scanning a logrx log needs to quickly determine if the run was clean. Which section do they check first?",
+    answer("SESSION INFO — to verify R version"),
+    answer("MESSAGES — to count all messages"),
+    answer("STATUS — shows SUCCESS or FAILURE in one line", correct = TRUE),
+    answer("HEADER — to see the script name"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 2 — `axecute()`: The Core Function
+
+### 2.1 Basic usage
+
+```{r axecute-basic, eval=FALSE}
+library(logrx)
+
+# Run a script and automatically produce a log
+axecute("adam/derive_adsl.R")
+
+# Log is written to: adam/derive_adsl.log   (same folder as script, by default)
+```
+
+### 2.2 Arguments
+
+```{r axecute-args, eval=FALSE}
+axecute(
+  file         = "adam/derive_adsl.R",   # script to execute
+  log_name     = "derive_adsl_v2.log",   # custom log name (default: same as script)
+  log_path     = "logs/",                # where to write the log
+  working_dir  = "adam/",                # working directory for script execution
+  quiet        = FALSE,                  # suppress console output
+  show_log     = TRUE,                   # print log to console after run
+  log_breaks   = TRUE                    # add visual section separators
+)
+```
+
+### 2.3 Exercise — run a simple script
+
+The `axecute_string()` helper below lets us execute inline script text within learnr. Run a minimal ADaM summary script and inspect the log.
+
+```{r axecute-basic-ex, exercise=TRUE, exercise.lines=20}
+log_result <- axecute_string('
+  library(dplyr)
+  library(pharmaverseadam)
+
+  adsl <- pharmaverseadam::adsl
+
+  # Safety population summary
+  safety_summary <- adsl |>
+    filter(SAFFL == "Y") |>
+    group_by(TRT01P) |>
+    summarise(N = n(),
+              mean_age = round(mean(AGE, na.rm=TRUE), 1),
+              .groups = "drop")
+
+  cat("Safety Population Summary:\n")
+  print(safety_summary)
+',
+  script_name = "summary_safety.R"
+)
+
+# Check the status
+status <- log_select(log_result, "status")
+cat("\nRun succeeded:", status$succeeded, "\n")
+cat("Warnings    :", status$n_warnings, "\n")
+```
+
+### 2.4 Exercise — inspect log sections
+
+```{r log-sections-ex, exercise=TRUE, exercise.lines=18}
+log_result <- axecute_string('
+  library(dplyr)
+  message("Starting ADSL derivation")
+  adsl <- pharmaverseadam::adsl
+  message(sprintf("Loaded %d subjects", nrow(adsl)))
+  warning("BMIBL not present — synthesising")
+  adsl <- mutate(adsl, BMIBL = round(WEIGHTBL/(HEIGHTBL/100)^2, 1))
+  cat("Done\n")
+', script_name = "derive_adsl.R", show_log = FALSE)
+
+# Extract sections
+cat("── Header ──────────────────────────────────────\n")
+hdr <- log_select(log_result, "header")
+cat("  Script :", hdr$script,  "\n")
+cat("  User   :", hdr$user,    "\n")
+cat("  Elapsed:", round(hdr$elapsed, 3), "seconds\n")
+
+cat("\n── Warnings ────────────────────────────────────\n")
+warns <- log_warn_select(___)
+if (length(warns) == 0) cat("  (none)\n") else
+  for (w in warns) cat(" ", w, "\n")
+
+cat("\n── Messages ────────────────────────────────────\n")
+msgs <- log_select(___, "status")
+cat("  N messages:", msgs$n_messages, "\n")
+cat("  Succeeded :", msgs$succeeded,  "\n")
+```
+
+```{r log-sections-ex-solution}
+log_result <- axecute_string('
+  library(dplyr)
+  message("Starting ADSL derivation")
+  adsl <- pharmaverseadam::adsl
+  message(sprintf("Loaded %d subjects", nrow(adsl)))
+  warning("BMIBL not present — synthesising")
+  adsl <- mutate(adsl, BMIBL = round(WEIGHTBL/(HEIGHTBL/100)^2, 1))
+  cat("Done\n")
+', script_name = "derive_adsl.R", show_log = FALSE)
+
+cat("── Header ──────────────────────────────────────\n")
+hdr <- log_select(log_result, "header")
+cat("  Script :", hdr$script,  "\n")
+cat("  User   :", hdr$user,    "\n")
+cat("  Elapsed:", round(hdr$elapsed, 3), "seconds\n")
+
+cat("\n── Warnings ────────────────────────────────────\n")
+warns <- log_warn_select(log_result)
+if (length(warns) == 0) cat("  (none)\n") else
+  for (w in warns) cat(" ", w, "\n")
+
+cat("\n── Messages ────────────────────────────────────\n")
+msgs <- log_select(log_result, "status")
+cat("  N messages:", msgs$n_messages, "\n")
+cat("  Succeeded :", msgs$succeeded,  "\n")
+```
+
+---
+
+## 3 — Error and Warning Handling
+
+### 3.1 How logrx records warnings
+
+logrx intercepts all `warning()` calls during execution and records them in the log, but allows the script to continue running. This is critical in clinical programming:
+
+```{r warning-demo, eval=FALSE}
+# Script with warnings — still succeeds overall
+axecute_string('
+  # This will trigger a common clinical programming warning
+  adlb <- pharmaverseadam::adlb
+  adlb_sub <- dplyr::filter(adlb, PARAMCD == "ALT")
+
+  # NAs in numeric column — causes warning in some operations
+  result <- mean(adlb_sub$ATOXGR)   # NA warning if all NA
+  cat("Mean ATOXGR:", result, "\n")
+')
+
+# Log STATUS will be: SUCCESS (warnings don't stop execution)
+# But WARNINGS section lists them for QC review
+```
+
+### 3.2 How logrx records errors
+
+When an error occurs, the log records it in the ERRORS section and STATUS shows FAILURE:
+
+```{r error-demo, exercise=TRUE, exercise.lines=18}
+log_fail <- axecute_string('
+  # This script has a deliberate error
+  library(dplyr)
+  adsl <- pharmaverseadam::adsl
+
+  # Reference a non-existent column
+  result <- adsl |>
+    filter(NONEXISTENT_VAR == "Y") |>
+    nrow()
+
+  cat("N:", result, "\n")
+', script_name = "broken_script.R", show_log = FALSE)
+
+# Check status
+status <- log_select(log_fail, "status")
+cat("Succeeded :", status$succeeded,  "\n")
+cat("N errors  :", length(log_error_select(log_fail)), "\n")
+
+# Show the error message
+errs <- log_error_select(log_fail)
+if (length(errs) > 0) cat("Error:", errs[1], "\n")
+```
+
+### 3.3 Distinguishing warning severity
+
+In clinical programming, not all warnings are equal. A common pattern is to fail the log if certain high-severity warnings occur:
+
+```{r warning-severity, eval=FALSE}
+# Post-execution warning triage
+check_log_warnings <- function(log_result,
+                                fail_patterns = c("NAs introduced",
+                                                  "coercion",
+                                                  "longer object length")) {
+  warns <- log_warn_select(log_result)
+  if (length(warns) == 0) return(invisible(TRUE))
+
+  critical <- warns[sapply(warns, function(w)
+    any(sapply(fail_patterns, function(p) grepl(p, w, ignore.case=TRUE)))
+  )]
+
+  if (length(critical) > 0) {
+    cat("CRITICAL WARNINGS:\n")
+    for (w in critical) cat(" •", w, "\n")
+    return(invisible(FALSE))
+  }
+  invisible(TRUE)
+}
+```
+
+### 3.4 Exercise — triage a log with warnings
+
+```{r triage-ex, exercise=TRUE, exercise.lines=22}
+log_with_warns <- axecute_string('
+  library(dplyr)
+  adsl <- pharmaverseadam::adsl
+
+  # Deliberately trigger a coercion warning
+  x <- as.integer(c("1","2","three","4"))
+  cat("Converted:", x, "\n")
+
+  # Also trigger an na.rm warning path
+  result <- mean(c(1, 2, NA, 4))
+  cat("Mean:", result, "\n")
+', script_name = "triage_test.R", show_log = FALSE)
+
+warns <- log_warn_select(log_with_warns)
+cat("Total warnings:", length(warns), "\n\n")
+
+# Classify each warning
+for (w in warns) {
+  severity <- if (grepl("NAs introduced|coercion", w, ignore.case=TRUE))
+                "CRITICAL" else "NOTE"
+  cat(sprintf("[%s] %s\n", severity, w))
+}
+```
+
+---
+
+## 4 — GxP Compliance Patterns
+
+### 4.1 The standard logging workflow
+
+In a GxP-validated R environment, every ADaM/TLF program follows this pattern:
+
+```{r gxp-pattern, eval=FALSE}
+# Standard GxP R programming workflow:
+
+# 1. Analyst writes analysis script: adam/derive_adsl.R
+# 2. Analyst runs: axecute("adam/derive_adsl.R")
+# 3. logrx produces: adam/derive_adsl.log
+# 4. QC programmer reviews: adam/derive_adsl.log
+#    - Checks STATUS = SUCCESS
+#    - Reviews WARNINGS section
+#    - Verifies R version and package versions match expected environment
+# 5. Both script and log are version-controlled together
+# 6. At submission, script + log are included in the analysis data package
+
+# File structure:
+# adam/
+#   derive_adsl.R       ← analysis script
+#   derive_adsl.log     ← logrx audit log
+#   adsl.xpt            ← output dataset
+# tlf/
+#   t14_1_1_demog.R
+#   t14_1_1_demog.log
+#   t14_1_1_demog.rtf
+```
+
+### 4.2 Script metadata block
+
+logrx is most useful when combined with a standardised script metadata block at the top of every program:
+
+```{r metadata-block, eval=FALSE}
+# ── Standard ADaM program header ──────────────────────────────────────────
+# Program  : derive_adsl.R
+# Purpose  : Derive ADSL (Subject-Level Analysis Dataset) for CDISCPILOT01
+# Author   : H. Tavakoli
+# Date     : 2026-05-24
+# Input    : sdtm/dm.xpt, sdtm/ds.xpt, sdtm/ex.xpt, sdtm/mh.xpt
+# Output   : adam/adsl.xpt
+# Spec     : specs/adam_spec.xlsx  (ADSL tab, version 3.1)
+# Notes    : Requires pharmaverseadam >= 0.3.0, admiral >= 1.0.0
+# ──────────────────────────────────────────────────────────────────────────
+
+library(admiral)
+library(pharmaversesdtm)
+library(dplyr)
+library(haven)
+library(xportr)
+library(logrx)    # loaded but axecute() is called externally
+
+# Analysis code follows...
+```
+
+When `axecute()` runs this script, all the header metadata appears in the log output via the MESSAGES section (since `message()` calls are captured).
+
+### 4.3 Exercise — write a compliant analysis script
+
+Write a minimal but GxP-compliant analysis script with proper header, `message()` milestones, and `tryCatch()` for safe output writing.
+
+```{r compliant-script-ex, exercise=TRUE, exercise.lines=35}
+log_result <- axecute_string('
+# ── Program Header ──────────────────────────────────────────────────────
+# Program : safety_summary.R
+# Purpose : Produce safety population summary for CDISCPILOT01
+# Author  : Clinical Programmer
+# Input   : pharmaverseadam::adsl
+# Output  : (console for this demo)
+# ────────────────────────────────────────────────────────────────────────
+
+library(dplyr)
+library(pharmaverseadam)
+
+message("=== START: safety_summary.R ===")
+
+# Load data
+message("Step 1: Loading ADSL")
+adsl <- pharmaverseadam::adsl
+message(sprintf("  ADSL loaded: %d subjects", nrow(adsl)))
+
+# Safety population
+message("Step 2: Filtering to safety population")
+adsl_saf <- filter(adsl, SAFFL == "Y")
+message(sprintf("  Safety population: %d subjects", nrow(adsl_saf)))
+
+# Summary
+message("Step 3: Computing summary")
+summary_tbl <- adsl_saf |>
+  group_by(TRT01P) |>
+  summarise(N       = n(),
+            Mean_Age = round(mean(AGE, na.rm=TRUE), 1),
+            Pct_F   = round(mean(SEX=="F")*100, 1),
+            .groups = "drop")
+
+print(summary_tbl)
+
+message("=== END: safety_summary.R — SUCCESS ===")
+', script_name = "safety_summary.R", show_log = FALSE)
+
+# Review the log
+status <- log_select(log_result, "status")
+cat("Status     :", if(status$succeeded) "SUCCESS" else "FAILURE", "\n")
+cat("Messages   :", status$n_messages, "\n")
+cat("Warnings   :", status$n_warnings, "\n")
+cat("Errors     :", length(log_error_select(log_result)), "\n")
+```
+
+---
+
+## 5 — Log File Management
+
+### 5.1 Log naming conventions
+
+```{r log-naming, eval=FALSE}
+# Convention 1: Same name as script (default — most common)
+axecute("adam/derive_adsl.R")
+# → adam/derive_adsl.log
+
+# Convention 2: Custom name with version
+axecute("adam/derive_adsl.R",
+        log_name = "derive_adsl_v02.log",
+        log_path = "logs/adam/")
+
+# Convention 3: Timestamp in name (useful for repeated runs)
+axecute("adam/derive_adsl.R",
+        log_name = paste0("derive_adsl_",
+                          format(Sys.time(), "%Y%m%d_%H%M%S"),
+                          ".log"),
+        log_path = "logs/")
+```
+
+### 5.2 Batch execution with logging
+
+```{r batch-logging, eval=FALSE}
+# Run all ADaM scripts in sequence, collect logs
+library(purrr)
+
+adam_scripts <- c(
+  "adam/derive_adsl.R",
+  "adam/derive_adae.R",
+  "adam/derive_adlb.R",
+  "adam/derive_advs.R"
+)
+
+batch_results <- map(adam_scripts, function(script) {
+  message(sprintf("Running: %s", script))
+  axecute(
+    file      = script,
+    log_path  = "logs/adam/",
+    show_log  = FALSE,
+    quiet     = TRUE
+  )
+})
+
+# Batch summary
+batch_summary <- tibble(
+  script    = map_chr(batch_results, ~ basename(.x$script)),
+  succeeded = map_lgl(batch_results, ~ .x$succeeded),
+  warnings  = map_int(batch_results, ~ length(.x$warnings)),
+  elapsed_s = map_dbl(batch_results, ~ round(.x$elapsed, 2))
+)
+
+print(batch_summary)
+
+# Fail loudly if any script failed
+failures <- filter(batch_summary, !succeeded)
+if (nrow(failures) > 0)
+  stop(sprintf("%d script(s) FAILED: %s",
+               nrow(failures),
+               paste(failures$script, collapse=", ")))
+```
+
+### 5.3 Exercise — batch summary
+
+Simulate running three scripts and produce a batch summary table.
+
+```{r batch-ex, exercise=TRUE, exercise.lines=35}
+scripts <- list(
+  list(name="derive_adsl.R", code='
+    library(dplyr); library(pharmaverseadam)
+    message("Deriving ADSL")
+    adsl <- pharmaverseadam::adsl
+    cat("ADSL:", nrow(adsl), "rows\n")
+  '),
+  list(name="derive_adae.R", code='
+    library(dplyr); library(pharmaverseadam)
+    message("Deriving ADAE")
+    adae <- pharmaverseadam::adae
+    warning("TRTA renamed to TRT01A")
+    adae <- rename(adae, TRT01A = TRTA)
+    cat("ADAE:", nrow(adae), "rows\n")
+  '),
+  list(name="derive_adlb.R", code='
+    library(dplyr); library(pharmaverseadam)
+    message("Deriving ADLB")
+    adlb <- pharmaverseadam::adlb
+    cat("ADLB:", nrow(adlb), "rows\n")
+  ')
+)
+
+batch_logs <- lapply(scripts, function(s)
+  axecute_string(s$code, script_name=s$name, show_log=FALSE))
+
+# Build summary
+batch_tbl <- tibble(
+  script    = sapply(scripts, `[[`, "name"),
+  succeeded = sapply(batch_logs, function(l) l$___),
+  n_warnings = sapply(batch_logs, function(l) length(log_warn_select(l))),
+  elapsed_s  = round(sapply(batch_logs, function(l) l$elapsed), 3)
+)
+
+cat("── Batch Execution Summary ─────────────────────────\n")
+print(batch_tbl)
+
+# Alert on failures
+failures <- filter(batch_tbl, !succeeded)
+if (nrow(failures) == 0) {
+  cat("\n✓ All scripts completed successfully\n")
+} else {
+  cat(sprintf("\n✗ %d failure(s): %s\n",
+              nrow(failures), paste(failures$script, collapse=", ")))
+}
+```
+
+```{r batch-ex-solution}
+scripts <- list(
+  list(name="derive_adsl.R", code='
+    library(dplyr); library(pharmaverseadam)
+    message("Deriving ADSL")
+    adsl <- pharmaverseadam::adsl
+    cat("ADSL:", nrow(adsl), "rows\n")
+  '),
+  list(name="derive_adae.R", code='
+    library(dplyr); library(pharmaverseadam)
+    message("Deriving ADAE")
+    adae <- pharmaverseadam::adae
+    warning("TRTA renamed to TRT01A")
+    adae <- rename(adae, TRT01A = TRTA)
+    cat("ADAE:", nrow(adae), "rows\n")
+  '),
+  list(name="derive_adlb.R", code='
+    library(dplyr); library(pharmaverseadam)
+    message("Deriving ADLB")
+    adlb <- pharmaverseadam::adlb
+    cat("ADLB:", nrow(adlb), "rows\n")
+  ')
+)
+
+batch_logs <- lapply(scripts, function(s)
+  axecute_string(s$code, script_name=s$name, show_log=FALSE))
+
+batch_tbl <- tibble(
+  script     = sapply(scripts, `[[`, "name"),
+  succeeded  = sapply(batch_logs, function(l) l$succeeded),
+  n_warnings = sapply(batch_logs, function(l) length(log_warn_select(l))),
+  elapsed_s  = round(sapply(batch_logs, function(l) l$elapsed), 3)
+)
+
+cat("── Batch Execution Summary ─────────────────────────\n")
+print(batch_tbl)
+
+failures <- filter(batch_tbl, !succeeded)
+if (nrow(failures) == 0) {
+  cat("\n✓ All scripts completed successfully\n")
+} else {
+  cat(sprintf("\n✗ %d failure(s): %s\n",
+              nrow(failures), paste(failures$script, collapse=", ")))
+}
+```
+
+---
+
+## 6 — Integration with CI/CD
+
+### 6.1 GitHub Actions workflow
+
+logrx integrates cleanly with GitHub Actions for automated validation:
+
+```{r gh-actions-demo, eval=FALSE}
+# .github/workflows/validate_adam.yml
+#
+# name: Validate ADaM Programs
+#
+# on:
+#   push:
+#     paths: ['adam/**', 'specs/**']
+#
+# jobs:
+#   run_adam:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: r-lib/actions/setup-r@v2
+#         with:
+#           r-version: '4.4.0'
+#       - uses: r-lib/actions/setup-renv@v2
+#       - name: Run ADaM programs
+#         run: |
+#           Rscript -e "
+#             library(logrx)
+#             scripts <- list.files('adam', pattern='\\\\.R$', full.names=TRUE)
+#             results <- lapply(scripts, function(s)
+#               axecute(s, log_path='logs/', show_log=FALSE, quiet=TRUE))
+#             failures <- Filter(function(r) !r$succeeded, results)
+#             if (length(failures) > 0) {
+#               cat('FAILED:', sapply(failures, function(r) basename(r$script)), '\n')
+#               quit(status=1)
+#             }
+#             cat('All ADaM programs: SUCCESS\n')
+#           "
+#       - name: Upload logs
+#         uses: actions/upload-artifact@v4
+#         if: always()
+#         with:
+#           name: adam-logs
+#           path: logs/
+```
+
+### 6.2 Log review in QC workflows
+
+```{r qc-review, eval=FALSE}
+# QC reviewer checks a log programmatically
+review_log <- function(log_path, max_warnings = 0) {
+  lines   <- readLines(log_path)
+
+  # Extract status
+  status_line <- grep("Status :", lines, value=TRUE)
+  succeeded   <- any(grepl("SUCCESS", status_line))
+
+  # Count warnings
+  warn_lines  <- grep("WARNING:", lines, value=TRUE)
+  n_warnings  <- length(warn_lines)
+
+  cat(sprintf("Log: %s\n", basename(log_path)))
+  cat(sprintf("  Status   : %s\n", if(succeeded) "✓ SUCCESS" else "✗ FAILURE"))
+  cat(sprintf("  Warnings : %d (threshold: %d)\n", n_warnings, max_warnings))
+
+  if (!succeeded) stop(sprintf("FAILURE in log: %s", log_path))
+  if (n_warnings > max_warnings)
+    stop(sprintf("%d warnings exceed threshold of %d", n_warnings, max_warnings))
+
+  invisible(TRUE)
+}
+```
+
+### 6.3 Quiz
+
+```{r quiz-gxp, echo=FALSE}
+quiz(
+  question(
+    "In a GxP-validated R environment, both the analysis script and its logrx log should be:",
+    answer("Stored only on the analyst's local computer"),
+    answer("Version-controlled together (e.g., in git) and archived with the submission", correct = TRUE),
+    answer("Deleted after QC review to save storage"),
+    answer("Emailed to the statistician for review"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A logrx log shows STATUS = SUCCESS but 3 warnings. How should a QC reviewer handle this?",
+    answer("Ignore — SUCCESS means the run is clean"),
+    answer("Fail the review — any warning is unacceptable"),
+    answer("Review each warning individually; document disposition; escalate coercion/NAs warnings", correct = TRUE),
+    answer("Re-run the script until there are no warnings"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 7 — Customising Log Output
+
+### 7.1 Adding custom sections
+
+Real-world pipelines often need custom log sections beyond the standard ones. Combine logrx with `message()` calls to produce structured custom sections:
+
+```{r custom-sections, eval=FALSE}
+# Pattern: use message() with a separator prefix
+# logrx captures all messages → custom sections appear in MESSAGES section
+
+axecute("adam/derive_adsl.R")
+
+# Inside derive_adsl.R:
+message(strrep("─", 50))
+message("  DATA INVENTORY")
+message(strrep("─", 50))
+message(sprintf("  DM  rows: %d", nrow(dm)))
+message(sprintf("  DS  rows: %d", nrow(ds)))
+message(sprintf("  EX  rows: %d", nrow(ex)))
+
+message(strrep("─", 50))
+message("  DERIVATION CHECKS")
+message(strrep("─", 50))
+message(sprintf("  ADSL rows:     %d", nrow(adsl)))
+message(sprintf("  Subjects:      %d", n_distinct(adsl$USUBJID)))
+message(sprintf("  Safety pop:    %d", sum(adsl$SAFFL=="Y", na.rm=TRUE)))
+message(sprintf("  ITT pop:       %d", sum(adsl$ITTFL=="Y", na.rm=TRUE)))
+```
+
+### 7.2 Exercise — structured log with custom sections
+
+Write a script that produces a well-structured log with data inventory and derivation check sections.
+
+```{r custom-log-ex, exercise=TRUE, exercise.lines=35}
+log_custom <- axecute_string('
+library(dplyr)
+library(pharmaverseadam)
+
+message(strrep("─", 50))
+message("  DATA INVENTORY")
+message(strrep("─", 50))
+
+adsl <- pharmaverseadam::adsl
+adae <- pharmaverseadam::adae
+
+message(sprintf("  ADSL raw rows : %d", nrow(adsl)))
+message(sprintf("  ADAE raw rows : %d", nrow(adae)))
+
+message(strrep("─", 50))
+message("  DERIVATION")
+message(strrep("─", 50))
+
+adsl <- adsl |>
+  mutate(ITTFL  = SAFFL,
+         DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"))
+
+message(strrep("─", 50))
+message("  OUTPUT CHECKS")
+message(strrep("─", 50))
+
+n_saf <- sum(adsl$SAFFL  == "Y", na.rm=TRUE)
+n_itt <- sum(adsl$ITTFL  == "Y", na.rm=TRUE)
+n_dia <- sum(adsl$DIABFL == "Y", na.rm=TRUE)
+
+message(sprintf("  Safety pop : %d", n_saf))
+message(sprintf("  ITT pop    : %d", n_itt))
+message(sprintf("  Diabetic   : %d", n_dia))
+
+cat("ADSL derivation complete\n")
+', script_name = "derive_adsl.R", show_log = FALSE)
+
+# Show only messages from the log
+msgs <- log_custom$messages
+cat("── Messages captured in log ────────────────────────\n")
+for (m in msgs) cat(m)
+```
+
+---
+
+## 8 — Capstone: Full Program Logging Pipeline
+
+Build a complete logging pipeline that runs three scripts, collects batch logs, and produces a QC-ready summary report.
+
+```{r capstone-logging, exercise=TRUE, exercise.lines=65}
+# ── Scripts to run ─────────────────────────────────────────────────────────
+program_suite <- list(
+  list(
+    name   = "derive_adsl.R",
+    domain = "ADSL",
+    code   = '
+      library(dplyr); library(pharmaverseadam)
+      message("=== START: derive_adsl.R ===")
+      adsl <- pharmaverseadam::adsl |>
+        mutate(ITTFL=SAFFL,
+               DIABFL=if_else(!is.na(BMIBL)&BMIBL>=30,"Y","N",missing="N"))
+      message(sprintf("  Subjects: %d", nrow(adsl)))
+      message(sprintf("  Safety N: %d", sum(adsl$SAFFL=="Y",na.rm=TRUE)))
+      message("=== END: derive_adsl.R ===")
+    '
+  ),
+  list(
+    name   = "derive_adae.R",
+    domain = "ADAE",
+    code   = '
+      library(dplyr); library(pharmaverseadam)
+      message("=== START: derive_adae.R ===")
+      adae <- pharmaverseadam::adae
+      if("TRTA" %in% names(adae) && !"TRT01A" %in% names(adae))
+        adae <- rename(adae, TRT01A=TRTA)
+      message(sprintf("  AE records: %d", nrow(adae)))
+      message(sprintf("  Subjects  : %d", dplyr::n_distinct(adae$USUBJID)))
+      message("=== END: derive_adae.R ===")
+    '
+  ),
+  list(
+    name   = "derive_adlb.R",
+    domain = "ADLB",
+    code   = '
+      library(dplyr); library(pharmaverseadam)
+      message("=== START: derive_adlb.R ===")
+      adlb <- pharmaverseadam::adlb |>
+        filter(is.na(DTYPE)) |>
+        mutate(ATOXGR=as.integer(ATOXGR))
+      message(sprintf("  Lab records: %d", nrow(adlb)))
+      message(sprintf("  Parameters : %d", dplyr::n_distinct(adlb$PARAMCD)))
+      message("=== END: derive_adlb.R ===")
+    '
+  )
+)
+
+# ── Execute all programs ──────────────────────────────────────────────────
+cat("╔══════════════════════════════════════════════════════╗\n")
+cat("║  CDISCPILOT01 — ADaM Batch Execution                ║\n")
+cat("╚══════════════════════════════════════════════════════╝\n\n")
+
+all_logs <- lapply(program_suite, function(p) {
+  cat(sprintf("Running %s...", p$name))
+  log_res <- axecute_string(p$code, script_name=p$name, show_log=FALSE)
+  status  <- if (log_res$succeeded) "✓ SUCCESS" else "✗ FAILURE"
+  cat(sprintf(" %s (%.3fs)\n", status, log_res$elapsed))
+  log_res
+})
+
+# ── Batch QC report ──────────────────────────────────────────────────────
+cat("\n╔══════════════════════════════════════════════════════╗\n")
+cat("║  QC Batch Summary                                    ║\n")
+cat("╚══════════════════════════════════════════════════════╝\n")
+
+qc_tbl <- tibble(
+  Program  = sapply(program_suite, `[[`, "name"),
+  Domain   = sapply(program_suite, `[[`, "domain"),
+  Status   = sapply(all_logs, function(l) if(l$succeeded) "SUCCESS" else "FAILURE"),
+  Warnings = sapply(all_logs, function(l) length(log_warn_select(l))),
+  Messages = sapply(all_logs, function(l) length(l$messages)),
+  Elapsed  = round(sapply(all_logs, function(l) l$elapsed), 3)
+)
+
+print(qc_tbl)
+
+n_fail <- sum(qc_tbl$Status == "FAILURE")
+n_warn <- sum(qc_tbl$Warnings)
+cat(sprintf("\n  Programs run   : %d\n", nrow(qc_tbl)))
+cat(sprintf("  Failures       : %d\n", n_fail))
+cat(sprintf("  Total warnings : %d\n", n_warn))
+cat(sprintf("  Overall status : %s\n",
+            if(n_fail==0) "✓ ALL PASS" else "✗ REVIEW REQUIRED"))
+```
+
+---
+
+## Summary
+
+logrx provides the audit trail that transforms R from a research tool into a GxP-validated clinical programming platform:
+
+- **`axecute(file)`** runs a script and automatically produces a structured log
+- The log captures: header (user, node, times), session info (R version, all packages), messages, warnings, errors, and final STATUS
+- `log_select(log, section)` extracts header, session, warnings, errors, or status programmatically
+- `log_warn_select()` / `log_error_select()` pull specific issue lists for triage
+- **STATUS = FAILURE** when any unhandled error occurs; warnings leave STATUS = SUCCESS but are recorded
+- Batch execution with `lapply()` or `purrr::map()` enables whole-suite logging in one call
+- GxP compliance requires: every script run via `axecute()`, log version-controlled alongside script, QC review documented
+
+Next: **Lesson 46** covers `diffdf` and `riskmetric` — comparing datasets for differences and scoring R packages for use in regulated environments.

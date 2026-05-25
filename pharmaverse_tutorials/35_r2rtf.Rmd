@@ -1,0 +1,1113 @@
+---
+title: "Lesson 35 — r2rtf: RTF Output for Clinical Submission Tables"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Build submission-grade RTF clinical tables using r2rtf: the data-first
+  philosophy, page setup, titles, column headers, body formatting, footnotes,
+  and a full capstone AE summary table.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 35_r2rtf.Rmd
+# PURPOSE       : Teach r2rtf for producing submission-grade RTF clinical tables:
+#                 page setup, titles, column headers, body formatting,
+#                 footnotes, number formatting, and a capstone AE table.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.blanks = TRUE)
+
+# ── Null-coalesce operator ────────────────────────────────────────────────────
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ── r2rtf mock functions ──────────────────────────────────────────────────────
+
+rtf_page <- function(df, orientation = "landscape", margin = rep(1, 4),
+                     nrow = 40, font_size = 9, ...) {
+  attr(df, "rtf_page") <- list(
+    orientation = orientation,
+    margin      = margin,
+    nrow        = nrow,
+    font_size   = font_size
+  )
+  df
+}
+
+rtf_title <- function(df, title = "", ...) {
+  prev <- attr(df, "rtf_titles") %||% character()
+  attr(df, "rtf_titles") <- c(prev, title)
+  df
+}
+
+rtf_colheader <- function(df, colheader, col_rel_width = NULL,
+                           border_top = NULL, border_bottom = NULL,
+                           text_justification = NULL, ...) {
+  prev <- attr(df, "rtf_colheaders") %||% character()
+  attr(df, "rtf_colheaders") <- c(prev, colheader)
+  df
+}
+
+rtf_body <- function(df, col_rel_width = NULL, text_justification = NULL,
+                     border_top = NULL, border_bottom = NULL,
+                     cell_height = 0.15, stripes = NULL, ...) {
+  attr(df, "rtf_body") <- list(
+    col_rel_width      = col_rel_width,
+    text_justification = text_justification
+  )
+  df
+}
+
+rtf_footnote <- function(df, footnote = "", ...) {
+  prev <- attr(df, "rtf_footnotes") %||% character()
+  attr(df, "rtf_footnotes") <- c(prev, footnote)
+  df
+}
+
+rtf_source <- function(df, source = "", ...) {
+  attr(df, "rtf_source") <- source
+  df
+}
+
+rtf_encode <- function(df, ...) {
+  structure(
+    list(
+      data       = df,
+      page       = attr(df, "rtf_page"),
+      titles     = attr(df, "rtf_titles"),
+      colheaders = attr(df, "rtf_colheaders"),
+      body       = attr(df, "rtf_body"),
+      footnotes  = attr(df, "rtf_footnotes"),
+      source     = attr(df, "rtf_source"),
+      nrow_body  = nrow(df),
+      ncol_body  = ncol(df)
+    ),
+    class = "rtf_doc"
+  )
+}
+
+rtf_write <- function(rtf, path = "output.rtf") {
+  cat(sprintf("RTF document written to: %s\n", path))
+  cat(sprintf("  Page        : %s, font_size = %s pt\n",
+      rtf$page$orientation %||% "landscape",
+      rtf$page$font_size   %||% 9))
+  cat(sprintf("  Titles      : %d line(s)\n",   length(rtf$titles)))
+  cat(sprintf("  Col headers : %d row(s)\n",    length(rtf$colheaders)))
+  cat(sprintf("  Body rows   : %d\n",            rtf$nrow_body))
+  cat(sprintf("  Footnotes   : %d line(s)\n",   length(rtf$footnotes)))
+  invisible(rtf)
+}
+
+print.rtf_doc <- function(x, ...) {
+  cat("rtf_doc:\n")
+  cat("  Titles :", paste(x$titles, collapse = " | "), "\n")
+  cat("  Rows   :", x$nrow_body, " Cols:", x$ncol_body, "\n")
+  invisible(x)
+}
+
+# ── Real pharmaverseadam data ─────────────────────────────────────────────────
+
+adsl <- pharmaverseadam::adsl
+
+# Age summary by treatment arm
+age_summary <- adsl |>
+  group_by(TRT01P) |>
+  summarise(
+    N      = n(),
+    Mean   = round(mean(AGE, na.rm = TRUE), 1),
+    SD     = round(sd(AGE,   na.rm = TRUE), 1),
+    Median = round(median(AGE, na.rm = TRUE), 1),
+    Min    = min(AGE, na.rm = TRUE),
+    Max    = max(AGE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Wide-format demographics table (r2rtf-ready character columns)
+demog_rtf <- tribble(
+  ~Parameter,     ~Statistic,  ~Placebo,      ~XanoLow,      ~XanoHigh,
+  "Age (years)",  "Mean (SD)", "75.2 (8.6)",  "75.7 (8.3)",  "74.4 (7.9)",
+  "",             "Median",    "76.0",         "77.5",         "76.0",
+  "",             "Range",     "[52, 89]",     "[56, 88]",     "[56, 88]",
+  "Sex, n (%)",   "Male",      "37 (43.0%)",   "35 (41.7%)",   "35 (41.7%)",
+  "",             "Female",    "49 (57.0%)",   "49 (58.3%)",   "49 (58.3%)",
+  "Race, n (%)",  "White",     "68 (79.1%)",   "70 (83.3%)",   "71 (84.5%)",
+  "",             "Black",     "8 (9.3%)",     "9 (10.7%)",    "8 (9.5%)"
+)
+
+# AE summary (wide, sorted by Placebo subject count descending)
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+
+ae_summary_rtf <- adae_raw |>
+  group_by(TRT01A, AEBODSYS) |>
+  summarise(n_subj = n_distinct(USUBJID), .groups = "drop") |>
+  pivot_wider(names_from = TRT01A, values_from = n_subj, values_fill = 0L) |>
+  arrange(desc(Placebo))
+```
+
+## Overview
+
+### What is r2rtf?
+
+**r2rtf** is a tidyverse-compatible R package that converts R data frames into
+RTF (Rich Text Format) files suitable for clinical trial submissions. RTF is
+one of the standard output formats for regulatory submissions because it can be
+opened in Microsoft Word and retains precise formatting.
+
+The SAS equivalent is `ODS RTF` combined with `PROC REPORT`:
+
+```sas
+/* SAS approach */
+ods rtf file="output.rtf";
+proc report data=demog nowd;
+  column trt parameter statistic value;
+  ...
+run;
+ods rtf close;
+```
+
+In r2rtf, you build the table contents as a plain R data frame first — then
+attach RTF formatting via a pipe chain.
+
+### What you will learn
+
+By the end of this lesson you will be able to:
+
+- Prepare a tidy summary data frame for RTF output
+- Set up page orientation, margins, and font size with `rtf_page()`
+- Add multi-line titles with `rtf_title()`
+- Create single- and multi-row column headers with `rtf_colheader()`
+- Control column widths and text justification with `rtf_body()`
+- Add footnotes and data source lines
+- Pre-format numbers with `sprintf()` before piping into r2rtf
+- Build a complete submission-grade AE summary table
+
+> **Note:** This tutorial uses a mock implementation of r2rtf so exercises run
+> inside learnr. The API is identical to the real package — the only difference
+> is that `rtf_write()` prints a summary instead of writing a real file.
+
+---
+
+## Section 1 — r2rtf Philosophy and the Data-First Approach
+
+### Data first, formatting second
+
+The key principle of r2rtf is simple: **prepare your data frame completely
+before you think about formatting**. Every column in your data frame becomes
+one column in the RTF table. Every row becomes one body row.
+
+This is a different mental model from SAS `PROC REPORT`, where you define the
+report structure and the data at the same time. In r2rtf, those two steps are
+completely separated:
+
+| Step | r2rtf | SAS PROC REPORT |
+|------|-------|-----------------|
+| 1 | Build a clean summary data frame with dplyr | Inline with PROC REPORT statements |
+| 2 | Attach RTF metadata via pipe chain | Column, define, compute statements |
+| 3 | `rtf_encode()` + `rtf_write()` | ODS RTF destination |
+
+### The full pipe chain
+
+```r
+my_data |>
+  rtf_page()        # page setup: orientation, margins, font size
+  rtf_title()       # one or more title lines
+  rtf_colheader()   # column header row(s)
+  rtf_body()        # body formatting: widths, justification
+  rtf_footnote()    # footnote lines
+  rtf_source()      # data source statement
+  rtf_encode()      # encode to RTF object
+  rtf_write("output.rtf")   # write the file
+```
+
+Each function (except `rtf_encode()` and `rtf_write()`) returns the same data
+frame with additional attributes attached — so the pipe just accumulates
+formatting instructions without modifying the data itself.
+
+### Demo: age summary table
+
+Here is `age_summary`, the pre-built data frame from the setup chunk:
+
+```{r show-age-summary}
+age_summary
+```
+
+Now pipe it through the full chain:
+
+```{r demo-full-chain}
+age_summary |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9) |>
+  rtf_title(title = "Table 14.1.2 — Summary of Age by Treatment Arm") |>
+  rtf_colheader(colheader = "Treatment Arm | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_footnote(footnote = "SD = Standard Deviation.") |>
+  rtf_source(source = "Source: ADSL") |>
+  rtf_encode() |>
+  rtf_write("table_14_1_2.rtf")
+```
+
+Notice that `rtf_write()` reports 3 body rows — one per treatment arm — which
+matches the 3 rows in `age_summary`.
+
+### Exercise 1.1 — Full chain
+
+Pipe `age_summary` through the complete r2rtf chain. Use the title
+`"Table 14.1.1 — Age Summary"`. Verify that `rtf_write()` reports the correct
+number of body rows.
+
+```{r full-chain, exercise=TRUE, exercise.lines=12}
+age_summary |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9) |>
+  rtf_title(title = ___) |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_footnote(footnote = "SD = Standard Deviation.") |>
+  rtf_source(source = "Source: ADSL") |>
+  rtf_encode() |>
+  rtf_write(___)
+```
+
+```{r full-chain-hint-1}
+# Fill in the title string and the output file path.
+# rtf_write() takes a character path like "age_table.rtf"
+```
+
+```{r full-chain-solution}
+age_summary |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9) |>
+  rtf_title(title = "Table 14.1.1 — Age Summary") |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_footnote(footnote = "SD = Standard Deviation.") |>
+  rtf_source(source = "Source: ADSL") |>
+  rtf_encode() |>
+  rtf_write("age_table.rtf")
+```
+
+### Exercise 1.2 — Inspect rtf_encode() output
+
+`rtf_encode()` returns an `rtf_doc` object. Store the result of encoding
+`age_summary` (with any title and colheader) and then print it to see the
+structure.
+
+```{r inspect-encode, exercise=TRUE, exercise.lines=10}
+doc <- age_summary |>
+  rtf_page() |>
+  rtf_title(title = "Age Summary") |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_encode()
+
+# Print the doc object and inspect nrow_body and ncol_body
+print(___)
+cat("nrow_body:", ___$nrow_body, "\n")
+cat("ncol_body:", ___$ncol_body, "\n")
+```
+
+```{r inspect-encode-hint-1}
+# Replace ___ with the name of your stored object: doc
+```
+
+```{r inspect-encode-solution}
+doc <- age_summary |>
+  rtf_page() |>
+  rtf_title(title = "Age Summary") |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_encode()
+
+print(doc)
+cat("nrow_body:", doc$nrow_body, "\n")
+cat("ncol_body:", doc$ncol_body, "\n")
+```
+
+---
+
+## Section 2 — rtf_page() and Page Setup
+
+### Page setup arguments
+
+`rtf_page()` controls the physical page properties of the RTF document. The
+three most important arguments for clinical tables are:
+
+| Argument | Default | Typical clinical use |
+|----------|---------|----------------------|
+| `orientation` | `"landscape"` | `"landscape"` for wide tables; `"portrait"` for narrow tables |
+| `nrow` | `40` | Maximum body rows per page before a page break is inserted |
+| `font_size` | `9` | 9 pt is standard for clinical submission tables |
+
+`margin` accepts a 4-element numeric vector in inches: `c(top, bottom, left, right)`.
+The regulatory standard is often 1-inch margins all around: `rep(1, 4)`.
+
+```r
+# Portrait, tight margins, small font for dense tables
+my_data |>
+  rtf_page(
+    orientation = "portrait",
+    margin      = c(1, 1, 1.25, 1.25),  # top, bottom, left, right
+    nrow        = 55,
+    font_size   = 8
+  )
+```
+
+### rtf_page() returns the same data frame
+
+`rtf_page()` does **not** modify the data — it attaches a `rtf_page` attribute.
+You can inspect it directly:
+
+```{r show-page-attr}
+df_with_page <- age_summary |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9)
+
+attr(df_with_page, "rtf_page")
+```
+
+### Exercise 2.1 — Landscape setup
+
+Set up `age_summary` for a landscape page with 40 rows per page and 9pt font.
+Inspect the `rtf_page` attribute and confirm the values are correct.
+
+```{r page-setup, exercise=TRUE, exercise.lines=8}
+df <- age_summary |>
+  rtf_page(
+    orientation = ___,
+    nrow        = ___,
+    font_size   = ___
+  )
+
+attr(df, "rtf_page")
+```
+
+```{r page-setup-hint-1}
+# orientation should be "landscape" (a character string)
+# nrow = 40, font_size = 9
+```
+
+```{r page-setup-solution}
+df <- age_summary |>
+  rtf_page(
+    orientation = "landscape",
+    nrow        = 40,
+    font_size   = 9
+  )
+
+attr(df, "rtf_page")
+```
+
+### Exercise 2.2 — Portrait for narrow tables
+
+Some tables (e.g. a single-arm listing) fit better in portrait orientation with
+a slightly larger font. Set up `demog_rtf` for portrait, 55 rows per page,
+10pt font, and 1-inch margins on all sides.
+
+```{r page-portrait, exercise=TRUE, exercise.lines=10}
+df_portrait <- demog_rtf |>
+  rtf_page(
+    orientation = ___,
+    margin      = ___,
+    nrow        = ___,
+    font_size   = ___
+  )
+
+attr(df_portrait, "rtf_page")
+```
+
+```{r page-portrait-hint-1}
+# margin = rep(1, 4) gives 1-inch margins on all four sides
+```
+
+```{r page-portrait-solution}
+df_portrait <- demog_rtf |>
+  rtf_page(
+    orientation = "portrait",
+    margin      = rep(1, 4),
+    nrow        = 55,
+    font_size   = 10
+  )
+
+attr(df_portrait, "rtf_page")
+```
+
+### Quiz
+
+```{r quiz-section2}
+quiz(
+  question(
+    "What does `nrow` control in `rtf_page()`?",
+    answer("The number of columns in the table"),
+    answer("The maximum body rows per page before a page break", correct = TRUE),
+    answer("The number of title rows"),
+    answer("The total rows in the data frame"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which margin argument format is correct for 1-inch margins all around?",
+    answer("`margin = 1`"),
+    answer("`margin = c(1, 1, 1, 1)`", correct = TRUE),
+    answer("`margin = list(top=1, bottom=1)`"),
+    answer("`margin = '1in'`"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 3 — Titles and Column Headers
+
+### Multi-line titles with rtf_title()
+
+Clinical tables almost always have at least a two-line title:
+
+- **Line 1:** Study / protocol identifier and table number
+- **Line 2:** Table description
+
+You add multiple title lines by calling `rtf_title()` twice in the pipe chain:
+
+```r
+df |>
+  rtf_title(title = "Protocol CDISCPILOT01 — Table 14.1.2") |>
+  rtf_title(title = "Summary of Demographics and Baseline Characteristics")
+```
+
+Each call appends one line to the `rtf_titles` attribute.
+
+### Column headers with rtf_colheader()
+
+`rtf_colheader()` takes a single character string where columns are delimited
+by `|`. The string must have exactly as many `|`-separated segments as there
+are columns in your data frame:
+
+```r
+# 5-column data frame → 5 segments
+df |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose")
+```
+
+### Multi-row headers: call rtf_colheader() twice
+
+For spanner headers (e.g., "Treatment Arm" spanning three columns), call
+`rtf_colheader()` twice. The first call defines the spanner row, the second
+defines the individual column labels. Empty segments create blank cells that
+serve as spacers:
+
+```r
+# Row 1: spanner
+df |>
+  rtf_colheader(colheader = " | | Treatment Arm") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose")
+```
+
+> The real r2rtf uses `col_rel_width` to control which cells merge for the
+> spanner. In this mock the visual merging is implied by the content.
+
+### Demo: two-line title and two-row header
+
+```{r demo-titles-headers}
+demog_rtf |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9) |>
+  rtf_title(title = "Protocol CDISCPILOT01 — Table 14.1.2") |>
+  rtf_title(title = "Summary of Demographics and Baseline Characteristics") |>
+  rtf_colheader(colheader = " | | Treatment Arm") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body() |>
+  rtf_encode() |>
+  rtf_write("demog_table.rtf")
+```
+
+The output confirms 2 title lines and 2 column header rows.
+
+### Exercise 3.1 — Two-line title
+
+Take `age_summary` and add a two-line title:
+1. `"Protocol CDISCPILOT01 — Table 14.1.2"`
+2. `"Age Summary by Treatment Arm"`
+
+Then encode and write to `"age_table.rtf"`. Confirm 2 title lines are reported.
+
+```{r two-line-title, exercise=TRUE, exercise.lines=12}
+age_summary |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = ___) |>
+  rtf_title(title = ___) |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_encode() |>
+  rtf_write("age_table.rtf")
+```
+
+```{r two-line-title-hint-1}
+# Call rtf_title() twice, once for each line
+```
+
+```{r two-line-title-solution}
+age_summary |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Protocol CDISCPILOT01 — Table 14.1.2") |>
+  rtf_title(title = "Age Summary by Treatment Arm") |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_encode() |>
+  rtf_write("age_table.rtf")
+```
+
+### Exercise 3.2 — Spanner header for demog_rtf
+
+`demog_rtf` has 5 columns: Parameter, Statistic, Placebo, XanoLow, XanoHigh.
+Add a spanner header row with `"Treatment Arm"` over the three treatment columns,
+then a second header row with individual column names.
+
+```{r spanner-header, exercise=TRUE, exercise.lines=14}
+demog_rtf |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Demographics and Baseline") |>
+  # Row 1: spanner — leave Parameter and Statistic empty
+  rtf_colheader(colheader = ___) |>
+  # Row 2: individual column labels
+  rtf_colheader(colheader = ___) |>
+  rtf_body() |>
+  rtf_encode() |>
+  rtf_write("demog_spanner.rtf")
+```
+
+```{r spanner-header-hint-1}
+# Row 1 spanner: " | | Treatment Arm"  (two empty segments for the first two cols)
+# Row 2 individual: "Parameter | Statistic | Placebo | Low Dose | High Dose"
+```
+
+```{r spanner-header-solution}
+demog_rtf |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Demographics and Baseline") |>
+  rtf_colheader(colheader = " | | Treatment Arm") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body() |>
+  rtf_encode() |>
+  rtf_write("demog_spanner.rtf")
+```
+
+---
+
+## Section 4 — rtf_body() Formatting
+
+### Body formatting options
+
+`rtf_body()` controls two key layout properties for the table body:
+
+**1. `text_justification` — per-column alignment**
+
+Pass a character vector with one value per column:
+
+| Code | Meaning |
+|------|---------|
+| `"l"` | Left-align |
+| `"c"` | Centre |
+| `"r"` | Right-align |
+| `"d"` | Decimal-align |
+
+Clinical convention: **left-align label/description columns, right-align
+numeric columns**. This makes the table scannable and matches submission
+standards.
+
+**2. `col_rel_width` — relative column widths**
+
+Pass a numeric vector summing to 1 (or any proportional values). Wider label
+columns get more space; narrow numeric columns get less:
+
+```r
+# 5-column table: label gets 30%, statistic gets 15%, 3 arms share 55%
+rtf_body(
+  col_rel_width      = c(0.30, 0.15, 0.183, 0.183, 0.184),
+  text_justification = c("l",  "l",  "r",   "r",   "r")
+)
+```
+
+### Demo: formatted demog_rtf body
+
+```{r demo-body-format}
+demog_rtf |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9) |>
+  rtf_title(title = "Table 14.1.2 — Demographics") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body(
+    col_rel_width      = c(0.25, 0.15, 0.20, 0.20, 0.20),
+    text_justification = c("l",  "l",  "r",  "r",  "r")
+  ) |>
+  rtf_encode() |>
+  rtf_write("demog_fmt.rtf")
+```
+
+### Exercise 4.1 — Apply body formatting
+
+Take `demog_rtf` and apply:
+- Column widths: `c(0.25, 0.15, 0.20, 0.20, 0.20)`
+- Justification: left for Parameter and Statistic, right for the three arm columns
+
+```{r body-format, exercise=TRUE, exercise.lines=14}
+demog_rtf |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9) |>
+  rtf_title(title = "Table 14.1.2 — Demographics and Baseline") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body(
+    col_rel_width      = ___,
+    text_justification = ___
+  ) |>
+  rtf_encode() |>
+  rtf_write("demog_body.rtf")
+```
+
+```{r body-format-hint-1}
+# col_rel_width = c(0.25, 0.15, 0.20, 0.20, 0.20)
+# text_justification = c("l", "l", "r", "r", "r")
+```
+
+```{r body-format-solution}
+demog_rtf |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9) |>
+  rtf_title(title = "Table 14.1.2 — Demographics and Baseline") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body(
+    col_rel_width      = c(0.25, 0.15, 0.20, 0.20, 0.20),
+    text_justification = c("l",  "l",  "r",  "r",  "r")
+  ) |>
+  rtf_encode() |>
+  rtf_write("demog_body.rtf")
+```
+
+### Exercise 4.2 — Centre the statistic column
+
+Repeat the formatting but centre-justify the Statistic column instead of
+left-justifying it. Keep all other settings the same.
+
+```{r body-centre, exercise=TRUE, exercise.lines=14}
+demog_rtf |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Demographics (centred statistic)") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body(
+    col_rel_width      = c(0.25, 0.15, 0.20, 0.20, 0.20),
+    text_justification = ___
+  ) |>
+  rtf_encode() |>
+  rtf_write("demog_centre.rtf")
+```
+
+```{r body-centre-hint-1}
+# Change the second element from "l" to "c"
+```
+
+```{r body-centre-solution}
+demog_rtf |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Demographics (centred statistic)") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body(
+    col_rel_width      = c(0.25, 0.15, 0.20, 0.20, 0.20),
+    text_justification = c("l", "c", "r", "r", "r")
+  ) |>
+  rtf_encode() |>
+  rtf_write("demog_centre.rtf")
+```
+
+---
+
+## Section 5 — Footnotes and Source Lines
+
+### Regulatory footnote requirements
+
+Submission tables must include:
+
+- **Footnotes** explaining abbreviations, statistical methods, and any
+  special handling (e.g., "Missing values excluded from percentage denominator")
+- **Source line** identifying the dataset(s) and data cut date
+
+Both are added at the end of the pipe chain, before `rtf_encode()`.
+
+### rtf_footnote() and rtf_source()
+
+```r
+df |>
+  rtf_footnote(footnote = "SD = Standard Deviation; N = number of subjects.") |>
+  rtf_footnote(footnote = "Missing values were excluded from all calculations.") |>
+  rtf_source(source   = "Source: ADSL; Data cut: 2024-01-01")
+```
+
+Like `rtf_title()`, calling `rtf_footnote()` multiple times appends lines —
+so you can have as many footnotes as needed.
+
+### Demo
+
+```{r demo-footnotes}
+age_summary |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Age Summary") |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body(text_justification = c("l", "r", "r", "r", "r", "r", "r")) |>
+  rtf_footnote(footnote = "SD = Standard Deviation.") |>
+  rtf_footnote(footnote = "N = number of subjects randomised to the treatment arm.") |>
+  rtf_source(source = "Source: ADSL; Data cut: 2024-01-01") |>
+  rtf_encode() |>
+  rtf_write("age_fn.rtf")
+```
+
+### Exercise 5.1 — Add footnote and source
+
+Build an `age_summary` table with:
+- Footnote: `"SD = Standard Deviation."`
+- Source: `"Source: ADSL; Data cut: 2024-01-01"`
+
+```{r add-footnote, exercise=TRUE, exercise.lines=13}
+age_summary |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Age Summary") |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_footnote(footnote = ___) |>
+  rtf_source(source = ___) |>
+  rtf_encode() |>
+  rtf_write("age_fn.rtf")
+```
+
+```{r add-footnote-hint-1}
+# Both arguments take a plain character string
+```
+
+```{r add-footnote-solution}
+age_summary |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Age Summary") |>
+  rtf_colheader(colheader = "Treatment | N | Mean | SD | Median | Min | Max") |>
+  rtf_body() |>
+  rtf_footnote(footnote = "SD = Standard Deviation.") |>
+  rtf_source(source = "Source: ADSL; Data cut: 2024-01-01") |>
+  rtf_encode() |>
+  rtf_write("age_fn.rtf")
+```
+
+### Exercise 5.2 — Multiple footnotes
+
+Add two footnotes to `demog_rtf`:
+1. `"n = number of subjects; % = percentage within treatment arm."`
+2. `"Missing values excluded from percentage denominators."`
+
+```{r multi-footnote, exercise=TRUE, exercise.lines=14}
+demog_rtf |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Demographics") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body(
+    col_rel_width      = c(0.25, 0.15, 0.20, 0.20, 0.20),
+    text_justification = c("l",  "l",  "r",  "r",  "r")
+  ) |>
+  rtf_footnote(footnote = ___) |>
+  rtf_footnote(footnote = ___) |>
+  rtf_source(source = "Source: ADSL; Data cut: 2024-01-01") |>
+  rtf_encode() |>
+  rtf_write("demog_fn.rtf")
+```
+
+```{r multi-footnote-hint-1}
+# Call rtf_footnote() twice, one per footnote line
+```
+
+```{r multi-footnote-solution}
+demog_rtf |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Table 14.1.2 — Demographics") |>
+  rtf_colheader(colheader = "Parameter | Statistic | Placebo | Low Dose | High Dose") |>
+  rtf_body(
+    col_rel_width      = c(0.25, 0.15, 0.20, 0.20, 0.20),
+    text_justification = c("l",  "l",  "r",  "r",  "r")
+  ) |>
+  rtf_footnote(footnote = "n = number of subjects; % = percentage within treatment arm.") |>
+  rtf_footnote(footnote = "Missing values excluded from percentage denominators.") |>
+  rtf_source(source = "Source: ADSL; Data cut: 2024-01-01") |>
+  rtf_encode() |>
+  rtf_write("demog_fn.rtf")
+```
+
+---
+
+## Section 6 — Formatting Numbers with sprintf
+
+### Why you pre-format numbers
+
+r2rtf works with **character columns**. When you pipe a data frame, every
+column becomes a text cell. If you want "75.2 (8.6)" in a cell, you must
+create that string *before* the `rtf_` calls — r2rtf does not know how to
+combine two numeric columns into one formatted string.
+
+This is the standard approach:
+
+```r
+# Mean (SD) as one formatted string
+df |> mutate(mean_sd = sprintf("%.1f (%.1f)", Mean, SD))
+
+# Count (%) — with %% to escape the percent sign in sprintf
+format_count_pct <- function(n, N) sprintf("%d (%.1f%%)", n, round(100 * n / N, 1))
+```
+
+### Common sprintf patterns for clinical tables
+
+| Display | sprintf pattern | Example |
+|---------|----------------|---------|
+| Mean (SD) | `"%.1f (%.1f)"` | `75.2 (8.6)` |
+| n (%) | `"%d (%.1f%%)"` | `42 (50.0%)` |
+| Median [Min, Max] | `"%.1f [%.0f, %.0f]"` | `76.0 [52, 89]` |
+| n / N | `"%d/%d"` | `42/84` |
+
+### Demo: format age_summary for RTF
+
+```{r demo-sprintf}
+age_rtf_fmt <- age_summary |>
+  mutate(
+    mean_sd    = sprintf("%.1f (%.1f)", Mean, SD),
+    median_str = sprintf("%.1f", Median),
+    range_str  = sprintf("[%.0f, %.0f]", Min, Max)
+  ) |>
+  select(TRT01P, N, mean_sd, median_str, range_str)
+
+age_rtf_fmt
+```
+
+Now this five-column frame is ready to pipe into r2rtf.
+
+### Exercise 6.1 — Create formatted strings
+
+Take `age_summary` and create two new character columns:
+- `mean_sd`: formatted as `"75.2 (8.6)"`
+- `range_str`: formatted as `"[52, 89]"` (integer display for min and max)
+
+Then select `TRT01P`, `N`, `mean_sd`, and `range_str` for the RTF pipe.
+
+```{r sprintf-fmt, exercise=TRUE, exercise.lines=12}
+age_rtf <- age_summary |>
+  mutate(
+    mean_sd   = sprintf(___, Mean, SD),
+    range_str = sprintf(___, Min, Max)
+  ) |>
+  select(TRT01P, N, mean_sd, range_str)
+
+age_rtf
+```
+
+```{r sprintf-fmt-hint-1}
+# mean_sd pattern:   "%.1f (%.1f)"
+# range_str pattern: "[%.0f, %.0f]"   (%.0f rounds to integer)
+```
+
+```{r sprintf-fmt-solution}
+age_rtf <- age_summary |>
+  mutate(
+    mean_sd   = sprintf("%.1f (%.1f)", Mean, SD),
+    range_str = sprintf("[%.0f, %.0f]", Min, Max)
+  ) |>
+  select(TRT01P, N, mean_sd, range_str)
+
+age_rtf
+```
+
+### Exercise 6.2 — Pipe formatted frame into r2rtf
+
+Using the `age_rtf` data frame you just created, build a complete RTF table
+with a two-line title, a column header, and a footnote explaining "SD = Standard
+Deviation."
+
+```{r sprintf-rtf, exercise=TRUE, exercise.lines=16}
+age_rtf <- age_summary |>
+  mutate(
+    mean_sd   = sprintf("%.1f (%.1f)", Mean, SD),
+    range_str = sprintf("[%.0f, %.0f]", Min, Max)
+  ) |>
+  select(TRT01P, N, mean_sd, range_str)
+
+age_rtf |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = ___) |>
+  rtf_title(title = ___) |>
+  rtf_colheader(colheader = "Treatment | N | Mean (SD) | Range") |>
+  rtf_body(
+    col_rel_width      = c(0.35, 0.10, 0.30, 0.25),
+    text_justification = c("l",  "r",  "r",  "r")
+  ) |>
+  rtf_footnote(footnote = ___) |>
+  rtf_encode() |>
+  rtf_write("age_formatted.rtf")
+```
+
+```{r sprintf-rtf-hint-1}
+# Two-line title: protocol identifier + description
+# Footnote: "SD = Standard Deviation."
+```
+
+```{r sprintf-rtf-solution}
+age_rtf <- age_summary |>
+  mutate(
+    mean_sd   = sprintf("%.1f (%.1f)", Mean, SD),
+    range_str = sprintf("[%.0f, %.0f]", Min, Max)
+  ) |>
+  select(TRT01P, N, mean_sd, range_str)
+
+age_rtf |>
+  rtf_page(orientation = "landscape") |>
+  rtf_title(title = "Protocol CDISCPILOT01 — Table 14.1.2") |>
+  rtf_title(title = "Age Summary by Treatment Arm") |>
+  rtf_colheader(colheader = "Treatment | N | Mean (SD) | Range") |>
+  rtf_body(
+    col_rel_width      = c(0.35, 0.10, 0.30, 0.25),
+    text_justification = c("l",  "r",  "r",  "r")
+  ) |>
+  rtf_footnote(footnote = "SD = Standard Deviation.") |>
+  rtf_encode() |>
+  rtf_write("age_formatted.rtf")
+```
+
+---
+
+## Section 7 — Capstone: Table 14.3.1 AE Summary
+
+### The pre-built AE summary frame
+
+The setup chunk built `ae_summary_rtf` from real `pharmaverseadam::adae` data.
+It is already in wide format, with one row per body system and one column per
+treatment arm, sorted by descending Placebo subject count:
+
+```{r show-ae-summary}
+ae_summary_rtf
+```
+
+This frame is ready to pipe directly into r2rtf — no further dplyr needed.
+
+### Your task
+
+Build a complete submission-grade RTF table from `ae_summary_rtf`:
+
+1. Landscape page, 40 rows per page, 9pt font
+2. Two-line title:
+   - Line 1: `"Protocol CDISCPILOT01 — Table 14.3.1"`
+   - Line 2: `"Number of Subjects with at Least One AE by Body System"`
+3. Two-row column header:
+   - Row 1 spanner: `" | Treatment Arm"`
+   - Row 2 individual labels (use actual column names)
+4. Body: left-justify body system column, right-justify the three count columns
+5. Column widths: `c(0.55, 0.15, 0.15, 0.15)`
+6. Footnote: `"n = number of subjects with at least one AE in the body system."`
+7. Source: `"Source: ADAE; Data cut: 2024-01-01"`
+
+After building, answer: how many columns does the encoded rtf document have?
+
+```{r ae-capstone, exercise=TRUE, exercise.lines=24}
+# Step 1: Check the column names of ae_summary_rtf
+names(ae_summary_rtf)
+
+# Step 2: Build the RTF table
+doc <- ae_summary_rtf |>
+  rtf_page(orientation = ___, nrow = ___, font_size = ___) |>
+  rtf_title(title = ___) |>
+  rtf_title(title = ___) |>
+  rtf_colheader(colheader = ___) |>
+  rtf_colheader(colheader = ___) |>
+  rtf_body(
+    col_rel_width      = ___,
+    text_justification = ___
+  ) |>
+  rtf_footnote(footnote = ___) |>
+  rtf_source(source = ___) |>
+  rtf_encode()
+
+rtf_write(doc, "table_14_3_1.rtf")
+cat("\nNumber of columns in encoded document:", doc$ncol_body, "\n")
+```
+
+```{r ae-capstone-hint-1}
+# names(ae_summary_rtf) will show: AEBODSYS + three treatment arm columns
+# The table has 4 columns total.
+# For the spanner: " | Treatment Arm"
+# For individual headers: paste the column names separated by " | "
+```
+
+```{r ae-capstone-solution}
+names(ae_summary_rtf)
+
+doc <- ae_summary_rtf |>
+  rtf_page(orientation = "landscape", nrow = 40, font_size = 9) |>
+  rtf_title(title = "Protocol CDISCPILOT01 — Table 14.3.1") |>
+  rtf_title(title = "Number of Subjects with at Least One AE by Body System") |>
+  rtf_colheader(colheader = " | Treatment Arm") |>
+  rtf_colheader(
+    colheader = paste(names(ae_summary_rtf), collapse = " | ")
+  ) |>
+  rtf_body(
+    col_rel_width      = c(0.55, 0.15, 0.15, 0.15),
+    text_justification = c("l",  "r",  "r",  "r")
+  ) |>
+  rtf_footnote(
+    footnote = "n = number of subjects with at least one AE in the body system."
+  ) |>
+  rtf_source(source = "Source: ADAE; Data cut: 2024-01-01") |>
+  rtf_encode()
+
+rtf_write(doc, "table_14_3_1.rtf")
+cat("\nNumber of columns in encoded document:", doc$ncol_body, "\n")
+```
+
+> **Expected answer:** 4 columns (`AEBODSYS` + 3 treatment arm count columns).
+
+---
+
+## Lesson Summary
+
+### Key r2rtf concepts
+
+| Concept | What you learned |
+|---------|-----------------|
+| Data-first | Build a clean tidy data frame before any `rtf_` calls |
+| `rtf_page()` | Controls orientation, margins, rows-per-page, font size |
+| `rtf_title()` | Call twice for two-line titles; each call appends one line |
+| `rtf_colheader()` | `\|`-delimited string; call twice for spanner + individual labels |
+| `rtf_body()` | `col_rel_width` for proportional widths; `text_justification` per column |
+| `rtf_footnote()` | Call multiple times for multiple footnote lines |
+| `rtf_source()` | Single data provenance statement |
+| `rtf_encode()` | Returns an `rtf_doc` object with metadata |
+| `rtf_write()` | Final step — writes (or in this mock, summarises) the RTF file |
+| `sprintf()` | Pre-format numeric columns into submission-display strings before piping |
+
+### SAS equivalence
+
+| r2rtf | SAS |
+|-------|-----|
+| `rtf_page(orientation="landscape")` | `ODS RTF; OPTIONS ORIENTATION=LANDSCAPE;` |
+| `rtf_title()` | `TITLE1 "..."; TITLE2 "...";` |
+| `rtf_colheader()` | `DEFINE col / "Header";` in PROC REPORT |
+| `rtf_footnote()` | `FOOTNOTE1 "...";` |
+| `rtf_body(text_justification)` | `DEFINE col / LEFT/CENTER/RIGHT;` |
+| `sprintf("%.1f (%.1f)", Mean, SD)` | `CATX(" ", PUT(Mean,5.1), "("||PUT(SD,5.1)||")")` |
+
+### Next lesson
+
+**Lesson 36 — Tplyr** covers a layered approach to building the *data frames*
+that feed into r2rtf (and other output packages): count tables, descriptive
+statistics, and shift tables with a clean `group_count() / group_desc() /
+group_shift()` API.

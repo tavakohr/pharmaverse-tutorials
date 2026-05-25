@@ -1,0 +1,1431 @@
+---
+title: "Lesson 37 — tidytlg: Tidy TLG Generation"
+output:
+  learnr::tutorial:
+    theme: flatly
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 37_tidytlg.Rmd
+# PURPOSE       : tidytlg package — tidy generation of Tables, Listings, and
+#                 Graphs (TLG) for clinical study reports: freq_table(),
+#                 cont_table(), nested_freq(), tlg_output(), and the full
+#                 tidytlg pipeline from summary stats to submission-ready RTF.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(rlang)
+library(pharmaverseadam)
+
+# ── tidytlg MOCK FUNCTIONS ────────────────────────────────────────────────────
+
+statlist <- function(...) {
+  stats <- c(...)
+  structure(list(stats = stats), class = "statlist")
+}
+
+freq_table <- function(df, colvar, rowvar, statlist = NULL,
+                       rowbyvar = NULL, subset = NULL,
+                       denominator = NULL, total = FALSE) {
+  if (!is.null(subset)) df <- df |> dplyr::filter(!!rlang::parse_expr(subset))
+
+  denom_df <- if (!is.null(denominator)) denominator else df
+
+  if (!is.null(rowbyvar)) {
+    result <- df |>
+      dplyr::group_by(dplyr::across(dplyr::all_of(c(colvar, rowbyvar, rowvar)))) |>
+      dplyr::summarise(n = dplyr::n_distinct(USUBJID), .groups = "drop") |>
+      dplyr::left_join(
+        denom_df |>
+          dplyr::group_by(dplyr::across(dplyr::all_of(colvar))) |>
+          dplyr::summarise(N = dplyr::n_distinct(USUBJID), .groups = "drop"),
+        by = colvar
+      ) |>
+      dplyr::mutate(
+        pct     = round(100 * n / N, 1),
+        display = paste0(n, " (", sprintf("%.1f", pct), "%)"),
+        label   = as.character(!!rlang::sym(rowvar))
+      ) |>
+      dplyr::select(dplyr::all_of(c(rowvar, colvar, "display"))) |>
+      tidyr::pivot_wider(
+        names_from  = dplyr::all_of(colvar),
+        values_from = display,
+        values_fill = "0 (0.0%)"
+      ) |>
+      dplyr::rename(label = !!rlang::sym(rowvar))
+  } else {
+    result <- df |>
+      dplyr::group_by(dplyr::across(dplyr::all_of(c(colvar, rowvar)))) |>
+      dplyr::summarise(n = dplyr::n_distinct(USUBJID), .groups = "drop") |>
+      dplyr::group_by(dplyr::across(dplyr::all_of(colvar))) |>
+      dplyr::mutate(N = sum(n)) |>
+      dplyr::ungroup() |>
+      dplyr::mutate(
+        pct     = round(100 * n / N, 1),
+        display = paste0(n, " (", sprintf("%.1f", pct), "%)"),
+        label   = as.character(!!rlang::sym(rowvar))
+      ) |>
+      dplyr::select(dplyr::all_of(c(rowvar, colvar, "display"))) |>
+      tidyr::pivot_wider(
+        names_from  = dplyr::all_of(colvar),
+        values_from = display,
+        values_fill = "0 (0.0%)"
+      ) |>
+      dplyr::rename(label = !!rlang::sym(rowvar))
+  }
+
+  structure(result, class = c("tidytlg_freq", "tbl_df", "tbl", "data.frame"))
+}
+
+cont_table <- function(df, colvar, rowvar,
+                       statlist = NULL,
+                       rowbyvar = NULL, subset = NULL) {
+  if (!is.null(subset)) df <- df |> dplyr::filter(!!rlang::parse_expr(subset))
+
+  stats_out <- df |>
+    dplyr::group_by(dplyr::across(dplyr::all_of(colvar))) |>
+    dplyr::summarise(
+      N      = sum(!is.na(.data[[rowvar]])),
+      Mean   = round(mean(.data[[rowvar]], na.rm = TRUE), 1),
+      SD     = round(sd(.data[[rowvar]],   na.rm = TRUE), 1),
+      Median = round(median(.data[[rowvar]], na.rm = TRUE), 1),
+      Min    = min(.data[[rowvar]], na.rm = TRUE),
+      Max    = max(.data[[rowvar]], na.rm = TRUE),
+      Q1     = round(quantile(.data[[rowvar]], 0.25, na.rm = TRUE), 1),
+      Q3     = round(quantile(.data[[rowvar]], 0.75, na.rm = TRUE), 1),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      mean_sd  = paste0(Mean, " (", SD, ")"),
+      range    = paste0(Min, ", ", Max),
+      q1q3     = paste0(Q1, ", ", Q3)
+    )
+
+  stat_rows <- tibble::tribble(
+    ~label,          ~stat_col,
+    "N",             "N",
+    "Mean (SD)",     "mean_sd",
+    "Median",        "Median",
+    "Range",         "range"
+  )
+
+  result <- lapply(seq_len(nrow(stat_rows)), function(i) {
+    sr <- stat_rows[i, ]
+    # Coerce to character first so all pivoted arm columns share the same type;
+    # without this, N (integer) vs mean_sd/range (character) causes bind_rows() to fail.
+    row_vals <- stats_out |>
+      dplyr::select(dplyr::all_of(c(colvar, sr$stat_col))) |>
+      dplyr::mutate(dplyr::across(dplyr::all_of(sr$stat_col), as.character)) |>
+      tidyr::pivot_wider(
+        names_from  = dplyr::all_of(colvar),
+        values_from = dplyr::all_of(sr$stat_col)
+      )
+    row_vals$label <- sr$label
+    row_vals
+  }) |> dplyr::bind_rows()
+
+  structure(result, class = c("tidytlg_cont", "tbl_df", "tbl", "data.frame"))
+}
+
+nested_freq <- function(df, colvar, dptvar, dptvarn = NULL,
+                        rowbyvar = NULL, subset = NULL,
+                        denominator = NULL) {
+  if (!is.null(subset)) df <- df |> dplyr::filter(!!rlang::parse_expr(subset))
+  denom_df <- if (!is.null(denominator)) denominator else df
+
+  grp_vars <- if (!is.null(rowbyvar)) c(colvar, rowbyvar, dptvar) else c(colvar, dptvar)
+
+  result <- df |>
+    dplyr::group_by(dplyr::across(dplyr::all_of(grp_vars))) |>
+    dplyr::summarise(n = dplyr::n_distinct(USUBJID), .groups = "drop")
+
+  N_denom <- denom_df |>
+    dplyr::group_by(dplyr::across(dplyr::all_of(colvar))) |>
+    dplyr::summarise(N = dplyr::n_distinct(USUBJID), .groups = "drop")
+
+  result <- result |>
+    dplyr::left_join(N_denom, by = colvar) |>
+    dplyr::mutate(
+      pct     = round(100 * n / N, 1),
+      display = paste0(n, " (", sprintf("%.1f", pct), "%)"),
+      label   = paste0("  ", .data[[dptvar]])
+    )
+
+  keep_cols <- c(if (!is.null(rowbyvar)) rowbyvar else NULL,
+                 dptvar, colvar, "display", "label")
+
+  wide <- result |>
+    dplyr::select(dplyr::all_of(keep_cols)) |>
+    tidyr::pivot_wider(
+      names_from  = dplyr::all_of(colvar),
+      values_from = display,
+      values_fill = "0 (0.0%)"
+    )
+
+  structure(wide, class = c("tidytlg_nested", "tbl_df", "tbl", "data.frame"))
+}
+
+tlg_output <- function(df, tbl_id = "T01",
+                       title = "Table",
+                       colhead = NULL,
+                       font_size = 9,
+                       orientation = "landscape",
+                       output_format = "rtf",
+                       output_file = "output.rtf",
+                       ...) {
+  cat(sprintf("=== tidytlg Output: %s ===\n", tbl_id))
+  cat("Title:", paste(title, collapse = "\n       "), "\n")
+  cat("Format:", output_format, "| Orientation:", orientation,
+      "| Font:", font_size, "pt\n")
+  cat("Output file:", output_file, "\n")
+  cat("Table dimensions:", nrow(df), "rows x", ncol(df), "cols\n")
+  if (!is.null(colhead)) cat("Column headers:", colhead, "\n")
+  print(df, n = 5)
+  invisible(df)
+}
+
+gentlg <- function(huxme, tlf = "table", ...) {
+  cat("[gentlg: combined compute+output - see tlg_output() for details]\n")
+  invisible(huxme)
+}
+
+# ── DATASETS ──────────────────────────────────────────────────────────────────
+
+adsl <- pharmaverseadam::adsl
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- dplyr::rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- dplyr::mutate(adlb,
+                        ATOXGR = as.integer(ATOXGR),
+                        BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- dplyr::filter(adlb, is.na(DTYPE))
+if (!"TRT01A" %in% names(adlb))
+  adlb <- dplyr::left_join(adlb,
+                            dplyr::select(adsl, USUBJID, TRT01A = TRT01P),
+                            by = "USUBJID")
+
+# ── PRE-BUILT OBJECTS for exercises ──────────────────────────────────────────
+
+demog_freq <- freq_table(adsl, colvar = "TRT01P", rowvar = "SEX")
+
+age_cont   <- cont_table(adsl, colvar = "TRT01P", rowvar = "AGE")
+
+ae_nested  <- nested_freq(
+  adae,
+  colvar    = "TRT01A",
+  dptvar    = "AEDECOD",
+  rowbyvar  = "AEBODSYS",
+  denominator = adsl   # adsl already carries TRT01A — no rename needed
+)
+
+tutorial_options(exercise.timelimit = 60)
+```
+
+## Overview
+
+Welcome to Lesson 37! This tutorial covers **tidytlg**, an open-source R package
+from Eli Lilly that provides a tidyverse-native pipeline for generating clinical
+Tables, Listings, and Graphs (TLGs) for study reports.
+
+### What you will learn
+
+| Section | Topic |
+|---------|-------|
+| 1 | tidytlg philosophy: compute then format |
+| 2 | `freq_table()` for categorical variables |
+| 3 | `cont_table()` for continuous variables |
+| 4 | `statlist()` and format control |
+| 5 | `nested_freq()` for AE body system / preferred term tables |
+| 6 | Combining tables with `bind_rows()` |
+| 7 | `tlg_output()` for rendering to RTF / HTML / PDF |
+| 8 | Capstone: full TLG pipeline |
+
+### Packages used
+
+```r
+library(tidytlg)   # main package — mocked in this tutorial
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(rlang)
+library(pharmaverseadam)
+```
+
+> **Note:** tidytlg is mocked in this tutorial so all exercises run
+> interactively. The function signatures and outputs match the real package
+> behaviour.
+
+---
+
+## Section 1 — tidytlg Philosophy: Compute Then Format
+
+### The SAS way vs. the tidytlg way
+
+In SAS, computation and formatting are tightly coupled. A `PROC FREQ` call
+produces a table, applies formats, and writes ODS output all in one step.
+If you want to stack two tables you need `ODS OUTPUT` into data sets, then
+`PROC REPORT` glue code.
+
+**tidytlg separates the two concerns:**
+
+| Step | Function(s) | Output |
+|------|-------------|--------|
+| Compute | `freq_table()`, `cont_table()`, `nested_freq()` | Plain `tibble` |
+| Format / render | `tlg_output()` | RTF, HTML, or PDF file |
+
+Because the intermediate result is just a `tibble`, you can use every dplyr
+verb you already know: `filter()`, `arrange()`, `bind_rows()`, `mutate()`, etc.
+
+### A first look at freq_table()
+
+```r
+freq_table(adsl, colvar = "TRT01P", rowvar = "SEX")
+```
+
+`colvar` defines the columns (treatment arms). `rowvar` defines the rows
+(levels of the categorical variable). The result has one row per level:
+
+```
+# A tidytlg_freq tibble
+  label  Placebo              Xanomeline High Dose  Xanomeline Low Dose
+  <chr>  <chr>                <chr>                 <chr>
+1 F      …                    …                     …
+2 M      …                    …                     …
+```
+
+Every cell shows **n (x.x%)** by default — the count of distinct subjects and
+their percentage within that treatment arm.
+
+### Demo
+
+Run the chunk below to see the actual output:
+
+```{r demo-freq-sex, exercise=TRUE, exercise.lines=4}
+freq_table(adsl, colvar = "TRT01P", rowvar = "SEX")
+```
+
+### Exercise 1.1 — RACE frequency table
+
+Compute a frequency table for `RACE` across treatment arms. How many rows does
+the result have? (Each race category = one row.)
+
+```{r ex1-race-freq, exercise=TRUE, exercise.lines=6}
+race_freq <- freq_table(___, colvar = "___", rowvar = "___")
+nrow(race_freq)
+```
+
+```{r ex1-race-freq-hint-1}
+# Use adsl as the data frame; colvar is the treatment column TRT01P
+# rowvar is RACE
+```
+
+```{r ex1-race-freq-solution}
+race_freq <- freq_table(adsl, colvar = "TRT01P", rowvar = "RACE")
+nrow(race_freq)
+# Returns the number of distinct RACE categories in adsl
+```
+
+### Exercise 1.2 — inspect the tibble class
+
+Run `class()` on the `demog_freq` object (pre-built from `freq_table(adsl, "TRT01P", "SEX")`).
+What does it tell you about the object type?
+
+```{r ex1-class, exercise=TRUE, exercise.lines=4}
+class(demog_freq)
+```
+
+```{r ex1-class-solution}
+class(demog_freq)
+# "tidytlg_freq" "tbl_df" "tbl" "data.frame"
+# It IS a plain tibble — you can use any dplyr verb on it.
+```
+
+---
+
+## Section 2 — freq_table() for Categorical Variables
+
+### Required arguments
+
+```r
+freq_table(df, colvar, rowvar)
+```
+
+| Argument | Type | Purpose |
+|----------|------|---------|
+| `df` | data frame | Source data |
+| `colvar` | string | Column-stratifying variable (treatment arm) |
+| `rowvar` | string | Row variable (categorical levels become rows) |
+| `statlist` | `statlist()` | Which statistics to display (default: n and %) |
+| `rowbyvar` | string | Optional outer grouping variable |
+| `subset` | string expression | Row filter (passed as a string, e.g. `"SAFFL == 'Y'"`) |
+| `denominator` | data frame | Override the denominator (critical for AE tables) |
+
+### Output structure
+
+The result is a wide tibble: one row per category level, one column per
+treatment arm. The `label` column holds the display text.
+
+```r
+freq_table(adsl, colvar = "TRT01P", rowvar = "SEX")
+# label    Placebo          Xanomeline High Dose   Xanomeline Low Dose
+# F        54 (42.5%)       40 (31.5%)             40 (31.5%)
+# M        …                …                      …
+```
+
+### The denominator argument
+
+When computing AE proportions, the denominator should be the number of
+**subjects** (from `adsl`), not the number of AE records (from `adae`).
+Pass `denominator = adsl` — the treatment column name in the denominator
+must match `colvar`. The `pharmaverseadam` ADSL already contains `TRT01A`,
+so no renaming is necessary:
+
+```r
+freq_table(
+  adae,
+  colvar      = "TRT01A",
+  rowvar      = "AEBODSYS",
+  denominator = adsl   # adsl has TRT01A — column names already match
+)
+```
+
+### Exercise 2.1 — SEX frequency table
+
+Run `freq_table` for SEX. In the Xanomeline High Dose arm, how many female
+subjects are there? Look at the cell value — it shows `n (x.x%)`.
+
+```{r ex2-sex, exercise=TRUE, exercise.lines=5}
+sex_freq <- freq_table(adsl, colvar = "TRT01P", rowvar = "SEX")
+sex_freq
+```
+
+```{r ex2-sex-solution}
+sex_freq <- freq_table(adsl, colvar = "TRT01P", rowvar = "SEX")
+sex_freq
+# Look at the "F" row under "Xanomeline High Dose"
+# The number before the parenthesis is the count of female subjects.
+```
+
+### Exercise 2.2 — AE body system frequency with denominator
+
+Compute a frequency table of `AEBODSYS` from `adae`, using `adsl` as the
+denominator. `adsl` already has a `TRT01A` column, so pass it directly —
+no renaming needed.
+
+```{r ex2-ae-denom, exercise=TRUE, exercise.lines=7}
+ae_bodsys_freq <- freq_table(
+  ___,
+  colvar      = "TRT01A",
+  rowvar      = "___",
+  denominator = ___
+)
+ae_bodsys_freq
+```
+
+```{r ex2-ae-denom-hint-1}
+# data = adae, rowvar = "AEBODSYS"
+# denominator = adsl  (adsl already has TRT01A — column names already match)
+```
+
+```{r ex2-ae-denom-solution}
+ae_bodsys_freq <- freq_table(
+  adae,
+  colvar      = "TRT01A",
+  rowvar      = "AEBODSYS",
+  denominator = adsl
+)
+ae_bodsys_freq
+```
+
+### Exercise 2.3 — subset argument
+
+Compute the frequency of `AGEGR1` (age group) restricted to subjects with
+`SEX == "F"` using the `subset` argument (pass as a character string).
+
+```{r ex2-subset, exercise=TRUE, exercise.lines=6}
+agegr_female <- freq_table(
+  adsl,
+  colvar = "TRT01P",
+  rowvar = "AGEGR1",
+  subset = "___"
+)
+agegr_female
+```
+
+```{r ex2-subset-hint-1}
+# subset takes a character string: subset = "SEX == 'F'"
+```
+
+```{r ex2-subset-solution}
+agegr_female <- freq_table(
+  adsl,
+  colvar = "TRT01P",
+  rowvar = "AGEGR1",
+  subset = "SEX == 'F'"
+)
+agegr_female
+```
+
+### Quiz
+
+```{r quiz-sec2, echo=FALSE}
+quiz(
+  question(
+    "What does the `denominator` argument in `freq_table()` control?",
+    answer("The number of decimal places in percentages"),
+    answer("The data frame used to calculate the 'N' in each percentage",
+           correct = TRUE),
+    answer("The column used to label each row"),
+    answer("Whether totals are appended to the table"),
+    allow_retry = TRUE
+  ),
+  question(
+    "In a `freq_table()` result, what does the `label` column contain?",
+    answer("The column variable name"),
+    answer("The formatted n (x.x%) cell value"),
+    answer("The levels of the row variable", correct = TRUE),
+    answer("The study identifier"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 3 — cont_table() for Continuous Variables
+
+### What cont_table() returns
+
+`cont_table()` computes descriptive statistics for a continuous variable and
+returns them as **separate rows** in a tidy tibble — one row per statistic:
+
+| label | Placebo | Xanomeline High Dose | Xanomeline Low Dose |
+|-------|---------|----------------------|---------------------|
+| N | 86 | 84 | 84 |
+| Mean (SD) | 75.2 (8.6) | 74.4 (7.9) | 75.7 (8.3) |
+| Median | 76.0 | 76.0 | 77.0 |
+| Range | 52, 89 | 56, 88 | 51, 88 |
+
+This "long-by-statistic" layout maps directly to a clinical study report table.
+
+### Arguments
+
+```r
+cont_table(df, colvar, rowvar, statlist = NULL, rowbyvar = NULL, subset = NULL)
+```
+
+`rowvar` is the **continuous** variable name. `colvar` is still the treatment
+column. The result has no denominator argument — percentages do not apply.
+
+### Demo
+
+```{r demo-cont-age, exercise=TRUE, exercise.lines=4}
+cont_table(adsl, colvar = "TRT01P", rowvar = "AGE")
+```
+
+### Exercise 3.1 — extract the Mean (SD) row
+
+Using the pre-built `age_cont` object, filter to the "Mean (SD)" row and
+print the Placebo value.
+
+```{r ex3-mean-sd, exercise=TRUE, exercise.lines=6}
+age_cont |>
+  dplyr::filter(label == "___") |>
+  dplyr::select(label, ___)
+```
+
+```{r ex3-mean-sd-hint-1}
+# label == "Mean (SD)"
+# Select the label column and the Placebo column
+```
+
+```{r ex3-mean-sd-solution}
+age_cont |>
+  dplyr::filter(label == "Mean (SD)") |>
+  dplyr::select(label, Placebo)
+# Shows the Mean (SD) for AGE in the Placebo arm
+```
+
+### Exercise 3.2 — continuous table for WEIGHTBL (if present)
+
+Check whether `WEIGHTBL` exists in `adsl`. If it does, compute a `cont_table`
+for it. Use `"TRT01P"` as `colvar`.
+
+```{r ex3-weightbl, exercise=TRUE, exercise.lines=8}
+if ("WEIGHTBL" %in% names(adsl)) {
+  cont_table(adsl, colvar = "TRT01P", rowvar = "___")
+} else {
+  message("WEIGHTBL not found — using AGE as fallback")
+  cont_table(adsl, colvar = "TRT01P", rowvar = "AGE")
+}
+```
+
+```{r ex3-weightbl-solution}
+if ("WEIGHTBL" %in% names(adsl)) {
+  cont_table(adsl, colvar = "TRT01P", rowvar = "WEIGHTBL")
+} else {
+  message("WEIGHTBL not found — using AGE as fallback")
+  cont_table(adsl, colvar = "TRT01P", rowvar = "AGE")
+}
+```
+
+### Exercise 3.3 — cont_table on lab data
+
+Compute a continuous stats table for AVAL from `adlb` filtered to the ALT
+parameter. Use `TRT01A` as `colvar`.
+
+```{r ex3-lab-alt, exercise=TRUE, exercise.lines=8}
+alt_stats <- cont_table(
+  adlb |> dplyr::filter(PARAMCD == "___"),
+  colvar = "TRT01A",
+  rowvar = "AVAL"
+)
+alt_stats
+```
+
+```{r ex3-lab-alt-hint-1}
+# PARAMCD == "ALT"
+# TRT01A is already in adlb (added in setup)
+```
+
+```{r ex3-lab-alt-solution}
+alt_stats <- cont_table(
+  adlb |> dplyr::filter(PARAMCD == "ALT"),
+  colvar = "TRT01A",
+  rowvar = "AVAL"
+)
+alt_stats
+```
+
+---
+
+## Section 4 — statlist() and Format Control
+
+### What statlist() does
+
+`statlist()` is a helper that communicates to `freq_table()` or `cont_table()`
+which statistics to include and how to label them. It returns a small list
+object of class `"statlist"`.
+
+```r
+statlist("n (x.x%)")                          # count + percent (default for freq)
+statlist("N", "mean (sd)", "median", "range") # standard continuous stats
+statlist("n")                                  # count only, no percent
+statlist("median (range)")                     # median with min–max
+```
+
+### Common statlist tokens
+
+| Token | Meaning |
+|-------|---------|
+| `"n"` | Subject count |
+| `"n (x.x%)"` | Count and percent |
+| `"N"` | Non-missing count |
+| `"mean (sd)"` | Mean and standard deviation |
+| `"median"` | Median |
+| `"range"` | Min, Max |
+| `"q1q3"` | First and third quartiles |
+
+> In the mocked functions used here, `statlist()` stores the token strings and
+> they are printed but the underlying compute functions always return the full
+> set of statistics. In the real tidytlg package, the statlist controls both
+> which rows appear and how cells are formatted.
+
+### Exercise 4.1 — inspect a statlist object
+
+Create a statlist for N, median, and q1q3. Print it and check its class.
+
+```{r ex4-statlist-obj, exercise=TRUE, exercise.lines=6}
+my_sl <- statlist("___", "___", "___")
+print(my_sl)
+class(my_sl)
+```
+
+```{r ex4-statlist-hint-1}
+# statlist("N", "median", "q1q3")
+```
+
+```{r ex4-statlist-solution}
+my_sl <- statlist("N", "median", "q1q3")
+print(my_sl)
+class(my_sl)
+# class is "statlist" — the function wraps the tokens in a named list
+```
+
+### Exercise 4.2 — pass statlist to cont_table
+
+Pass a statlist specifying only N and Median to `cont_table` for AGE. Observe
+the statlist is accepted (in the mock the rows are fixed, but in real tidytlg
+the rows would match your statlist).
+
+```{r ex4-pass-statlist, exercise=TRUE, exercise.lines=7}
+sl_n_med <- statlist("N", "median")
+
+cont_table(
+  adsl,
+  colvar   = "TRT01P",
+  rowvar   = "AGE",
+  statlist = ___
+)
+```
+
+```{r ex4-pass-statlist-solution}
+sl_n_med <- statlist("N", "median")
+
+cont_table(
+  adsl,
+  colvar   = "TRT01P",
+  rowvar   = "AGE",
+  statlist = sl_n_med
+)
+```
+
+### Exercise 4.3 — freq_table with count-only statlist
+
+Compute a frequency table for `AGEGR1` using a statlist that requests counts
+only (no percent).
+
+```{r ex4-count-only, exercise=TRUE, exercise.lines=7}
+sl_count <- statlist("___")
+
+freq_table(
+  adsl,
+  colvar   = "TRT01P",
+  rowvar   = "AGEGR1",
+  statlist = ___
+)
+```
+
+```{r ex4-count-only-hint-1}
+# statlist("n") for count only
+```
+
+```{r ex4-count-only-solution}
+sl_count <- statlist("n")
+
+freq_table(
+  adsl,
+  colvar   = "TRT01P",
+  rowvar   = "AGEGR1",
+  statlist = sl_count
+)
+```
+
+### Quiz
+
+```{r quiz-sec4, echo=FALSE}
+quiz(
+  question(
+    "Which statlist token requests the interquartile range (Q1 and Q3)?",
+    answer('"iqr"'),
+    answer('"quartile"'),
+    answer('"q1q3"', correct = TRUE),
+    answer('"p25_p75"'),
+    allow_retry = TRUE
+  ),
+  question(
+    "What R class does `statlist()` return?",
+    answer('"character"'),
+    answer('"list"'),
+    answer('"statlist"', correct = TRUE),
+    answer('"tbl_df"'),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 5 — nested_freq() for AE Tables
+
+### Two-level nesting
+
+A standard adverse event table in a clinical study report shows:
+
+```
+NERVOUS SYSTEM DISORDERS                12 (14.1%)  …
+  Headache                               6 (7.1%)   …
+  Dizziness                              4 (4.7%)   …
+GASTROINTESTINAL DISORDERS              …
+  Nausea                                …
+```
+
+`nested_freq()` produces exactly this layout. The outer level (body system)
+uses `rowbyvar`; the inner level (preferred term) uses `dptvar`. PT rows are
+automatically indented in the `label` column.
+
+### Arguments
+
+```r
+nested_freq(
+  df,
+  colvar    = "TRT01A",   # treatment column
+  dptvar    = "AEDECOD",  # preferred term (inner level)
+  rowbyvar  = "AEBODSYS", # body system (outer level)
+  denominator = adsl_renamed  # use subject counts not AE counts
+)
+```
+
+> **Critical:** Always pass `denominator` as the `adsl` data frame (with
+> the treatment column renamed to match `colvar`). Using `adae` as the
+> denominator would divide by AE records, not subjects — a serious error.
+
+### Exercise 5.1 — inspect ae_nested
+
+The pre-built `ae_nested` object was created with:
+
+```r
+ae_nested <- nested_freq(
+  adae,
+  colvar      = "TRT01A",
+  dptvar      = "AEDECOD",
+  rowbyvar    = "AEBODSYS",
+  denominator = adsl   # adsl already has TRT01A
+)
+```
+
+Inspect it: how many preferred terms fall under `"NERVOUS SYSTEM DISORDERS"`?
+
+```{r ex5-inspect-nested, exercise=TRUE, exercise.lines=6}
+ae_nested |>
+  dplyr::filter(AEBODSYS == "___") |>
+  dplyr::select(AEBODSYS, AEDECOD, label) |>
+  nrow()
+```
+
+```{r ex5-inspect-nested-hint-1}
+# AEBODSYS == "NERVOUS SYSTEM DISORDERS"
+```
+
+```{r ex5-inspect-nested-solution}
+ae_nested |>
+  dplyr::filter(AEBODSYS == "NERVOUS SYSTEM DISORDERS") |>
+  dplyr::select(AEBODSYS, AEDECOD, label) |>
+  nrow()
+# The number of rows = number of distinct preferred terms under that body system
+```
+
+### Exercise 5.2 — build a nested_freq from scratch
+
+Build a `nested_freq` for AEs in the GASTROINTESTINAL DISORDERS body system
+only, using `subset`. Check the count of preferred terms.
+
+```{r ex5-gi-nested, exercise=TRUE, exercise.lines=9}
+gi_nested <- nested_freq(
+  adae,
+  colvar      = "TRT01A",
+  dptvar      = "AEDECOD",
+  rowbyvar    = "AEBODSYS",
+  subset      = "AEBODSYS == 'GASTROINTESTINAL DISORDERS'",
+  denominator = ___
+)
+nrow(gi_nested)
+```
+
+```{r ex5-gi-nested-hint-1}
+# denominator = adsl
+# adsl already has TRT01A — no rename needed; column names already match colvar
+```
+
+```{r ex5-gi-nested-solution}
+gi_nested <- nested_freq(
+  adae,
+  colvar      = "TRT01A",
+  dptvar      = "AEDECOD",
+  rowbyvar    = "AEBODSYS",
+  subset      = "AEBODSYS == 'GASTROINTESTINAL DISORDERS'",
+  denominator = adsl
+)
+nrow(gi_nested)
+```
+
+### Exercise 5.3 — check label indentation
+
+The `label` column in a `nested_freq` result indents PT rows with two spaces.
+Verify this for the first 3 rows of `ae_nested`.
+
+```{r ex5-label-indent, exercise=TRUE, exercise.lines=4}
+ae_nested |>
+  dplyr::select(label) |>
+  head(___)
+```
+
+```{r ex5-label-indent-solution}
+ae_nested |>
+  dplyr::select(label) |>
+  head(3)
+# Each label starts with "  " (two spaces) — the PT indentation
+```
+
+### Exercise 5.4 — most common AE preferred term
+
+From `ae_nested`, find the preferred term with the highest count in any arm.
+Hint: the count is embedded in the display string — use `tidyr::separate()` or
+just sort by one treatment column alphabetically (higher n → larger leading
+digits).
+
+```{r ex5-common-pt, exercise=TRUE, exercise.lines=8}
+# Sort ae_nested to find the row with the largest count
+# Pick the Xanomeline High Dose column for sorting
+arm_col <- names(ae_nested)[3]   # third column after rowbyvar and dptvar
+
+ae_nested |>
+  dplyr::arrange(dplyr::desc(.data[[arm_col]])) |>
+  dplyr::select(AEBODSYS, AEDECOD, label, dplyr::all_of(arm_col)) |>
+  head(5)
+```
+
+```{r ex5-common-pt-solution}
+arm_col <- names(ae_nested)[3]
+
+ae_nested |>
+  dplyr::arrange(dplyr::desc(.data[[arm_col]])) |>
+  dplyr::select(AEBODSYS, AEDECOD, label, dplyr::all_of(arm_col)) |>
+  head(5)
+# Shows the preferred terms with the highest subject counts
+```
+
+---
+
+## Section 6 — Combining Tables with bind_rows()
+
+### Stack any tidytlg outputs
+
+Because `freq_table()`, `cont_table()`, and `nested_freq()` all return plain
+tibbles, you can stack them with `dplyr::bind_rows()`. This is how you build
+a multi-block demographics table that shows:
+
+1. Age statistics (continuous)
+2. Sex distribution (categorical)
+3. Race distribution (categorical)
+
+all in one table object — matching the layout of ICH E3 Table 14.1.1.
+
+### Pattern
+
+```r
+# Add an ordering column before binding
+age_block  <- cont_table(adsl, "TRT01P", "AGE")  |> mutate(ord = 1L)
+sex_block  <- freq_table(adsl, "TRT01P", "SEX")  |> mutate(ord = 2L)
+race_block <- freq_table(adsl, "TRT01P", "RACE") |> mutate(ord = 3L)
+
+combined <- bind_rows(age_block, sex_block, race_block) |>
+  arrange(ord)
+```
+
+### Blank separator rows
+
+Add a visual blank row between blocks using `add_row()`:
+
+```r
+spacer <- tibble(label = "", ord = 1L)  # fill other cols as needed
+combined <- bind_rows(age_block, spacer, sex_block)
+```
+
+### Exercise 6.1 — bind age_cont and demog_freq
+
+Using the pre-built `age_cont` and `demog_freq` objects, add an `ord` column
+to each and bind them. Arrange by `ord`.
+
+```{r ex6-bind-rows, exercise=TRUE, exercise.lines=10}
+age_block  <- age_cont  |> dplyr::mutate(ord = ___)
+sex_block  <- demog_freq |> dplyr::mutate(ord = ___)
+
+combined <- dplyr::bind_rows(age_block, sex_block) |>
+  dplyr::arrange(___)
+
+combined |> dplyr::select(label, ord)
+```
+
+```{r ex6-bind-rows-hint-1}
+# age_block gets ord = 1L, sex_block gets ord = 2L
+# arrange(ord)
+```
+
+```{r ex6-bind-rows-solution}
+age_block  <- age_cont   |> dplyr::mutate(ord = 1L)
+sex_block  <- demog_freq |> dplyr::mutate(ord = 2L)
+
+combined <- dplyr::bind_rows(age_block, sex_block) |>
+  dplyr::arrange(ord)
+
+combined |> dplyr::select(label, ord)
+```
+
+### Exercise 6.2 — three-block demographics table
+
+Extend the combined table to include a RACE block as `ord = 3L`.
+
+```{r ex6-three-block, exercise=TRUE, exercise.lines=12}
+age_block  <- age_cont   |> dplyr::mutate(ord = 1L)
+sex_block  <- demog_freq |> dplyr::mutate(ord = 2L)
+race_block <- freq_table(adsl, colvar = "TRT01P", rowvar = "___") |>
+  dplyr::mutate(ord = 3L)
+
+demog_combined <- dplyr::bind_rows(age_block, sex_block, race_block) |>
+  dplyr::arrange(ord)
+
+nrow(demog_combined)
+```
+
+```{r ex6-three-block-hint-1}
+# rowvar = "RACE"
+```
+
+```{r ex6-three-block-solution}
+age_block  <- age_cont   |> dplyr::mutate(ord = 1L)
+sex_block  <- demog_freq |> dplyr::mutate(ord = 2L)
+race_block <- freq_table(adsl, colvar = "TRT01P", rowvar = "RACE") |>
+  dplyr::mutate(ord = 3L)
+
+demog_combined <- dplyr::bind_rows(age_block, sex_block, race_block) |>
+  dplyr::arrange(ord)
+
+nrow(demog_combined)
+# Total rows = 4 (age stats) + 2 (sex levels) + n_race_levels
+```
+
+### Exercise 6.3 — verify label column after bind
+
+After binding tables of different classes (`tidytlg_cont` and `tidytlg_freq`),
+confirm that `label` is still a character column in the combined result.
+
+```{r ex6-label-class, exercise=TRUE, exercise.lines=6}
+age_block <- age_cont  |> dplyr::mutate(ord = 1L)
+sex_block <- demog_freq |> dplyr::mutate(ord = 2L)
+combined  <- dplyr::bind_rows(age_block, sex_block)
+
+class(combined$label)
+```
+
+```{r ex6-label-class-solution}
+age_block <- age_cont   |> dplyr::mutate(ord = 1L)
+sex_block <- demog_freq |> dplyr::mutate(ord = 2L)
+combined  <- dplyr::bind_rows(age_block, sex_block)
+
+class(combined$label)
+# "character" — bind_rows coerces consistently
+```
+
+---
+
+## Section 7 — tlg_output() for Rendering
+
+### tlg_output() overview
+
+Once you have a final combined tibble, `tlg_output()` applies the submission
+display layer: column headers, font, orientation, and file format.
+
+```r
+tlg_output(
+  df,
+  tbl_id         = "T14-1-1",
+  title          = c("Table 14.1.1", "Demographic Characteristics"),
+  colhead        = NULL,
+  font_size      = 9,
+  orientation    = "landscape",
+  output_format  = "rtf",
+  output_file    = "T14-1-1.rtf"
+)
+```
+
+### Key arguments
+
+| Argument | Default | Notes |
+|----------|---------|-------|
+| `tbl_id` | `"T01"` | Table identifier — matches define-XML traceability |
+| `title` | `"Table"` | Character vector; each element = one title line |
+| `colhead` | `NULL` | Override column header labels |
+| `output_format` | `"rtf"` | Also `"html"` or `"pdf"` |
+| `output_file` | `"output.rtf"` | File path for the output |
+
+> **Always specify `tbl_id`**. In e-submissions, this identifier links the
+> table to its entry in the define-XML table-of-contents and to the
+> Reviewer's Guide.
+
+In this mocked version, `tlg_output()` prints a summary to the console and
+calls `print()` on the tibble — no file is written.
+
+### Exercise 7.1 — render age_cont
+
+Call `tlg_output()` on `age_cont` with a two-line title and
+`tbl_id = "T14-1-1"`.
+
+```{r ex7-render-age, exercise=TRUE, exercise.lines=10}
+tlg_output(
+  age_cont,
+  tbl_id        = "___",
+  title         = c("Table 14.1.1", "Age — Descriptive Statistics"),
+  output_format = "rtf",
+  output_file   = "T14-1-1.rtf"
+)
+```
+
+```{r ex7-render-age-hint-1}
+# tbl_id = "T14-1-1"
+```
+
+```{r ex7-render-age-solution}
+tlg_output(
+  age_cont,
+  tbl_id        = "T14-1-1",
+  title         = c("Table 14.1.1", "Age — Descriptive Statistics"),
+  output_format = "rtf",
+  output_file   = "T14-1-1.rtf"
+)
+# Output shows: Table dimensions: 4 rows x 4 cols (label + 3 treatment cols)
+```
+
+### Exercise 7.2 — combined demographics table output
+
+Build the combined demographics table from Section 6 (age + sex + race),
+then render it. Note the total row count reported.
+
+```{r ex7-combined-output, exercise=TRUE, exercise.lines=16}
+age_block  <- age_cont   |> dplyr::mutate(ord = 1L)
+sex_block  <- demog_freq |> dplyr::mutate(ord = 2L)
+race_block <- freq_table(adsl, "TRT01P", "RACE") |> dplyr::mutate(ord = 3L)
+
+demog_tbl  <- dplyr::bind_rows(age_block, sex_block, race_block) |>
+  dplyr::arrange(ord)
+
+tlg_output(
+  demog_tbl,
+  tbl_id        = "___",
+  title         = c("Table 14.1.1", "Demographic Characteristics — All Subjects"),
+  output_format = "rtf",
+  output_file   = "T14-1-1.rtf"
+)
+```
+
+```{r ex7-combined-output-hint-1}
+# tbl_id = "T14-1-1"
+```
+
+```{r ex7-combined-output-solution}
+age_block  <- age_cont   |> dplyr::mutate(ord = 1L)
+sex_block  <- demog_freq |> dplyr::mutate(ord = 2L)
+race_block <- freq_table(adsl, "TRT01P", "RACE") |> dplyr::mutate(ord = 3L)
+
+demog_tbl  <- dplyr::bind_rows(age_block, sex_block, race_block) |>
+  dplyr::arrange(ord)
+
+tlg_output(
+  demog_tbl,
+  tbl_id        = "T14-1-1",
+  title         = c("Table 14.1.1", "Demographic Characteristics — All Subjects"),
+  output_format = "rtf",
+  output_file   = "T14-1-1.rtf"
+)
+# "Table dimensions: N rows x 5 cols" — N = 4 + 2 + n_race_levels
+```
+
+### Exercise 7.3 — HTML output format
+
+Re-render `age_cont` with `output_format = "html"` and a custom
+`output_file = "T14-1-1.html"`. Note the format line in the output.
+
+```{r ex7-html, exercise=TRUE, exercise.lines=8}
+tlg_output(
+  age_cont,
+  tbl_id        = "T14-1-1",
+  title         = "Age — Descriptive Statistics",
+  output_format = "___",
+  output_file   = "T14-1-1.html"
+)
+```
+
+```{r ex7-html-solution}
+tlg_output(
+  age_cont,
+  tbl_id        = "T14-1-1",
+  title         = "Age — Descriptive Statistics",
+  output_format = "html",
+  output_file   = "T14-1-1.html"
+)
+# Format line shows: "html | Orientation: landscape | Font: 9 pt"
+```
+
+### Quiz
+
+```{r quiz-sec7, echo=FALSE}
+quiz(
+  question(
+    "Why is the `tbl_id` argument important in `tlg_output()`?",
+    answer("It determines the number of decimal places"),
+    answer("It links the table to define-XML and e-submission traceability",
+           correct = TRUE),
+    answer("It sets the font size"),
+    answer("It controls whether totals are shown"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What does `tlg_output()` return invisibly?",
+    answer("The output file path as a character string"),
+    answer("NULL"),
+    answer("The input data frame unchanged", correct = TRUE),
+    answer("A summary statistics list"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 8 — Capstone: Full TLG Pipeline
+
+In this capstone you will build three complete TLG outputs that mirror a
+real clinical study report appendix:
+
+| Table ID | Description | Source data |
+|----------|-------------|-------------|
+| T14.1.1 | Demographics | `adsl` |
+| T14.3.1 | AE summary by body system | `adae` / `adsl` |
+| T14.4.1 | ALT lab statistics | `adlb` |
+
+### Part 1 — Demographics (T14.1.1)
+
+```{r cap-demog, exercise=TRUE, exercise.lines=22}
+# Step 1: compute blocks
+age_block  <- cont_table(adsl, colvar = "TRT01P", rowvar = "AGE") |>
+  dplyr::mutate(ord = 1L)
+
+sex_block  <- freq_table(adsl, colvar = "TRT01P", rowvar = "SEX") |>
+  dplyr::mutate(ord = 2L)
+
+race_block <- freq_table(adsl, colvar = "___",   rowvar = "___") |>
+  dplyr::mutate(ord = 3L)
+
+# Step 2: combine
+t1411 <- dplyr::bind_rows(age_block, sex_block, race_block) |>
+  dplyr::arrange(ord)
+
+# Step 3: render
+tlg_output(
+  t1411,
+  tbl_id        = "T14.1.1",
+  title         = c("Table 14.1.1", "Demographic Characteristics"),
+  output_format = "rtf",
+  output_file   = "T14.1.1.rtf"
+)
+```
+
+```{r cap-demog-hint-1}
+# race_block: colvar = "TRT01P", rowvar = "RACE"
+```
+
+```{r cap-demog-solution}
+age_block  <- cont_table(adsl, colvar = "TRT01P", rowvar = "AGE") |>
+  dplyr::mutate(ord = 1L)
+
+sex_block  <- freq_table(adsl, colvar = "TRT01P", rowvar = "SEX") |>
+  dplyr::mutate(ord = 2L)
+
+race_block <- freq_table(adsl, colvar = "TRT01P", rowvar = "RACE") |>
+  dplyr::mutate(ord = 3L)
+
+t1411 <- dplyr::bind_rows(age_block, sex_block, race_block) |>
+  dplyr::arrange(ord)
+
+tlg_output(
+  t1411,
+  tbl_id        = "T14.1.1",
+  title         = c("Table 14.1.1", "Demographic Characteristics"),
+  output_format = "rtf",
+  output_file   = "T14.1.1.rtf"
+)
+```
+
+### Part 2 — AE Overview (T14.3.1)
+
+```{r cap-ae, exercise=TRUE, exercise.lines=18}
+# Denominator: adsl (already has TRT01A — column names match adae)
+adsl_ae_denom <- adsl  # adsl already has TRT01A
+
+# Compute AE body system frequency
+ae_bodsys <- freq_table(
+  adae,
+  colvar      = "TRT01A",
+  rowvar      = "AEBODSYS",
+  denominator = ___
+)
+
+# Render
+tlg_output(
+  ae_bodsys,
+  tbl_id        = "___",
+  title         = c("Table 14.3.1", "Adverse Events by Body System"),
+  output_format = "rtf",
+  output_file   = "T14.3.1.rtf"
+)
+```
+
+```{r cap-ae-hint-1}
+# denominator = adsl_ae_denom  (which is just adsl)
+# tbl_id = "T14.3.1"
+```
+
+```{r cap-ae-solution}
+adsl_ae_denom <- adsl  # adsl already has TRT01A
+
+ae_bodsys <- freq_table(
+  adae,
+  colvar      = "TRT01A",
+  rowvar      = "AEBODSYS",
+  denominator = adsl_ae_denom
+)
+
+tlg_output(
+  ae_bodsys,
+  tbl_id        = "T14.3.1",
+  title         = c("Table 14.3.1", "Adverse Events by Body System"),
+  output_format = "rtf",
+  output_file   = "T14.3.1.rtf"
+)
+# "Table dimensions: N rows" — N = number of distinct body systems in adae
+```
+
+### Part 3 — ALT Lab Statistics (T14.4.1)
+
+```{r cap-lab, exercise=TRUE, exercise.lines=16}
+# adlb already has TRT01A from setup; filter to ALT parameter
+alt_data <- adlb |> dplyr::filter(PARAMCD == "ALT")
+
+alt_stats <- cont_table(
+  alt_data,
+  colvar = "___",
+  rowvar = "AVAL"
+)
+
+tlg_output(
+  alt_stats,
+  tbl_id        = "T14.4.1",
+  title         = c("Table 14.4.1", "ALT — Descriptive Statistics"),
+  output_format = "rtf",
+  output_file   = "T14.4.1.rtf"
+)
+```
+
+```{r cap-lab-hint-1}
+# colvar = "TRT01A"
+# adlb already has TRT01A added in the setup chunk
+```
+
+```{r cap-lab-solution}
+alt_data <- adlb |> dplyr::filter(PARAMCD == "ALT")
+
+alt_stats <- cont_table(
+  alt_data,
+  colvar = "TRT01A",
+  rowvar = "AVAL"
+)
+
+tlg_output(
+  alt_stats,
+  tbl_id        = "T14.4.1",
+  title         = c("Table 14.4.1", "ALT — Descriptive Statistics"),
+  output_format = "rtf",
+  output_file   = "T14.4.1.rtf"
+)
+# Returns 4 rows: N, Mean (SD), Median, Range
+```
+
+### Exercise 8.4 — count AE body systems
+
+From the AE body system frequency table built in Part 2, how many distinct
+body systems appear in the result? Store it in a variable called `n_bodsys`.
+
+```{r cap-count-bodsys, exercise=TRUE, exercise.lines=8}
+adsl_ae_denom <- adsl  # adsl already has TRT01A
+
+ae_bodsys <- freq_table(
+  adae,
+  colvar      = "TRT01A",
+  rowvar      = "AEBODSYS",
+  denominator = adsl_ae_denom
+)
+
+n_bodsys <- nrow(ae_bodsys)
+n_bodsys
+```
+
+```{r cap-count-bodsys-solution}
+adsl_ae_denom <- adsl  # adsl already has TRT01A
+
+ae_bodsys <- freq_table(
+  adae,
+  colvar      = "TRT01A",
+  rowvar      = "AEBODSYS",
+  denominator = adsl_ae_denom
+)
+
+n_bodsys <- nrow(ae_bodsys)
+n_bodsys
+# Each row = one distinct body system; total reflects CDISCPILOT01 AE data
+```
+
+---
+
+## Lesson Summary
+
+### What you learned
+
+| Topic | Key function | Output |
+|-------|-------------|--------|
+| Categorical frequencies | `freq_table()` | Tidy wide tibble, n (x.x%) cells |
+| Continuous descriptives | `cont_table()` | Tidy wide tibble, one row per statistic |
+| AE body system / PT | `nested_freq()` | Two-level nested tibble, indented PT labels |
+| Stat format control | `statlist()` | Token list passed to compute functions |
+| Multi-block tables | `bind_rows()` + `ord` | Standard dplyr operations |
+| Rendering | `tlg_output()` | RTF / HTML / PDF with title and metadata |
+
+### The tidytlg pipeline at a glance
+
+```
+adsl / adae / adlb
+      │
+      ▼
+freq_table() / cont_table() / nested_freq()
+      │  (plain tibble)
+      ▼
+bind_rows() + arrange(ord)    ← optional multi-block stacking
+      │
+      ▼
+tlg_output(tbl_id, title, output_format, output_file)
+      │
+      ▼
+  submission-ready RTF
+```
+
+### Common pitfalls
+
+| Pitfall | Fix |
+|---------|-----|
+| Denominator from `adae` instead of `adsl` for AE % | Always pass `denominator = adsl` (renamed) |
+| Treatment column name mismatch between `adae` and `adsl` | `rename(TRT01A = TRT01P)` in the denominator |
+| DTYPE rows in `adlb` inflating statistics | Filter `is.na(DTYPE)` in setup (already done here) |
+| Forgetting `tbl_id` in `tlg_output()` | Always specify — needed for define-XML traceability |
+| Stacking tables without an `ord` column | Add `mutate(ord = nL

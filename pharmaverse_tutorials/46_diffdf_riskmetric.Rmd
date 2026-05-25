@@ -1,0 +1,1055 @@
+---
+title: "Lesson 46 — diffdf & riskmetric: Dataset QC and Package Risk"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Master diffdf for dataset comparison and QC, and riskmetric for scoring
+  R packages for use in regulated clinical environments. Covers row/column
+  diffs, tolerance-based numeric comparison, QC workflows, package risk
+  scores, cohort assessments, and validation documentation.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 46_diffdf_riskmetric.Rmd
+# PURPOSE       : diffdf + riskmetric — double-programming QC with diffdf() and
+#                 package risk scoring with riskmetric: pkg_ref() →
+#                 assess() → score() → risk tier classification.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+library(learnr)
+library(dplyr)
+library(tibble)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.eval = FALSE)
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ── Reference and modified ADSL for diffing ─────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(ITTFL  = SAFFL,
+         DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing="N")) |>
+  select(STUDYID, USUBJID, SUBJID, SITEID,
+         TRT01P, TRT01A, ARM, ARMCD,
+         AGE, AGEGR1, SEX, RACE, ETHNIC,
+         SAFFL, ITTFL, DIABFL,
+         HEIGHTBL, WEIGHTBL, BMIBL,
+         TRTSDT, TRTEDT, TRTDURD,
+         COUNTRY, DTHFL)
+
+# Make a "QC programmer's version" with deliberate differences for exercises
+set.seed(42)
+adsl_qc <- adsl |>
+  mutate(
+    # Difference 1: rounding differences in BMIBL for 5 subjects
+    BMIBL   = if_else(row_number() %in% c(10,20,30,40,50),
+                      round(BMIBL + 0.05, 1), BMIBL),
+    # Difference 2: DIABFL recoded for 2 subjects
+    DIABFL  = if_else(row_number() %in% c(15,25), "Y", DIABFL),
+    # Difference 3: TRTDURD off by 1 for 3 subjects
+    TRTDURD = if_else(row_number() %in% c(100,101,102),
+                      TRTDURD + 1L, TRTDURD)
+  )
+
+# ADAE for diffing
+adae <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae) && !"TRT01A" %in% names(adae))
+  adae <- rename(adae, TRT01A = TRTA)
+adae <- select(adae, STUDYID, USUBJID, AESEQ, AEDECOD, AESOC,
+               AESEV, AESER, AEREL, TRT01A, ASTDT, AENDT)
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR=as.integer(ATOXGR), BTOXGR=as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+
+# ── Mock diffdf infrastructure ────────────────────────────────────────────────
+# diffdf compares two data frames and returns structured difference information.
+
+diffdf <- function(base, compare,
+                   keys         = NULL,
+                   suppress_warnings = FALSE,
+                   tolerance    = NULL,
+                   check_column_order = FALSE) {
+
+  result <- list(
+    base_name    = deparse(substitute(base)),
+    compare_name = deparse(substitute(compare)),
+    keys         = keys,
+    tolerance    = tolerance
+  )
+
+  # ── Check 1: column differences ─────────────────────────────────────────
+  cols_base    <- names(base)
+  cols_compare <- names(compare)
+  result$cols_in_base_not_compare <- setdiff(cols_base, cols_compare)
+  result$cols_in_compare_not_base <- setdiff(cols_compare, cols_base)
+
+  # ── Check 2: row count ───────────────────────────────────────────────────
+  result$nrow_base    <- nrow(base)
+  result$nrow_compare <- nrow(compare)
+
+  # ── Check 3: type differences ────────────────────────────────────────────
+  common_cols <- intersect(cols_base, cols_compare)
+  type_diffs <- tibble(
+    variable   = common_cols,
+    class_base = sapply(base[common_cols],    function(v) class(v)[1]),
+    class_comp = sapply(compare[common_cols], function(v) class(v)[1])
+  ) |>
+    filter(class_base != class_comp)
+  result$type_diffs <- type_diffs
+
+  # ── Check 4: value differences ───────────────────────────────────────────
+  value_diffs <- list()
+
+  # Key-based matching
+  if (!is.null(keys) && all(keys %in% names(base)) && all(keys %in% names(compare))) {
+    base_keyed    <- base[, common_cols, drop=FALSE]
+    compare_keyed <- compare[, common_cols, drop=FALSE]
+
+    # Join on keys
+    joined <- inner_join(
+      mutate(base_keyed,    .row_base = row_number()),
+      mutate(compare_keyed, .row_comp = row_number()),
+      by = keys,
+      suffix = c("_base", "_comp")
+    )
+
+    non_key_cols <- setdiff(common_cols, keys)
+
+    for (col in non_key_cols) {
+      base_col <- paste0(col, "_base")
+      comp_col <- paste0(col, "_comp")
+      if (!base_col %in% names(joined) || !comp_col %in% names(joined)) next
+
+      b_vals <- joined[[base_col]]
+      c_vals <- joined[[comp_col]]
+
+      # Determine differences
+      if (is.numeric(b_vals) && is.numeric(c_vals)) {
+        tol <- tolerance %||% 0
+        diffs_idx <- which(!is.na(b_vals) & !is.na(c_vals) & abs(b_vals - c_vals) > tol)
+        both_na   <- which(is.na(b_vals) != is.na(c_vals))
+        diff_rows <- unique(c(diffs_idx, both_na))
+      } else {
+        diff_rows <- which(!mapply(identical, b_vals, c_vals))
+      }
+
+      if (length(diff_rows) > 0) {
+        diff_df <- joined[diff_rows, c(keys, base_col, comp_col), drop=FALSE]
+        names(diff_df)[names(diff_df)==base_col] <- "base_value"
+        names(diff_df)[names(diff_df)==comp_col] <- "compare_value"
+        diff_df$variable <- col
+        value_diffs[[col]] <- diff_df
+      }
+    }
+  } else {
+    # Positional matching (no keys)
+    min_rows <- min(nrow(base), nrow(compare))
+    for (col in common_cols) {
+      b_vals <- base[[col]][seq_len(min_rows)]
+      c_vals <- compare[[col]][seq_len(min_rows)]
+      if (is.numeric(b_vals) && is.numeric(c_vals)) {
+        tol <- tolerance %||% 0
+        diff_rows <- which(!is.na(b_vals) & !is.na(c_vals) & abs(b_vals-c_vals)>tol)
+      } else {
+        diff_rows <- which(!mapply(identical, b_vals, c_vals))
+      }
+      if (length(diff_rows) > 0) {
+        value_diffs[[col]] <- tibble(
+          row          = diff_rows,
+          variable     = col,
+          base_value   = as.character(b_vals[diff_rows]),
+          compare_value = as.character(c_vals[diff_rows])
+        )
+      }
+    }
+  }
+
+  result$value_diffs  <- value_diffs
+  result$n_var_diffs  <- length(value_diffs)
+  result$is_identical <- (
+    length(result$cols_in_base_not_compare) == 0 &&
+    length(result$cols_in_compare_not_base) == 0 &&
+    result$nrow_base == result$nrow_compare &&
+    nrow(result$type_diffs) == 0 &&
+    length(value_diffs) == 0
+  )
+
+  class(result) <- "diffdf_result"
+  result
+}
+
+print.diffdf_result <- function(x, ...) {
+  cat("── diffdf Result ────────────────────────────────────\n")
+  if (x$is_identical) {
+    cat("  ✓ Datasets are IDENTICAL\n")
+    return(invisible(x))
+  }
+
+  if (length(x$cols_in_base_not_compare) > 0)
+    cat(sprintf("  Columns in base not in compare: %s\n",
+                paste(x$cols_in_base_not_compare, collapse=", ")))
+  if (length(x$cols_in_compare_not_base) > 0)
+    cat(sprintf("  Columns in compare not in base: %s\n",
+                paste(x$cols_in_compare_not_base, collapse=", ")))
+  if (x$nrow_base != x$nrow_compare)
+    cat(sprintf("  Row count: base=%d, compare=%d\n", x$nrow_base, x$nrow_compare))
+  if (nrow(x$type_diffs) > 0) {
+    cat("  Type differences:\n")
+    for (i in seq_len(nrow(x$type_diffs)))
+      cat(sprintf("    %s: base=%s, compare=%s\n",
+                  x$type_diffs$variable[i],
+                  x$type_diffs$class_base[i],
+                  x$type_diffs$class_comp[i]))
+  }
+  if (x$n_var_diffs > 0) {
+    cat(sprintf("  Variable differences: %d variable(s) have differing values\n",
+                x$n_var_diffs))
+    for (nm in names(x$value_diffs)) {
+      nd <- nrow(x$value_diffs[[nm]])
+      cat(sprintf("    %-20s %d row(s) differ\n", nm, nd))
+    }
+  }
+  cat("────────────────────────────────────────────────────\n")
+  invisible(x)
+}
+
+# Accessor helpers
+diffdf_has_issues  <- function(x) !x$is_identical
+diffdf_n_diffs     <- function(x) x$n_var_diffs
+diffdf_issue_cols  <- function(x) names(x$value_diffs)
+diffdf_var_diffs   <- function(x, variable) {
+  if (variable %in% names(x$value_diffs)) x$value_diffs[[variable]]
+  else tibble()
+}
+diffdf_is_identical <- function(x) x$is_identical
+
+# ── Mock riskmetric infrastructure ────────────────────────────────────────────
+# riskmetric scores R packages for use in regulated environments.
+
+pkg_ref <- function(pkg_name, source = "cran", ...) {
+  structure(
+    list(name = pkg_name, source = source, extra = list(...)),
+    class = "pkg_ref"
+  )
+}
+
+# Metrics calculators (mocked)
+.score_has_news     <- function(pkg) if (pkg %in% c("admiral","dplyr","ggplot2","tidyr","xportr","logrx","diffdf","pharmaverseadam")) 1 else 0.5
+.score_has_vignette <- function(pkg) if (pkg %in% c("admiral","dplyr","ggplot2","tidyr","xportr","logrx")) 1 else 0.6
+.score_has_tests    <- function(pkg) if (pkg %in% c("admiral","dplyr","ggplot2","xportr","logrx","diffdf")) 1 else 0.7
+.score_covr         <- function(pkg) if (pkg %in% c("admiral","dplyr","ggplot2")) 0.95 else if (pkg %in% c("xportr","logrx","diffdf")) 0.85 else 0.70
+.score_downloads    <- function(pkg) {
+  d <- c(admiral=25000, dplyr=5000000, ggplot2=6000000, tidyr=4000000,
+         xportr=8000, logrx=5000, diffdf=12000, pharmaverseadam=3500,
+         metacore=6000, metatools=5500, teal=9000)
+  d[[pkg]] %||% 1000
+}
+.score_cran_checks  <- function(pkg) if (pkg %in% c("dplyr","ggplot2","tidyr")) 1 else 0.9
+
+# assess() — compute all metrics
+assess <- function(pkg_ref_list) {
+  if (inherits(pkg_ref_list, "pkg_ref")) pkg_ref_list <- list(pkg_ref_list)
+  lapply(pkg_ref_list, function(p) {
+    nm <- p$name
+    list(
+      pkg_name       = nm,
+      has_news       = .score_has_news(nm),
+      has_vignette   = .score_has_vignette(nm),
+      has_tests      = .score_has_tests(nm),
+      covr_coverage  = .score_covr(nm),
+      downloads_1yr  = .score_downloads(nm),
+      cran_checks    = .score_cran_checks(nm)
+    )
+  })
+}
+
+# score() — aggregate into a 0–1 risk score
+score <- function(assessed_list) {
+  lapply(assessed_list, function(a) {
+    metric_scores <- c(
+      a$has_news,
+      a$has_vignette,
+      a$has_tests,
+      a$covr_coverage,
+      min(1, log10(a$downloads_1yr + 1) / log10(1e7)),
+      a$cran_checks
+    )
+    risk_score <- mean(metric_scores)
+    a$risk_score <- round(risk_score, 3)
+    a$risk_label <- if (risk_score >= 0.75) "Low Risk"
+                    else if (risk_score >= 0.50) "Medium Risk"
+                    else "High Risk"
+    class(a) <- "pkg_score"
+    a
+  })
+}
+
+print.pkg_score <- function(x, ...) {
+  cat(sprintf("Package : %s\n", x$pkg_name))
+  cat(sprintf("  Risk score  : %.3f  [%s]\n", x$risk_score, x$risk_label))
+  cat(sprintf("  Has NEWS    : %.2f\n", x$has_news))
+  cat(sprintf("  Vignettes   : %.2f\n", x$has_vignette))
+  cat(sprintf("  Unit tests  : %.2f\n", x$has_tests))
+  cat(sprintf("  Test cov    : %.2f\n", x$covr_coverage))
+  cat(sprintf("  Downloads   : %d /yr\n", x$downloads_1yr))
+  cat(sprintf("  CRAN checks : %.2f\n", x$cran_checks))
+  invisible(x)
+}
+
+# pkg_score_tbl() — combine scores into a tibble
+pkg_score_tbl <- function(scored_list) {
+  bind_rows(lapply(scored_list, function(s) {
+    tibble(
+      Package        = s$pkg_name,
+      Risk_Score     = s$risk_score,
+      Risk_Label     = s$risk_label,
+      Has_News       = s$has_news,
+      Has_Tests      = s$has_tests,
+      Cov_Pct        = round(s$covr_coverage * 100, 0),
+      Downloads_1yr  = s$downloads_1yr
+    )
+  }))
+}
+
+# cohort workflow helpers
+pkg_cohort <- function(...) {
+  pkgs <- list(...)
+  lapply(pkgs, function(p) {
+    if (is.character(p)) pkg_ref(p) else p
+  })
+}
+```
+
+## Overview
+
+This lesson covers two packages used in QC and governance for clinical R programming:
+
+**diffdf** — compare two data frames to find rows, columns, or values that differ. Essential for double-programming QC, where a second programmer independently derives the same dataset and the two versions must be compared.
+
+**riskmetric** — score R packages across dimensions like documentation, test coverage, download volume, and CRAN checks to produce a risk-based assessment for regulated use. Required by many organisations' R validation frameworks (e.g., the R Validation Hub's white paper).
+
+---
+
+## 1 — diffdf: Dataset Comparison
+
+### 1.1 Why double-programming uses diffdf
+
+In clinical trials, critical ADaM datasets (especially ADSL, ADAE, primary endpoint datasets) are derived **independently by two programmers** and the results compared. If the datasets are identical, the derivation is validated. Any differences must be investigated and resolved.
+
+```
+Programmer 1: derive_adsl.R  →  adsl_p1.xpt
+Programmer 2: derive_adsl_qc.R → adsl_p2.xpt
+                                        │
+                                        ▼
+                        diffdf(adsl_p1, adsl_p2,
+                               keys = c("STUDYID","USUBJID"))
+                                        │
+                                ┌───────┴──────────┐
+                           ✓ Identical         ✗ Differences found
+                         → QC passed            → Investigate & resolve
+```
+
+### 1.2 Basic `diffdf()` usage
+
+```{r diffdf-basic, eval=FALSE}
+library(diffdf)
+
+result <- diffdf(
+  base    = adsl_p1,     # reference (Programmer 1)
+  compare = adsl_p2,     # new version (Programmer 2 / QC)
+  keys    = c("STUDYID", "USUBJID")
+)
+
+# Check if identical
+diffdf_is_identical(result)   # TRUE → pass; FALSE → investigate
+print(result)
+```
+
+### 1.3 Exercise — basic comparison
+
+Compare `adsl` (reference) with `adsl_qc` (has deliberate differences). The QC dataset has BMIBL rounding differences, DIABFL changes, and TRTDURD off-by-one errors.
+
+```{r diffdf-basic-ex, exercise=TRUE, exercise.lines=14}
+result <- diffdf(
+  base    = ___,
+  compare = ___,
+  keys    = c("STUDYID", "USUBJID")
+)
+
+print(result)
+
+cat("\nIdentical?    ", diffdf_is_identical(result), "\n")
+cat("N vars differ:", diffdf_n_diffs(result), "\n")
+cat("Diff columns: ", paste(diffdf_issue_cols(result), collapse=", "), "\n")
+```
+
+```{r diffdf-basic-ex-solution}
+result <- diffdf(
+  base    = adsl,
+  compare = adsl_qc,
+  keys    = c("STUDYID", "USUBJID")
+)
+
+print(result)
+
+cat("\nIdentical?    ", diffdf_is_identical(result), "\n")
+cat("N vars differ:", diffdf_n_diffs(result), "\n")
+cat("Diff columns: ", paste(diffdf_issue_cols(result), collapse=", "), "\n")
+```
+
+---
+
+## 2 — Exploring Differences
+
+### 2.1 Drilling into a specific variable
+
+```{r drill-diff-ex, exercise=TRUE, exercise.lines=16}
+result <- diffdf(adsl, adsl_qc, keys=c("STUDYID","USUBJID"))
+
+# Inspect BMIBL differences
+bmibl_diffs <- diffdf_var_diffs(result, "BMIBL")
+
+cat("BMIBL differences:\n")
+print(bmibl_diffs)
+
+cat("\nDIABFL differences:\n")
+diabfl_diffs <- diffdf_var_diffs(result, ___)
+print(diabfl_diffs)
+```
+
+```{r drill-diff-ex-solution}
+result <- diffdf(adsl, adsl_qc, keys=c("STUDYID","USUBJID"))
+
+cat("BMIBL differences:\n")
+bmibl_diffs <- diffdf_var_diffs(result, "BMIBL")
+print(bmibl_diffs)
+
+cat("\nDIABFL differences:\n")
+diabfl_diffs <- diffdf_var_diffs(result, "DIABFL")
+print(diabfl_diffs)
+```
+
+### 2.2 Numeric tolerance
+
+When comparing numeric variables, rounding differences between SAS and R outputs are expected. Use `tolerance` to allow small differences:
+
+```{r tolerance-ex, exercise=TRUE, exercise.lines=16}
+# Without tolerance: BMIBL differences flagged
+result_strict <- diffdf(adsl, adsl_qc,
+                         keys      = c("STUDYID","USUBJID"),
+                         tolerance = 0)
+cat("Strict (tol=0) — vars with diffs:", diffdf_n_diffs(result_strict), "\n")
+
+# With tolerance of 0.1: minor rounding forgiven
+result_lenient <- diffdf(adsl, adsl_qc,
+                          keys      = c("STUDYID","USUBJID"),
+                          tolerance = ___)
+cat("Lenient (tol=0.1) — vars with diffs:", diffdf_n_diffs(result_lenient), "\n")
+cat("Remaining diff columns:", paste(diffdf_issue_cols(result_lenient), collapse=", "), "\n")
+```
+
+```{r tolerance-ex-solution}
+result_strict <- diffdf(adsl, adsl_qc,
+                         keys      = c("STUDYID","USUBJID"),
+                         tolerance = 0)
+cat("Strict (tol=0) — vars with diffs:", diffdf_n_diffs(result_strict), "\n")
+
+result_lenient <- diffdf(adsl, adsl_qc,
+                          keys      = c("STUDYID","USUBJID"),
+                          tolerance = 0.1)
+cat("Lenient (tol=0.1) — vars with diffs:", diffdf_n_diffs(result_lenient), "\n")
+cat("Remaining diff columns:", paste(diffdf_issue_cols(result_lenient), collapse=", "), "\n")
+```
+
+### 2.3 Column differences
+
+```{r col-diff-ex, exercise=TRUE, exercise.lines=16}
+# Create a version with an extra column and a missing column
+adsl_modified <- adsl |>
+  select(-DIABFL) |>              # remove one column
+  mutate(NEW_SCORE = AGE * 2)     # add a new column
+
+result_cols <- diffdf(
+  base    = ___,
+  compare = ___,
+  keys    = c("STUDYID","USUBJID")
+)
+
+cat("Cols in base not compare:", result_cols$cols_in_base_not_compare, "\n")
+cat("Cols in compare not base:", result_cols$cols_in_compare_not_base, "\n")
+```
+
+```{r col-diff-ex-solution}
+adsl_modified <- adsl |>
+  select(-DIABFL) |>
+  mutate(NEW_SCORE = AGE * 2)
+
+result_cols <- diffdf(
+  base    = adsl,
+  compare = adsl_modified,
+  keys    = c("STUDYID","USUBJID")
+)
+
+cat("Cols in base not compare:", result_cols$cols_in_base_not_compare, "\n")
+cat("Cols in compare not base:", result_cols$cols_in_compare_not_base, "\n")
+```
+
+### 2.4 Quiz
+
+```{r quiz-diffdf, echo=FALSE}
+quiz(
+  question(
+    "In a double-programming QC workflow, what does it mean when `diffdf_is_identical()` returns TRUE?",
+    answer("The datasets have the same column names only"),
+    answer("The two independently-derived datasets are identical — QC passed", correct = TRUE),
+    answer("The row counts are equal but values may differ"),
+    answer("The column types match but values are not checked"),
+    allow_retry = TRUE
+  ),
+  question(
+    "When would you set `tolerance = 0.01` in a diffdf() call?",
+    answer("To ignore all numeric differences regardless of size"),
+    answer("To allow small floating-point differences due to SAS vs R rounding", correct = TRUE),
+    answer("To skip character variable comparisons"),
+    answer("To compare only the first 0.01% of rows"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 3 — diffdf in a QC Pipeline
+
+### 3.1 Automated QC comparison
+
+```{r qc-pipeline, eval=FALSE}
+# Standard QC comparison pipeline
+qc_compare <- function(prog1_path, prog2_path, keys,
+                        tolerance = NULL,
+                        output_dir = "qc_results/") {
+
+  # Load both versions
+  prog1 <- haven::read_xpt(prog1_path)
+  prog2 <- haven::read_xpt(prog2_path)
+  domain <- toupper(tools::file_path_sans_ext(basename(prog1_path)))
+
+  # Compare
+  result <- diffdf(prog1, prog2, keys=keys, tolerance=tolerance)
+
+  # Write QC report
+  report_path <- file.path(output_dir,
+                            paste0(tolower(domain), "_qc_report.txt"))
+  dir.create(output_dir, recursive=TRUE, showWarnings=FALSE)
+
+  sink(report_path)
+  cat(sprintf("QC Comparison Report: %s\n", domain))
+  cat(sprintf("Generated: %s\n\n", Sys.time()))
+  print(result)
+  if (!diffdf_is_identical(result)) {
+    cat("\nDetailed differences:\n")
+    for (v in diffdf_issue_cols(result)) {
+      cat(sprintf("\n%s:\n", v))
+      print(diffdf_var_diffs(result, v))
+    }
+  }
+  sink()
+
+  message(sprintf("[%s] QC: %s | Diffs: %d variable(s)",
+                  domain,
+                  if(diffdf_is_identical(result)) "PASS" else "FAIL",
+                  diffdf_n_diffs(result)))
+
+  invisible(result)
+}
+```
+
+### 3.2 Exercise — complete QC comparison
+
+Run a QC comparison between `adsl` and `adsl_qc`, build a resolution table for each difference found, and determine if the dataset passes QC.
+
+```{r qc-complete-ex, exercise=TRUE, exercise.lines=35}
+# Step 1: compare
+result <- diffdf(___, ___, keys=c("STUDYID","USUBJID"))
+
+# Step 2: if identical, pass; otherwise investigate
+if (diffdf_is_identical(result)) {
+  cat("✓ QC PASS — Datasets are identical\n")
+} else {
+  cat(sprintf("✗ QC FAIL — %d variable(s) differ\n\n", diffdf_n_diffs(result)))
+
+  # Step 3: build resolution table
+  resolution <- tibble(
+    Variable     = diffdf_issue_cols(result),
+    N_Diffs      = sapply(diffdf_issue_cols(result), function(v)
+                          nrow(diffdf_var_diffs(result, v))),
+    Investigation = "Pending",
+    Resolution    = NA_character_
+  )
+
+  # Step 4: annotate (in real QC, programmer fills these in)
+  resolution <- resolution |>
+    mutate(
+      Investigation = case_when(
+        Variable == "BMIBL"   ~ "Rounding: Programmer 2 used 2 decimal places",
+        Variable == "DIABFL"  ~ "Logic error: P2 used BMIBL > 30 instead of >= 30",
+        Variable == "TRTDURD" ~ "Date calculation: P2 used inclusive end date",
+        TRUE                   ~ "Under investigation"
+      ),
+      Resolution = case_when(
+        Variable == "BMIBL"   ~ "ACCEPTED — within tolerance 0.1",
+        Variable == "DIABFL"  ~ "PROGRAMMER 2 CORRECTED",
+        Variable == "TRTDURD" ~ "PROGRAMMER 1 CORRECTED per SAP Section 4.2",
+        TRUE                   ~ "TBD"
+      )
+    )
+
+  cat("Resolution Table:\n")
+  print(resolution)
+}
+```
+
+---
+
+## 4 — riskmetric: Package Risk Scoring
+
+### 4.1 Why package risk scoring matters
+
+21 CFR Part 11 and ICH E9(R1) require that software used in clinical trial analysis is validated. For commercial software (like SAS), the vendor provides validation documentation. For open-source R packages, the organisation using them is responsible for their own validation.
+
+The **R Validation Hub** (a pharmaverse initiative) provides a framework based on:
+
+1. **Risk assessment** — score each package on testability, documentation, and community support
+2. **Testing evidence** — run package tests; document results
+3. **Risk-based qualification** — low-risk packages require less validation effort
+
+riskmetric automates step 1.
+
+### 4.2 Risk scoring dimensions
+
+| Metric | What it measures | Low risk |
+|--------|-----------------|---------|
+| `has_news` | CHANGELOG/NEWS file present | Yes |
+| `has_vignette` | Vignettes/documentation | Yes |
+| `has_tests` | Unit test suite present | Yes |
+| `covr_coverage` | Test code coverage % | ≥ 80% |
+| `downloads_1yr` | CRAN download count | ≥ 10,000 |
+| `cran_checks` | CRAN check results passing | All pass |
+
+### 4.3 Basic scoring pipeline
+
+```{r riskmetric-basic, eval=FALSE}
+library(riskmetric)
+
+# Step 1: create package references
+pkgs <- pkg_cohort(
+  pkg_ref("admiral"),
+  pkg_ref("dplyr"),
+  pkg_ref("xportr"),
+  pkg_ref("logrx")
+)
+
+# Step 2: assess all metrics
+assessed <- assess(pkgs)
+
+# Step 3: score
+scored <- score(assessed)
+
+# Step 4: tabulate
+tbl <- pkg_score_tbl(scored)
+print(tbl)
+```
+
+### 4.4 Exercise — score the pharmaverse core
+
+Score a cohort of pharmaverse packages and identify any that require additional validation effort.
+
+```{r riskmetric-ex, exercise=TRUE, exercise.lines=20}
+pharmaverse_pkgs <- pkg_cohort(
+  "admiral",
+  "xportr",
+  "logrx",
+  "diffdf",
+  "pharmaverseadam",
+  "metacore"
+)
+
+scored <- pharmaverse_pkgs |>
+  assess() |>
+  ___()          # score
+
+tbl <- pkg_score_tbl(scored)
+
+cat("── Pharmaverse Package Risk Scores ─────────────────\n")
+print(arrange(tbl, Risk_Score))
+
+cat("\n── Packages requiring enhanced validation ──────────\n")
+high_risk <- filter(tbl, Risk_Label != "Low Risk")
+if (nrow(high_risk) == 0) cat("  None — all packages low risk\n")
+else print(select(high_risk, Package, Risk_Score, Risk_Label))
+```
+
+```{r riskmetric-ex-solution}
+pharmaverse_pkgs <- pkg_cohort(
+  "admiral",
+  "xportr",
+  "logrx",
+  "diffdf",
+  "pharmaverseadam",
+  "metacore"
+)
+
+scored <- pharmaverse_pkgs |>
+  assess() |>
+  score()
+
+tbl <- pkg_score_tbl(scored)
+
+cat("── Pharmaverse Package Risk Scores ─────────────────\n")
+print(arrange(tbl, Risk_Score))
+
+cat("\n── Packages requiring enhanced validation ──────────\n")
+high_risk <- filter(tbl, Risk_Label != "Low Risk")
+if (nrow(high_risk) == 0) cat("  None — all packages low risk\n")
+else print(select(high_risk, Package, Risk_Score, Risk_Label))
+```
+
+### 4.5 Exercise — individual package deep dive
+
+```{r riskmetric-deep-ex, exercise=TRUE, exercise.lines=16}
+# Deep dive into admiral's risk profile
+admiral_ref <- pkg_ref("admiral")
+
+admiral_assessed <- assess(list(admiral_ref))
+admiral_scored   <- score(admiral_assessed)
+
+cat("── admiral Risk Profile ──────────────────────────────\n")
+print(admiral_scored[[1]])
+```
+
+---
+
+## 5 — Risk Tiers and Validation Strategy
+
+### 5.1 Mapping scores to validation effort
+
+```{r risk-tiers, eval=FALSE}
+# R Validation Hub recommended tiering
+classify_validation_effort <- function(score_tbl) {
+  score_tbl |>
+    mutate(
+      Validation_Effort = case_when(
+        Risk_Score >= 0.75 ~ "Tier 1 — Test suite review + use in production",
+        Risk_Score >= 0.50 ~ "Tier 2 — Additional testing + documented assessment",
+        TRUE               ~ "Tier 3 — Full validation including independent testing"
+      ),
+      Action = case_when(
+        Risk_Score >= 0.75 ~ "Review test results; document in validation plan",
+        Risk_Score >= 0.50 ~ "Supplement with organisation-specific tests",
+        TRUE               ~ "Evaluate alternatives or conduct full qualification"
+      )
+    )
+}
+```
+
+### 5.2 Generating a risk assessment report
+
+```{r risk-report-demo, eval=FALSE}
+# Generate a validation plan excerpt
+generate_validation_excerpt <- function(score_tbl) {
+  cat("R Package Validation Plan — CDISCPILOT01\n")
+  cat(sprintf("Generated: %s\n\n", Sys.Date()))
+
+  for (i in seq_len(nrow(score_tbl))) {
+    row <- score_tbl[i,]
+    cat(sprintf("Package: %s v%s\n", row$Package, packageVersion(row$Package)))
+    cat(sprintf("  Risk Score  : %.3f (%s)\n", row$Risk_Score, row$Risk_Label))
+    cat(sprintf("  Test Cov    : %d%%\n", row$Cov_Pct))
+    cat(sprintf("  Downloads   : %s /yr\n",
+                formatC(row$Downloads_1yr, big.mark=",", format="d")))
+    cat(sprintf("  Disposition : %s\n\n",
+                if(row$Risk_Score>=0.75) "ACCEPTED for use in regulated systems"
+                else "REQUIRES additional validation documentation"))
+  }
+}
+```
+
+### 5.3 Exercise — full risk assessment
+
+Score a full validation cohort, classify validation effort, and identify any packages needing escalated review.
+
+```{r full-risk-ex, exercise=TRUE, exercise.lines=30}
+validation_cohort <- pkg_cohort(
+  "admiral", "dplyr", "ggplot2", "tidyr",
+  "xportr", "logrx", "diffdf",
+  "pharmaverseadam", "metacore", "teal"
+)
+
+scored_tbl <- validation_cohort |>
+  ___() |>   # assess
+  ___() |>   # score
+  pkg_score_tbl()
+
+# Add validation tier
+tiered <- scored_tbl |>
+  mutate(
+    Tier = case_when(
+      Risk_Score >= 0.75 ~ 1L,
+      Risk_Score >= 0.50 ~ 2L,
+      TRUE               ~ 3L
+    ),
+    Effort = case_when(
+      Tier == 1 ~ "Test review",
+      Tier == 2 ~ "Supplemental testing",
+      Tier == 3 ~ "Full qualification"
+    )
+  ) |>
+  arrange(Tier, Risk_Score)
+
+cat("── Validation Plan Summary ─────────────────────────\n")
+print(select(tiered, Package, Risk_Score, Risk_Label, Tier, Effort))
+
+cat(sprintf("\nTier 1 (low effort)  : %d packages\n", sum(tiered$Tier==1)))
+cat(sprintf("Tier 2 (medium)      : %d packages\n", sum(tiered$Tier==2)))
+cat(sprintf("Tier 3 (full qual.)  : %d packages\n", sum(tiered$Tier==3)))
+```
+
+```{r full-risk-ex-solution}
+validation_cohort <- pkg_cohort(
+  "admiral", "dplyr", "ggplot2", "tidyr",
+  "xportr", "logrx", "diffdf",
+  "pharmaverseadam", "metacore", "teal"
+)
+
+scored_tbl <- validation_cohort |>
+  assess() |>
+  score() |>
+  pkg_score_tbl()
+
+tiered <- scored_tbl |>
+  mutate(
+    Tier = case_when(
+      Risk_Score >= 0.75 ~ 1L,
+      Risk_Score >= 0.50 ~ 2L,
+      TRUE               ~ 3L
+    ),
+    Effort = case_when(
+      Tier == 1 ~ "Test review",
+      Tier == 2 ~ "Supplemental testing",
+      Tier == 3 ~ "Full qualification"
+    )
+  ) |>
+  arrange(Tier, Risk_Score)
+
+cat("── Validation Plan Summary ─────────────────────────\n")
+print(select(tiered, Package, Risk_Score, Risk_Label, Tier, Effort))
+
+cat(sprintf("\nTier 1 (low effort)  : %d packages\n", sum(tiered$Tier==1)))
+cat(sprintf("Tier 2 (medium)      : %d packages\n", sum(tiered$Tier==2)))
+cat(sprintf("Tier 3 (full qual.)  : %d packages\n", sum(tiered$Tier==3)))
+```
+
+---
+
+## 6 — Capstone: Full QC and Governance Workflow
+
+Combine diffdf and riskmetric into a single QC governance workflow.
+
+```{r capstone-qcgov, exercise=TRUE, exercise.eval=FALSE, exercise.lines=75}
+library(purrr)
+
+# ══════════════════════════════════════════════════════════
+#  PART A: Dataset QC via diffdf
+# ══════════════════════════════════════════════════════════
+cat("╔══════════════════════════════════════════════════════╗\n")
+cat("║  PART A: Double-Programming QC — ADSL               ║\n")
+cat("╚══════════════════════════════════════════════════════╝\n\n")
+
+qc_result <- diffdf(
+  base    = ___,
+  compare = adsl_qc,
+  keys    = c("STUDYID", "USUBJID"),
+  tolerance = 0.05   # allow minor rounding
+)
+
+if (diffdf_is_identical(qc_result)) {
+  cat("✓ ADSL QC PASS — Datasets identical within tolerance\n")
+} else {
+  n_diff <- diffdf_n_diffs(qc_result)
+  cat(sprintf("⚠ ADSL QC: %d variable(s) with differences\n\n", n_diff))
+
+  qc_log <- imap_dfr(
+    setNames(diffdf_issue_cols(qc_result), diffdf_issue_cols(qc_result)),
+    function(v, nm) {
+      diffs <- diffdf_var_diffs(qc_result, v)
+      tibble(
+        Variable = v,
+        N_Diffs  = nrow(diffs),
+        Max_Abs_Diff = if (is.numeric(diffs$base_value %||% NA)) {
+          tryCatch(max(abs(as.numeric(diffs$base_value) -
+                            as.numeric(diffs$compare_value)), na.rm=TRUE),
+                   error=function(e) NA_real_)
+        } else NA_real_
+      )
+    }
+  )
+  cat("Difference summary:\n")
+  print(qc_log)
+}
+
+# ══════════════════════════════════════════════════════════
+#  PART B: Package risk assessment
+# ══════════════════════════════════════════════════════════
+cat("\n╔══════════════════════════════════════════════════════╗\n")
+cat("║  PART B: Package Risk Assessment                     ║\n")
+cat("╚══════════════════════════════════════════════════════╝\n\n")
+
+study_pkgs <- pkg_cohort(
+  "admiral", "dplyr", "ggplot2", "xportr",
+  "logrx", "diffdf", "pharmaverseadam"
+)
+
+risk_tbl <- study_pkgs |>
+  ___() |>
+  ___() |>
+  pkg_score_tbl() |>
+  mutate(
+    Approved = Risk_Score >= 0.70,
+    Flag     = if_else(!Approved, "⚠ REVIEW REQUIRED", "✓ APPROVED")
+  ) |>
+  arrange(Risk_Score)
+
+cat("Package Risk Summary:\n")
+print(select(risk_tbl, Package, Risk_Score, Risk_Label, Flag))
+
+n_approved <- sum(risk_tbl$Approved)
+cat(sprintf("\n✓ Approved: %d / %d packages\n", n_approved, nrow(risk_tbl)))
+
+flagged <- filter(risk_tbl, !Approved)
+if (nrow(flagged) > 0) {
+  cat(sprintf("⚠ Flagged for review: %s\n",
+              paste(flagged$Package, collapse=", ")))
+}
+```
+
+```{r capstone-qcgov-solution}
+library(purrr)
+
+cat("╔══════════════════════════════════════════════════════╗\n")
+cat("║  PART A: Double-Programming QC — ADSL               ║\n")
+cat("╚══════════════════════════════════════════════════════╝\n\n")
+
+qc_result <- diffdf(
+  base      = adsl,
+  compare   = adsl_qc,
+  keys      = c("STUDYID", "USUBJID"),
+  tolerance = 0.05
+)
+
+if (diffdf_is_identical(qc_result)) {
+  cat("✓ ADSL QC PASS — Datasets identical within tolerance\n")
+} else {
+  n_diff <- diffdf_n_diffs(qc_result)
+  cat(sprintf("⚠ ADSL QC: %d variable(s) with differences\n\n", n_diff))
+
+  qc_log <- imap_dfr(
+    setNames(diffdf_issue_cols(qc_result), diffdf_issue_cols(qc_result)),
+    function(v, nm) {
+      diffs <- diffdf_var_diffs(qc_result, v)
+      tibble(
+        Variable     = v,
+        N_Diffs      = nrow(diffs),
+        Max_Abs_Diff = tryCatch(
+          max(abs(as.numeric(diffs$base_value) -
+                    as.numeric(diffs$compare_value)), na.rm=TRUE),
+          error = function(e) NA_real_
+        )
+      )
+    }
+  )
+  cat("Difference summary:\n")
+  print(qc_log)
+}
+
+cat("\n╔══════════════════════════════════════════════════════╗\n")
+cat("║  PART B: Package Risk Assessment                     ║\n")
+cat("╚══════════════════════════════════════════════════════╝\n\n")
+
+study_pkgs <- pkg_cohort(
+  "admiral", "dplyr", "ggplot2", "xportr",
+  "logrx", "diffdf", "pharmaverseadam"
+)
+
+risk_tbl <- study_pkgs |>
+  assess() |>
+  score() |>
+  pkg_score_tbl() |>
+  mutate(
+    Approved = Risk_Score >= 0.70,
+    Flag     = if_else(!Approved, "⚠ REVIEW REQUIRED", "✓ APPROVED")
+  ) |>
+  arrange(Risk_Score)
+
+cat("Package Risk Summary:\n")
+print(select(risk_tbl, Package, Risk_Score, Risk_Label, Flag))
+
+n_approved <- sum(risk_tbl$Approved)
+cat(sprintf("\n✓ Approved: %d / %d packages\n", n_approved, nrow(risk_tbl)))
+
+flagged <- filter(risk_tbl, !Approved)
+if (nrow(flagged) > 0)
+  cat(sprintf("⚠ Flagged for review: %s\n", paste(flagged$Package, collapse=", ")))
+```
+
+---
+
+## Summary
+
+You now have the two main QC and governance tools for regulated R programming:
+
+**diffdf:**
+- `diffdf(base, compare, keys, tolerance)` — compare two data frames
+- `diffdf_is_identical(result)` — single TRUE/FALSE pass/fail signal
+- `diffdf_n_diffs(result)` — count of variables with differences
+- `diffdf_issue_cols(result)` — names of variables that differ
+- `diffdf_var_diffs(result, variable)` — row-level differences for one variable
+- `tolerance` — allow numeric differences up to a threshold (for SAS/R rounding)
+- Used in double-programming QC: two independent derivations must match
+
+**riskmetric:**
+- `pkg_ref(name)` → `assess()` → `score()` → `pkg_score_tbl()` — the four-step pipeline
+- `pkg_cohort(...)` — shorthand to build a list of `pkg_ref` objects
+- Scores 0–1 across: NEWS, vignettes, tests, coverage, downloads, CRAN checks
+- Low Risk (≥ 0.75): test review only; Medium (0.50–0.75): supplemental tests; High (< 0.50): full qualification
+- Required by R Validation Hub framework for regulated clinical use
+
+Next: **Lesson 47** — the full Pharmaverse10 capstone, Part 1: deriving ADSL and ADAE from SDTM using admiral, with the complete pipeline from raw data through XPT export.

@@ -1,0 +1,1353 @@
+---
+title: "Lesson 43 — xportr: Submission-Ready XPT Export"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Master xportr for producing FDA/EMA submission-ready SAS XPT transport
+  files from R. Covers variable type coercion, label application, length
+  assignment, format codes, variable ordering, and the full xportr() pipeline
+  integrated with metacore metadata specifications.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 43_xportr.Rmd
+# PURPOSE       : xportr package — preparing ADaM datasets for eCTD submission:
+#                 xportr_type/label/length/format/order pipeline,
+#                 unified xportr() wrapper, date handling, validation.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+library(learnr)
+library(dplyr)
+library(tibble)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.eval = FALSE)
+
+# ── Pharmaverseadam datasets ────────────────────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+adsl <- adsl_raw |>
+  mutate(ITTFL  = SAFFL,
+         DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N")) |>
+  select(STUDYID, USUBJID, SUBJID, SITEID, ARM, ARMCD,
+         TRT01P, TRT01A, AGE, AGEGR1, SEX, RACE, ETHNIC,
+         SAFFL, ITTFL, DIABFL, HEIGHTBL, WEIGHTBL, BMIBL,
+         TRTSDT, TRTEDT, TRTDURD, RFSTDTC, RFENDTC,
+         DTHFL, COUNTRY)
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(AESEV=="MILD"~1L, AESEV=="MODERATE"~2L,
+                             AESEV=="SEVERE"~3L, TRUE~NA_integer_)) |>
+  select(STUDYID, USUBJID, AESEQ, AEDECOD, AESOC, AESEV, AESEVN,
+         AESTDTC, AEENDTC, AESER, AEREL, AEOUT,
+         ASTDT, AENDT, ASTDY, AENDY, TRT01A,
+         any_of(c("TRTA","TRTEMFL")))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR=as.integer(ATOXGR), BTOXGR=as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+
+# ── Synthetic metadata spec (mirrors a real ADaM spec workbook) ────────────
+# adsl_spec: one row per variable in ADSL
+adsl_spec <- tribble(
+  ~dataset,  ~variable,   ~label,                              ~type,     ~length, ~format,
+  "ADSL",   "STUDYID",   "Study Identifier",                  "character", 12,    NA_character_,
+  "ADSL",   "USUBJID",   "Unique Subject Identifier",         "character", 50,    NA_character_,
+  "ADSL",   "SUBJID",    "Subject Identifier for the Study",  "character", 10,    NA_character_,
+  "ADSL",   "SITEID",    "Study Site Identifier",             "character",  3,    NA_character_,
+  "ADSL",   "ARM",       "Description of Planned Arm",        "character", 200,   NA_character_,
+  "ADSL",   "ARMCD",     "Planned Arm Code",                  "character",  20,   NA_character_,
+  "ADSL",   "TRT01P",    "Planned Treatment for Period 01",   "character", 200,   NA_character_,
+  "ADSL",   "TRT01A",    "Actual Treatment for Period 01",    "character", 200,   NA_character_,
+  "ADSL",   "AGE",       "Age",                               "numeric",     8,   NA_character_,
+  "ADSL",   "AGEGR1",    "Pooled Age Group 1",                "character",  10,   NA_character_,
+  "ADSL",   "SEX",       "Sex",                               "character",   2,   NA_character_,
+  "ADSL",   "RACE",      "Race",                              "character",  64,   NA_character_,
+  "ADSL",   "ETHNIC",    "Ethnicity",                         "character",  64,   NA_character_,
+  "ADSL",   "SAFFL",     "Safety Population Flag",            "character",   2,   NA_character_,
+  "ADSL",   "ITTFL",     "Intent-To-Treat Population Flag",   "character",   2,   NA_character_,
+  "ADSL",   "DIABFL",    "Diabetic Flag",                     "character",   2,   NA_character_,
+  "ADSL",   "HEIGHTBL",  "Baseline Height (cm)",              "numeric",     8,   NA_character_,
+  "ADSL",   "WEIGHTBL",  "Baseline Weight (kg)",              "numeric",     8,   NA_character_,
+  "ADSL",   "BMIBL",     "Baseline BMI (kg/m^2)",             "numeric",     8,   NA_character_,
+  "ADSL",   "TRTSDT",    "Date of First Exposure to Treatment","numeric",   8,   "DATE9.",
+  "ADSL",   "TRTEDT",    "Date of Last Exposure to Treatment","numeric",    8,   "DATE9.",
+  "ADSL",   "TRTDURD",   "Total Treatment Duration (Days)",   "numeric",     8,   NA_character_,
+  "ADSL",   "RFSTDTC",   "Subject Reference Start Date/Time","character",   20,   NA_character_,
+  "ADSL",   "RFENDTC",   "Subject Reference End Date/Time",  "character",   20,   NA_character_,
+  "ADSL",   "DTHFL",     "Death Flag",                       "character",    2,   NA_character_,
+  "ADSL",   "COUNTRY",   "Country",                          "character",    3,   NA_character_
+)
+
+# adae_spec
+adae_spec <- tribble(
+  ~dataset, ~variable,  ~label,                                  ~type,      ~length, ~format,
+  "ADAE",  "STUDYID",  "Study Identifier",                      "character",  12,   NA_character_,
+  "ADAE",  "USUBJID",  "Unique Subject Identifier",             "character",  50,   NA_character_,
+  "ADAE",  "AESEQ",    "Sequence Number",                       "numeric",     8,   NA_character_,
+  "ADAE",  "AEDECOD",  "Dictionary-Derived Term",               "character", 200,   NA_character_,
+  "ADAE",  "AESOC",    "Primary System Organ Class",            "character", 200,   NA_character_,
+  "ADAE",  "AESEV",    "Severity/Intensity",                    "character",  10,   NA_character_,
+  "ADAE",  "AESEVN",   "Severity/Intensity (N)",                "numeric",     8,   NA_character_,
+  "ADAE",  "AESTDTC",  "Start Date/Time of Adverse Event",     "character",  20,   NA_character_,
+  "ADAE",  "AEENDTC",  "End Date/Time of Adverse Event",       "character",  20,   NA_character_,
+  "ADAE",  "AESER",    "Serious Adverse Event",                 "character",   2,   NA_character_,
+  "ADAE",  "AEREL",    "Causality",                             "character",  16,   NA_character_,
+  "ADAE",  "AEOUT",    "Outcome of Adverse Event",             "character",  60,   NA_character_,
+  "ADAE",  "ASTDT",    "Analysis Start Date",                   "numeric",    8,   "DATE9.",
+  "ADAE",  "AENDT",    "Analysis End Date",                     "numeric",    8,   "DATE9.",
+  "ADAE",  "ASTDY",    "Analysis Start Relative Day",           "numeric",    8,   NA_character_,
+  "ADAE",  "AENDY",    "Analysis End Relative Day",             "numeric",    8,   NA_character_,
+  "ADAE",  "TRT01A",   "Actual Treatment for Period 01",        "character", 200,   NA_character_
+)
+
+# ── Mock xportr functions ─────────────────────────────────────────────────
+# xportr is a package for writing SAS XPT files with metadata.
+# We mock its core functions so exercises run inside learnr.
+# Real xportr writes actual XPT binary files via haven::write_xpt().
+
+# Helper to look up spec for a variable
+.xp_lookup <- function(spec, dataset_name, variable) {
+  spec[spec$dataset == toupper(dataset_name) & spec$variable == variable, ]
+}
+
+# xportr_metadata() — attach spec to dataset as attribute
+xportr_metadata <- function(.df, metadata, domain = NULL) {
+  domain <- domain %||% deparse(substitute(.df))
+  attr(.df, "xportr.df_metadata") <- metadata
+  attr(.df, "xportr.domain")      <- toupper(domain)
+  .df
+}
+
+# xportr_type() — coerce columns to types declared in spec
+xportr_type <- function(.df, metadata = NULL, domain = NULL,
+                         verbose = "none") {
+  spec <- metadata %||% attr(.df, "xportr.df_metadata")
+  dom  <- domain   %||% attr(.df, "xportr.domain") %||% "UNKNOWN"
+
+  if (is.null(spec)) {
+    message("xportr_type: no metadata — skipping type coercion")
+    return(.df)
+  }
+
+  spec_dom <- spec[toupper(spec$dataset) == toupper(dom), ]
+  changes  <- character(0)
+
+  for (v in intersect(names(.df), spec_dom$variable)) {
+    target_type <- spec_dom$type[spec_dom$variable == v]
+    if (length(target_type) == 0 || is.na(target_type)) next
+
+    current_class <- class(.df[[v]])[1]
+
+    if (target_type == "numeric" && !is.numeric(.df[[v]])) {
+      suppressWarnings({ .df[[v]] <- as.numeric(.df[[v]]) })
+      changes <- c(changes, sprintf("%s: %s → numeric", v, current_class))
+    } else if (target_type == "character" && !is.character(.df[[v]])) {
+      .df[[v]] <- as.character(.df[[v]])
+      changes <- c(changes, sprintf("%s: %s → character", v, current_class))
+    }
+  }
+
+  if (verbose == "message" && length(changes) > 0) {
+    message(sprintf("xportr_type [%s]: %d column(s) coerced:\n  %s",
+                    dom, length(changes), paste(changes, collapse="\n  ")))
+  }
+  .df
+}
+
+# xportr_label() — apply variable labels from spec
+xportr_label <- function(.df, metadata = NULL, domain = NULL,
+                          verbose = "none") {
+  spec <- metadata %||% attr(.df, "xportr.df_metadata")
+  dom  <- domain   %||% attr(.df, "xportr.domain") %||% "UNKNOWN"
+
+  if (is.null(spec)) return(.df)
+
+  spec_dom <- spec[toupper(spec$dataset) == toupper(dom), ]
+  labelled <- character(0)
+
+  for (v in intersect(names(.df), spec_dom$variable)) {
+    lbl <- spec_dom$label[spec_dom$variable == v]
+    if (length(lbl) == 0 || is.na(lbl)) next
+    attr(.df[[v]], "label") <- lbl
+    labelled <- c(labelled, v)
+  }
+
+  if (verbose == "message")
+    message(sprintf("xportr_label [%s]: labels applied to %d variable(s)",
+                    dom, length(labelled)))
+  .df
+}
+
+# xportr_length() — apply display lengths from spec
+xportr_length <- function(.df, metadata = NULL, domain = NULL,
+                           length_source = "spec", verbose = "none") {
+  spec <- metadata %||% attr(.df, "xportr.df_metadata")
+  dom  <- domain   %||% attr(.df, "xportr.domain") %||% "UNKNOWN"
+
+  if (is.null(spec)) return(.df)
+
+  spec_dom <- spec[toupper(spec$dataset) == toupper(dom), ]
+
+  for (v in intersect(names(.df), spec_dom$variable)) {
+    len <- spec_dom$length[spec_dom$variable == v]
+    if (length(len) == 0 || is.na(len)) next
+    attr(.df[[v]], "width") <- as.integer(len)
+  }
+
+  if (verbose == "message")
+    message(sprintf("xportr_length [%s]: lengths applied", dom))
+  .df
+}
+
+# xportr_format() — apply SAS format codes from spec
+xportr_format <- function(.df, metadata = NULL, domain = NULL,
+                           verbose = "none") {
+  spec <- metadata %||% attr(.df, "xportr.df_metadata")
+  dom  <- domain   %||% attr(.df, "xportr.domain") %||% "UNKNOWN"
+
+  if (is.null(spec)) return(.df)
+
+  spec_dom <- spec[toupper(spec$dataset) == toupper(dom), ]
+  formatted <- character(0)
+
+  for (v in intersect(names(.df), spec_dom$variable)) {
+    fmt <- spec_dom$format[spec_dom$variable == v]
+    if (length(fmt) == 0 || is.na(fmt)) next
+    attr(.df[[v]], "format.sas") <- fmt
+    formatted <- c(formatted, sprintf("%s=%s", v, fmt))
+  }
+
+  if (verbose == "message" && length(formatted) > 0)
+    message(sprintf("xportr_format [%s]: SAS formats applied: %s",
+                    dom, paste(formatted, collapse=", ")))
+  .df
+}
+
+# xportr_order() — reorder columns to match spec variable order
+xportr_order <- function(.df, metadata = NULL, domain = NULL,
+                          verbose = "none") {
+  spec <- metadata %||% attr(.df, "xportr.df_metadata")
+  dom  <- domain   %||% attr(.df, "xportr.domain") %||% "UNKNOWN"
+
+  if (is.null(spec)) return(.df)
+
+  spec_vars <- spec$variable[toupper(spec$dataset) == toupper(dom)]
+  ordered   <- intersect(spec_vars, names(.df))
+  extra     <- setdiff(names(.df), spec_vars)
+
+  if (length(extra) > 0 && verbose == "message")
+    message(sprintf("xportr_order [%s]: %d extra column(s) not in spec moved to end: %s",
+                    dom, length(extra), paste(extra, collapse=", ")))
+
+  .df[, c(ordered, extra), drop=FALSE]
+}
+
+# xportr_write() — write XPT file (mocked: prints what would be written)
+xportr_write <- function(.df, path, label = NULL, metadata = NULL,
+                          domain = NULL, verbose = "none") {
+  dom   <- domain %||% attr(.df, "xportr.domain") %||%
+           toupper(tools::file_path_sans_ext(basename(path)))
+  label <- label %||% sprintf("%s dataset", dom)
+
+  # Collect variable metadata from attributes
+  var_info <- lapply(names(.df), function(v) {
+    list(
+      variable = v,
+      type     = if (is.numeric(.df[[v]])) "numeric" else "character",
+      label    = attr(.df[[v]], "label")   %||% "",
+      length   = attr(.df[[v]], "width")   %||% NA_integer_,
+      format   = attr(.df[[v]], "format.sas") %||% ""
+    )
+  })
+
+  cat(sprintf(
+    "\n── xportr_write ──────────────────────────────────────\n",
+  ))
+  cat(sprintf("  Output path : %s\n", path))
+  cat(sprintf("  Dataset     : %s\n", dom))
+  cat(sprintf("  Label       : %s\n", label))
+  cat(sprintf("  Rows        : %d\n", nrow(.df)))
+  cat(sprintf("  Variables   : %d\n", ncol(.df)))
+
+  labelled_n <- sum(vapply(var_info, function(v) nchar(v$label)>0, logical(1)))
+  formatted_n <- sum(vapply(var_info, function(v) nchar(v$format)>0, logical(1)))
+  cat(sprintf("  Labelled    : %d / %d variables\n", labelled_n, ncol(.df)))
+  cat(sprintf("  SAS formats : %d variable(s)\n", formatted_n))
+  cat(sprintf("  [mock] XPT write to '%s' (haven::write_xpt)\n", path))
+  cat("──────────────────────────────────────────────────────\n")
+
+  invisible(.df)
+}
+
+# xportr() — the pipe-friendly unified wrapper (teal >= 1.0.0)
+# Applies type, label, length, format, order, and write in one call
+xportr <- function(.df, metadata, domain = NULL, path = NULL,
+                   label = NULL, verbose = "none") {
+  dom <- domain %||% deparse(substitute(.df))
+
+  result <- .df |>
+    xportr_metadata(metadata, domain = dom) |>
+    xportr_type(    verbose = verbose) |>
+    xportr_label(   verbose = verbose) |>
+    xportr_length(  verbose = verbose) |>
+    xportr_format(  verbose = verbose) |>
+    xportr_order(   verbose = verbose)
+
+  if (!is.null(path))
+    xportr_write(result, path=path, label=label, verbose=verbose)
+
+  invisible(result)
+}
+
+# xportr_df_label() — set dataset-level label (SAS PROC format LABEL= equivalent)
+xportr_df_label <- function(.df, label) {
+  attr(.df, "label") <- label
+  .df
+}
+
+# Utility: show metadata summary for a dataset
+xportr_var_names <- function(.df) {
+  cat(sprintf("Variables in dataset: %d\n", ncol(.df)))
+  cat(sprintf("  %-20s %-12s %-8s %-12s %s\n",
+              "Variable", "Type", "Length", "Format", "Label"))
+  cat(strrep("-", 80), "\n")
+  for (v in names(.df)) {
+    cat(sprintf("  %-20s %-12s %-8s %-12s %s\n",
+                v,
+                if (is.numeric(.df[[v]])) "numeric" else "character",
+                attr(.df[[v]], "width") %||% NA,
+                attr(.df[[v]], "format.sas") %||% "",
+                attr(.df[[v]], "label") %||% ""))
+  }
+  invisible(.df)
+}
+
+# Validation summary (mock Pinnacle 21 / P21 checks)
+xportr_validate <- function(.df, metadata, domain = NULL) {
+  dom <- domain %||% attr(.df, "xportr.domain") %||% "UNKNOWN"
+  spec_dom <- metadata[toupper(metadata$dataset) == toupper(dom), ]
+
+  issues <- character(0)
+
+  # Check 1: all spec variables present
+  missing_from_data <- setdiff(spec_dom$variable, names(.df))
+  if (length(missing_from_data) > 0)
+    issues <- c(issues, sprintf("[WARN] Variables in spec but not in data: %s",
+                                paste(missing_from_data, collapse=", ")))
+
+  # Check 2: extra variables not in spec
+  extra_in_data <- setdiff(names(.df), spec_dom$variable)
+  if (length(extra_in_data) > 0)
+    issues <- c(issues, sprintf("[INFO] Variables in data but not in spec: %s",
+                                paste(extra_in_data, collapse=", ")))
+
+  # Check 3: character variables exceeding declared length
+  for (v in intersect(names(.df), spec_dom$variable)) {
+    if (is.character(.df[[v]])) {
+      max_nchar <- max(nchar(.df[[v]]), na.rm=TRUE)
+      spec_len  <- spec_dom$length[spec_dom$variable == v]
+      if (length(spec_len) > 0 && !is.na(spec_len) && max_nchar > spec_len)
+        issues <- c(issues, sprintf(
+          "[ERROR] %s: max length %d exceeds spec length %d",
+          v, max_nchar, spec_len))
+    }
+  }
+
+  # Check 4: labels missing
+  unlabelled <- intersect(spec_dom$variable[is.na(spec_dom$label)], names(.df))
+  if (length(unlabelled) > 0)
+    issues <- c(issues, sprintf("[WARN] No label in spec for: %s",
+                                paste(unlabelled, collapse=", ")))
+
+  cat(sprintf("── xportr validation [%s] ──────────────────────────\n", dom))
+  if (length(issues) == 0) {
+    cat("  ✓ No issues found\n")
+  } else {
+    for (iss in issues) cat(" ", iss, "\n")
+  }
+  cat(sprintf("  Total issues: %d\n", length(issues)))
+  cat("──────────────────────────────────────────────────────\n")
+  invisible(issues)
+}
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+```
+
+## Overview
+
+**xportr** is the pharmaverse package that turns an R data frame into a submission-ready SAS XPT transport file. It bridges the gap between the open-source R workflow and the FDA/EMA requirement that electronic submissions include data in SAS Version 5 transport format.
+
+> **Why not just `haven::write_xpt()`?**
+>
+> `haven::write_xpt()` writes the XPT binary, but it cannot apply variable labels, SAS format codes, or declaration lengths — all required by the CDISC Submission Data Standards and validated by Pinnacle 21. xportr adds that metadata layer using your ADaM specification workbook.
+
+### What you will learn
+
+- The five xportr transformation steps: type → label → length → format → order
+- `xportr_metadata()` for attaching a spec to a pipeline
+- `xportr_write()` for producing the XPT file
+- The `xportr()` unified wrapper
+- Validation with `xportr_validate()`
+- Integration with metacore spec objects
+- Common submission gotchas: date numeric encoding, flag lengths, label truncation
+
+---
+
+## 1 — The XPT Submission Standard
+
+### 1.1 What FDA requires in an XPT file
+
+SAS Version 5 transport format (XPT) has strict rules enforced by Pinnacle 21 Enterprise during submission validation:
+
+| Requirement | Rule |
+|-------------|------|
+| Variable names | ≤ 8 characters, uppercase, no special chars |
+| Variable labels | ≤ 200 characters |
+| Character length | Declared width ≥ actual max character length |
+| Date variables | Stored as **numeric** (SAS date integer = days since 1960-01-01) |
+| SAS formats | Date variables must carry `DATE9.` or `DATETIME20.` format |
+| Variable order | Must match define.xml / ADaM spec variable order |
+| Dataset label | ≤ 200 characters |
+
+### 1.2 The SAS date encoding problem
+
+This is the most common source of XPT validation failures when migrating from SAS to R:
+
+```{r sas-date-demo, eval=FALSE}
+# SAS stores dates as integers: days since 1960-01-01
+# R stores dates as Date objects (days since 1970-01-01)
+
+# A SAS date of 20000 means: 1960-01-01 + 20000 days = 2014-10-13
+as.Date("1960-01-01") + 20000   # → 2014-10-13
+
+# haven::write_xpt() converts R Date → SAS integer automatically
+# BUT: in your ADaM data frame the date must be NUMERIC (integer),
+# not a Date class object, to get the right format code applied.
+
+# Wrong type (Date class — haven converts OK but P21 misses format code):
+class(adsl$TRTSDT)   # "Date"
+
+# Correct for xportr pipeline (numeric with DATE9. format):
+# xportr_type() + xportr_format() handle this conversion
+```
+
+### 1.3 Quiz
+
+```{r quiz-xpt, echo=FALSE}
+quiz(
+  question(
+    "What is the maximum allowed length for a variable label in a SAS XPT submission file?",
+    answer("40 characters"),
+    answer("200 characters", correct = TRUE),
+    answer("256 characters"),
+    answer("There is no limit"),
+    allow_retry = TRUE
+  ),
+  question(
+    "How does SAS (and XPT format) store date values internally?",
+    answer("As ISO 8601 character strings (e.g., '2024-03-15')"),
+    answer("As integers representing days since 1960-01-01", correct = TRUE),
+    answer("As integers representing days since 1970-01-01"),
+    answer("As double-precision floating point timestamps"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What Pinnacle 21 message would you expect if a character variable's actual max length exceeds its declared spec length?",
+    answer("A WARNING about variable ordering"),
+    answer("An ERROR about dataset label"),
+    answer("An ERROR about character length exceeding declared width", correct = TRUE),
+    answer("An INFO about missing format code"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 2 — Metadata Specifications
+
+### 2.1 The spec data frame
+
+xportr works from a metadata data frame — typically exported from your ADaM specification workbook. The minimum required columns are:
+
+| Column | Contents |
+|--------|---------|
+| `dataset` | Dataset name in UPPERCASE (e.g., `"ADSL"`) |
+| `variable` | Variable name in UPPERCASE (e.g., `"AGE"`) |
+| `label` | Variable label ≤ 200 characters |
+| `type` | `"character"` or `"numeric"` |
+| `length` | Integer — declared width for XPT |
+| `format` | SAS format code (e.g., `"DATE9."`) — `NA` for most variables |
+
+> The `adsl_spec` and `adae_spec` objects shown in these exercises are already loaded in the setup chunk. They mirror what a real `ADSL` and `ADAE` specification workbook would produce.
+
+### 2.2 Examine the ADSL spec
+
+```{r spec-examine, exercise=TRUE, exercise.lines=12}
+# Look at the first several rows of adsl_spec
+head(adsl_spec, 10)
+```
+
+```{r spec-examine-solution}
+head(adsl_spec, 10)
+```
+
+### 2.3 Exercise — inspect date and flag variables in spec
+
+Pull only the date-type variables (those with a `format` value) and the flag variables (ending in `FL`).
+
+```{r spec-dates-flags, exercise=TRUE, exercise.lines=12}
+# Date variables (have a SAS format code)
+date_vars <- adsl_spec |>
+  filter(!is.na(___)) |>
+  select(variable, label, type, format)
+
+cat("Date variables:\n")
+print(date_vars)
+
+# Flag variables
+flag_vars <- adsl_spec |>
+  filter(grepl(___,  variable)) |>
+  select(variable, label, length)
+
+cat("\nFlag variables:\n")
+print(flag_vars)
+```
+
+```{r spec-dates-flags-solution}
+date_vars <- adsl_spec |>
+  filter(!is.na(format)) |>
+  select(variable, label, type, format)
+
+cat("Date variables:\n")
+print(date_vars)
+
+flag_vars <- adsl_spec |>
+  filter(grepl("FL$", variable)) |>
+  select(variable, label, length)
+
+cat("\nFlag variables:\n")
+print(flag_vars)
+```
+
+---
+
+## 3 — Step-by-Step: The Five xportr Functions
+
+### 3.1 `xportr_metadata()` — attach spec to dataset
+
+Rather than passing `metadata =` to every function call, attach the spec once:
+
+```{r metadata-attach-demo, eval=FALSE}
+adsl_ready <- adsl |>
+  xportr_metadata(metadata = adsl_spec, domain = "ADSL")
+
+# Now all subsequent xportr_*() calls infer metadata automatically
+```
+
+### 3.2 `xportr_type()` — coerce column types
+
+```{r type-demo, eval=FALSE}
+# Before: check current types
+sapply(select(adsl, AGE, TRT01P, TRTSDT, SAFFL), class)
+# AGE    TRT01P  TRTSDT  SAFFL
+# integer character Date    character
+
+# After xportr_type() with spec declaring TRTSDT as numeric:
+adsl_typed <- adsl |>
+  xportr_metadata(adsl_spec, "ADSL") |>
+  xportr_type(verbose = "message")
+# xportr_type [ADSL]: TRTSDT: Date → numeric, TRTEDT: Date → numeric
+```
+
+### 3.3 `xportr_label()` — attach variable labels
+
+```{r label-demo, eval=FALSE}
+adsl_labelled <- adsl_typed |>
+  xportr_label(verbose = "message")
+
+# Verify a label
+attr(adsl_labelled$AGE, "label")
+# [1] "Age"
+
+attr(adsl_labelled$USUBJID, "label")
+# [1] "Unique Subject Identifier"
+```
+
+### 3.4 `xportr_length()` — set declared widths
+
+```{r length-demo, eval=FALSE}
+adsl_lengthed <- adsl_labelled |>
+  xportr_length(verbose = "message")
+
+attr(adsl_lengthed$STUDYID, "width")   # 12
+attr(adsl_lengthed$USUBJID, "width")   # 50
+attr(adsl_lengthed$AGE,     "width")   # 8
+```
+
+### 3.5 `xportr_format()` — apply SAS format codes
+
+```{r format-demo, eval=FALSE}
+adsl_formatted <- adsl_lengthed |>
+  xportr_format(verbose = "message")
+# xportr_format [ADSL]: SAS formats applied: TRTSDT=DATE9., TRTEDT=DATE9.
+
+attr(adsl_formatted$TRTSDT, "format.sas")   # "DATE9."
+attr(adsl_formatted$AGE,    "format.sas")   # ""  (NA → no format)
+```
+
+### 3.6 `xportr_order()` — reorder to match spec
+
+```{r order-demo, eval=FALSE}
+# Confirm variable order matches spec
+adsl_ordered <- adsl_formatted |>
+  xportr_order(verbose = "message")
+
+# Check first 5 variables in order
+names(adsl_ordered)[1:5]
+# [1] "STUDYID" "USUBJID" "SUBJID"  "SITEID"  "ARM"
+```
+
+### 3.7 `xportr_write()` — write the XPT
+
+```{r write-demo, eval=FALSE}
+xportr_write(adsl_ordered,
+             path  = "adam/adsl.xpt",
+             label = "Subject-Level Analysis Dataset",
+             verbose = "message")
+```
+
+### 3.8 Exercise — apply all five steps manually
+
+Apply all five xportr transformations to ADSL in sequence and print the result summary.
+
+```{r five-steps-ex, exercise=TRUE, exercise.lines=30}
+adsl_xpt <- adsl |>
+  xportr_metadata(___, domain = "ADSL") |>
+  xportr_type(   verbose = "message") |>
+  ___( verbose = "message") |>   # label
+  ___( verbose = "message") |>   # length
+  ___( verbose = "message") |>   # format
+  xportr_order(  verbose = "message")
+
+# Inspect the processed dataset
+cat("\n── Variable metadata after processing ──\n")
+xportr_var_names(adsl_xpt)
+```
+
+```{r five-steps-ex-solution}
+adsl_xpt <- adsl |>
+  xportr_metadata(adsl_spec, domain = "ADSL") |>
+  xportr_type(   verbose = "message") |>
+  xportr_label(  verbose = "message") |>
+  xportr_length( verbose = "message") |>
+  xportr_format( verbose = "message") |>
+  xportr_order(  verbose = "message")
+
+cat("\n── Variable metadata after processing ──\n")
+xportr_var_names(adsl_xpt)
+```
+
+---
+
+## 4 — The Unified `xportr()` Wrapper
+
+### 4.1 One function, all steps
+
+From xportr ≥ 1.0.0, the unified `xportr()` call replaces five separate calls:
+
+```{r unified-wrapper, eval=FALSE}
+# Equivalent to all five steps + write:
+adsl |>
+  xportr(
+    metadata = adsl_spec,
+    domain   = "ADSL",
+    path     = "adam/adsl.xpt",
+    label    = "Subject-Level Analysis Dataset",
+    verbose  = "message"
+  )
+```
+
+### 4.2 Exercise — use the unified wrapper for ADAE
+
+```{r unified-adae-ex, exercise=TRUE, exercise.lines=15}
+adae_xpt <- adae |>
+  xportr(
+    metadata = ___,
+    domain   = ___,
+    path     = "adam/adae.xpt",
+    label    = "Adverse Events Analysis Dataset",
+    verbose  = "message"
+  )
+
+cat("\nDimensions:", nrow(adae_xpt), "×", ncol(adae_xpt), "\n")
+```
+
+```{r unified-adae-ex-solution}
+adae_xpt <- adae |>
+  xportr(
+    metadata = adae_spec,
+    domain   = "ADAE",
+    path     = "adam/adae.xpt",
+    label    = "Adverse Events Analysis Dataset",
+    verbose  = "message"
+  )
+
+cat("\nDimensions:", nrow(adae_xpt), "×", ncol(adae_xpt), "\n")
+```
+
+### 4.3 Dataset-level label with `xportr_df_label()`
+
+XPT files carry a dataset-level label in addition to variable-level labels. Apply it with `xportr_df_label()`:
+
+```{r df-label-ex, exercise=TRUE, exercise.lines=10}
+adsl_final <- adsl |>
+  xportr_metadata(adsl_spec, "ADSL") |>
+  xportr_type() |>
+  xportr_label() |>
+  xportr_length() |>
+  xportr_format() |>
+  xportr_order() |>
+  xportr_df_label(label = ___)  # "Subject-Level Analysis Dataset"
+
+cat("Dataset label:", attr(adsl_final, "label"), "\n")
+```
+
+```{r df-label-ex-solution}
+adsl_final <- adsl |>
+  xportr_metadata(adsl_spec, "ADSL") |>
+  xportr_type() |>
+  xportr_label() |>
+  xportr_length() |>
+  xportr_format() |>
+  xportr_order() |>
+  xportr_df_label(label = "Subject-Level Analysis Dataset")
+
+cat("Dataset label:", attr(adsl_final, "label"), "\n")
+```
+
+---
+
+## 5 — Validation
+
+### 5.1 `xportr_validate()` — pre-submission checks
+
+Before writing the XPT, validate the dataset against the spec:
+
+```{r validate-demo, eval=FALSE}
+issues <- xportr_validate(adsl_xpt, metadata = adsl_spec, domain = "ADSL")
+# ── xportr validation [ADSL] ──────────────────────────────────────────
+#   ✓ No issues found
+#   Total issues: 0
+```
+
+Common issues caught by `xportr_validate()`:
+
+| Issue level | Cause | Impact |
+|------------|-------|--------|
+| ERROR | Character variable exceeds declared spec length | XPT will fail P21 |
+| ERROR | Numeric variable stored as character | Type mismatch in XPT |
+| WARN | Variable in spec but missing from data | Missing variable warning in P21 |
+| WARN | Variable label missing in spec | P21 message about unlabelled variable |
+| INFO | Variable in data but not in spec | Extra variable — may be intentional |
+
+### 5.2 Exercise — validate a dataset with deliberate issues
+
+We'll create a modified ADSL with an intentional length violation and observe the validation output.
+
+```{r validate-ex, exercise=TRUE, exercise.lines=25}
+# Create a dataset with a deliberate issue:
+# Add a new variable not in spec (INFO)
+# Make COUNTRY have a value longer than its spec length (3)
+adsl_bad <- adsl |>
+  mutate(
+    COUNTRY    = if_else(COUNTRY == "USA", "UNITED STATES OF AMERICA", COUNTRY),
+    NEW_VAR    = "not in spec"
+  )
+
+# Run validation
+issues <- xportr_validate(
+  adsl_bad,
+  metadata = ___,
+  domain   = "ADSL"
+)
+
+cat("\nIssues found:", length(issues), "\n")
+```
+
+```{r validate-ex-solution}
+adsl_bad <- adsl |>
+  mutate(
+    COUNTRY    = if_else(COUNTRY == "USA", "UNITED STATES OF AMERICA", COUNTRY),
+    NEW_VAR    = "not in spec"
+  )
+
+issues <- xportr_validate(
+  adsl_bad,
+  metadata = adsl_spec,
+  domain   = "ADSL"
+)
+
+cat("\nIssues found:", length(issues), "\n")
+```
+
+### 5.3 Fix and re-validate
+
+```{r fix-validate-ex, exercise=TRUE, exercise.lines=20}
+# Fix the issues:
+# 1. Truncate COUNTRY back to ISO 3-char code
+# 2. Remove NEW_VAR
+adsl_fixed <- adsl |>
+  mutate(
+    COUNTRY = substr(COUNTRY, 1, ___)   # truncate to spec length 3
+  ) |>
+  select(-any_of("NEW_VAR"))
+
+# Re-validate
+xportr_validate(adsl_fixed, metadata = adsl_spec, domain = "ADSL")
+```
+
+```{r fix-validate-ex-solution}
+adsl_fixed <- adsl |>
+  mutate(
+    COUNTRY = substr(COUNTRY, 1, 3)
+  ) |>
+  select(-any_of("NEW_VAR"))
+
+xportr_validate(adsl_fixed, metadata = adsl_spec, domain = "ADSL")
+```
+
+---
+
+## 6 — Working with Date Variables
+
+### 6.1 R Date → SAS numeric
+
+This is the most common type of submission error. In pharmaverseadam, date variables like `TRTSDT` are `Date` class. For XPT they must be **numeric** with `DATE9.` format.
+
+```{r date-conversion-demo, exercise=TRUE, exercise.lines=18}
+# Check current type of TRTSDT in adsl
+cat("Class of TRTSDT:", class(adsl$TRTSDT), "\n")
+cat("First 3 values:", format(head(adsl$TRTSDT, 3)), "\n\n")
+
+# How xportr converts: as.numeric(Date) = days since 1970-01-01
+# SAS needs days since 1960-01-01, so offset = 3653 days
+# haven::write_xpt handles the offset automatically during write
+
+# Show the numeric representation
+adsl_dates <- adsl |>
+  select(USUBJID, TRTSDT, TRTEDT) |>
+  mutate(
+    TRTSDT_NUM = as.numeric(TRTSDT),  # days since 1970-01-01
+    TRTEDT_NUM = as.numeric(TRTEDT)
+  )
+
+head(adsl_dates, 5)
+```
+
+### 6.2 Type coercion in the pipeline
+
+`xportr_type()` converts `Date` → `numeric` automatically when the spec declares the variable as `"numeric"`. Verify this:
+
+```{r date-type-ex, exercise=TRUE, exercise.lines=15}
+# Before: TRTSDT is Date
+cat("Before - TRTSDT class:", class(adsl$TRTSDT), "\n")
+
+adsl_typed <- adsl |>
+  xportr_metadata(adsl_spec, "ADSL") |>
+  xportr_type(verbose = "message")
+
+# After: TRTSDT should be numeric
+cat("\nAfter  - TRTSDT class:", class(adsl_typed$TRTSDT), "\n")
+cat("First value:", adsl_typed$TRTSDT[1], "\n")
+cat("Decoded back:", format(as.Date(adsl_typed$TRTSDT[1], origin="1970-01-01")), "\n")
+```
+
+### 6.3 Quiz
+
+```{r quiz-dates, echo=FALSE}
+quiz(
+  question(
+    "After `xportr_type()` converts an R Date variable to numeric for XPT, what additional step ensures Pinnacle 21 recognises it as a date?",
+    answer("`xportr_label()` — the label must say 'Date'"),
+    answer("`xportr_format()` — applies the DATE9. SAS format code", correct = TRUE),
+    answer("`xportr_length()` — date variables need length=10"),
+    answer("`xportr_order()` — date variables must come last"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A date variable in your spec has `type = 'numeric'` but `format = NA`. What will happen after `xportr_type()` + `xportr_format()`?",
+    answer("The variable will be left as Date class"),
+    answer("The variable will be converted to numeric with no SAS format code — P21 may warn about missing format", correct = TRUE),
+    answer("An error is thrown because format is required for numeric dates"),
+    answer("The variable is dropped from the dataset"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 7 — Integration with metacore
+
+### 7.1 `metacore` as a metadata source
+
+In Lesson 12 you learned `metacore` — a package that stores structured ADaM specification objects. xportr can consume a `metacore` object directly instead of a raw data frame.
+
+```{r metacore-integration, eval=FALSE}
+library(metacore)
+library(metatools)
+
+# Load a metacore spec from an Excel workbook
+mc <- spec_to_metacore(
+  path     = "specs/adam_specs.xlsx",
+  where_sep_sheet = FALSE
+)
+
+# xportr accepts metacore directly in any metadata argument:
+adsl |>
+  xportr_metadata(mc, domain = "ADSL") |>
+  xportr_type() |>
+  xportr_label() |>
+  xportr_length() |>
+  xportr_format() |>
+  xportr_order() |>
+  xportr_write("adam/adsl.xpt",
+               label = "Subject-Level Analysis Dataset")
+```
+
+### 7.2 Extracting a flat spec from metacore
+
+If you have a metacore object but need a flat data frame (for inspection or logging):
+
+```{r metacore-flat, eval=FALSE}
+# Extract variable-level metadata as a flat tibble
+flat_spec <- mc |>
+  select_dataset("ADSL") |>
+  get_variables()
+
+# flat_spec has columns: dataset, variable, label, type, length, format, ...
+head(flat_spec)
+```
+
+---
+
+## 8 — Building a Submission Package: Multiple Datasets
+
+### 8.1 The `purrr::walk()` pattern
+
+In a real submission you export 10+ ADaM datasets. Use `purrr::walk()` for clean iteration:
+
+```{r multi-dataset-export, eval=FALSE}
+library(purrr)
+
+# Named list of datasets
+adam_datasets <- list(
+  ADSL = adsl,
+  ADAE = adae,
+  ADLB = adlb,
+  ADVS = advs
+)
+
+# Combined spec (bind rows from each dataset spec)
+full_spec <- bind_rows(adsl_spec, adae_spec, adlb_spec, advs_spec)
+
+# Dataset labels
+ds_labels <- c(
+  ADSL = "Subject-Level Analysis Dataset",
+  ADAE = "Adverse Events Analysis Dataset",
+  ADLB = "Laboratory Test Results",
+  ADVS = "Vital Signs Analysis Dataset"
+)
+
+# Export all datasets
+output_dir <- "submission/adam/"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+walk(names(adam_datasets), function(dsname) {
+  message(sprintf("Exporting %s...", dsname))
+  adam_datasets[[dsname]] |>
+    xportr(
+      metadata = full_spec,
+      domain   = dsname,
+      path     = file.path(output_dir, paste0(tolower(dsname), ".xpt")),
+      label    = ds_labels[[dsname]],
+      verbose  = "message"
+    )
+})
+
+message("All datasets exported to ", output_dir)
+```
+
+### 8.2 Exercise — export two datasets in a loop
+
+Export ADSL and ADAE using the loop pattern. Use the mock specs and `xportr()`.
+
+```{r multi-export-ex, exercise=TRUE, exercise.lines=28}
+library(purrr)
+
+adam_list <- list(
+  ADSL = adsl,
+  ADAE = ___
+)
+
+combined_spec <- bind_rows(___, adae_spec)
+
+ds_labels <- c(
+  ADSL = "Subject-Level Analysis Dataset",
+  ADAE = "Adverse Events Analysis Dataset"
+)
+
+walk(names(adam_list), function(dsname) {
+  cat(sprintf("\n── Exporting %s ──────────────────\n", dsname))
+  adam_list[[dsname]] |>
+    xportr(
+      metadata = ___,
+      domain   = ___,
+      path     = paste0("adam/", tolower(dsname), ".xpt"),
+      label    = ds_labels[[___]],
+      verbose  = "none"
+    )
+  cat(sprintf("  ✓ %s: %d rows × %d cols exported\n",
+              dsname,
+              nrow(adam_list[[dsname]]),
+              ncol(adam_list[[dsname]])))
+})
+```
+
+```{r multi-export-ex-solution}
+library(purrr)
+
+adam_list <- list(
+  ADSL = adsl,
+  ADAE = adae
+)
+
+combined_spec <- bind_rows(adsl_spec, adae_spec)
+
+ds_labels <- c(
+  ADSL = "Subject-Level Analysis Dataset",
+  ADAE = "Adverse Events Analysis Dataset"
+)
+
+walk(names(adam_list), function(dsname) {
+  cat(sprintf("\n── Exporting %s ──────────────────\n", dsname))
+  adam_list[[dsname]] |>
+    xportr(
+      metadata = combined_spec,
+      domain   = dsname,
+      path     = paste0("adam/", tolower(dsname), ".xpt"),
+      label    = ds_labels[[dsname]],
+      verbose  = "none"
+    )
+  cat(sprintf("  ✓ %s: %d rows × %d cols exported\n",
+              dsname,
+              nrow(adam_list[[dsname]]),
+              ncol(adam_list[[dsname]])))
+})
+```
+
+---
+
+## 9 — Common Submission Issues
+
+### 9.1 The eight most common P21 xportr failures
+
+```{r p21-issues, eval=FALSE}
+# 1. Variable name > 8 characters
+# Solution: rename before xportr pipeline
+adsl <- rename(adsl, USUBJID = UNIQUE_SUBJECT_ID)  # if it was too long
+
+# 2. Character variable value exceeds declared width
+# Solution: check max nchar() and increase spec width or truncate
+adsl |>
+  summarise(across(where(is.character), ~max(nchar(.), na.rm=TRUE))) |>
+  tidyr::pivot_longer(everything(),
+                      names_to="variable", values_to="max_len") |>
+  left_join(select(adsl_spec, variable, length), by="variable") |>
+  filter(max_len > length)
+
+# 3. Date variable left as Date class (not numeric)
+# Symptom: P21 "Variable format does not match type"
+# Solution: xportr_type() with spec declaring type="numeric"
+
+# 4. Flag variable (SAFFL, ITTFL) declared with length=1 but has "Y" / "N" / ""
+# "" has nchar 0, but "Y" has nchar 1 — spec length=2 covers both safely
+# Solution: always declare flag variables with length >= 2
+
+# 5. Label > 200 characters
+# Solution: truncate in spec
+adsl_spec |>
+  filter(nchar(label) > 200)   # should be empty; fix if not
+
+# 6. Missing format code for date variable
+# Solution: spec must have format="DATE9." for any numeric date
+
+# 7. Variables in wrong order
+# Solution: xportr_order() sorts to spec order; ensure spec is complete
+
+# 8. Dataset label missing or > 200 chars
+# Solution: xportr_df_label("Subject-Level Analysis Dataset")
+```
+
+### 9.2 Exercise — detect length violations before export
+
+Write code to find any character variables in ADSL whose actual maximum length exceeds the spec-declared length.
+
+```{r length-violations-ex, exercise=TRUE, exercise.lines=20}
+# Step 1: compute actual max character length per variable
+actual_lengths <- adsl |>
+  select(where(is.character)) |>
+  summarise(across(everything(), ~max(nchar(.), na.rm=TRUE))) |>
+  tidyr::pivot_longer(everything(),
+                      names_to  = "variable",
+                      values_to = "actual_max")
+
+# Step 2: join to spec
+violations <- actual_lengths |>
+  left_join(select(adsl_spec, variable, ___), by = "variable") |>
+  filter(!is.na(length), ___ > length) |>
+  arrange(desc(actual_max - length))
+
+if (nrow(violations) == 0) {
+  cat("✓ No length violations found\n")
+} else {
+  cat("Length violations:\n")
+  print(violations)
+}
+```
+
+```{r length-violations-ex-solution}
+actual_lengths <- adsl |>
+  select(where(is.character)) |>
+  summarise(across(everything(), ~max(nchar(.), na.rm=TRUE))) |>
+  tidyr::pivot_longer(everything(),
+                      names_to  = "variable",
+                      values_to = "actual_max")
+
+violations <- actual_lengths |>
+  left_join(select(adsl_spec, variable, length), by = "variable") |>
+  filter(!is.na(length), actual_max > length) |>
+  arrange(desc(actual_max - length))
+
+if (nrow(violations) == 0) {
+  cat("✓ No length violations found\n")
+} else {
+  cat("Length violations:\n")
+  print(violations)
+}
+```
+
+---
+
+## 10 — The Full Submission Export Pipeline
+
+### 10.1 End-to-end pipeline
+
+```{r full-pipeline, eval=FALSE}
+# ── Full ADaM XPT export pipeline ─────────────────────────────────────────
+library(xportr)
+library(dplyr)
+library(purrr)
+
+# ── 1. Load and prepare data ─────────────────────────────────────────────
+source("R/data_prep.R")   # loads adsl, adae, adlb, advs
+
+# ── 2. Load metadata spec ────────────────────────────────────────────────
+library(readxl)
+spec <- bind_rows(
+  read_excel("specs/adam_spec.xlsx", sheet="ADSL"),
+  read_excel("specs/adam_spec.xlsx", sheet="ADAE"),
+  read_excel("specs/adam_spec.xlsx", sheet="ADLB"),
+  read_excel("specs/adam_spec.xlsx", sheet="ADVS")
+) |>
+  mutate(
+    type   = tolower(type),        # normalise "Char"/"Text" → "character"
+    format = na_if(format, ""),    # blank → NA
+    length = as.integer(length)
+  )
+
+# ── 3. Validate all datasets ─────────────────────────────────────────────
+datasets <- list(ADSL=adsl, ADAE=adae, ADLB=adlb, ADVS=advs)
+
+all_issues <- imap(datasets, function(ds, nm) {
+  xportr_validate(ds, metadata=spec, domain=nm)
+}) |>
+  compact()
+
+if (length(all_issues) > 0) {
+  warning("Validation issues found — review before submitting")
+}
+
+# ── 4. Export ────────────────────────────────────────────────────────────
+ds_labels <- c(
+  ADSL = "Subject-Level Analysis Dataset",
+  ADAE = "Adverse Events Analysis Dataset",
+  ADLB = "Laboratory Test Results",
+  ADVS = "Vital Signs Analysis Dataset"
+)
+
+output_dir <- "submission/adam"
+dir.create(output_dir, recursive=TRUE, showWarnings=FALSE)
+
+walk(names(datasets), function(nm) {
+  datasets[[nm]] |>
+    xportr(
+      metadata = spec,
+      domain   = nm,
+      path     = file.path(output_dir, paste0(tolower(nm), ".xpt")),
+      label    = ds_labels[[nm]],
+      verbose  = "message"
+    )
+})
+
+# ── 5. Verify written files ──────────────────────────────────────────────
+xpt_files <- list.files(output_dir, pattern="\\.xpt$", full.names=TRUE)
+file_info <- tibble(
+  file    = basename(xpt_files),
+  size_kb = round(file.size(xpt_files)/1024, 1)
+)
+print(file_info)
+```
+
+### 10.2 Capstone: build and validate the ADSL export
+
+Build the complete ADSL XPT export pipeline: validate → fix issues → apply all xportr steps → write → verify.
+
+```{r capstone-export, exercise=TRUE, exercise.lines=45}
+# Step 1: Pre-export validation
+cat("=== Step 1: Pre-export validation ===\n")
+issues_before <- xportr_validate(adsl, metadata = adsl_spec, domain = "ADSL")
+
+# Step 2: Prepare clean dataset
+cat("\n=== Step 2: Prepare dataset ===\n")
+adsl_clean <- adsl |>
+  # Keep only variables that are in the spec
+  select(any_of(adsl_spec$variable)) |>
+  # Ensure COUNTRY is at most 3 chars (spec length)
+  mutate(COUNTRY = substr(COUNTRY, 1, 3))
+
+cat("Variables retained:", ncol(adsl_clean), "\n")
+cat("Variables dropped:", ncol(adsl) - ncol(adsl_clean), "\n")
+
+# Step 3: Apply xportr pipeline
+cat("\n=== Step 3: Apply xportr ===\n")
+adsl_submission <- adsl_clean |>
+  xportr_metadata(___, domain = "ADSL") |>
+  xportr_type() |>
+  xportr_label() |>
+  ___() |>    # length
+  ___() |>    # format
+  xportr_order() |>
+  xportr_df_label("Subject-Level Analysis Dataset")
+
+# Step 4: Post-pipeline validation
+cat("\n=== Step 4: Post-pipeline validation ===\n")
+xportr_validate(adsl_submission, metadata = ___, domain = "ADSL")
+
+# Step 5: Write (mock)
+cat("\n=== Step 5: Write XPT ===\n")
+xportr_write(adsl_submission,
+             path    = "adam/adsl.xpt",
+             label   = "Subject-Level Analysis Dataset",
+             verbose = "none")
+
+cat("\n✓ Pipeline complete\n")
+cat("  Rows:      ", nrow(adsl_submission), "\n")
+cat("  Variables: ", ncol(adsl_submission), "\n")
+cat("  Label:     ", attr(adsl_submission, "label"), "\n")
+```
+
+```{r capstone-export-solution}
+cat("=== Step 1: Pre-export validation ===\n")
+issues_before <- xportr_validate(adsl, metadata = adsl_spec, domain = "ADSL")
+
+cat("\n=== Step 2: Prepare dataset ===\n")
+adsl_clean <- adsl |>
+  select(any_of(adsl_spec$variable)) |>
+  mutate(COUNTRY = substr(COUNTRY, 1, 3))
+
+cat("Variables retained:", ncol(adsl_clean), "\n")
+cat("Variables dropped:", ncol(adsl) - ncol(adsl_clean), "\n")
+
+cat("\n=== Step 3: Apply xportr ===\n")
+adsl_submission <- adsl_clean |>
+  xportr_metadata(adsl_spec, domain = "ADSL") |>
+  xportr_type() |>
+  xportr_label() |>
+  xportr_length() |>
+  xportr_format() |>
+  xportr_order() |>
+  xportr_df_label("Subject-Level Analysis Dataset")
+
+cat("\n=== Step 4: Post-pipeline validation ===\n")
+xportr_validate(adsl_submission, metadata = adsl_spec, domain = "ADSL")
+
+cat("\n=== Step 5: Write XPT ===\n")
+xportr_write(adsl_submission,
+             path    = "adam/adsl.xpt",
+             label   = "Subject-Level Analysis Dataset",
+             verbose = "none")
+
+cat("\n✓ Pipeline complete\n")
+cat("  Rows:      ", nrow(adsl_submission), "\n")
+cat("  Variables: ", ncol(adsl_submission), "\n")
+cat("  Label:     ", attr(adsl_submission, "label"), "\n")
+```
+
+---
+
+## Summary
+
+You can now produce FDA/EMA submission-ready XPT files from R:
+
+**The five xportr transformations (applied in order):**
+1. `xportr_type()` — coerce column types (especially Date → numeric for date vars)
+2. `xportr_label()` — attach variable labels from spec
+3. `xportr_length()` — declare character widths
+4. `xportr_format()` — apply SAS format codes (critical: `DATE9.` for dates)
+5. `xportr_order()` — reorder variables to match spec
+
+**Key patterns:**
+- `xportr_metadata(.df, spec, domain)` — attach spec once, skip `metadata=` in every call
+- `xportr(.df, metadata, domain, path, label)` — unified wrapper runs all steps + write
+- `xportr_validate(.df, metadata, domain)` — pre/post validation against spec
+- `xportr_df_label(.df, label)` — set the dataset-level XPT label
+- `purrr::walk()` loop — export multiple datasets cleanly
+
+**Most common submission errors:**
+- Date variable stays as `Date` class (needs `type="numeric"` in spec + `format="DATE9."`)
+- Flag variable declared with `length=1` but `"Y"`/`"N"` need at least 2
+- Character value exceeds declared spec length — detect with `max(nchar(.))`
+- Variable order wrong — always run `xportr_order()` last
+
+Next: **Lesson 44** covers `datasetjson` — the modern CDISC Dataset-JSON format for electronic submissions, and how xportr and datasetjson complement each other.

@@ -1,0 +1,1980 @@
+---
+title: "Lesson 21 — admiral Vaccine Extension (admiralvaccine): Immunogenicity & Reactogenicity ADaMs"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Vaccine trial ADaM derivations using the admiralvaccine package: immunogenicity
+  specimen datasets (ADIS) with HAI/MN titres, seroconversion, seroprotection,
+  geometric mean titres (GMT), geometric mean fold rise (GMFR), solicited adverse
+  events (ADFACE), and vaccine-specific time-to-event. Includes real-world capstone
+  problems for influenza and RSV trial scenarios.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 21_admiralvaccine.Rmd
+# PURPOSE       : admiralvaccine extension — vaccine immunogenicity ADaM: geometric mean
+#                 titres (GMT), geometric mean fold rise (GMFR),
+#                 seroconversion, seroprotection, and reactogenicity
+#                 (ADFACE) endpoint derivations.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNTHETIC VACCINE TRIAL DATA
+# Simulates a Phase III influenza + RSV bivalent vaccine trial.
+# 120 subjects, 2 arms: Vaccine (VAC) vs Placebo (PBO).
+# Immunogenicity measured as HAI (influenza) and ELISA (RSV) titres.
+# ══════════════════════════════════════════════════════════════════════════════
+set.seed(2024)
+n_sub <- 120
+
+adsl_vac <- tibble(
+  STUDYID  = "VAC2024",
+  USUBJID  = sprintf("VAC2024-%03d", seq_len(n_sub)),
+  SUBJID   = sprintf("%03d",         seq_len(n_sub)),
+  AGE      = sample(18:75, n_sub, replace = TRUE),
+  AGEGR1   = cut(sample(18:75, n_sub, replace = TRUE),
+                 breaks = c(17, 50, 64, Inf),
+                 labels = c("18-50","51-64",">=65")),
+  SEX      = sample(c("M","F"), n_sub, replace = TRUE),
+  RACE     = sample(c("WHITE","ASIAN","BLACK OR AFRICAN AMERICAN"),
+                    n_sub, replace = TRUE, prob = c(.60,.25,.15)),
+  ARM      = rep(c("Vaccine","Placebo"), each = n_sub/2),
+  ARMCD    = rep(c("VAC","PBO"),         each = n_sub/2),
+  TRTSDT   = as.Date("2023-09-01") + sample(0:30, n_sub, replace = TRUE),
+  SAFFL    = "Y",
+  IMMFL    = "Y"   # immunogenicity evaluable flag
+) |>
+  mutate(TRTEDT = TRTSDT + 28L)   # single-dose trial, Day 29 = post-vaccination visit
+
+# ── IS domain (Immunogenicity Specimens) ──────────────────────────────────────
+# Three antigens: H1N1 (HAI titre), H3N2 (HAI titre), RSV-F (ELISA IU/mL)
+# Two visits: Day 1 (pre-vaccination baseline) and Day 29 (post-vaccination)
+antigens <- c("H1N1","H3N2","RSV-F")
+visits   <- c("DAY 1","DAY 29")
+days     <- c(1L, 29L)
+
+# Helper: simulate log-normal titres. Vaccine arm has higher post-vax rise.
+sim_titre <- function(arm, antigen, visit, n) {
+  is_vac  <- arm == "VAC"
+  is_post <- visit == "DAY 29"
+
+  # HAI titres (H1N1, H3N2): baseline ~10-40, vaccine arm 4–8-fold rise
+  if (antigen %in% c("H1N1","H3N2")) {
+    base_log2 <- rnorm(n, mean = 4.0, sd = 0.8)   # ~log2(16) baseline
+    rise      <- if (is_vac && is_post) rnorm(n, mean = 2.5, sd = 0.7)
+                 else rnorm(n, mean = 0.2, sd = 0.4)
+    titre_raw <- 2^(base_log2 + rise)
+    # Round to nearest HAI dilution (10, 20, 40, 80, 160, 320, 640)
+    dilutions <- c(10, 20, 40, 80, 160, 320, 640)
+    sapply(titre_raw, function(t) dilutions[which.min(abs(dilutions - t))])
+
+  # RSV-F ELISA titres (IU/mL): baseline ~50-200, vaccine arm ~10-fold rise
+  } else {
+    base_log  <- rnorm(n, mean = log(100), sd = 0.6)
+    rise      <- if (is_vac && is_post) rnorm(n, mean = log(10), sd = 0.5)
+                 else rnorm(n, mean = log(1.1), sd = 0.3)
+    round(exp(base_log + rise), 1)
+  }
+}
+
+is_rows <- lapply(seq_len(n_sub), function(i) {
+  subj  <- adsl_vac$USUBJID[i]
+  arm   <- adsl_vac$ARMCD[i]
+  trtdt <- adsl_vac$TRTSDT[i]
+
+  lapply(seq_along(antigens), function(a) {
+    antigen <- antigens[a]
+    lapply(seq_along(visits), function(v) {
+      visit <- visits[v]; day <- days[v]
+      titre <- sim_titre(arm, antigen, visit, 1)
+      tibble(
+        STUDYID  = "VAC2024",
+        USUBJID  = subj,
+        ISSEQ    = as.integer((i - 1) * 6 + (a - 1) * 2 + v),
+        VISIT    = visit,
+        VISITNUM = as.numeric(v),
+        VISITDY  = day,
+        ISTESTCD = antigen,
+        ISTEST   = case_when(
+          antigen == "H1N1"  ~ "H1N1 Influenza HAI Titre",
+          antigen == "H3N2"  ~ "H3N2 Influenza HAI Titre",
+          antigen == "RSV-F" ~ "RSV Fusion Protein IgG (ELISA)"
+        ),
+        ISCAT    = if_else(antigen %in% c("H1N1","H3N2"), "INFLUENZA", "RSV"),
+        ISORRESU = if_else(antigen %in% c("H1N1","H3N2"), "titre (1:dilution)", "IU/mL"),
+        ISSTRESN = titre,
+        ISSTRESC = as.character(titre),
+        ADT      = trtdt + day - 1L,
+        ADY      = day,
+        ARMCD    = arm,
+        AVAL     = titre
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+}) |> bind_rows()
+
+# ── Pre-built ADIS skeleton ───────────────────────────────────────────────────
+adis_base <- is_rows |>
+  mutate(
+    PARAMCD = ISTESTCD,
+    PARAM   = ISTEST,
+    DTYPE   = NA_character_,
+    AVISITN = if_else(VISIT == "DAY 1", 1, 29),
+    ABLFL   = if_else(VISIT == "DAY 1", "Y", NA_character_)
+  )
+
+# Baseline value per subject per antigen
+adis_base <- adis_base |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    BASE  = AVAL[VISIT == "DAY 1"][1],
+    BASEC = as.character(BASE)
+  ) |>
+  ungroup()
+
+# ── FACE domain (Solicited Adverse Events — reactogenicity) ──────────────────
+# Local: injection-site pain, redness, swelling (Days 1-7)
+# Systemic: fatigue, headache, myalgia, fever (Days 1-7)
+face_symptoms <- tibble(
+  FACECAT  = c(rep("LOCAL", 3), rep("SYSTEMIC", 4)),
+  FACETESTCD = c("PAIN","REDNESS","SWELLING","FATIGUE","HEADACHE","MYALGIA","FEVER"),
+  FACETEST   = c("Injection Site Pain","Injection Site Redness",
+                 "Injection Site Swelling","Fatigue","Headache","Myalgia","Fever")
+)
+
+face_rows <- lapply(seq_len(n_sub), function(i) {
+  subj <- adsl_vac$USUBJID[i]
+  arm  <- adsl_vac$ARMCD[i]
+  trtdt <- adsl_vac$TRTSDT[i]
+
+  lapply(seq_len(nrow(face_symptoms)), function(j) {
+    sym     <- face_symptoms[j, ]
+    is_vac  <- arm == "VAC"
+    # Vaccine arm has higher reactogenicity
+    prob_any <- if (is_vac) {
+      if (sym$FACECAT == "LOCAL") 0.70 else 0.55
+    } else {
+      if (sym$FACECAT == "LOCAL") 0.25 else 0.20
+    }
+    occurred <- rbinom(1, 1, prob_any) == 1
+    if (!occurred) return(NULL)
+
+    # Grade 1–3 (1=mild, 2=moderate, 3=severe)
+    grade  <- sample(1:3, 1, prob = c(.55, .35, .10))
+    onset  <- sample(1:3, 1)   # onset day post-vaccination
+    dur    <- sample(1:5, 1)   # duration in days
+
+    tibble(
+      STUDYID    = "VAC2024",
+      USUBJID    = subj,
+      FACESEQ    = as.integer(i * 10 + j),
+      FACECAT    = sym$FACECAT,
+      FACETESTCD = sym$FACETESTCD,
+      FACETEST   = sym$FACETEST,
+      FACESEV    = c("MILD","MODERATE","SEVERE")[grade],
+      FACESEVN   = grade,
+      FACESTDT   = trtdt + onset,
+      FACEENDT   = trtdt + onset + dur - 1L,
+      ADT        = trtdt + onset,
+      ADURN      = dur,
+      ARMCD      = arm
+    )
+  }) |> bind_rows()
+}) |> bind_rows()
+
+face_rows <- face_rows |> filter(!is.null(USUBJID))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIRALVACCINE FUNCTION MOCKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── GMT/GMFR helpers ─────────────────────────────────────────────────────────
+
+#' Geometric Mean Titre (GMT) — exp(mean(log(AVAL)))
+#' For HAI titres the convention is log2; for ELISA, natural log.
+gmt <- function(x, log_base = exp(1)) {
+  x <- x[x > 0 & !is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  log_base^mean(log(x) / log(log_base))
+}
+
+#' Geometric Mean Fold Rise (GMFR) = GMT(post) / GMT(pre)
+#' Equivalently: exp(mean(log(post/pre)))
+gmfr <- function(post, pre) {
+  ratio <- post / pre
+  ratio <- ratio[ratio > 0 & !is.na(ratio)]
+  if (length(ratio) == 0) return(NA_real_)
+  exp(mean(log(ratio)))
+}
+
+#' Derive log2-transformed titre variable (standard for HAI)
+derive_var_aval_log2 <- function(dataset, aval_var = AVAL, new_var = AVALOG2) {
+  aval_nm <- deparse(substitute(aval_var))
+  new_nm  <- deparse(substitute(new_var))
+  dataset[[new_nm]] <- log2(pmax(dataset[[aval_nm]], 0.5))
+  dataset
+}
+
+#' Derive seroconversion flag per subject per antigen
+#' RECIST analogue: seroconversion = ≥4-fold rise AND post-vax titre ≥ threshold
+#' HAI threshold: 40; ELISA threshold: 4× lower limit of quantitation
+derive_param_seroconversion <- function(dataset,
+                                         dataset_adsl,
+                                         by_vars      = c("USUBJID","PARAMCD"),
+                                         baseline_var = BASE,
+                                         aval_var     = AVAL,
+                                         fold_threshold  = 4,
+                                         titre_threshold = NULL,
+                                         set_values_to   = list(),
+                                         ...) {
+  base_nm  <- deparse(substitute(baseline_var))
+  aval_nm  <- deparse(substitute(aval_var))
+  by_cols  <- if (is.character(by_vars)) by_vars
+              else sapply(by_vars, deparse)
+
+  post <- dataset |> filter(VISIT != "DAY 1", !is.na(.data[[base_nm]]))
+
+  post <- post |>
+    mutate(
+      FOLD_RISE = .data[[aval_nm]] / .data[[base_nm]],
+      .SCFL     = FOLD_RISE >= fold_threshold &
+                  (is.null(titre_threshold) | .data[[aval_nm]] >= titre_threshold)
+    )
+
+  # One row per subject per antigen
+  sc_rows <- post |>
+    group_by(across(all_of(by_cols))) |>
+    summarise(
+      AVAL  = as.integer(any(.SCFL, na.rm = TRUE)),
+      AVALC = if_else(any(.SCFL, na.rm = TRUE), "Y", "N"),
+      .groups = "drop"
+    ) |>
+    mutate(DTYPE = "SCONV")
+
+  for (nm in names(set_values_to)) sc_rows[[nm]] <- set_values_to[[nm]]
+
+  bind_rows(dataset, sc_rows)
+}
+
+#' Derive seroprotection flag
+#' Seroprotection = post-vaccination titre ≥ threshold (e.g., HAI ≥ 40)
+derive_param_seroprotection <- function(dataset,
+                                         dataset_adsl,
+                                         by_vars         = c("USUBJID","PARAMCD"),
+                                         aval_var        = AVAL,
+                                         titre_threshold = 40,
+                                         set_values_to   = list(),
+                                         ...) {
+  aval_nm <- deparse(substitute(aval_var))
+  by_cols <- if (is.character(by_vars)) by_vars
+             else sapply(by_vars, deparse)
+
+  post <- dataset |> filter(VISIT != "DAY 1")
+
+  sp_rows <- post |>
+    group_by(across(all_of(by_cols))) |>
+    summarise(
+      AVAL  = as.integer(any(.data[[aval_nm]] >= titre_threshold, na.rm = TRUE)),
+      AVALC = if_else(any(.data[[aval_nm]] >= titre_threshold, na.rm = TRUE), "Y", "N"),
+      .groups = "drop"
+    ) |>
+    mutate(DTYPE = "SPROT")
+
+  for (nm in names(set_values_to)) sp_rows[[nm]] <- set_values_to[[nm]]
+
+  bind_rows(dataset, sp_rows)
+}
+
+#' Derive GMFR parameter rows (one per subject per antigen)
+derive_param_gmfr <- function(dataset,
+                               by_vars       = c("USUBJID","PARAMCD"),
+                               baseline_var  = BASE,
+                               aval_var      = AVAL,
+                               set_values_to = list(),
+                               ...) {
+  base_nm <- deparse(substitute(baseline_var))
+  aval_nm <- deparse(substitute(aval_var))
+  by_cols <- if (is.character(by_vars)) by_vars
+             else sapply(by_vars, deparse)
+
+  post <- dataset |> filter(VISIT != "DAY 1", !is.na(.data[[base_nm]]),
+                             .data[[base_nm]] > 0)
+
+  gmfr_rows <- post |>
+    mutate(FOLD = .data[[aval_nm]] / .data[[base_nm]]) |>
+    group_by(across(all_of(by_cols))) |>
+    summarise(
+      AVAL = round(exp(mean(log(FOLD[FOLD > 0 & !is.na(FOLD)]))), 3),
+      .groups = "drop"
+    ) |>
+    mutate(DTYPE = "GMFR")
+
+  for (nm in names(set_values_to)) gmfr_rows[[nm]] <- set_values_to[[nm]]
+
+  bind_rows(dataset, gmfr_rows)
+}
+
+#' Derive 4-fold rise flag (simpler than full seroconversion — no titre floor)
+derive_param_fourfold <- function(dataset,
+                                   by_vars      = c("USUBJID","PARAMCD"),
+                                   baseline_var = BASE,
+                                   aval_var     = AVAL,
+                                   fold         = 4,
+                                   set_values_to = list(),
+                                   ...) {
+  base_nm <- deparse(substitute(baseline_var))
+  aval_nm <- deparse(substitute(aval_var))
+  by_cols <- if (is.character(by_vars)) by_vars else sapply(by_vars, deparse)
+
+  post <- dataset |> filter(VISIT != "DAY 1", !is.na(.data[[base_nm]]),
+                             .data[[base_nm]] > 0)
+
+  ff_rows <- post |>
+    mutate(.FF = (.data[[aval_nm]] / .data[[base_nm]]) >= fold) |>
+    group_by(across(all_of(by_cols))) |>
+    summarise(
+      AVAL  = as.integer(any(.FF, na.rm = TRUE)),
+      AVALC = if_else(any(.FF, na.rm = TRUE), "Y", "N"),
+      .groups = "drop"
+    ) |>
+    mutate(DTYPE = "4FOLD")
+
+  for (nm in names(set_values_to)) ff_rows[[nm]] <- set_values_to[[nm]]
+  bind_rows(dataset, ff_rows)
+}
+
+# ── Shared admiral helpers ────────────────────────────────────────────────────
+exprs <- function(...) as.list(substitute(list(...)))[-1]
+
+derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL, ...) {
+  by_nm <- if (is.character(by_vars)) by_vars else sapply(by_vars, deparse)
+  jdf   <- dataset_add
+  if (!is.null(new_vars)) {
+    old <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d,"=")[[1]][2]) else d
+    })
+    new <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d,"=")[[1]][1]) else d
+    })
+    keep <- intersect(c(by_nm, old), names(jdf)); jdf <- jdf |> select(all_of(keep))
+    for (i in seq_along(old))
+      if (old[i] != new[i] && old[i] %in% names(jdf))
+        jdf <- rename(jdf, !!new[i] := !!old[i])
+  }
+  left_join(dataset, jdf, by = intersect(by_nm, names(jdf)))
+}
+```
+
+## Overview
+
+### The vaccine ADaM landscape
+
+Vaccine trials differ fundamentally from therapeutic trials. Instead of measuring disease outcomes in sick patients, they measure **immune response** in healthy volunteers and track **reactogenicity** (side effects). This requires specialised ADaM datasets:
+
+| Dataset | Full Name | Key Content |
+|---------|-----------|-------------|
+| **ADIS** | Immunogenicity Specimens | Antibody titres (HAI, MN, ELISA), seroconversion, seroprotection, GMT |
+| **ADFACE** | Solicited Adverse Events | Reactogenicity: injection-site and systemic reactions, graded 1–3 |
+| **ADCE** | Clinical Events | Unsolicited AEs, medically attended events (MAEs), disease endpoints |
+
+> **SAS parallel:** In SAS vaccine programs, GMT and GMFR are typically computed in `PROC MEANS` with log-transformed data, then back-transformed. `derive_param_gmfr()` and `gmt()` in admiralvaccine replace this with a consistent, reproducible function interface.
+
+### Assay types in this tutorial
+
+| Assay | Abbrev | Measure | Scale |
+|-------|--------|---------|-------|
+| Hemagglutination Inhibition | HAI | Influenza neutralising antibodies | Titre (1:dilution) — rounded to series: 10, 20, 40, 80 … |
+| Enzyme-Linked Immunosorbent Assay | ELISA | RSV-F protein IgG | IU/mL (continuous) |
+| Microneutralisation | MN | Virus neutralisation | Titre (1:dilution) |
+
+```{r overview-explore, exercise=FALSE}
+# Pre-loaded datasets:
+#   adsl_vac  — 120 subjects, arms VAC / PBO
+#   adis_base — IS-derived ADIS skeleton (AVAL = raw titre)
+#   face_rows — FACE-derived reactogenicity events
+
+adis_base |>
+  group_by(PARAMCD, VISIT) |>
+  summarise(
+    n       = n(),
+    GMT     = round(gmt(AVAL), 1),
+    min_val = min(AVAL),
+    max_val = max(AVAL),
+    .groups = "drop"
+  )
+```
+
+---
+
+## Section 1 — Immunogenicity Concepts and Titre Arithmetic
+
+### HAI titres and the log2 scale
+
+HAI titres are reported as reciprocal dilutions (10, 20, 40 …). The conventional analysis scale is **log₂** (so titre 40 → log₂ 40 ≈ 5.32). This linearises the multiplicative fold-rise.
+
+```{r quiz-concepts1, echo=FALSE}
+quiz(
+  caption = "Quiz — Immunogenicity Concepts",
+
+  question("A subject's Day 1 HAI titre is 20 and Day 29 titre is 160. Their fold rise is:",
+    answer("140"),
+    answer("8", correct = TRUE,
+           message = "Fold rise = 160 / 20 = 8. On the log₂ scale this is log₂(8) = 3 doublings."),
+    answer("3"),
+    answer("4"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("Seroconversion for HAI is typically defined as:",
+    answer("Any increase in titre from baseline"),
+    answer("≥4-fold rise in titre AND post-vaccination titre ≥ 40 (1:40)", correct = TRUE,
+           message = "Both conditions must be met: the ratio and the absolute titre floor. This prevents a subject with baseline 5 and post 25 (5-fold but still sub-protective) from being counted as seroconverted."),
+    answer("≥2-fold rise in titre"),
+    answer("Post-vaccination titre ≥ 40 only"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 1.0 — Compute GMT from first principles
+
+The GMT formula is `exp(mean(log(x)))`. Using `adis_base`, compute the GMT for H1N1 at each visit by arm — without using the pre-built `gmt()` helper.
+
+```{r ex-gmt-calc, exercise=TRUE, exercise.lines=12}
+# adis_base has HAI titres for H1N1 at DAY 1 and DAY 29.
+# Compute the Geometric Mean Titre (GMT) for H1N1 by visit and arm.
+# GMT = exp(mean(log(x))). Use filter(PARAMCD == "H1N1").
+
+adis_base |>
+  filter(PARAMCD == ___, !is.na(AVAL)) |>
+  group_by(ARMCD, VISIT) |>
+  summarise(
+    GMT = round(exp(mean(log(___))), 2),
+    n   = n(),
+    .groups = "drop"
+  )
+```
+
+```{r ex-gmt-calc-hint-1}
+# PARAMCD == "H1N1"
+# GMT = exp(mean(log(AVAL)))
+```
+
+```{r ex-gmt-calc-solution}
+adis_base |>
+  filter(PARAMCD == "H1N1", !is.na(AVAL)) |>
+  group_by(ARMCD, VISIT) |>
+  summarise(
+    GMT = round(exp(mean(log(AVAL))), 2),
+    n   = n(),
+    .groups = "drop"
+  )
+```
+
+### Exercise 1.1 — Compute fold rise per subject
+
+Using `adis_base`, compute the fold rise (Day 29 / Day 1) for **H1N1** only. Then find the proportion of subjects in each arm who achieved ≥4-fold rise.
+
+```{r ex-fold-rise, exercise=TRUE, exercise.lines=22}
+# adis_base has USUBJID, PARAMCD, VISIT, AVAL, BASE, ARMCD
+fold_rise_h1n1 <- adis_base |>
+  filter(PARAMCD == ___, VISIT == "DAY 29") |>
+  mutate(
+    FOLD_RISE = ___ / ___,              # post / baseline
+    FOURFOLD  = FOLD_RISE >= ___        # ≥4-fold flag
+  ) |>
+  group_by(___) |>
+  summarise(
+    n           = n(),
+    n_fourfold  = sum(FOURFOLD, na.rm = TRUE),
+    pct_fourfold = round(100 * n_fourfold / n, 1),
+    .groups     = "drop"
+  )
+
+fold_rise_h1n1
+```
+
+```{r ex-fold-rise-hint-1}
+# filter PARAMCD == "H1N1", VISIT == "DAY 29"
+# FOLD_RISE = AVAL / BASE; FOURFOLD = FOLD_RISE >= 4
+# group by ARMCD
+adis_base |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  mutate(FOLD_RISE = AVAL / BASE, FOURFOLD = FOLD_RISE >= 4) |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_fourfold = sum(FOURFOLD, na.rm = TRUE),
+            pct_fourfold = round(100 * n_fourfold / n, 1), .groups = "drop")
+```
+
+```{r ex-fold-rise-solution}
+fold_rise_h1n1 <- adis_base |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  mutate(
+    FOLD_RISE = AVAL / BASE,
+    FOURFOLD  = FOLD_RISE >= 4
+  ) |>
+  group_by(ARMCD) |>
+  summarise(
+    n            = n(),
+    n_fourfold   = sum(FOURFOLD, na.rm = TRUE),
+    pct_fourfold = round(100 * n_fourfold / n, 1),
+    .groups      = "drop"
+  )
+fold_rise_h1n1
+```
+
+### Exercise 1.2 — Log₂ transform and compare distributions
+
+Derive the log₂ titre (`AVALOG2`) using `derive_var_aval_log2()`, then compare the mean log₂ titre at Day 29 by arm and antigen.
+
+```{r ex-log2, exercise=TRUE, exercise.lines=20}
+# Apply log2 transform to ALL rows in adis_base
+adis_log2 <- derive_var_aval_log2(
+  dataset  = ___,
+  aval_var = AVAL,
+  new_var  = AVALOG2
+)
+
+# Mean log2 titre at Day 29 by arm and antigen
+adis_log2 |>
+  filter(VISIT == ___) |>
+  group_by(ARMCD, ___) |>
+  summarise(
+    mean_log2  = round(mean(AVALOG2, na.rm = TRUE), 2),
+    sd_log2    = round(sd(AVALOG2,   na.rm = TRUE), 2),
+    .groups    = "drop"
+  ) |>
+  arrange(PARAMCD, ARMCD)
+```
+
+```{r ex-log2-hint-1}
+# dataset = adis_base; aval_var = AVAL; new_var = AVALOG2
+# filter VISIT == "DAY 29"; group by ARMCD and PARAMCD
+adis_log2 <- derive_var_aval_log2(dataset = adis_base, aval_var = AVAL, new_var = AVALOG2)
+adis_log2 |>
+  filter(VISIT == "DAY 29") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(mean_log2 = round(mean(AVALOG2, na.rm = TRUE), 2),
+            sd_log2 = round(sd(AVALOG2, na.rm = TRUE), 2), .groups = "drop") |>
+  arrange(PARAMCD, ARMCD)
+```
+
+```{r ex-log2-solution}
+adis_log2 <- derive_var_aval_log2(
+  dataset  = adis_base,
+  aval_var = AVAL,
+  new_var  = AVALOG2
+)
+
+adis_log2 |>
+  filter(VISIT == "DAY 29") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(
+    mean_log2 = round(mean(AVALOG2, na.rm = TRUE), 2),
+    sd_log2   = round(sd(AVALOG2,   na.rm = TRUE), 2),
+    .groups   = "drop"
+  ) |>
+  arrange(PARAMCD, ARMCD)
+```
+
+---
+
+## Section 2 — GMT and GMFR
+
+### The GMT / GMFR framework
+
+Every immunogenicity summary table in a vaccine trial has at minimum:
+
+| Statistic | Formula | ADIS DTYPE |
+|-----------|---------|------------|
+| GMT (per visit) | exp(mean(log(AVAL))) | *inline* — not a separate DTYPE |
+| GMFR | exp(mean(log(Day 29 / Day 1))) | `GMFR` |
+| Seroconversion rate | % with ≥4-fold rise AND titre ≥40 | `SCONV` |
+| Seroprotection rate | % with titre ≥40 post-vax | `SPROT` |
+
+```{r quiz-gmt1, echo=FALSE}
+quiz(
+  caption = "Quiz — GMT / GMFR",
+
+  question("GMFR = 6.2 means:",
+    answer("The average titre increased by 6.2 IU/mL"),
+    answer("On average, titres increased 6.2-fold from baseline", correct = TRUE),
+    answer("62% of subjects responded"),
+    answer("The GMT at Day 29 is 6.2 times the lower limit of normal"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("Why is GMFR calculated on the log scale rather than directly as the ratio of GMTs?",
+    answer("They are mathematically identical — it does not matter", correct = FALSE,
+           message = "Actually they ARE mathematically identical: GMT(post)/GMT(pre) = exp(mean(log(post))) / exp(mean(log(pre))) = exp(mean(log(post/pre))). The log-scale approach avoids paired-ratio outliers in some edge cases."),
+    answer("They are mathematically equivalent — exp(mean(log(post/pre))) = GMT(post)/GMT(pre)",
+           correct = TRUE),
+    answer("The ratio of GMTs is biased upward"),
+    answer("Regulatory guidance mandates the log-scale formula"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 2.0 — Compute GMFR manually
+
+Compute GMFR for H1N1 without using `derive_param_gmfr()`. GMFR = GMT(Day 29) / GMT(Day 1). Use `pivot_wider()` to get one row per arm with Day 1 and Day 29 GMTs side by side, then divide.
+
+```{r ex-gmfr-manual, exercise=TRUE, exercise.lines=14}
+# Compute GMFR manually for H1N1: GMFR = GMT(post) / GMT(pre).
+# Use DAY 29 as post, DAY 1 as pre.
+
+gmfr_manual <- adis_base |>
+  filter(PARAMCD == "H1N1", VISIT %in% c("DAY 1", "DAY 29")) |>
+  group_by(ARMCD, VISIT) |>
+  summarise(GMT = exp(mean(log(AVAL))), .groups = "drop") |>
+  pivot_wider(names_from = VISIT, values_from = GMT,
+              names_repair = "universal") |>
+  mutate(GMFR = round(___ / ___, 2))  # DAY.29 / DAY.1
+
+gmfr_manual
+```
+
+```{r ex-gmfr-manual-hint-1}
+# After pivot_wider, column names become "DAY.1" and "DAY.29"
+# GMFR = DAY.29 / DAY.1
+```
+
+```{r ex-gmfr-manual-solution}
+gmfr_manual <- adis_base |>
+  filter(PARAMCD == "H1N1", VISIT %in% c("DAY 1", "DAY 29")) |>
+  group_by(ARMCD, VISIT) |>
+  summarise(GMT = exp(mean(log(AVAL))), .groups = "drop") |>
+  pivot_wider(names_from = VISIT, values_from = GMT,
+              names_repair = "universal") |>
+  mutate(GMFR = round(DAY.29 / DAY.1, 2))
+
+gmfr_manual
+```
+
+### Exercise 2.1 — Compute GMT by arm and antigen
+
+Using `adis_base` and the `gmt()` helper, compute GMT at **each visit** by arm and antigen.
+
+```{r ex-gmt, exercise=TRUE, exercise.lines=18}
+# gmt(x) = exp(mean(log(x))) for x > 0
+# adis_base has AVAL, VISIT, PARAMCD, ARMCD
+
+gmt_table <- adis_base |>
+  group_by(___, ___, ___) |>
+  summarise(
+    n   = n(),
+    GMT = round(gmt(___), 2),
+    .groups = "drop"
+  ) |>
+  arrange(PARAMCD, ARMCD, VISIT)
+
+gmt_table
+```
+
+```{r ex-gmt-hint-1}
+# group by PARAMCD, ARMCD, VISIT; summarise with gmt(AVAL)
+adis_base |>
+  group_by(PARAMCD, ARMCD, VISIT) |>
+  summarise(n = n(), GMT = round(gmt(AVAL), 2), .groups = "drop") |>
+  arrange(PARAMCD, ARMCD, VISIT)
+```
+
+```{r ex-gmt-solution}
+gmt_table <- adis_base |>
+  group_by(PARAMCD, ARMCD, VISIT) |>
+  summarise(
+    n   = n(),
+    GMT = round(gmt(AVAL), 2),
+    .groups = "drop"
+  ) |>
+  arrange(PARAMCD, ARMCD, VISIT)
+
+gmt_table
+```
+
+### Exercise 2.2 — Derive GMFR parameter rows
+
+Use `derive_param_gmfr()` to add per-subject GMFR rows (DTYPE = `"GMFR"`) for all three antigens, then summarise GMFR by arm.
+
+```{r ex-gmfr, exercise=TRUE, exercise.lines=22}
+adis_with_gmfr <- derive_param_gmfr(
+  dataset       = ___,
+  by_vars       = c("USUBJID","PARAMCD"),
+  baseline_var  = BASE,
+  aval_var      = AVAL,
+  set_values_to = list(
+    PARAM   = "Geometric Mean Fold Rise",
+    PARAMCD = "GMFR"
+  )
+)
+
+# Summarise: geometric mean of individual GMFRs by arm and antigen
+adis_with_gmfr |>
+  filter(DTYPE == "GMFR") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(___, PARAMCD) |>
+  summarise(
+    n      = n(),
+    geo_mean_GMFR = round(gmt(___), 2),   # geometric mean of per-subject GMFRs
+    .groups = "drop"
+  ) |>
+  arrange(PARAMCD, ARMCD)
+```
+
+```{r ex-gmfr-hint-1}
+# dataset = adis_base; group by ARMCD and PARAMCD; gmt(AVAL) where DTYPE == "GMFR"
+adis_with_gmfr <- derive_param_gmfr(
+  dataset = adis_base,
+  by_vars = c("USUBJID","PARAMCD"),
+  baseline_var = BASE, aval_var = AVAL,
+  set_values_to = list(PARAM = "Geometric Mean Fold Rise", PARAMCD = "GMFR")
+)
+adis_with_gmfr |>
+  filter(DTYPE == "GMFR") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(n = n(), geo_mean_GMFR = round(gmt(AVAL), 2), .groups = "drop") |>
+  arrange(PARAMCD, ARMCD)
+```
+
+```{r ex-gmfr-solution}
+adis_with_gmfr <- derive_param_gmfr(
+  dataset       = adis_base,
+  by_vars       = c("USUBJID","PARAMCD"),
+  baseline_var  = BASE,
+  aval_var      = AVAL,
+  set_values_to = list(
+    PARAM   = "Geometric Mean Fold Rise",
+    PARAMCD = "GMFR"
+  )
+)
+
+adis_with_gmfr |>
+  filter(DTYPE == "GMFR") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(
+    n             = n(),
+    geo_mean_GMFR = round(gmt(AVAL), 2),
+    .groups       = "drop"
+  ) |>
+  arrange(PARAMCD, ARMCD)
+```
+
+---
+
+## Section 3 — Seroconversion and Seroprotection
+
+### Endpoint definitions at a glance
+
+| Endpoint | Definition | HAI threshold | RSV-F ELISA threshold |
+|----------|-----------|---------------|-----------------------|
+| Seroconversion | ≥4-fold rise AND titre ≥ floor | Titre ≥ 40 | Varies by assay LLOQ |
+| Seroprotection | Titre ≥ protective threshold | ≥ 40 (1:40) | Not applicable |
+| 4-fold rise | ≥4-fold rise (no absolute floor) | — | Common for ELISA |
+
+> **Gotcha:** Seroconversion ≠ 4-fold rise. A subject with baseline 5 rising to 25 (5-fold) achieves the fold criterion but NOT the titre floor (25 < 40), so they are **not** seroconverted. This is the most common mistake in vaccine immunogenicity programming.
+
+```{r quiz-seroconv1, echo=FALSE}
+quiz(
+  caption = "Quiz — Seroconversion vs Seroprotection",
+
+  question("Subject A: baseline HAI 10, Day 29 HAI 40. Subject B: baseline 20, Day 29 40. Who is seroconverted?",
+    answer("Both — both reach titre ≥ 40"),
+    answer("Subject A only — 4-fold rise (10→40) AND titre ≥ 40", correct = TRUE,
+           message = "Subject A: 40/10 = 4× ✓ AND 40 ≥ 40 ✓. Subject B: 40/20 = 2× ✗ — does not meet the ≥4-fold criterion."),
+    answer("Subject B only — higher absolute titre"),
+    answer("Neither — the titre must exceed 40, not equal it"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("Subject C has baseline HAI 10, Day 29 HAI 40. Are they seroprotected?",
+    answer("No — they must have been seroprotected at baseline first"),
+    answer("Yes — post-vaccination titre 40 ≥ 40", correct = TRUE,
+           message = "Seroprotection only checks the post-vaccination titre, not the fold rise. 40 ≥ 40 → seroprotected."),
+    answer("Yes — but only if they are also seroconverted"),
+    answer("No — the threshold is > 40, not ≥ 40"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 3.0 — Manually compute seroconversion flag
+
+Using `adis_base`, manually compute seroconversion for H1N1 without using `derive_param_seroconversion()`. Pivot to wide format so each subject has one row with DAY 1 (pre) and DAY 29 (post), then apply the two-condition rule: fold rise ≥ 4 AND post ≥ 40.
+
+```{r ex-seroconv-flag, exercise=TRUE, exercise.lines=18}
+# Seroconversion = post/pre >= 4 AND post >= 40.
+# Use VISIT == "DAY 1" as pre, and VISIT == "DAY 29" as post.
+
+seroconv_manual <- adis_base |>
+  filter(PARAMCD == "H1N1", VISIT %in% c("DAY 1", "DAY 29")) |>
+  select(USUBJID, VISIT, AVAL, ARMCD) |>
+  pivot_wider(names_from = VISIT, values_from = AVAL,
+              names_repair = "universal") |>
+  rename(PRE = DAY.1, POST = DAY.29) |>
+  mutate(
+    FOLD_RISE   = POST / PRE,
+    SEROCONV_FL = ___ >= 4 & ___ >= 40   # fold rise >= 4 AND post >= 40
+  )
+
+seroconv_manual |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_sc = sum(SEROCONV_FL, na.rm = TRUE),
+            pct = round(100 * mean(SEROCONV_FL, na.rm = TRUE), 1),
+            .groups = "drop")
+```
+
+```{r ex-seroconv-flag-hint-1}
+# FOLD_RISE >= 4 AND POST >= 40
+# SEROCONV_FL = FOLD_RISE >= 4 & POST >= 40
+```
+
+```{r ex-seroconv-flag-solution}
+seroconv_manual <- adis_base |>
+  filter(PARAMCD == "H1N1", VISIT %in% c("DAY 1", "DAY 29")) |>
+  select(USUBJID, VISIT, AVAL, ARMCD) |>
+  pivot_wider(names_from = VISIT, values_from = AVAL,
+              names_repair = "universal") |>
+  rename(PRE = DAY.1, POST = DAY.29) |>
+  mutate(
+    FOLD_RISE   = POST / PRE,
+    SEROCONV_FL = FOLD_RISE >= 4 & POST >= 40
+  )
+
+seroconv_manual |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_sc = sum(SEROCONV_FL, na.rm = TRUE),
+            pct = round(100 * mean(SEROCONV_FL, na.rm = TRUE), 1),
+            .groups = "drop")
+```
+
+### Exercise 3.1 — Derive seroconversion (H1N1 and H3N2 only)
+
+Apply `derive_param_seroconversion()` to HAI titres (H1N1, H3N2). Use `fold_threshold = 4` and `titre_threshold = 40`.
+
+```{r ex-seroconv, exercise=TRUE, exercise.lines=22}
+# Filter to HAI antigens only, then derive seroconversion
+adis_hai <- adis_base |> filter(PARAMCD %in% c("H1N1","H3N2"))
+
+adis_sc <- derive_param_seroconversion(
+  dataset          = ___,
+  dataset_adsl     = adsl_vac,
+  by_vars          = c("USUBJID","PARAMCD"),
+  baseline_var     = BASE,
+  aval_var         = AVAL,
+  fold_threshold   = ___,
+  titre_threshold  = ___,
+  set_values_to    = list(PARAM = "Seroconversion", PARAMCD = "SCONV_HAI")
+)
+
+# Seroconversion rate by arm and antigen
+adis_sc |>
+  filter(DTYPE == "SCONV") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(n = n(), n_sc = sum(AVALC == "Y"),
+            pct = round(100 * n_sc / n, 1), .groups = "drop")
+```
+
+```{r ex-seroconv-hint-1}
+# dataset = adis_hai; fold_threshold = 4; titre_threshold = 40
+adis_sc <- derive_param_seroconversion(
+  dataset = adis_hai, dataset_adsl = adsl_vac,
+  by_vars = c("USUBJID","PARAMCD"), baseline_var = BASE, aval_var = AVAL,
+  fold_threshold = 4, titre_threshold = 40,
+  set_values_to = list(PARAM = "Seroconversion", PARAMCD = "SCONV_HAI")
+)
+adis_sc |>
+  filter(DTYPE == "SCONV") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(n = n(), n_sc = sum(AVALC == "Y"), pct = round(100 * n_sc / n, 1), .groups = "drop")
+```
+
+```{r ex-seroconv-solution}
+adis_hai <- adis_base |> filter(PARAMCD %in% c("H1N1","H3N2"))
+
+adis_sc <- derive_param_seroconversion(
+  dataset         = adis_hai,
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  baseline_var    = BASE,
+  aval_var        = AVAL,
+  fold_threshold  = 4,
+  titre_threshold = 40,
+  set_values_to   = list(PARAM = "Seroconversion", PARAMCD = "SCONV_HAI")
+)
+
+adis_sc |>
+  filter(DTYPE == "SCONV") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(n    = n(), n_sc = sum(AVALC == "Y"),
+            pct  = round(100 * n_sc / n, 1),
+            .groups = "drop")
+```
+
+### Exercise 3.2 — Derive seroprotection
+
+Derive seroprotection for **H1N1** using titre threshold = 40, then compare the pre-vaccination and post-vaccination seroprotection rates.
+
+```{r ex-seroprot, exercise=TRUE, exercise.lines=28}
+# For seroprotection we need to run it separately on Day 1 and Day 29 rows
+sp_day29 <- derive_param_seroprotection(
+  dataset         = adis_base |> filter(PARAMCD == "H1N1", VISIT == "DAY 29"),
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  aval_var        = AVAL,
+  titre_threshold = ___,
+  set_values_to   = list(PARAM = "Seroprotection D29", PARAMCD = "SPROT_D29")
+)
+
+sp_day1 <- derive_param_seroprotection(
+  dataset         = adis_base |> filter(PARAMCD == "H1N1", VISIT == "DAY 1"),
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  aval_var        = AVAL,
+  titre_threshold = ___,
+  set_values_to   = list(PARAM = "Seroprotection D1", PARAMCD = "SPROT_D1")
+)
+
+# Compare rates by arm
+bind_rows(
+  sp_day29 |> filter(DTYPE == "SPROT") |> mutate(Timepoint = "Day 29"),
+  sp_day1  |> filter(DTYPE == "SPROT") |> mutate(Timepoint = "Day 1")
+) |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(Timepoint, ARMCD) |>
+  summarise(n = n(), n_sp = sum(AVALC == "Y"),
+            pct = round(100 * n_sp / n, 1), .groups = "drop") |>
+  arrange(Timepoint, ARMCD)
+```
+
+```{r ex-seroprot-hint-1}
+# titre_threshold = 40 for both Day 29 and Day 1
+# The mock function treats ALL rows as "post-baseline" to evaluate — pass the already-filtered data
+```
+
+```{r ex-seroprot-solution}
+sp_day29 <- derive_param_seroprotection(
+  dataset         = adis_base |> filter(PARAMCD == "H1N1", VISIT == "DAY 29"),
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  aval_var        = AVAL,
+  titre_threshold = 40,
+  set_values_to   = list(PARAM = "Seroprotection D29", PARAMCD = "SPROT_D29")
+)
+
+sp_day1 <- derive_param_seroprotection(
+  dataset         = adis_base |> filter(PARAMCD == "H1N1", VISIT == "DAY 1"),
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  aval_var        = AVAL,
+  titre_threshold = 40,
+  set_values_to   = list(PARAM = "Seroprotection D1", PARAMCD = "SPROT_D1")
+)
+
+bind_rows(
+  sp_day29 |> filter(DTYPE == "SPROT") |> mutate(Timepoint = "Day 29"),
+  sp_day1  |> filter(DTYPE == "SPROT") |> mutate(Timepoint = "Day 1")
+) |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(Timepoint, ARMCD) |>
+  summarise(n = n(), n_sp = sum(AVALC == "Y"),
+            pct = round(100 * n_sp / n, 1),
+            .groups = "drop") |>
+  arrange(Timepoint, ARMCD)
+```
+
+### Exercise 3.3 — RSV: four-fold rise (no titre floor)
+
+ELISA titres (RSV-F) use a **four-fold rise** without a titre floor (the floor varies by assay and LLOQ). Derive the 4-fold rise flag for RSV-F and compute the response rate by arm.
+
+```{r ex-fourfold-rsv, exercise=TRUE, exercise.lines=22}
+adis_rsv_ff <- derive_param_fourfold(
+  dataset       = adis_base |> filter(PARAMCD == ___),
+  by_vars       = c("USUBJID","PARAMCD"),
+  baseline_var  = BASE,
+  aval_var      = AVAL,
+  fold          = ___,
+  set_values_to = list(PARAMCD = "FF_RSV", PARAM = "RSV-F 4-Fold Rise")
+)
+
+adis_rsv_ff |>
+  filter(DTYPE == "4FOLD") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD) |>
+  summarise(
+    n       = n(),
+    n_resp  = sum(AVALC == "Y"),
+    pct     = round(100 * n_resp / n, 1),
+    .groups = "drop"
+  )
+```
+
+```{r ex-fourfold-rsv-hint-1}
+# PARAMCD == "RSV-F"; fold = 4
+adis_rsv_ff <- derive_param_fourfold(
+  dataset = adis_base |> filter(PARAMCD == "RSV-F"),
+  by_vars = c("USUBJID","PARAMCD"), baseline_var = BASE, aval_var = AVAL, fold = 4,
+  set_values_to = list(PARAMCD = "FF_RSV", PARAM = "RSV-F 4-Fold Rise")
+)
+adis_rsv_ff |>
+  filter(DTYPE == "4FOLD") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_resp = sum(AVALC == "Y"),
+            pct = round(100 * n_resp / n, 1), .groups = "drop")
+```
+
+```{r ex-fourfold-rsv-solution}
+adis_rsv_ff <- derive_param_fourfold(
+  dataset       = adis_base |> filter(PARAMCD == "RSV-F"),
+  by_vars       = c("USUBJID","PARAMCD"),
+  baseline_var  = BASE,
+  aval_var      = AVAL,
+  fold          = 4,
+  set_values_to = list(PARAMCD = "FF_RSV", PARAM = "RSV-F 4-Fold Rise")
+)
+
+adis_rsv_ff |>
+  filter(DTYPE == "4FOLD") |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD) |>
+  summarise(
+    n       = n(),
+    n_resp  = sum(AVALC == "Y"),
+    pct     = round(100 * n_resp / n, 1),
+    .groups = "drop"
+  )
+```
+
+---
+
+## Section 4 — ADFACE: Solicited Adverse Events (Reactogenicity)
+
+### What is ADFACE?
+
+ADFACE (Solicited Adverse Events) captures **pre-specified reactions** collected via electronic diary or paper diary within a defined post-vaccination surveillance window (typically 7 days). It is distinct from spontaneous AEs (captured in ADAE).
+
+Key ADFACE variables:
+
+| Variable | Meaning |
+|----------|---------|
+| `FACECAT` | LOCAL (injection site) vs SYSTEMIC |
+| `FACETESTCD` | Symptom code: PAIN, REDNESS, SWELLING, FATIGUE, HEADACHE, MYALGIA, FEVER |
+| `FACESEVN` | Grade 1 (mild) / 2 (moderate) / 3 (severe) |
+| `ADURN` | Duration in days |
+
+```{r quiz-adface1, echo=FALSE}
+quiz(
+  caption = "Quiz — ADFACE Reactogenicity",
+
+  question("Injection site pain and redness are classified as:",
+    answer("Systemic reactions — they affect the whole body"),
+    answer("Local reactions — they occur at the injection site", correct = TRUE),
+    answer("Unsolicited adverse events — they are not pre-specified"),
+    answer("Grade 3 reactions by default"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("The 7-day post-vaccination reactogenicity surveillance period starts:",
+    answer("On Day 1 (day of vaccination)", correct = TRUE,
+           message = "Day 1 = day of vaccination; the diary covers Days 1–7 (inclusive). Some protocols use Day 0 = vax day and Days 1–7."),
+    answer("On Day 2 — the day after vaccination"),
+    answer("On Day 8 — after the acute period"),
+    answer("Whenever the subject first reports a symptom"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 4.0 — Worst symptom grade per subject
+
+`face_rows` contains reactogenicity symptoms with `FACESEVN` (1 = mild, 2 = moderate, 3 = severe). For each subject, find their worst (maximum) symptom grade across all symptoms. Then report the proportion with any Grade 3 (severe) event by arm.
+
+```{r ex-react-worst, exercise=TRUE, exercise.lines=14}
+# face_rows has USUBJID, ARMCD, FACESEVN
+# Step 1: worst grade per subject and arm
+worst_grade_subj <- face_rows |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(MAX_GRADE = max(___, na.rm = TRUE), .groups = "drop")
+
+# Step 2: proportion with Grade 3 by arm
+worst_grade_subj |>
+  group_by(ARMCD) |>
+  summarise(
+    n        = n(),
+    n_grade3 = sum(MAX_GRADE == ___),
+    pct      = round(100 * n_grade3 / n, 1),
+    .groups  = "drop"
+  )
+```
+
+```{r ex-react-worst-hint-1}
+# MAX_GRADE = max(FACESEVN, na.rm = TRUE)
+# n_grade3 = sum(MAX_GRADE == 3)
+```
+
+```{r ex-react-worst-solution}
+worst_grade_subj <- face_rows |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(MAX_GRADE = max(FACESEVN, na.rm = TRUE), .groups = "drop")
+
+worst_grade_subj |>
+  group_by(ARMCD) |>
+  summarise(
+    n        = n(),
+    n_grade3 = sum(MAX_GRADE == 3),
+    pct      = round(100 * n_grade3 / n, 1),
+    .groups  = "drop"
+  )
+```
+
+### Exercise 4.1 — Reactogenicity incidence by grade
+
+Using `face_rows`, compute the incidence (% of subjects with at least one occurrence) of **any Grade ≥ 2** local and systemic reaction, by arm.
+
+```{r ex-reacto-grade, exercise=TRUE, exercise.lines=24}
+# face_rows has USUBJID, FACECAT, FACETESTCD, FACESEVN, ARMCD
+# Count subjects with any Grade >= 2 local OR systemic reaction
+
+reacto_summary <- face_rows |>
+  filter(FACESEVN >= ___) |>
+  group_by(USUBJID, FACECAT, ARMCD) |>
+  summarise(had_reaction = TRUE, .groups = "drop") |>
+  # Join back to adsl to get denominator (all randomised subjects)
+  right_join(
+    adsl_vac |> select(USUBJID, ARMCD),
+    by = c("USUBJID", "ARMCD")
+  ) |>
+  mutate(had_reaction = replace_na(had_reaction, FALSE)) |>
+  group_by(___, ___) |>
+  summarise(
+    n_total    = n(),
+    n_reaction = sum(had_reaction),
+    pct        = round(100 * n_reaction / n_total, 1),
+    .groups    = "drop"
+  ) |>
+  filter(!is.na(___))   # remove rows where FACECAT is NA (non-reactors)
+
+reacto_summary
+```
+
+```{r ex-reacto-grade-hint-1}
+# filter FACESEVN >= 2; group by USUBJID, FACECAT, ARMCD; right_join adsl
+# then group by FACECAT and ARMCD
+face_rows |>
+  filter(FACESEVN >= 2) |>
+  group_by(USUBJID, FACECAT, ARMCD) |>
+  summarise(had_reaction = TRUE, .groups = "drop") |>
+  right_join(adsl_vac |> select(USUBJID, ARMCD), by = c("USUBJID","ARMCD")) |>
+  mutate(had_reaction = replace_na(had_reaction, FALSE)) |>
+  group_by(FACECAT, ARMCD) |>
+  summarise(n_total = n(), n_reaction = sum(had_reaction),
+            pct = round(100 * n_reaction / n_total, 1), .groups = "drop") |>
+  filter(!is.na(FACECAT))
+```
+
+```{r ex-reacto-grade-solution}
+reacto_summary <- face_rows |>
+  filter(FACESEVN >= 2) |>
+  group_by(USUBJID, FACECAT, ARMCD) |>
+  summarise(had_reaction = TRUE, .groups = "drop") |>
+  right_join(
+    adsl_vac |> select(USUBJID, ARMCD),
+    by = c("USUBJID", "ARMCD")
+  ) |>
+  mutate(had_reaction = replace_na(had_reaction, FALSE)) |>
+  group_by(FACECAT, ARMCD) |>
+  summarise(
+    n_total    = n(),
+    n_reaction = sum(had_reaction),
+    pct        = round(100 * n_reaction / n_total, 1),
+    .groups    = "drop"
+  ) |>
+  filter(!is.na(FACECAT))
+
+reacto_summary
+```
+
+### Exercise 4.2 — Mean duration by symptom
+
+Compute the mean duration (in days) for each solicited symptom, limited to subjects who reported it at any grade, by arm.
+
+```{r ex-duration, exercise=TRUE, exercise.lines=18}
+face_rows |>
+  group_by(___, FACETESTCD, FACETEST, FACECAT) |>
+  summarise(
+    n_subjects   = n_distinct(___),
+    mean_dur     = round(mean(ADURN, na.rm = TRUE), 1),
+    pct_grade3   = round(100 * mean(FACESEVN == 3, na.rm = TRUE), 1),
+    .groups      = "drop"
+  ) |>
+  arrange(FACECAT, ARMCD, FACETESTCD)
+```
+
+```{r ex-duration-hint-1}
+# group by ARMCD, FACETESTCD, FACETEST, FACECAT
+# n_distinct(USUBJID); mean(ADURN); mean(FACESEVN == 3) for % Grade 3
+face_rows |>
+  group_by(ARMCD, FACETESTCD, FACETEST, FACECAT) |>
+  summarise(n_subjects = n_distinct(USUBJID),
+            mean_dur = round(mean(ADURN, na.rm = TRUE), 1),
+            pct_grade3 = round(100 * mean(FACESEVN == 3, na.rm = TRUE), 1),
+            .groups = "drop") |>
+  arrange(FACECAT, ARMCD, FACETESTCD)
+```
+
+```{r ex-duration-solution}
+face_rows |>
+  group_by(ARMCD, FACETESTCD, FACETEST, FACECAT) |>
+  summarise(
+    n_subjects = n_distinct(USUBJID),
+    mean_dur   = round(mean(ADURN, na.rm = TRUE), 1),
+    pct_grade3 = round(100 * mean(FACESEVN == 3, na.rm = TRUE), 1),
+    .groups    = "drop"
+  ) |>
+  arrange(FACECAT, ARMCD, FACETESTCD)
+```
+
+---
+
+## Section 5 — Age Subgroup Analyses
+
+### Why age subgroups matter in vaccine trials
+
+Vaccine immunogenicity varies substantially by age: elderly subjects (≥65) often mount weaker responses due to immunosenescence. Regulators require analyses in pre-specified age strata.
+
+```{r quiz-age1, echo=FALSE}
+quiz(
+  caption = "Quiz — Subgroup Analysis",
+
+  question("In a vaccine trial, the elderly subgroup (≥65) typically shows:",
+    answer("Higher seroconversion rates due to prior exposure"),
+    answer("Lower GMT and seroconversion rates due to immunosenescence",
+           correct = TRUE,
+           message = "Immunosenescence — age-related immune decline — leads to weaker vaccine responses in older adults. This is why some vaccines require higher doses or adjuvants for this group."),
+    answer("No difference compared to younger adults"),
+    answer("Higher reactogenicity"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("When computing GMFR within age subgroups, which approach is statistically correct?",
+    answer("Compute GMFR separately within each subgroup", correct = TRUE,
+           message = "Subgroup GMFRs should be computed within-group, not post-hoc filtered from an overall model."),
+    answer("Compute overall GMFR then split by subgroup"),
+    answer("Average the subgroup GMFRs to get an overall GMFR"),
+    answer("Use the same GMFR for all subgroups — it does not vary"),
+    allow_retry = TRUE
+  )
+)
+```
+
+### Exercise 5.1 — GMT and seroprotection by age group
+
+Using `adis_base` and `adsl_vac` (which has `AGEGR1`), compute GMT at Day 29 and seroprotection rate for H1N1, by arm and age group.
+
+```{r ex-age-subgroup, exercise=TRUE, exercise.lines=28}
+# Step 1: merge AGEGR1 from adsl_vac into adis_base
+adis_age <- adis_base |>
+  left_join(select(adsl_vac, USUBJID, AGEGR1), by = "USUBJID")
+
+# Step 2: GMT at Day 29 by arm, age group, antigen (H1N1 only)
+gmt_by_age <- adis_age |>
+  filter(PARAMCD == "H1N1", VISIT == ___) |>
+  group_by(ARMCD, ___) |>
+  summarise(
+    n   = n(),
+    GMT = round(gmt(AVAL), 1),
+    .groups = "drop"
+  )
+
+# Step 3: Seroprotection rate by arm and age group
+sp_by_age <- adis_age |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  group_by(ARMCD, ___) |>
+  summarise(
+    n        = n(),
+    n_sprot  = sum(AVAL >= 40, na.rm = TRUE),
+    pct_sp   = round(100 * n_sprot / n, 1),
+    .groups  = "drop"
+  )
+
+# Combine
+left_join(gmt_by_age, sp_by_age, by = c("ARMCD","AGEGR1")) |>
+  arrange(ARMCD, AGEGR1)
+```
+
+```{r ex-age-subgroup-hint-1}
+# filter VISIT == "DAY 29"; group by ARMCD and AGEGR1
+# GMT: gmt(AVAL); seroprotection: sum(AVAL >= 40)
+adis_age <- adis_base |> left_join(select(adsl_vac, USUBJID, AGEGR1), by = "USUBJID")
+gmt_by_age <- adis_age |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  group_by(ARMCD, AGEGR1) |>
+  summarise(n = n(), GMT = round(gmt(AVAL), 1), .groups = "drop")
+sp_by_age <- adis_age |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  group_by(ARMCD, AGEGR1) |>
+  summarise(n = n(), n_sprot = sum(AVAL >= 40, na.rm = TRUE),
+            pct_sp = round(100 * n_sprot / n, 1), .groups = "drop")
+left_join(gmt_by_age, sp_by_age, by = c("ARMCD","AGEGR1")) |> arrange(ARMCD, AGEGR1)
+```
+
+```{r ex-age-subgroup-solution}
+adis_age <- adis_base |>
+  left_join(select(adsl_vac, USUBJID, AGEGR1), by = "USUBJID")
+
+gmt_by_age <- adis_age |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  group_by(ARMCD, AGEGR1) |>
+  summarise(n = n(), GMT = round(gmt(AVAL), 1), .groups = "drop")
+
+sp_by_age <- adis_age |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  group_by(ARMCD, AGEGR1) |>
+  summarise(n = n(), n_sprot = sum(AVAL >= 40, na.rm = TRUE),
+            pct_sp = round(100 * n_sprot / n, 1), .groups = "drop")
+
+left_join(gmt_by_age, sp_by_age, by = c("ARMCD","AGEGR1")) |>
+  arrange(ARMCD, AGEGR1)
+```
+
+---
+
+## Section 6 — Capstone Problems
+
+### Capstone 1 — Complete ADIS Assembly
+
+**Scenario:** You are programming ADIS for a bivalent influenza + RSV vaccine submission. The statistical analysis plan requires a single ADIS containing:
+
+| PARAMCD | Description | DTYPE |
+|---------|-------------|-------|
+| `H1N1`, `H3N2`, `RSV-F` | Observed titre (as-is rows) | NA |
+| `GMFR` | Per-subject geometric mean fold rise for each antigen | `GMFR` |
+| `SCONV` | Seroconversion (≥4-fold AND ≥40) for HAI antigens only | `SCONV` |
+| `FF_RSV` | 4-fold rise for RSV-F | `4FOLD` |
+| `SPROT` | Seroprotection (≥40) for HAI antigens | `SPROT` |
+
+Additionally: `CHG` = AVAL − BASE and `PCHG` = 100 × CHG / BASE must be present on **observed titre rows** (not summary DTYPE rows).
+
+```{r capstone1, exercise=TRUE, exercise.lines=70}
+# ── Step 1: Observed titres with CHG / PCHG ───────────────────────────────────
+adis_obs <- adis_base |>
+  filter(is.na(DTYPE)) |>
+  mutate(
+    CHG  = AVAL - BASE,
+    PCHG = round(100 * CHG / BASE, 2)
+  )
+
+# ── Step 2: GMFR rows for all three antigens ──────────────────────────────────
+adis_gmfr <- derive_param_gmfr(
+  dataset       = ___,
+  by_vars       = c("USUBJID","PARAMCD"),
+  baseline_var  = BASE,
+  aval_var      = AVAL,
+  set_values_to = list(PARAM = "Geometric Mean Fold Rise")
+)
+
+# ── Step 3: Seroconversion for HAI antigens ───────────────────────────────────
+adis_sc <- derive_param_seroconversion(
+  dataset         = adis_obs |> filter(PARAMCD %in% c("H1N1","H3N2")),
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  baseline_var    = BASE,
+  aval_var        = AVAL,
+  fold_threshold  = ___,
+  titre_threshold = ___,
+  set_values_to   = list(PARAM = "Seroconversion", PARAMCD = "SCONV")
+)
+
+# ── Step 4: 4-fold rise for RSV-F ─────────────────────────────────────────────
+adis_ff <- derive_param_fourfold(
+  dataset       = adis_obs |> filter(PARAMCD == ___),
+  by_vars       = c("USUBJID","PARAMCD"),
+  baseline_var  = BASE,
+  aval_var      = AVAL,
+  fold          = 4,
+  set_values_to = list(PARAM = "RSV-F 4-Fold Rise", PARAMCD = "FF_RSV")
+)
+
+# ── Step 5: Seroprotection for HAI ───────────────────────────────────────────
+adis_sp <- derive_param_seroprotection(
+  dataset         = adis_obs |> filter(PARAMCD %in% c("H1N1","H3N2"),
+                                        VISIT == "DAY 29"),
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  aval_var        = AVAL,
+  titre_threshold = ___,
+  set_values_to   = list(PARAM = "Seroprotection", PARAMCD = "SPROT")
+)
+
+# ── Step 6: Assemble ─────────────────────────────────────────────────────────
+adis_final <- bind_rows(
+  adis_obs,
+  adis_gmfr |> filter(DTYPE == "GMFR"),
+  adis_sc   |> filter(DTYPE == "SCONV"),
+  adis_ff   |> filter(DTYPE == "4FOLD"),
+  adis_sp   |> filter(DTYPE == "SPROT")
+) |>
+  arrange(USUBJID, PARAMCD, DTYPE, VISIT)
+
+# ── Validation ────────────────────────────────────────────────────────────────
+cat("Total rows:", nrow(adis_final), "\n")
+adis_final |>
+  count(PARAMCD, DTYPE) |>
+  arrange(PARAMCD, DTYPE) |>
+  print()
+```
+
+```{r capstone1-hint-1}
+# Step 2: dataset = adis_obs (or adis_base with is.na filter)
+# Step 3: fold_threshold = 4, titre_threshold = 40
+# Step 4: PARAMCD == "RSV-F"
+# Step 5: titre_threshold = 40
+```
+
+```{r capstone1-hint-2}
+# Step 2:
+adis_gmfr <- derive_param_gmfr(
+  dataset = adis_obs, by_vars = c("USUBJID","PARAMCD"),
+  baseline_var = BASE, aval_var = AVAL,
+  set_values_to = list(PARAM = "Geometric Mean Fold Rise")
+)
+# Step 3: fold_threshold = 4, titre_threshold = 40
+# Step 4: filter(PARAMCD == "RSV-F")
+# Step 5: titre_threshold = 40
+```
+
+```{r capstone1-solution}
+adis_obs <- adis_base |>
+  filter(is.na(DTYPE)) |>
+  mutate(CHG  = AVAL - BASE,
+         PCHG = round(100 * CHG / BASE, 2))
+
+adis_gmfr <- derive_param_gmfr(
+  dataset       = adis_obs,
+  by_vars       = c("USUBJID","PARAMCD"),
+  baseline_var  = BASE, aval_var = AVAL,
+  set_values_to = list(PARAM = "Geometric Mean Fold Rise")
+)
+
+adis_sc <- derive_param_seroconversion(
+  dataset         = adis_obs |> filter(PARAMCD %in% c("H1N1","H3N2")),
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  baseline_var    = BASE, aval_var = AVAL,
+  fold_threshold  = 4, titre_threshold = 40,
+  set_values_to   = list(PARAM = "Seroconversion", PARAMCD = "SCONV")
+)
+
+adis_ff <- derive_param_fourfold(
+  dataset       = adis_obs |> filter(PARAMCD == "RSV-F"),
+  by_vars       = c("USUBJID","PARAMCD"),
+  baseline_var  = BASE, aval_var = AVAL, fold = 4,
+  set_values_to = list(PARAM = "RSV-F 4-Fold Rise", PARAMCD = "FF_RSV")
+)
+
+adis_sp <- derive_param_seroprotection(
+  dataset         = adis_obs |> filter(PARAMCD %in% c("H1N1","H3N2"),
+                                        VISIT == "DAY 29"),
+  dataset_adsl    = adsl_vac,
+  by_vars         = c("USUBJID","PARAMCD"),
+  aval_var        = AVAL, titre_threshold = 40,
+  set_values_to   = list(PARAM = "Seroprotection", PARAMCD = "SPROT")
+)
+
+adis_final <- bind_rows(
+  adis_obs,
+  adis_gmfr |> filter(DTYPE == "GMFR"),
+  adis_sc   |> filter(DTYPE == "SCONV"),
+  adis_ff   |> filter(DTYPE == "4FOLD"),
+  adis_sp   |> filter(DTYPE == "SPROT")
+) |>
+  arrange(USUBJID, PARAMCD, DTYPE, VISIT)
+
+cat("Total rows:", nrow(adis_final), "\n")
+adis_final |>
+  count(PARAMCD, DTYPE) |>
+  arrange(PARAMCD, DTYPE) |>
+  print()
+```
+
+### Capstone 2 — Immunogenicity Summary Table (ISE format)
+
+**Scenario:** Build a submission-ready immunogenicity summary table matching the format used in Integrated Summary of Efficacy (ISE) documents. The table must show for each antigen and arm:
+
+- N (evaluable subjects)
+- GMT at Day 1 and Day 29 (with 95% CI using ±1.96 SE on log scale)
+- GMFR (with 95% CI)
+- Seroconversion rate % (n / N)
+- Seroprotection rate % at Day 29
+
+95% CI for GMT: back-transform from `exp(mean(log) ± 1.96 × sd(log)/√N)`
+
+```{r capstone2, exercise=TRUE, exercise.lines=60}
+# ── Helper: GMT with 95% CI string ───────────────────────────────────────────
+gmt_ci <- function(x) {
+  x   <- x[x > 0 & !is.na(x)]
+  n   <- length(x)
+  if (n == 0) return(NA_character_)
+  lx  <- log(x)
+  mn  <- mean(lx)
+  se  <- sd(lx) / sqrt(n)
+  sprintf("%.1f (%.1f, %.1f)", exp(mn), exp(mn - 1.96*se), exp(mn + 1.96*se))
+}
+
+# ── Observed titre data ───────────────────────────────────────────────────────
+obs <- adis_base |>
+  filter(is.na(DTYPE)) |>
+  left_join(select(adsl_vac, USUBJID, AGEGR1), by = "USUBJID")
+
+# ── GMT at Day 1 and Day 29 ──────────────────────────────────────────────────
+gmt_rows <- obs |>
+  group_by(ARMCD, PARAMCD, VISIT) |>
+  summarise(
+    N         = n(),
+    Stat      = paste0("GMT (", VISIT, ")"),
+    Value     = gmt_ci(___),
+    .groups   = "drop"
+  )
+
+# ── GMFR ────────────────────────────────────────────────────────────────────
+gmfr_rows <- obs |>
+  filter(VISIT == "DAY 29", BASE > 0) |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(
+    N     = n(),
+    Stat  = "GMFR (Day 1 → Day 29)",
+    Value = {
+      folds <- AVAL / BASE
+      folds <- folds[folds > 0]
+      gmt_ci(folds)
+    },
+    .groups = "drop"
+  )
+
+# ── Seroconversion (HAI only) ────────────────────────────────────────────────
+sconv_rows <- obs |>
+  filter(PARAMCD %in% c("H1N1","H3N2"), VISIT == "DAY 29") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(
+    N     = n(),
+    Stat  = "Seroconversion n (%)",
+    Value = {
+      sc <- (AVAL / BASE >= 4) & (AVAL >= 40)
+      sprintf("%d (%.1f%%)", sum(sc, na.rm=TRUE),
+              100*mean(sc, na.rm=TRUE))
+    },
+    .groups = "drop"
+  )
+
+# ── Seroprotection (HAI only, Day 29) ────────────────────────────────────────
+sprot_rows <- obs |>
+  filter(PARAMCD %in% c("H1N1","H3N2"), VISIT == "DAY 29") |>
+  group_by(___, ___) |>
+  summarise(
+    N     = n(),
+    Stat  = "Seroprotection n (%)",
+    Value = sprintf("%d (%.1f%%)", sum(AVAL >= 40, na.rm=TRUE),
+                    100*mean(AVAL >= 40, na.rm=TRUE)),
+    .groups = "drop"
+  )
+
+# ── Assemble ─────────────────────────────────────────────────────────────────
+ise_table <- bind_rows(gmt_rows, gmfr_rows, sconv_rows, sprot_rows) |>
+  select(PARAMCD, ARMCD, N, Stat, Value) |>
+  arrange(PARAMCD, ARMCD, Stat)
+
+print(ise_table, n = Inf)
+```
+
+```{r capstone2-hint-1}
+# gmt_rows: gmt_ci(AVAL)
+# sprot_rows: group by ARMCD and PARAMCD (same pattern as sconv_rows)
+```
+
+```{r capstone2-solution}
+gmt_ci <- function(x) {
+  x  <- x[x > 0 & !is.na(x)]; n <- length(x)
+  if (n == 0) return(NA_character_)
+  lx <- log(x); mn <- mean(lx); se <- sd(lx) / sqrt(n)
+  sprintf("%.1f (%.1f, %.1f)", exp(mn), exp(mn - 1.96*se), exp(mn + 1.96*se))
+}
+
+obs <- adis_base |>
+  filter(is.na(DTYPE)) |>
+  left_join(select(adsl_vac, USUBJID, AGEGR1), by = "USUBJID")
+
+gmt_rows <- obs |>
+  group_by(ARMCD, PARAMCD, VISIT) |>
+  summarise(N = n(), Stat = paste0("GMT (", VISIT, ")"),
+            Value = gmt_ci(AVAL), .groups = "drop")
+
+gmfr_rows <- obs |>
+  filter(VISIT == "DAY 29", BASE > 0) |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(N = n(), Stat = "GMFR (Day 1 → Day 29)",
+            Value = { folds <- AVAL / BASE; folds <- folds[folds > 0]; gmt_ci(folds) },
+            .groups = "drop")
+
+sconv_rows <- obs |>
+  filter(PARAMCD %in% c("H1N1","H3N2"), VISIT == "DAY 29") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(N = n(), Stat = "Seroconversion n (%)",
+            Value = { sc <- (AVAL / BASE >= 4) & (AVAL >= 40)
+                      sprintf("%d (%.1f%%)", sum(sc,na.rm=TRUE), 100*mean(sc,na.rm=TRUE)) },
+            .groups = "drop")
+
+sprot_rows <- obs |>
+  filter(PARAMCD %in% c("H1N1","H3N2"), VISIT == "DAY 29") |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(N = n(), Stat = "Seroprotection n (%)",
+            Value = sprintf("%d (%.1f%%)", sum(AVAL >= 40, na.rm=TRUE),
+                            100*mean(AVAL >= 40, na.rm=TRUE)),
+            .groups = "drop")
+
+ise_table <- bind_rows(gmt_rows, gmfr_rows, sconv_rows, sprot_rows) |>
+  select(PARAMCD, ARMCD, N, Stat, Value) |>
+  arrange(PARAMCD, ARMCD, Stat)
+
+print(ise_table, n = Inf)
+```
+
+---
+
+## Section 7 — Hard Challenges
+
+### Challenge 1 — Baseline seropositive subjects
+
+**Background:** Subjects who are seropositive at baseline (pre-existing titre ≥ 40 for HAI) respond differently to vaccination. Regulators require efficacy analyses stratified by baseline serostatus. Flag all subjects as `SEROPRE = "Y"/"N"` at Day 1 per antigen, then re-compute seroconversion rates separately for seronegative and seropositive subjects.
+
+```{r challenge-seropre, exercise=TRUE, exercise.lines=36}
+# Step 1: Seropositivity flag at Day 1 per antigen (HAI only)
+baseline_status <- adis_base |>
+  filter(VISIT == "DAY 1", PARAMCD %in% c("H1N1","H3N2")) |>
+  mutate(SEROPRE = if_else(AVAL >= ___, "Y", "N")) |>
+  select(USUBJID, PARAMCD, SEROPRE)
+
+# Step 2: Attach SEROPRE to post-baseline rows and compute fold rise
+sc_by_seropre <- adis_base |>
+  filter(VISIT == "DAY 29", PARAMCD %in% c("H1N1","H3N2")) |>
+  left_join(___, by = c("USUBJID","PARAMCD")) |>
+  mutate(
+    FOLD_RISE = AVAL / BASE,
+    SCONV     = (FOLD_RISE >= 4) & (AVAL >= 40)
+  ) |>
+  group_by(ARMCD, PARAMCD, ___) |>
+  summarise(
+    n        = n(),
+    n_sc     = sum(SCONV, na.rm = TRUE),
+    pct_sc   = round(100 * n_sc / n, 1),
+    GMT_D29  = round(gmt(AVAL), 1),
+    .groups  = "drop"
+  )
+
+sc_by_seropre |> arrange(PARAMCD, ARMCD, SEROPRE)
+```
+
+```{r challenge-seropre-hint-1}
+# Threshold for seropositivity: AVAL >= 40
+# left_join baseline_status by c("USUBJID","PARAMCD")
+# group by ARMCD, PARAMCD, SEROPRE
+```
+
+```{r challenge-seropre-solution}
+baseline_status <- adis_base |>
+  filter(VISIT == "DAY 1", PARAMCD %in% c("H1N1","H3N2")) |>
+  mutate(SEROPRE = if_else(AVAL >= 40, "Y", "N")) |>
+  select(USUBJID, PARAMCD, SEROPRE)
+
+sc_by_seropre <- adis_base |>
+  filter(VISIT == "DAY 29", PARAMCD %in% c("H1N1","H3N2")) |>
+  left_join(baseline_status, by = c("USUBJID","PARAMCD")) |>
+  mutate(FOLD_RISE = AVAL / BASE,
+         SCONV     = (FOLD_RISE >= 4) & (AVAL >= 40)) |>
+  group_by(ARMCD, PARAMCD, SEROPRE) |>
+  summarise(n = n(), n_sc = sum(SCONV, na.rm = TRUE),
+            pct_sc = round(100 * n_sc / n, 1),
+            GMT_D29 = round(gmt(AVAL), 1), .groups = "drop")
+
+sc_by_seropre |> arrange(PARAMCD, ARMCD, SEROPRE)
+```
+
+### Challenge 2 — Reactogenicity severity shift analysis
+
+**Scenario:** The DSMB requests a **worst-grade** reactogenicity profile: for each subject and each symptom, what was the worst (maximum) grade reported over the 7-day diary? Then produce a cross-tabulation of worst grade (None / Grade 1 / Grade 2 / Grade 3) by arm and symptom — similar to a CTCAE shift table.
+
+```{r challenge-worst-grade, exercise=TRUE, exercise.lines=40}
+# Step 1: Find worst grade per subject per symptom
+worst_grade <- face_rows |>
+  group_by(USUBJID, FACETESTCD, FACETEST, FACECAT, ARMCD) |>
+  summarise(WORST_GRADE = max(FACESEVN, na.rm = TRUE), .groups = "drop")
+
+# Step 2: Fill in subjects who did NOT report a symptom (worst grade = 0 = "None")
+all_combos <- expand_grid(
+  USUBJID    = adsl_vac$USUBJID,
+  FACETESTCD = face_symptoms$FACETESTCD
+) |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  left_join(face_symptoms, by = "FACETESTCD") |>
+  left_join(___, by = c("USUBJID","FACETESTCD","ARMCD")) |>
+  mutate(
+    WORST_GRADE = replace_na(___, 0L),
+    GRADE_LABEL = case_when(
+      WORST_GRADE == 0 ~ "None",
+      WORST_GRADE == 1 ~ "Grade 1",
+      WORST_GRADE == 2 ~ "Grade 2",
+      WORST_GRADE == 3 ~ "Grade 3"
+    )
+  )
+
+# Step 3: Cross-tab
+shift_tbl <- all_combos |>
+  group_by(ARMCD, FACECAT, FACETESTCD, GRADE_LABEL) |>
+  summarise(n = n(), .groups = "drop") |>
+  pivot_wider(names_from = ___, values_from = n, values_fill = 0L) |>
+  select(ARMCD, FACECAT, FACETESTCD, None, `Grade 1`, `Grade 2`, `Grade 3`) |>
+  arrange(FACECAT, ARMCD, FACETESTCD)
+
+print(shift_tbl, n = Inf)
+```
+
+```{r challenge-worst-grade-hint-1}
+# left_join worst_grade by c("USUBJID","FACETESTCD","ARMCD")
+# replace_na(WORST_GRADE, 0L)
+# pivot_wider: names_from = GRADE_LABEL
+```
+
+```{r challenge-worst-grade-solution}
+worst_grade <- face_rows |>
+  group_by(USUBJID, FACETESTCD, FACETEST, FACECAT, ARMCD) |>
+  summarise(WORST_GRADE = max(FACESEVN, na.rm = TRUE), .groups = "drop")
+
+all_combos <- expand_grid(
+  USUBJID    = adsl_vac$USUBJID,
+  FACETESTCD = face_symptoms$FACETESTCD
+) |>
+  left_join(select(adsl_vac, USUBJID, ARMCD), by = "USUBJID") |>
+  left_join(face_symptoms, by = "FACETESTCD") |>
+  left_join(worst_grade, by = c("USUBJID","FACETESTCD","ARMCD")) |>
+  mutate(
+    WORST_GRADE = replace_na(WORST_GRADE, 0L),
+    GRADE_LABEL = case_when(
+      WORST_GRADE == 0 ~ "None",
+      WORST_GRADE == 1 ~ "Grade 1",
+      WORST_GRADE == 2 ~ "Grade 2",
+      WORST_GRADE == 3 ~ "Grade 3"
+    )
+  )
+
+shift_tbl <- all_combos |>
+  group_by(ARMCD, FACECAT, FACETESTCD, GRADE_LABEL) |>
+  summarise(n = n(), .groups = "drop") |>
+  pivot_wider(names_from = GRADE_LABEL, values_from = n, values_fill = 0L) |>
+  select(ARMCD, FACECAT, FACETESTCD,
+         any_of(c("None","Grade 1","Grade 2","Grade 3"))) |>
+  arrange(FACECAT, ARMCD, FACETESTCD)
+
+print(shift_tbl, n = Inf)
+```
+
+### Challenge 3 — Vaccine efficacy against seroconversion using risk ratio
+
+**Advanced:** Compute the **risk ratio (RR)** and its 95% CI for seroconversion (H1N1) comparing VAC to PBO. Use the log-binomial formula: RR = p_vac / p_pbo; 95% CI via `exp(log(RR) ± 1.96 × sqrt(1/x_vac − 1/n_vac + 1/x_pbo − 1/n_pbo))`.
+
+```{r challenge-rr, exercise=TRUE, exercise.lines=36}
+# Step 1: Seroconversion counts per arm (H1N1)
+sc_counts <- adis_base |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  mutate(SC = (AVAL / BASE >= 4) & (AVAL >= 40)) |>
+  group_by(ARMCD) |>
+  summarise(n = n(), x = sum(SC, na.rm = TRUE),
+            p = x / n, .groups = "drop")
+
+sc_counts
+
+# Step 2: Extract components
+n_vac <- sc_counts$n[sc_counts$ARMCD == "VAC"]
+x_vac <- sc_counts$x[sc_counts$ARMCD == "VAC"]
+n_pbo <- sc_counts$n[sc_counts$ARMCD == "PBO"]
+x_pbo <- sc_counts$x[sc_counts$ARMCD == "PBO"]
+
+p_vac <- x_vac / n_vac
+p_pbo <- x_pbo / n_pbo
+
+# Step 3: Risk Ratio and 95% CI
+RR    <- ___ / ___
+se_lnRR <- sqrt(1/x_vac - 1/n_vac + 1/x_pbo - 1/n_pbo)
+CI_lo <- exp(log(RR) - 1.96 * se_lnRR)
+CI_hi <- exp(log(RR) + 1.96 * se_lnRR)
+
+cat(sprintf(
+  "H1N1 Seroconversion\n  VAC: %d/%d (%.1f%%)\n  PBO: %d/%d (%.1f%%)\n  RR: %.2f (95%% CI: %.2f, %.2f)\n",
+  x_vac, n_vac, 100*p_vac,
+  x_pbo, n_pbo, 100*p_pbo,
+  RR, CI_lo, CI_hi
+))
+```
+
+```{r challenge-rr-hint-1}
+# RR = p_vac / p_pbo
+# se_lnRR = sqrt(1/x_vac - 1/n_vac + 1/x_pbo - 1/n_pbo)
+# CI: exp(log(RR) ± 1.96 * se_lnRR)
+```
+
+```{r challenge-rr-solution}
+sc_counts <- adis_base |>
+  filter(PARAMCD == "H1N1", VISIT == "DAY 29") |>
+  mutate(SC = (AVAL / BASE >= 4) & (AVAL >= 40)) |>
+  group_by(ARMCD) |>
+  summarise(n = n(), x = sum(SC, na.rm = TRUE), p = x / n, .groups = "drop")
+
+sc_counts
+
+n_vac <- sc_counts$n[sc_counts$ARMCD == "VAC"]
+x_vac <- sc_counts$x[sc_counts$ARMCD == "VAC"]
+n_pbo <- sc_counts$n[sc_counts$ARMCD == "PBO"]
+x_pbo <- sc_counts$x[sc_counts$ARMCD == "PBO"]
+p_vac <- x_vac / n_vac
+p_pbo <- x_pbo / n_pbo
+
+RR       <- p_vac / p_pbo
+se_lnRR  <- sqrt(1/x_vac - 1/n_vac + 1/x_pbo - 1/n_pbo)
+CI_lo    <- exp(log(RR) - 1.96 * se_lnRR)
+CI_hi    <- exp(log(RR) + 1.96 * se_lnRR)
+
+cat(sprintf(
+  "H1N1 Seroconversion\n  VAC: %d/%d (%.1f%%)\n  PBO: %d/%d (%.1f%%)\n  RR: %.2f (95%% CI: %.2f, %.2f)\n",
+  x_vac, n_vac, 100*p_vac, x_pbo, n_pbo, 100*p_pbo, RR, CI_lo, CI_hi
+))
+```
+
+---
+
+## Lesson Summary
+
+```{r quiz-final, echo=FALSE}
+quiz(
+  caption = "Final Knowledge Check",
+
+  question("The correct formula for Geometric Mean Titre (GMT) from individual titres x₁, x₂ … xₙ is:",
+    answer("mean(x)"),
+    answer("exp(mean(log(x)))", correct = TRUE),
+    answer("median(x)"),
+    answer("prod(x)^(1/n) — which is equivalent to exp(mean(log(x)))",
+           correct = TRUE,
+           message = "Both are correct and mathematically identical: the geometric mean."),
+    allow_retry = TRUE
+  ),
+
+  question("Which statement correctly distinguishes seroconversion from a 4-fold rise?",
+    answer("They are the same thing"),
+    answer("Seroconversion requires ≥4-fold rise AND post-vaccination titre ≥ threshold; a 4-fold rise has no titre floor",
+           correct = TRUE),
+    answer("A 4-fold rise requires a higher fold increase (≥8-fold)"),
+    answer("Seroconversion applies only to ELISA; 4-fold rise applies to HAI"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise — End-to-end immunogenicity summary
+
+Bring it all together: for **both HAI antigens** (H1N1 and H3N2), compute a one-table summary by arm showing GMT at Day 29, GMFR, and seroconversion rate. Use the `gmt()` helper and the seroconversion two-condition rule directly (no helper functions needed).
+
+```{r ex-final-summary, exercise=TRUE, exercise.lines=22}
+# adis_base has PARAMCD, VISIT, AVAL, BASE, ARMCD
+# Filter to HAI antigens and DAY 29 post-vaccination rows
+
+adis_base |>
+  filter(PARAMCD %in% c("H1N1", "H3N2"), VISIT == ___) |>
+  mutate(
+    FOLD_RISE = AVAL / BASE,
+    SCONV     = FOLD_RISE >= ___ & AVAL >= ___   # seroconversion two conditions
+  ) |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(
+    n          = n(),
+    GMT_D29    = round(gmt(___), 1),
+    GMFR       = round(exp(mean(log(FOLD_RISE[FOLD_RISE > 0 & !is.na(FOLD_RISE)]))), 2),
+    n_sc       = sum(SCONV, na.rm = TRUE),
+    pct_sc     = round(100 * n_sc / n, 1),
+    .groups    = "drop"
+  ) |>
+  arrange(PARAMCD, ARMCD)
+```
+
+```{r ex-final-summary-hint-1}
+# VISIT == "DAY 29"
+# SCONV = FOLD_RISE >= 4 & AVAL >= 40
+# GMT_D29 = gmt(AVAL)
+```
+
+```{r ex-final-summary-solution}
+adis_base |>
+  filter(PARAMCD %in% c("H1N1", "H3N2"), VISIT == "DAY 29") |>
+  mutate(
+    FOLD_RISE = AVAL / BASE,
+    SCONV     = FOLD_RISE >= 4 & AVAL >= 40
+  ) |>
+  group_by(ARMCD, PARAMCD) |>
+  summarise(
+    n       = n(),
+    GMT_D29 = round(gmt(AVAL), 1),
+    GMFR    = round(exp(mean(log(FOLD_RISE[FOLD_RISE > 0 & !is.na(FOLD_RISE)]))), 2),
+    n_sc    = sum(SCONV, na.rm = TRUE),
+    pct_sc  = round(100 * n_sc / n, 1),
+    .groups = "drop"
+  ) |>
+  arrange(PARAMCD, ARMCD)
+```
+
+### Key takeaways
+
+You have learned to:
+
+- Understand vaccine ADaM datasets: ADIS (immunogenicity), ADFACE (reactogenicity), ADCE (clinical events)
+- Apply the GMT / GMFR framework using log-normal arithmetic
+- Distinguish seroconversion (fold + titre floor) from seroprotection (titre only) and 4-fold rise (fold only)
+- Use `derive_param_seroconversion()`, `derive_param_seroprotection()`, `derive_param_gmfr()`, and `derive_param_fourfold()`
+- Build ADFACE reactogenicity summaries with grade-based incidence and worst-grade shift tables
+- Perform age-stratified immunogenicity analyses and risk ratio estimation for regulatory submissions
+
+**Next lesson:** Lesson 22 — `admiralophtha` — ADaM derivations for ophthalmology trials (BCVA, IOP, retinal thickness, laterality handling).

@@ -11,6 +11,32 @@ description: >
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 15_admiral_part2_adsl.Rmd
+# PURPOSE       : admiral Part 2 — ADSL derivation: treatment variables, disposition
+#                 endpoints, baseline flags (SAFFL, ITTFL), study day
+#                 calculations, and population-level subject-level
+#                 analysis dataset construction.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tidyr)
@@ -18,6 +44,9 @@ library(lubridate)
 library(stringr)
 
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# exprs: capture unevaluated arguments as a list of expressions (mirrors rlang::exprs)
+exprs <- function(...) as.list(substitute(list(...)))[-1]
 
 # ── Mock admiral functions (same as Lesson 14 + new ones) ────────────────────
 
@@ -104,10 +133,11 @@ derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
                                 missing_values = NULL) {
   by_nm <- sapply(by_vars, deparse)
   fe    <- substitute(filter_add)
-  if (!is.null(fe) && deparse(fe) != "NULL")
+  # collapse deparse to single string — avoids length > 1 error with compound expressions
+  if (!is.null(fe) && paste(deparse(fe), collapse = " ") != "NULL")
     dataset_add <- dataset_add |> filter(!!fe)
   if (!is.null(order)) {
-    ord_nm  <- sapply(order, deparse)
+    ord_nm   <- sapply(order, deparse)
     ord_desc <- grepl("^desc\\(", ord_nm)
     ord_cl   <- str_replace_all(ord_nm, "^desc\\(|\\)$", "")
     for (i in rev(seq_along(ord_cl)))
@@ -119,14 +149,15 @@ derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
     dataset_add <- dataset_add |> group_by(across(all_of(by_nm))) |> fn(n = 1) |> ungroup()
   }
   if (!is.null(new_vars)) {
-    nv_nm  <- sapply(new_vars, deparse)
-    nv_map <- setNames(names(nv_nm), nv_nm)
+    nv_nm <- sapply(new_vars, deparse)           # c(new_name = "old_name")
     dataset_add <- dataset_add |>
-      select(any_of(c(by_nm, names(nv_map)))) |>
-      rename(any_of(nv_map))
+      select(any_of(c(by_nm, unname(nv_nm)))) |> # select by OLD column names
+      rename(any_of(nv_nm))                       # rename(any_of(c(new="old"))) ✓
+    new_col_names <- names(nv_nm)                 # the NEW column names for the join
+  } else {
+    new_col_names <- setdiff(names(dataset_add), by_nm)
   }
-  keep <- setdiff(names(dataset_add), names(dataset)[names(dataset) != by_nm])
-  dataset |> left_join(dataset_add |> select(any_of(c(by_nm, sapply(new_vars, deparse)))), by = by_nm)
+  dataset |> left_join(dataset_add |> select(any_of(c(by_nm, new_col_names))), by = by_nm)
 }
 
 derive_var_trtdurd <- function(dataset, new_var = TRTDURD,
@@ -179,24 +210,24 @@ derive_vars_extreme_event <- function(dataset, by_vars, events, order, mode,
 
   event_rows <- lapply(events, function(ev) {
     src <- source_datasets[[ev$dataset_name]]
-    # Apply filter
-    if (!is.null(ev$filter) && deparse(ev$filter) != "NULL")
+    # Apply filter (collapse deparse to avoid length > 1 in compound expressions)
+    if (!is.null(ev$filter) && paste(deparse(ev$filter), collapse = " ") != "NULL")
       src <- src |> filter(!!ev$filter)
     if (nrow(src) == 0) return(NULL)
     # Evaluate date expression
     src <- src |> mutate(.EVENT_DATE = !!ev$date)
-    # Apply set_values_to
-    nv_names <- sapply(ev$set_values_to, deparse)
-    for (i in seq_along(nv_names)) {
-      out_nm  <- names(nv_names)[i]
-      src_col <- nv_names[i]
-      src[[out_nm]] <- tryCatch(src[[src_col]], error = function(e) src[[src_col]])
+    # Apply set_values_to: evaluate each expression (handles function calls like convert_dtc_to_dt())
+    for (i in seq_along(ev$set_values_to)) {
+      out_nm   <- names(ev$set_values_to)[i]
+      src_expr <- ev$set_values_to[[i]]
+      src <- src |> mutate(!!out_nm := !!src_expr)
     }
-    src |> select(any_of(c(by_nm, ".EVENT_DATE", names(nv_names))))
+    src |> select(any_of(c(by_nm, ".EVENT_DATE", names(ev$set_values_to))))
   }) |> bind_rows()
 
   if (nrow(event_rows) == 0) {
-    for (nm in names(sapply(new_vars, deparse))) dataset[[nm]] <- NA_character_
+    # new_vars are unnamed exprs e.g. exprs(DTHCAUS, DTHDT) — use values, not names
+    for (nm in sapply(new_vars, deparse)) dataset[[nm]] <- NA_character_
     return(dataset)
   }
 
@@ -305,6 +336,13 @@ lb <- tibble(
   LBDTC    = c("2014-01-02", "2014-04-01", "2012-08-05", "2013-07-09"),
   LBORRES  = c("28", "35", "22", "41")
 ) |> convert_blanks_to_na()
+
+# ── Real pharmaverse datasets (for validation exercises) ──────────────────────
+library(pharmaversesdtm)
+library(pharmaverseadam)
+dm_real   <- pharmaversesdtm::dm |> convert_blanks_to_na()
+ex_real   <- pharmaversesdtm::ex |> convert_blanks_to_na()
+adsl_real <- pharmaverseadam::adsl
 ```
 
 ## Welcome
@@ -465,6 +503,105 @@ adsl_dur |>
     TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01"),
     TRTEDT_human = as.Date(TRTEDT, origin = "1970-01-01")
   )
+```
+
+### Exercise: Validate TRTSDT against real pharmaverseadam data
+
+Use `dm_real` and `ex_real` (the full CDISCPILOT01 SDTM datasets from pharmaversesdtm) to re-derive TRTSDT for the first 10 subjects, then compare to the published values in `adsl_real`.
+
+> **Why this matters:** In real submissions, your ADSL is compared to an independently derived QC dataset. Discrepancies usually mean a wrong filter, wrong mode, or a missing `convert_blanks_to_na()`.
+
+```{r trt-dates-real-validate, exercise=TRUE, exercise.lines=52}
+# Step 1: subset to 10 subjects that appear in adsl_real
+subs10 <- adsl_real$USUBJID[1:10]
+
+dm10 <- dm_real |> filter(USUBJID %in% subs10)
+
+ex10_ext <- ex_real |>
+  filter(USUBJID %in% subs10) |>
+  derive_vars_dtm(
+    dtc             = EXSTDTC,
+    new_vars_prefix = "EXST",
+    date_imputation = "first",
+    time_imputation = "first"
+  )
+
+# Step 2: derive TRTSDTM → TRTSDT using the standard EX filter
+derived10 <- dm10 |>
+  derive_vars_merged(
+    dataset_add = ex10_ext,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &
+                  !is.na(EXSTDTM),
+    new_vars    = exprs(TRTSDTM = EXSTDTM),
+    order       = exprs(EXSTDTM, EXSEQ),
+    mode        = "first",
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  derive_vars_dtm_to_dt(source_vars = exprs(TRTSDTM)) |>
+  mutate(TRTSDT_derived = as.Date(TRTSDT, origin = "1970-01-01"))
+
+# Step 3: pull reference from pharmaverseadam and compare
+ref <- adsl_real |>
+  filter(USUBJID %in% subs10) |>
+  select(USUBJID, TRTSDT_ref = TRTSDT)
+
+comparison <- left_join(
+  derived10 |> select(USUBJID, ARM, TRTSDT_derived),
+  ref, by = "USUBJID"
+) |>
+  mutate(
+    d_derived = as.integer(TRTSDT_derived),
+    d_ref     = as.integer(as.Date(TRTSDT_ref, origin = "1970-01-01")),
+    MATCH     = (d_derived == d_ref) | (is.na(d_derived) & is.na(d_ref))
+  ) |>
+  select(USUBJID, ARM, TRTSDT_derived, TRTSDT_ref, MATCH)
+
+cat("Matching subjects:", sum(comparison$MATCH, na.rm = TRUE), "/ 10\n\n")
+print(comparison)
+```
+
+```{r trt-dates-real-validate-hint-1}
+# The key EX filter: (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))
+# mode = "first"  picks the earliest qualifying dose start (= first treatment date)
+# Any mismatch here suggests a filter, mode, or blank-handling discrepancy
+```
+
+```{r trt-dates-real-validate-solution}
+subs10 <- adsl_real$USUBJID[1:10]
+dm10 <- dm_real |> filter(USUBJID %in% subs10)
+
+ex10_ext <- ex_real |>
+  filter(USUBJID %in% subs10) |>
+  derive_vars_dtm(
+    dtc = EXSTDTC, new_vars_prefix = "EXST",
+    date_imputation = "first", time_imputation = "first"
+  )
+
+derived10 <- dm10 |>
+  derive_vars_merged(
+    dataset_add = ex10_ext,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &
+                  !is.na(EXSTDTM),
+    new_vars    = exprs(TRTSDTM = EXSTDTM),
+    order       = exprs(EXSTDTM, EXSEQ),
+    mode        = "first",
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  derive_vars_dtm_to_dt(source_vars = exprs(TRTSDTM)) |>
+  mutate(TRTSDT_derived = as.Date(TRTSDT, origin = "1970-01-01"))
+
+ref <- adsl_real |>
+  filter(USUBJID %in% subs10) |>
+  select(USUBJID, TRTSDT_ref = TRTSDT)
+
+left_join(derived10 |> select(USUBJID, ARM, TRTSDT_derived), ref, by = "USUBJID") |>
+  mutate(
+    d_derived = as.integer(TRTSDT_derived),
+    d_ref     = as.integer(as.Date(TRTSDT_ref, origin = "1970-01-01")),
+    MATCH     = (d_derived == d_ref) | (is.na(d_derived) & is.na(d_ref))
+  ) |>
+  select(USUBJID, ARM, TRTSDT_derived, TRTSDT_ref, MATCH) |>
+  print()
 ```
 
 ---
@@ -915,6 +1052,201 @@ adsl_full |>
 
 ---
 
+## 11.5 — P21 Derivation Diagnostics
+
+Clinical programmers submitting to FDA routinely receive Pinnacle 21 (P21) validation reports that flag derivation errors in ADSL. This section presents three realistic bugs — each accompanied by a **P21-style derivation method specification** exactly as it would appear in a define.xml submission file. Your task: read the spec, study the broken code, identify what is wrong, and fix it.
+
+> **Format for each exercise:** (1) the derivation specification text, (2) the broken programmer code, (3) the P21 error message received. Fill in the blank to correct the code.
+
+---
+
+### Diagnostic 1 — SAFFL: Safety Analysis Set Flag
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *SAFFL = 'Y' if the subject has at least one exposure record in EX where EXDOSE > 0, OR where EXDOSE = 0 AND EXTRT contains the string 'PLACEBO'. Subjects with no qualifying EX record should have SAFFL missing (not 'N'). ADaM IG §4.5. Source variables: EX.EXDOSE, EX.EXTRT.*
+
+The programmer submitted:
+
+```r
+adsl_draft <- dm |>
+  mutate(TRT01P = ARM, TRT01A = ACTARM) |>
+  derive_var_merged_exist_flag(
+    dataset_add = ex,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = SAFFL,
+    condition   = EXDOSE > 0          # ← bug here
+  )
+```
+
+**P21 report:** *"SAFFL is missing for 2 Placebo subjects. All subjects with an EX record should have SAFFL populated per derivation spec."*
+
+```{r p21-bug-saffl, exercise=TRUE, exercise.lines=18}
+# Fix the SAFFL derivation so Placebo subjects (EXDOSE = 0, EXTRT contains "PLACEBO")
+# are correctly included in the Safety Analysis Set.
+
+adsl_fixed_saffl <- dm |>
+  mutate(TRT01P = ARM, TRT01A = ACTARM) |>
+  derive_var_merged_exist_flag(
+    dataset_add = ex,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = SAFFL,
+    condition   = ___
+  )
+
+adsl_fixed_saffl |> select(USUBJID, ACTARM, SAFFL)
+# Expected: all 5 subjects have SAFFL = "Y"
+```
+
+```{r p21-bug-saffl-hint-1}
+# The condition must cover BOTH active-dose records AND zero-dose placebo records:
+# condition = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))
+```
+
+```{r p21-bug-saffl-solution}
+adsl_fixed_saffl <- dm |>
+  mutate(TRT01P = ARM, TRT01A = ACTARM) |>
+  derive_var_merged_exist_flag(
+    dataset_add = ex,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = SAFFL,
+    condition   = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))
+  )
+
+adsl_fixed_saffl |> select(USUBJID, ACTARM, SAFFL)
+# All 5 subjects should now have SAFFL = "Y"
+```
+
+---
+
+### Diagnostic 2 — TRTDURD: Treatment Duration in Days
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *TRTDURD = number of days of study treatment exposure. Calculated as TRTEDT − TRTSDT + 1 (inclusive of both the first and last treatment dates). Unit: days. Source variables: derived TRTSDT, TRTEDT.*
+
+The programmer submitted:
+
+```r
+adsl_dur_draft <- adsl |>
+  derive_vars_duration(
+    new_var    = TRTDURD,
+    start_date = TRTSDT,
+    end_date   = TRTEDT,
+    out_unit   = "days",
+    add_one    = FALSE         # ← bug here
+  )
+```
+
+**P21 report:** *"TRTDURD is 1 day less than expected for all subjects. Example: USUBJID 01-701-1015 — TRTSDT = 2014-01-02, TRTEDT = 2014-06-15. Expected TRTDURD = 165; observed = 164."*
+
+```{r p21-bug-trtdurd, exercise=TRUE, exercise.lines=22}
+# adsl already has TRTSDT and TRTEDT from the demo steps above.
+# Fix the duration derivation to match the spec (inclusive: TRTEDT - TRTSDT + 1).
+
+adsl_fixed_dur <- adsl |>
+  derive_vars_duration(
+    new_var    = TRTDURD_fixed,
+    start_date = TRTSDT,
+    end_date   = TRTEDT,
+    out_unit   = "days",
+    add_one    = ___           # fix this argument
+  )
+
+# Compare broken vs fixed vs expected
+adsl_fixed_dur |>
+  select(USUBJID, TRTSDT, TRTEDT, TRTDURD, TRTDURD_fixed) |>
+  mutate(
+    TRTSDT_d = as.Date(TRTSDT, origin = "1970-01-01"),
+    TRTEDT_d = as.Date(TRTEDT, origin = "1970-01-01"),
+    expected = as.integer(TRTEDT_d - TRTSDT_d) + 1L
+  )
+```
+
+```{r p21-bug-trtdurd-hint-1}
+# add_one = TRUE  ← the spec says "inclusive of both endpoints" = TRTEDT - TRTSDT + 1
+# add_one = FALSE gives TRTEDT - TRTSDT (excludes the start day) — 1 day short
+```
+
+```{r p21-bug-trtdurd-solution}
+adsl_fixed_dur <- adsl |>
+  derive_vars_duration(
+    new_var    = TRTDURD_fixed,
+    start_date = TRTSDT,
+    end_date   = TRTEDT,
+    out_unit   = "days",
+    add_one    = TRUE
+  )
+
+adsl_fixed_dur |>
+  select(USUBJID, TRTSDT, TRTEDT, TRTDURD, TRTDURD_fixed) |>
+  mutate(
+    TRTSDT_d = as.Date(TRTSDT, origin = "1970-01-01"),
+    TRTEDT_d = as.Date(TRTEDT, origin = "1970-01-01"),
+    expected = as.integer(TRTEDT_d - TRTSDT_d) + 1L
+  )
+```
+
+---
+
+### Diagnostic 3 — COMPLFL: Study Completion Flag
+
+**Derivation method (define.xml / Pinnacle 21 field):**
+
+> *COMPLFL = 'Y' if the subject completed the study per protocol (DCSREAS = 'COMPLETED STUDY'). Subjects who did not complete should have COMPLFL missing. Per ADaM IG §4.5, flag variables take values 'Y' or missing — the value 'N' is not permitted. Source variables: derived DCSREAS.*
+
+The programmer submitted:
+
+```r
+adsl_comp_draft <- adsl_with_dcsreas |>
+  mutate(COMPLFL = if_else(DCSREAS == "COMPLETED STUDY", "Y", "N"))   # ← bug here
+```
+
+**P21 report:** *"AD0018 — COMPLFL contains the value 'N'. Flag variables (suffix -FL) must only contain 'Y' or missing per ADaM IG. Permissible values violated."*
+
+```{r p21-bug-complfl, exercise=TRUE, exercise.lines=22}
+# Build adsl_with_dcsreas (self-contained — ds_ext is available from the demo chunks above)
+adsl_with_dcsreas <- adsl |>
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(DCSREAS = DSTERM),
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+# Fix: replace "N" with the correct ADaM IG value for subjects not in the flag group
+adsl_fixed_complfl <- adsl_with_dcsreas |>
+  mutate(COMPLFL = if_else(DCSREAS == "COMPLETED STUDY", "Y", ___))
+
+adsl_fixed_complfl |>
+  select(USUBJID, ACTARM, DCSREAS, COMPLFL)
+# Expected: completers → "Y"; discontinuers → NA (not "N")
+```
+
+```{r p21-bug-complfl-hint-1}
+# ADaM IG: flag variables are "Y" or NA — the value "N" is never valid.
+# Use NA_character_ as the false branch:
+# mutate(COMPLFL = if_else(DCSREAS == "COMPLETED STUDY", "Y", NA_character_))
+```
+
+```{r p21-bug-complfl-solution}
+adsl_with_dcsreas <- adsl |>
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(DCSREAS = DSTERM),
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_fixed_complfl <- adsl_with_dcsreas |>
+  mutate(COMPLFL = if_else(DCSREAS == "COMPLETED STUDY", "Y", NA_character_))
+
+adsl_fixed_complfl |>
+  select(USUBJID, ACTARM, DCSREAS, COMPLFL)
+```
+
+---
+
 ## 12 — Validation strategy
 
 ```{r quiz-validation, echo=FALSE}
@@ -950,25 +1282,94 @@ quiz(
 ```{r quiz-final-15, echo=FALSE}
 quiz(
   question(
-    "The standard admiral pattern for most ADSL variables from EX is:",
-    answer("derive_vars_dtm() on EX → derive_vars_merged() with filter/order/mode onto ADSL", correct = TRUE),
-    answer("derive_param_*() to add EX parameters"),
-    answer("Manually mutate() with left_join()"),
-    random_answer_order = TRUE
+    "A programmer derives SAFFL using `condition = EXDOSE > 0`. P21 reports SAFFL is missing for all Placebo subjects. What is the correct fix?",
+    answer("Change to `condition = EXDOSE >= 0`"),
+    answer("Add `mutate(SAFFL = if_else(ARM == 'Placebo', 'Y', SAFFL))` after the flag derivation"),
+    answer("Use `condition = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, 'PLACEBO')))`", correct = TRUE),
+    answer("Filter EX to only rows where EXDOSE > 0 before calling derive_var_merged_exist_flag()"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
   ),
   question(
-    "derive_vars_extreme_event() is used for DTHCAUS and LSTALVDT because:",
-    answer("These variables can come from multiple different source datasets, and you need the first/last across all of them", correct = TRUE),
-    answer("derive_vars_merged() can't handle date variables"),
-    answer("It's faster than derive_vars_merged() for large datasets"),
-    random_answer_order = TRUE
+    "The derivation spec says TRTDURD = TRTEDT − TRTSDT + 1 (inclusive). The programmer uses `add_one = FALSE`. A subject treated January 1–31 gets TRTDURD = 30. The spec expects 31. What does `add_one = FALSE` calculate?",
+    answer("The elapsed gap between two dates, not counting the start day — TRTEDT − TRTSDT with no +1 adjustment", correct = TRUE),
+    answer("Duration rounded down to avoid double-counting"),
+    answer("Duration in calendar months instead of days"),
+    answer("Exactly the same result as add_one = TRUE"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
   ),
   question(
-    "After this lesson, what are the three most common admiral functions you'll use in any ADSL build?",
-    answer("derive_vars_dt/dtm(), derive_vars_merged(), derive_var_merged_exist_flag()", correct = TRUE),
-    answer("derive_param_*(), derive_vars_dy(), compute_*()"),
-    answer("combine_supp(), build_from_derived(), check_variables()"),
-    random_answer_order = TRUE
+    "P21 rule AD0018 flags COMPLFL = 'N'. Why does 'N' violate ADaM IG and what replaces it?",
+    answer("'N' is not a valid R logical — use FALSE instead"),
+    answer("ADaM IG §4.5 specifies flag variables take values 'Y' or missing (NA_character_) — 'N' is prohibited", correct = TRUE),
+    answer("'N' causes a metadata mismatch with the define.xml codelist for FL variables"),
+    answer("'N' is valid in SDTM but not in ADaM — use 0 instead"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "LSTALVDT is the *last* known alive date. A programmer accidentally writes `mode = 'first'` in derive_vars_extreme_event(). What is the consequence?",
+    answer("The function throws an error — 'first' is not a valid mode for alive-date sources"),
+    answer("LSTALVDT is set to the *earliest* date the subject was observed alive, underestimating their known survival time", correct = TRUE),
+    answer("LSTALVDT is replaced by the death date for subjects who died"),
+    answer("No consequence — for alive-date derivations, 'first' and 'last' produce identical results"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "The AGEGR1N derivation uses `between(AGE, 18, 65) ~ 2` for the '18-64' group. A 65-year-old ends up in AGEGR1N = 2 instead of AGEGR1N = 3 ('>=65'). What is the bug?",
+    answer("`between(AGE, 18, 65)` includes 65 (it is inclusive on both ends) — the fix is `between(AGE, 18, 64)`", correct = TRUE),
+    answer("case_when() evaluates all conditions and picks the last match, overwriting group 3 with group 2"),
+    answer("Age 65 belongs in group 2 per CDISC ADaM IG guidance"),
+    answer("The bug is only in the character AGEGR1 variable, not AGEGR1N"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "A programmer forgets convert_blanks_to_na() on DM before building ADSL. Some subjects have ARM = '' (empty string). What goes wrong downstream?",
+    answer("admiral immediately errors when it encounters empty strings in character columns"),
+    answer("Empty strings pass `!is.na(ARM)` checks, so those subjects appear to have a valid ARM — but str_detect() and equality comparisons on ARM then return NA or FALSE unexpectedly, producing wrong flags", correct = TRUE),
+    answer("Nothing — admiral automatically coerces empty strings to NA internally"),
+    answer("Empty strings are identical to NA in all R comparisons"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "The spec says EOSDT is the date of the subject's disposition event, excluding screen failures. A programmer writes `filter_add = DSDECOD == 'COMPLETED'`. Which subjects will have a missing EOSDT?",
+    answer("Only subjects who completed the study — they are included, not excluded"),
+    answer("All subjects who discontinued (adverse event, withdrew consent, lost to follow-up) because their DSDECOD is not 'COMPLETED'", correct = TRUE),
+    answer("Subjects with partial disposition dates only"),
+    answer("All subjects — the filter should be on DSCAT, not DSDECOD"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "EXSTDTC = '2014-07' (year-month partial date, no day). The programmer calls derive_vars_dtm(..., date_imputation = 'first', time_imputation = 'first'). What datetime will EXSTDTM represent?",
+    answer("2014-07-15T12:00:00 — admiral imputes the middle of the period"),
+    answer("NA — admiral cannot impute partial dates with a missing day component"),
+    answer("2014-07-01T00:00:00 — 'first' imputes the first day of the month and midnight time", correct = TRUE),
+    answer("2014-07-31T23:59:59 — admiral always imputes to the end of the period by default"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "Why is derive_vars_extreme_event() preferred over two sequential derive_vars_merged() calls when deriving DTHCAUS from both DS and AE?",
+    answer("derive_vars_extreme_event() executes in a single database pass and is more memory efficient"),
+    answer("Sequential derive_vars_merged() calls overwrite the first source's value for subjects found in both sources — derive_vars_extreme_event() selects the true first/last event across all sources simultaneously", correct = TRUE),
+    answer("derive_vars_merged() cannot join on date columns — only character keys"),
+    answer("There is no practical difference; both approaches produce identical results for all subjects"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
+  ),
+  question(
+    "The standard admiral pipeline for treatment start date is: (1) derive_vars_dtm() on EX, (2) derive_vars_merged() onto ADSL, (3) derive_vars_dtm_to_dt(). Why does step 3 come last — why not derive the date directly in step 1?",
+    answer("Admiral stores datetimes internally as numerics; deriving the datetime first preserves precision and time-flag metadata (TRTSTMF); dtm_to_dt() then creates the date-only variable cleanly from the stored datetime", correct = TRUE),
+    answer("derive_vars_merged() can only operate on datetime (POSIXct) columns, not Date columns"),
+    answer("Step 3 is only required for submission datasets — it is optional for internal QC"),
+    answer("TRTSDT must be sourced from DM.RFXSTDTC, not EX — step 3 reads it from the correct domain"),
+    random_answer_order = TRUE,
+    allow_retry = TRUE
   )
 )
 ```

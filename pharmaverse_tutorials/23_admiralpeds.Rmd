@@ -1,0 +1,1879 @@
+---
+title: "Lesson 23 — admiral Paediatric Extension (admiralpeds): Growth, Age & Weight-Based Dosing"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Paediatric ADaM derivations using the admiralpeds package: precise age
+  calculations (chronological and corrected for preterm), WHO/CDC growth
+  standard z-scores (WAZ, HAZ, BAZ, WHZ) via the LMS method, percentile
+  conversions, stunting/wasting/overweight flags, weight-based dosing with
+  dose-cap logic, and developmental milestone analysis. Includes paediatric
+  epilepsy and asthma trial capstone problems.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 23_admiralpeds.Rmd
+# PURPOSE       : admiralpeds extension — paediatric ADaM: corrected age for preterm
+#                 infants, WHO/CDC LMS growth z-scores (WAZ/HAZ/BAZ),
+#                 nutritional status flags
+#                 (stunting/wasting/overweight), and weight-based dosing
+#                 with Levetiracetam dose-cap logic.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMPLIFIED WHO CDC LMS REFERENCE TABLES
+# LMS values by sex and age (months). These are representative values
+# from the WHO growth standards (0–60 months) and CDC reference (24–216 months).
+# L = Box-Cox power, M = median, S = coefficient of variation.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Weight-for-age LMS (boys: SEX="M", girls: SEX="F") — selected ages in months
+waz_lms <- tribble(
+  ~SEX, ~AGE_MO, ~L_WAZ,  ~M_WAZ,  ~S_WAZ,
+  "M",  24,      0.3209,  12.526,  0.1157,
+  "M",  36,      0.2986,  14.302,  0.1192,
+  "M",  48,      0.2810,  16.118,  0.1226,
+  "M",  60,      0.2630,  18.020,  0.1265,
+  "M",  72,      0.1730,  20.120,  0.1380,
+  "M",  84,      0.0833,  22.400,  0.1470,
+  "M",  96,     -0.0100,  24.930,  0.1550,
+  "M", 108,     -0.1038,  27.840,  0.1625,
+  "M", 120,     -0.1983,  31.090,  0.1695,
+  "M", 132,     -0.2921,  34.740,  0.1760,
+  "M", 144,     -0.3872,  38.870,  0.1820,
+  "M", 156,     -0.4829,  43.420,  0.1873,
+  "M", 168,     -0.5791,  48.320,  0.1920,
+  "M", 180,     -0.6750,  53.440,  0.1960,
+  "M", 192,     -0.7712,  58.660,  0.1993,
+  "M", 204,     -0.8672,  63.720,  0.2018,
+  "F",  24,     -0.0631,  11.922,  0.1275,
+  "F",  36,     -0.1051,  13.598,  0.1317,
+  "F",  48,     -0.1472,  15.376,  0.1358,
+  "F",  60,     -0.1890,  17.275,  0.1399,
+  "F",  72,     -0.3039,  19.380,  0.1513,
+  "F",  84,     -0.4186,  21.690,  0.1620,
+  "F",  96,     -0.5341,  24.290,  0.1720,
+  "F", 108,     -0.6497,  27.240,  0.1812,
+  "F", 120,     -0.7658,  30.540,  0.1897,
+  "F", 132,     -0.8820,  34.300,  0.1975,
+  "F", 144,     -0.9984,  38.540,  0.2045,
+  "F", 156,     -1.1148,  43.250,  0.2107,
+  "F", 168,     -1.2308,  48.320,  0.2162,
+  "F", 180,     -1.3465,  53.590,  0.2208,
+  "F", 192,     -1.4620,  58.880,  0.2245,
+  "F", 204,     -1.5773,  63.890,  0.2274
+)
+
+# Height-for-age LMS (representative values)
+haz_lms <- tribble(
+  ~SEX, ~AGE_MO, ~L_HAZ,  ~M_HAZ,  ~S_HAZ,
+  "M",  24,       1.0000,  87.80,   0.0370,
+  "M",  36,       1.0000,  96.10,   0.0356,
+  "M",  48,       1.0000, 103.30,   0.0347,
+  "M",  60,       1.0000, 110.00,   0.0400,
+  "M",  72,       1.0000, 116.10,   0.0401,
+  "M",  84,       1.0000, 121.70,   0.0396,
+  "M",  96,       1.0000, 127.00,   0.0395,
+  "M", 108,       1.0000, 132.20,   0.0396,
+  "M", 120,       1.0000, 137.50,   0.0400,
+  "M", 132,       1.0000, 143.00,   0.0408,
+  "M", 144,       1.0000, 148.80,   0.0420,
+  "M", 156,       1.0000, 154.80,   0.0435,
+  "M", 168,       1.0000, 161.00,   0.0446,
+  "M", 180,       1.0000, 166.20,   0.0445,
+  "M", 192,       1.0000, 169.60,   0.0434,
+  "M", 204,       1.0000, 171.40,   0.0422,
+  "F",  24,       1.0000,  86.40,   0.0372,
+  "F",  36,       1.0000,  95.10,   0.0357,
+  "F",  48,       1.0000, 102.70,   0.0350,
+  "F",  60,       1.0000, 109.40,   0.0393,
+  "F",  72,       1.0000, 115.60,   0.0393,
+  "F",  84,       1.0000, 121.60,   0.0389,
+  "F",  96,       1.0000, 127.30,   0.0388,
+  "F", 108,       1.0000, 133.00,   0.0390,
+  "F", 120,       1.0000, 138.90,   0.0396,
+  "F", 132,       1.0000, 145.10,   0.0405,
+  "F", 144,       1.0000, 151.50,   0.0411,
+  "F", 156,       1.0000, 157.10,   0.0409,
+  "F", 168,       1.0000, 161.00,   0.0399,
+  "F", 180,       1.0000, 163.20,   0.0388,
+  "F", 192,       1.0000, 164.30,   0.0380,
+  "F", 204,       1.0000, 164.80,   0.0375
+)
+
+# BMI-for-age LMS (selected representative values)
+baz_lms <- tribble(
+  ~SEX, ~AGE_MO, ~L_BAZ,  ~M_BAZ,  ~S_BAZ,
+  "M",  24,      -2.5396,  16.016,  0.0848,
+  "M",  48,      -3.1005,  15.439,  0.0869,
+  "M",  72,      -2.5390,  15.343,  0.0948,
+  "M",  96,      -1.9811,  15.750,  0.1025,
+  "M", 120,      -1.4418,  16.528,  0.1095,
+  "M", 144,      -0.9122,  17.592,  0.1156,
+  "M", 168,      -0.3945,  18.844,  0.1204,
+  "M", 192,       0.0963,  20.146,  0.1238,
+  "M", 204,       0.2967,  20.706,  0.1249,
+  "F",  24,      -2.8665,  15.687,  0.0931,
+  "F",  48,      -3.3691,  15.124,  0.0951,
+  "F",  72,      -2.8568,  15.117,  0.1024,
+  "F",  96,      -2.3425,  15.590,  0.1097,
+  "F", 120,      -1.8270,  16.408,  0.1166,
+  "F", 144,      -1.3106,  17.511,  0.1228,
+  "F", 168,      -0.7934,  18.866,  0.1280,
+  "F", 192,      -0.2756,  20.300,  0.1320,
+  "F", 204,      -0.0166,  20.929,  0.1336
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNTHETIC PAEDIATRIC TRIAL DATA
+# Phase III paediatric epilepsy trial.
+# Drug: Levetiracetam-like anti-epileptic, weight-based dosing.
+# 80 children aged 2–16 years; treatment for 52 weeks.
+# Measurements: weight, height, seizure frequency, developmental scores.
+# ══════════════════════════════════════════════════════════════════════════════
+set.seed(2024)
+n_sub <- 80
+
+# Age at enrolment (years and months)
+age_years_enrol <- sample(seq(2, 16, by = 0.25), n_sub, replace = TRUE)
+
+adsl_peds <- tibble(
+  STUDYID  = "PEDS2024",
+  USUBJID  = sprintf("PEDS2024-%03d", seq_len(n_sub)),
+  SUBJID   = sprintf("%03d", seq_len(n_sub)),
+  SEX      = sample(c("M","F"), n_sub, replace = TRUE),
+  RACE     = sample(c("WHITE","ASIAN","BLACK OR AFRICAN AMERICAN","OTHER"),
+                    n_sub, replace = TRUE, prob = c(.55,.20,.15,.10)),
+  ARM      = rep(c("Levetiracetam","Placebo"), each = n_sub/2),
+  ARMCD    = rep(c("LEV","PBO"), each = n_sub/2),
+  # Gestational age at birth (in weeks); 15% preterm (<37 weeks)
+  GA_WKS   = sample(c(rep(40L, 68), sample(28:36, 12, replace = TRUE))),
+  SAFFL    = "Y",
+  ITTFL    = "Y"
+) |>
+  mutate(
+    AGE_ENR_YR  = age_years_enrol,
+    AGE_ENR_MO  = round(age_years_enrol * 12),
+    BRTHDTC     = as.Date("2024-01-15") - round(age_years_enrol * 365.25),
+    TRTSDT      = as.Date("2024-01-15") + sample(0:30, n_sub, replace = TRUE),
+    PRETERM     = GA_WKS < 37,
+    # Corrected age in months (subtract weeks of prematurity from chronological)
+    # Only clinically meaningful up to age 24 months
+    ADJ_WKS     = pmax(0L, 40L - GA_WKS),   # weeks of prematurity
+    AGE_CORR_MO = round(pmax(0, AGE_ENR_MO - ADJ_WKS / 4.33)),
+    AGEGR1      = case_when(
+      AGE_ENR_YR < 2  ~ "Infant (< 2 yr)",
+      AGE_ENR_YR < 6  ~ "Toddler (2–5 yr)",
+      AGE_ENR_YR < 12 ~ "Child (6–11 yr)",
+      TRUE            ~ "Adolescent (12–16 yr)"
+    )
+  ) |>
+  mutate(
+    # Baseline weight (kg) — age- and sex-appropriate
+    WGTBL = case_when(
+      AGE_ENR_YR < 2  ~ round(rnorm(n(), 10, 1.5), 1),
+      AGE_ENR_YR < 6  ~ round(rnorm(n(), 18, 3.0), 1),
+      AGE_ENR_YR < 12 ~ round(rnorm(n(), 30, 7.0), 1),
+      TRUE            ~ round(rnorm(n(), 55, 12.0), 1)
+    ),
+    # Baseline height (cm)
+    HGTBL = case_when(
+      AGE_ENR_YR < 2  ~ round(rnorm(n(), 82, 5), 1),
+      AGE_ENR_YR < 6  ~ round(rnorm(n(), 108, 8), 1),
+      AGE_ENR_YR < 12 ~ round(rnorm(n(), 135, 12), 1),
+      TRUE            ~ round(rnorm(n(), 163, 12), 1)
+    ),
+    BMIBL = round(WGTBL / (HGTBL / 100)^2, 1)
+  )
+
+# ── Visit schedule ──────────────────────────────────────────────────────────
+vs_visits <- tibble(
+  VISIT    = c("BASELINE","WEEK 4","WEEK 12","WEEK 24","WEEK 52"),
+  VISITNUM = 1:5,
+  VISITDY  = c(1L, 29L, 85L, 169L, 365L)
+)
+
+# ── VS domain: weight and height at each visit ───────────────────────────────
+vs_rows <- lapply(seq_len(n_sub), function(i) {
+  subj  <- adsl_peds$USUBJID[i]
+  arm   <- adsl_peds$ARMCD[i]
+  sex   <- adsl_peds$SEX[i]
+  age_y <- adsl_peds$AGE_ENR_YR[i]
+  bwt   <- adsl_peds$WGTBL[i]
+  bht   <- adsl_peds$HGTBL[i]
+  trtdt <- adsl_peds$TRTSDT[i]
+
+  lapply(seq_len(nrow(vs_visits)), function(v) {
+    vrow  <- vs_visits[v, ]
+    weeks <- vrow$VISITDY / 7
+
+    # Children grow during the study
+    wt_gain <- weeks * ifelse(age_y < 6, 0.05, ifelse(age_y < 12, 0.06, 0.04))
+    ht_gain <- weeks * ifelse(age_y < 6, 0.12, ifelse(age_y < 12, 0.10, 0.07))
+    wt <- round(pmax(5, bwt + wt_gain + rnorm(1, 0, 0.5)), 1)
+    ht <- round(pmax(50, bht + ht_gain + rnorm(1, 0, 0.5)), 1)
+
+    bind_rows(
+      tibble(STUDYID="PEDS2024", USUBJID=subj, VISIT=vrow$VISIT,
+             VISITNUM=vrow$VISITNUM, VISITDY=vrow$VISITDY,
+             VSTESTCD="WEIGHT", VSTEST="Weight", VSSTRESU="kg",
+             VSSTRESN=wt, ADT=trtdt+vrow$VISITDY-1L,
+             ADY=vrow$VISITDY, ARMCD=arm, SEX=sex,
+             AGE_ENR_MO=adsl_peds$AGE_ENR_MO[i]),
+      tibble(STUDYID="PEDS2024", USUBJID=subj, VISIT=vrow$VISIT,
+             VISITNUM=vrow$VISITNUM, VISITDY=vrow$VISITDY,
+             VSTESTCD="HEIGHT", VSTEST="Height", VSSTRESU="cm",
+             VSSTRESN=ht, ADT=trtdt+vrow$VISITDY-1L,
+             ADY=vrow$VISITDY, ARMCD=arm, SEX=sex,
+             AGE_ENR_MO=adsl_peds$AGE_ENR_MO[i])
+    )
+  }) |> bind_rows()
+}) |> bind_rows()
+
+# ── Seizure frequency dataset ─────────────────────────────────────────────────
+# Monthly seizure count (primary endpoint for epilepsy trial)
+sz_rows <- lapply(seq_len(n_sub), function(i) {
+  subj <- adsl_peds$USUBJID[i]
+  arm  <- adsl_peds$ARMCD[i]
+  base_sz <- sample(4:20, 1)   # baseline monthly seizures
+
+  lapply(seq_len(nrow(vs_visits)), function(v) {
+    vrow <- vs_visits[v, ]
+    reduction <- if (arm == "LEV") {
+      pmax(0, base_sz * (1 - 0.55 * (vrow$VISITDY / 365)) + rnorm(1, 0, 1.5))
+    } else {
+      pmax(0, base_sz * (1 - 0.10 * (vrow$VISITDY / 365)) + rnorm(1, 0, 2.0))
+    }
+    tibble(STUDYID="PEDS2024", USUBJID=subj, VISIT=vrow$VISIT,
+           VISITNUM=vrow$VISITNUM, VISITDY=vrow$VISITDY,
+           PARAMCD="SZFREQ", PARAM="Monthly Seizure Frequency",
+           AVAL=round(reduction, 1),
+           BASE=base_sz, ADY=vrow$VISITDY, ARMCD=arm,
+           AGE_ENR_YR=adsl_peds$AGE_ENR_YR[i])
+  }) |> bind_rows()
+}) |> bind_rows()
+
+# ── ADVS skeleton with baseline ───────────────────────────────────────────────
+# Join weight and height for BMI calculation
+wt_rows <- vs_rows |> filter(VSTESTCD == "WEIGHT") |> select(-VSTESTCD,-VSTEST,-VSSTRESU) |> rename(WEIGHT=VSSTRESN)
+ht_rows <- vs_rows |> filter(VSTESTCD == "HEIGHT") |> select(-VSTESTCD,-VSTEST,-VSSTRESU) |> rename(HEIGHT=VSSTRESN)
+
+advs_peds <- vs_rows |>
+  group_by(USUBJID, VSTESTCD) |>
+  mutate(
+    BASE  = VSSTRESN[VISIT == "BASELINE"][1],
+    ABLFL = if_else(VISIT == "BASELINE", "Y", NA_character_),
+    CHG   = VSSTRESN - BASE
+  ) |>
+  ungroup()
+
+# Age in months at each visit (round to nearest 12-month bin for LMS lookup)
+advs_peds <- advs_peds |>
+  mutate(
+    AGE_VISIT_MO = AGE_ENR_MO + round(ADY / 30.44),
+    AGE_LMS_MO   = pmin(204, pmax(24, round(AGE_VISIT_MO / 12) * 12))
+  )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIRALPEDS FUNCTION MOCKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' Compute LMS z-score
+#' Z = ((X/M)^L - 1) / (L * S)   when L ≠ 0
+#' Z = log(X/M) / S               when L = 0
+.lms_zscore <- function(x, L, M, S) {
+  ifelse(
+    abs(L) < 1e-6,
+    log(x / M) / S,
+    ((x / M)^L - 1) / (L * S)
+  )
+}
+
+#' Convert z-score to percentile using standard normal CDF
+zscore_to_pct <- function(z) round(100 * pnorm(z), 1)
+
+#' Derive Weight-for-Age Z-score (WAZ)
+derive_params_growth_age_waz <- function(dataset,
+                                          lms_table    = waz_lms,
+                                          wt_var       = VSSTRESN,
+                                          age_mo_var   = AGE_LMS_MO,
+                                          sex_var      = SEX,
+                                          set_values_to = list(),
+                                          ...) {
+  wt_nm  <- deparse(substitute(wt_var))
+  age_nm <- deparse(substitute(age_mo_var))
+  sex_nm <- deparse(substitute(sex_var))
+
+  wt_data <- dataset |> filter(VSTESTCD == "WEIGHT")
+
+  wt_data <- wt_data |>
+    left_join(lms_table, by = setNames(c("SEX","AGE_MO"), c(sex_nm, age_nm))) |>
+    mutate(
+      WAZ     = .lms_zscore(.data[[wt_nm]], L_WAZ, M_WAZ, S_WAZ),
+      WAZ_PCT = zscore_to_pct(WAZ),
+      PARAMCD = "WAZ",
+      PARAM   = "Weight-for-Age Z-score",
+      AVAL    = round(WAZ, 3),
+      DTYPE   = NA_character_
+    )
+
+  for (nm in names(set_values_to)) wt_data[[nm]] <- set_values_to[[nm]]
+  wt_data
+}
+
+#' Derive Height-for-Age Z-score (HAZ)
+derive_params_growth_age_haz <- function(dataset,
+                                          lms_table    = haz_lms,
+                                          ht_var       = VSSTRESN,
+                                          age_mo_var   = AGE_LMS_MO,
+                                          sex_var      = SEX,
+                                          set_values_to = list(),
+                                          ...) {
+  ht_nm  <- deparse(substitute(ht_var))
+  age_nm <- deparse(substitute(age_mo_var))
+  sex_nm <- deparse(substitute(sex_var))
+
+  ht_data <- dataset |> filter(VSTESTCD == "HEIGHT")
+
+  ht_data <- ht_data |>
+    left_join(lms_table, by = setNames(c("SEX","AGE_MO"), c(sex_nm, age_nm))) |>
+    mutate(
+      HAZ     = .lms_zscore(.data[[ht_nm]], L_HAZ, M_HAZ, S_HAZ),
+      HAZ_PCT = zscore_to_pct(HAZ),
+      PARAMCD = "HAZ",
+      PARAM   = "Height-for-Age Z-score",
+      AVAL    = round(HAZ, 3),
+      DTYPE   = NA_character_
+    )
+
+  for (nm in names(set_values_to)) ht_data[[nm]] <- set_values_to[[nm]]
+  ht_data
+}
+
+#' Derive BMI-for-Age Z-score (BAZ)
+derive_params_growth_age_baz <- function(dataset,
+                                          lms_table    = baz_lms,
+                                          bmi_var      = BMI,
+                                          age_mo_var   = AGE_LMS_MO,
+                                          sex_var      = SEX,
+                                          set_values_to = list(),
+                                          ...) {
+  bmi_nm <- deparse(substitute(bmi_var))
+  age_nm <- deparse(substitute(age_mo_var))
+  sex_nm <- deparse(substitute(sex_var))
+
+  bmi_data <- dataset
+
+  bmi_data <- bmi_data |>
+    left_join(lms_table, by = setNames(c("SEX","AGE_MO"), c(sex_nm, age_nm))) |>
+    mutate(
+      BAZ     = .lms_zscore(.data[[bmi_nm]], L_BAZ, M_BAZ, S_BAZ),
+      BAZ_PCT = zscore_to_pct(BAZ),
+      PARAMCD = "BAZ",
+      PARAM   = "BMI-for-Age Z-score",
+      AVAL    = round(BAZ, 3),
+      DTYPE   = NA_character_
+    ) |>
+    filter(!is.na(BAZ))
+
+  for (nm in names(set_values_to)) bmi_data[[nm]] <- set_values_to[[nm]]
+  bmi_data
+}
+
+#' Derive nutritional status flags from z-scores
+#' Stunting: HAZ < -2; Wasting: WAZ < -2; Overweight: BAZ > 2; Obese: BAZ > 3
+derive_var_nutrit_flag <- function(dataset,
+                                    haz_var   = HAZ,
+                                    waz_var   = WAZ,
+                                    baz_var   = BAZ,
+                                    ...) {
+  haz_nm <- deparse(substitute(haz_var))
+  waz_nm <- deparse(substitute(waz_var))
+  baz_nm <- deparse(substitute(baz_var))
+
+  dataset |>
+    mutate(
+      STUNTING   = if_else(.data[[haz_nm]] < -2, "Y", "N"),
+      WASTING    = if_else(.data[[waz_nm]] < -2, "Y", "N"),
+      OVERWT     = if_else(.data[[baz_nm]] > 2,  "Y", "N"),
+      OBESE      = if_else(.data[[baz_nm]] > 3,  "Y", "N")
+    )
+}
+
+#' Derive weight-based dose with floor and ceiling
+#' dose_mg = weight_kg * dose_per_kg, capped at [dose_min, dose_max]
+derive_var_wt_dose <- function(dataset,
+                                wt_var       = VSSTRESN,
+                                dose_per_kg  = 20,
+                                dose_min     = NULL,
+                                dose_max     = NULL,
+                                new_var      = DOSE_MG,
+                                ...) {
+  wt_nm  <- deparse(substitute(wt_var))
+  new_nm <- deparse(substitute(new_var))
+
+  dataset[[new_nm]] <- dataset[[wt_nm]] * dose_per_kg
+  if (!is.null(dose_min)) dataset[[new_nm]] <- pmax(dataset[[new_nm]], dose_min)
+  if (!is.null(dose_max)) dataset[[new_nm]] <- pmin(dataset[[new_nm]], dose_max)
+  dataset[[new_nm]] <- round(dataset[[new_nm]])
+  dataset
+}
+
+#' Compute corrected age for preterm infants (in months)
+#' Corrected age = chronological age - weeks of prematurity / 4.33
+derive_var_age_corrected <- function(dataset,
+                                      age_mo_var  = AGE_ENR_MO,
+                                      ga_wks_var  = GA_WKS,
+                                      new_var     = AGE_CORR_MO,
+                                      ...) {
+  age_nm <- deparse(substitute(age_mo_var))
+  ga_nm  <- deparse(substitute(ga_wks_var))
+  new_nm <- deparse(substitute(new_var))
+
+  dataset[[new_nm]] <- pmax(
+    0,
+    dataset[[age_nm]] - pmax(0, 40 - dataset[[ga_nm]]) / 4.33
+  )
+  dataset[[new_nm]] <- round(dataset[[new_nm]], 1)
+  dataset
+}
+
+# Shared helpers
+exprs <- function(...) as.list(substitute(list(...)))[-1]
+```
+
+## Overview
+
+### The paediatric ADaM landscape
+
+Paediatric trials require specialised derivations that do not exist in adult programmes. Three challenges are unique to this population:
+
+| Challenge | Why it matters | Key derivation |
+|-----------|---------------|----------------|
+| **Age precision** | Dosing, eligibility, and endpoints depend on exact age | `AGE_MO`, corrected age for preterm |
+| **Growth z-scores** | "Normal" weight/height depend on age AND sex — raw values are uninterpretable | WHO/CDC LMS method → WAZ, HAZ, BAZ |
+| **Weight-based dosing** | Every dose change visit recalculates mg/kg × weight | `derive_var_wt_dose()` with floor/ceiling |
+
+> **SAS parallel:** In SAS, growth z-scores were typically derived by merging with an external SAS dataset of LMS values, then computing in a `DATA` step. `admiralpeds` wraps this into purpose-built functions that handle the LMS lookup and Box-Cox transform consistently.
+
+```{r overview-explore, exercise=FALSE}
+# Check the age distribution across paediatric age groups
+adsl_peds |>
+  count(AGEGR1, ARMCD) |>
+  pivot_wider(names_from = ARMCD, values_from = n)
+```
+
+```{r overview-preterm, exercise=FALSE}
+# Preterm subjects: how many and what GA range?
+adsl_peds |>
+  filter(PRETERM) |>
+  summarise(n = n(), min_ga = min(GA_WKS), max_ga = max(GA_WKS),
+            mean_adj_wks = round(mean(ADJ_WKS), 1))
+```
+
+---
+
+## Section 1 — Paediatric Age Calculations
+
+### Age precision matters
+
+In paediatric trials, age drives eligibility, dose bands, and growth z-score lookups. `AGE` in years (integer) is insufficient — you need age in months (or days) at each visit. For preterm infants, **corrected age** adjusts for weeks of prematurity and is the clinically correct basis for growth assessment up to age 24 months.
+
+| Term | Formula | Used for |
+|------|---------|---------|
+| Chronological age | Date of assessment − date of birth | All subjects |
+| Weeks of prematurity | 40 − gestational age at birth (weeks) | Preterm only |
+| Corrected age | Chronological age − weeks of prematurity ÷ 4.33 | Growth z-scores, milestones in infants |
+
+```{r quiz-age1, echo=FALSE}
+quiz(
+  caption = "Quiz — Paediatric Age",
+
+  question("A child born at 32 weeks gestation is now 6 months (chronological) old. Their corrected age is:",
+    answer("6 months — corrected age equals chronological age after 3 months"),
+    answer("4 months", correct = TRUE,
+           message = "Weeks of prematurity = 40 − 32 = 8 weeks = 8/4.33 ≈ 1.85 months. Corrected age = 6 − 1.85 ≈ 4 months. This is the appropriate age for growth chart assessment."),
+    answer("8 months — add prematurity, not subtract"),
+    answer("3 months"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("Corrected age is typically used for growth chart assessment until:",
+    answer("Age 1 year (12 months)"),
+    answer("Age 2 years (24 months)", correct = TRUE,
+           message = "Most guidelines recommend using corrected age until 24–36 months, by which time catch-up growth has usually occurred and the difference is negligible."),
+    answer("Age 5 years"),
+    answer("It is always used throughout childhood"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+```{r ex-corr-age-manual, exercise=TRUE, exercise.lines=12}
+# adsl_peds has AGE_ENR_MO (chronological age in months),
+# ADJ_WKS (weeks of prematurity = 40 - GA_WKS), and AGE_CORR_MO.
+# The formula is: corrected age = chronological age - ADJ_WKS / 4.33
+# Re-derive it and compare to the pre-computed AGE_CORR_MO.
+
+adsl_peds |>
+  mutate(MY_CORR = round(pmax(0, AGE_ENR_MO - ___ / 4.33))) |>
+  filter(PRETERM == TRUE) |>
+  select(USUBJID, AGE_ENR_MO, ADJ_WKS, AGE_CORR_MO, MY_CORR) |>
+  head(10)
+```
+
+```{r ex-corr-age-manual-hint-1}
+# ADJ_WKS holds the weeks of prematurity.
+# MY_CORR = round(pmax(0, AGE_ENR_MO - ADJ_WKS / 4.33))
+```
+
+```{r ex-corr-age-manual-solution}
+adsl_peds |>
+  mutate(MY_CORR = round(pmax(0, AGE_ENR_MO - ADJ_WKS / 4.33))) |>
+  filter(PRETERM == TRUE) |>
+  select(USUBJID, AGE_ENR_MO, ADJ_WKS, AGE_CORR_MO, MY_CORR) |>
+  head(10)
+```
+
+### Exercise 1.1 — Derive corrected age for preterm infants
+
+Use `derive_var_age_corrected()` on `adsl_peds`. Then compare chronological vs corrected age for preterm subjects only.
+
+```{r ex-corr-age, exercise=TRUE, exercise.lines=22}
+# adsl_peds has: AGE_ENR_MO (chronological months), GA_WKS, PRETERM, ADJ_WKS
+adsl_corrected <- derive_var_age_corrected(
+  dataset     = ___,
+  age_mo_var  = AGE_ENR_MO,
+  ga_wks_var  = GA_WKS,
+  new_var     = AGE_CORR_MO
+)
+
+# Show difference for preterm subjects
+adsl_corrected |>
+  filter(___) |>
+  select(USUBJID, GA_WKS, ADJ_WKS, AGE_ENR_MO, AGE_CORR_MO) |>
+  mutate(DIFF_MO = round(AGE_ENR_MO - AGE_CORR_MO, 1)) |>
+  arrange(GA_WKS)
+```
+
+```{r ex-corr-age-hint-1}
+# dataset = adsl_peds; filter PRETERM == TRUE
+adsl_corrected <- derive_var_age_corrected(
+  dataset = adsl_peds, age_mo_var = AGE_ENR_MO, ga_wks_var = GA_WKS, new_var = AGE_CORR_MO
+)
+adsl_corrected |>
+  filter(PRETERM) |>
+  select(USUBJID, GA_WKS, ADJ_WKS, AGE_ENR_MO, AGE_CORR_MO) |>
+  mutate(DIFF_MO = round(AGE_ENR_MO - AGE_CORR_MO, 1)) |>
+  arrange(GA_WKS)
+```
+
+```{r ex-corr-age-solution}
+adsl_corrected <- derive_var_age_corrected(
+  dataset    = adsl_peds,
+  age_mo_var = AGE_ENR_MO,
+  ga_wks_var = GA_WKS,
+  new_var    = AGE_CORR_MO
+)
+
+adsl_corrected |>
+  filter(PRETERM) |>
+  select(USUBJID, GA_WKS, ADJ_WKS, AGE_ENR_MO, AGE_CORR_MO) |>
+  mutate(DIFF_MO = round(AGE_ENR_MO - AGE_CORR_MO, 1)) |>
+  arrange(GA_WKS)
+```
+
+### Exercise 1.2 — Age group derivation across study visits
+
+`advs_peds` tracks exact age at each visit. Derive `AGEGR_VISIT` (age group at the visit) and count how many subject-visits fall in each group. This matters because eligibility age groups can change mid-study for a child turning 12 during a 52-week trial.
+
+```{r ex-age-visit, exercise=TRUE, exercise.lines=22}
+# advs_peds has AGE_VISIT_MO = age in months at each visit
+age_visit_grp <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT") |>
+  mutate(
+    AGE_VISIT_YR = AGE_VISIT_MO / 12,
+    AGEGR_VISIT  = case_when(
+      AGE_VISIT_YR <  2 ~ "Infant (< 2 yr)",
+      AGE_VISIT_YR <  6 ~ "Toddler (2–5 yr)",
+      AGE_VISIT_YR < 12 ~ "Child (6–11 yr)",
+      TRUE              ~ "Adolescent (12–16 yr)"
+    )
+  )
+
+# Count subject-visits per age group and arm
+age_visit_grp |>
+  group_by(___, AGEGR_VISIT) |>
+  summarise(n_visits = n(), n_subjects = n_distinct(___), .groups = "drop") |>
+  arrange(ARMCD, AGEGR_VISIT)
+```
+
+```{r ex-age-visit-hint-1}
+# group by ARMCD and AGEGR_VISIT; n_distinct(USUBJID)
+advs_peds |>
+  filter(VSTESTCD == "WEIGHT") |>
+  mutate(AGE_VISIT_YR = AGE_VISIT_MO / 12,
+         AGEGR_VISIT = case_when(
+           AGE_VISIT_YR < 2  ~ "Infant (< 2 yr)",
+           AGE_VISIT_YR < 6  ~ "Toddler (2–5 yr)",
+           AGE_VISIT_YR < 12 ~ "Child (6–11 yr)",
+           TRUE              ~ "Adolescent (12–16 yr)"
+         )) |>
+  group_by(ARMCD, AGEGR_VISIT) |>
+  summarise(n_visits = n(), n_subjects = n_distinct(USUBJID), .groups = "drop") |>
+  arrange(ARMCD, AGEGR_VISIT)
+```
+
+```{r ex-age-visit-solution}
+age_visit_grp <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT") |>
+  mutate(
+    AGE_VISIT_YR = AGE_VISIT_MO / 12,
+    AGEGR_VISIT  = case_when(
+      AGE_VISIT_YR <  2 ~ "Infant (< 2 yr)",
+      AGE_VISIT_YR <  6 ~ "Toddler (2–5 yr)",
+      AGE_VISIT_YR < 12 ~ "Child (6–11 yr)",
+      TRUE              ~ "Adolescent (12–16 yr)"
+    )
+  )
+
+age_visit_grp |>
+  group_by(ARMCD, AGEGR_VISIT) |>
+  summarise(n_visits    = n(),
+            n_subjects  = n_distinct(USUBJID),
+            .groups     = "drop") |>
+  arrange(ARMCD, AGEGR_VISIT)
+```
+
+---
+
+## Section 2 — Growth Z-Scores: The LMS Method
+
+### Why raw measurements are meaningless without context
+
+A 7-year-old weighing 22 kg and a 14-year-old weighing 22 kg have very different nutritional statuses. The **LMS method** (Box-Cox transformation) converts observed measurements to **z-scores** relative to the age- and sex-specific reference population.
+
+**The LMS formula:**
+
+| Condition | Formula |
+|-----------|---------|
+| L ≠ 0 | Z = [ (X/M)^L − 1 ] / (L × S) |
+| L = 0 | Z = ln(X/M) / S |
+
+Where **L** = skewness correction, **M** = median, **S** = coefficient of variation — all from the WHO/CDC reference table for each sex × age.
+
+```{r quiz-lms1, echo=FALSE}
+quiz(
+  caption = "Quiz — LMS Growth Z-scores",
+
+  question("A WAZ (Weight-for-Age Z-score) of −2.5 means:",
+    answer("The child weighs 2.5 kg less than the median"),
+    answer("The child's weight is 2.5 standard deviations below the age/sex median — classified as underweight/wasting",
+           correct = TRUE,
+           message = "Z = −2.5 is below the −2 SD threshold for wasting (acute undernutrition). The WHO defines wasting as WAZ < −2."),
+    answer("The child is 2.5 months younger than expected for their weight"),
+    answer("25th percentile for weight"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("HAZ < −2 is the WHO definition of:",
+    answer("Wasting (acute undernutrition)"),
+    answer("Stunting (chronic undernutrition / low height-for-age)", correct = TRUE,
+           message = "Stunting (HAZ < −2) reflects chronic undernutrition leading to reduced linear growth. Wasting (WAZ or WHZ < −2) reflects acute undernutrition."),
+    answer("Overweight"),
+    answer("Microcephaly"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+```{r ex-lms-formula, exercise=TRUE, exercise.lines=12}
+# LMS z-score: Z = ((X/M)^L - 1) / (L * S)  when L != 0
+# .lms_zscore() is already defined in the setup chunk.
+# A 48-month-old boy weighs 16.5 kg.
+# waz_lms row for M=48, SEX="M": L=0.2810, M=16.118, S=0.1226
+
+waz_val <- .lms_zscore(x = ___, L = 0.2810, M = 16.118, S = 0.1226)
+cat("WAZ =", round(waz_val, 2), "\n")
+cat("Percentile =", zscore_to_pct(waz_val), "%\n")
+```
+
+```{r ex-lms-formula-hint-1}
+# x = 16.5 (the child's weight in kg)
+# .lms_zscore(x = 16.5, L = 0.2810, M = 16.118, S = 0.1226)
+```
+
+```{r ex-lms-formula-solution}
+waz_val <- .lms_zscore(x = 16.5, L = 0.2810, M = 16.118, S = 0.1226)
+cat("WAZ =", round(waz_val, 2), "\n")
+cat("Percentile =", zscore_to_pct(waz_val), "%\n")
+```
+
+### Exercise 2.1 — Derive WAZ at baseline
+
+Use `derive_params_growth_age_waz()` on the baseline `advs_peds` rows, then show mean WAZ by age group and sex.
+
+```{r ex-waz, exercise=TRUE, exercise.lines=24}
+# advs_peds has VSTESTCD, VSSTRESN, SEX, AGE_LMS_MO
+# Filter to baseline weight rows only
+baseline_wt <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", VISIT == "___")
+
+waz_baseline <- derive_params_growth_age_waz(
+  dataset      = ___,
+  lms_table    = waz_lms,
+  wt_var       = VSSTRESN,
+  age_mo_var   = AGE_LMS_MO,
+  sex_var      = SEX
+)
+
+# Mean WAZ by sex and age group (join AGEGR1 from adsl_peds)
+waz_baseline |>
+  filter(!is.na(WAZ)) |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1), by = "USUBJID") |>
+  group_by(SEX, AGEGR1) |>
+  summarise(
+    n        = n(),
+    mean_waz = round(mean(WAZ, na.rm = TRUE), 2),
+    pct_wasting = round(100 * mean(WAZ < -2, na.rm = TRUE), 1),
+    .groups  = "drop"
+  ) |>
+  arrange(AGEGR1, SEX)
+```
+
+```{r ex-waz-hint-1}
+# VISIT == "BASELINE"; dataset = baseline_wt
+baseline_wt <- advs_peds |> filter(VSTESTCD == "WEIGHT", VISIT == "BASELINE")
+waz_baseline <- derive_params_growth_age_waz(
+  dataset = baseline_wt, lms_table = waz_lms,
+  wt_var = VSSTRESN, age_mo_var = AGE_LMS_MO, sex_var = SEX
+)
+waz_baseline |>
+  filter(!is.na(WAZ)) |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1), by = "USUBJID") |>
+  group_by(SEX, AGEGR1) |>
+  summarise(n = n(), mean_waz = round(mean(WAZ,na.rm=TRUE),2),
+            pct_wasting = round(100*mean(WAZ < -2,na.rm=TRUE),1), .groups = "drop") |>
+  arrange(AGEGR1, SEX)
+```
+
+```{r ex-waz-solution}
+baseline_wt <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", VISIT == "BASELINE")
+
+waz_baseline <- derive_params_growth_age_waz(
+  dataset    = baseline_wt,
+  lms_table  = waz_lms,
+  wt_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+)
+
+waz_baseline |>
+  filter(!is.na(WAZ)) |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1), by = "USUBJID") |>
+  group_by(SEX, AGEGR1) |>
+  summarise(
+    n           = n(),
+    mean_waz    = round(mean(WAZ, na.rm = TRUE), 2),
+    pct_wasting = round(100 * mean(WAZ < -2, na.rm = TRUE), 1),
+    .groups     = "drop"
+  ) |>
+  arrange(AGEGR1, SEX)
+```
+
+### Exercise 2.2 — Derive HAZ and nutritional status flags
+
+Derive HAZ at baseline and apply `derive_var_nutrit_flag()` to identify stunted children.
+
+```{r ex-haz-flag, exercise=TRUE, exercise.lines=28}
+baseline_ht <- advs_peds |>
+  filter(VSTESTCD == "HEIGHT", VISIT == "BASELINE")
+
+haz_baseline <- derive_params_growth_age_haz(
+  dataset    = ___,
+  lms_table  = haz_lms,
+  ht_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+)
+
+# Join WAZ and HAZ so we can flag stunting + wasting together
+combined <- waz_baseline |>
+  select(USUBJID, WAZ) |>
+  left_join(haz_baseline |> select(USUBJID, HAZ), by = "USUBJID") |>
+  # Add a placeholder BAZ = 0 for the flag function
+  mutate(BAZ = 0) |>
+  derive_var_nutrit_flag(haz_var = HAZ, waz_var = WAZ, baz_var = BAZ) |>
+  left_join(select(adsl_peds, USUBJID, ARMCD, AGEGR1), by = "USUBJID")
+
+combined |>
+  group_by(AGEGR1) |>
+  summarise(
+    n          = n(),
+    n_stunted  = sum(___ == "Y", na.rm = TRUE),
+    n_wasting  = sum(___ == "Y", na.rm = TRUE),
+    pct_stunt  = round(100 * n_stunted / n, 1),
+    pct_wast   = round(100 * n_wasting / n, 1),
+    .groups    = "drop"
+  ) |>
+  arrange(AGEGR1)
+```
+
+```{r ex-haz-flag-hint-1}
+# dataset = baseline_ht
+# n_stunted: STUNTING == "Y"; n_wasting: WASTING == "Y"
+```
+
+```{r ex-haz-flag-solution}
+baseline_ht <- advs_peds |>
+  filter(VSTESTCD == "HEIGHT", VISIT == "BASELINE")
+
+haz_baseline <- derive_params_growth_age_haz(
+  dataset    = baseline_ht,
+  lms_table  = haz_lms,
+  ht_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+)
+
+combined <- waz_baseline |>
+  select(USUBJID, WAZ) |>
+  left_join(haz_baseline |> select(USUBJID, HAZ), by = "USUBJID") |>
+  mutate(BAZ = 0) |>
+  derive_var_nutrit_flag(haz_var = HAZ, waz_var = WAZ, baz_var = BAZ) |>
+  left_join(select(adsl_peds, USUBJID, ARMCD, AGEGR1), by = "USUBJID")
+
+combined |>
+  group_by(AGEGR1) |>
+  summarise(
+    n         = n(),
+    n_stunted = sum(STUNTING == "Y", na.rm = TRUE),
+    n_wasting = sum(WASTING  == "Y", na.rm = TRUE),
+    pct_stunt = round(100 * n_stunted / n, 1),
+    pct_wast  = round(100 * n_wasting  / n, 1),
+    .groups   = "drop"
+  ) |>
+  arrange(AGEGR1)
+```
+
+```{r ex-nutrit-flags, exercise=TRUE, exercise.lines=16}
+# advs_peds has WAZ already derived (after the WAZ exercise above).
+# Use a simple case_when to manually apply WHO nutritional flags:
+#   Stunting:   HAZ < -2
+#   Wasting:    WAZ < -2
+#   Overweight: BAZ > 2
+# For this exercise, work only with WAZ on BASELINE records.
+
+advs_peds |>
+  filter(VSTESTCD == "WEIGHT", VISIT == "BASELINE") |>
+  left_join(
+    adsl_peds |> mutate(AGE_LMS_MO = pmin(204, pmax(24, round(AGE_ENR_MO/12)*12))) |>
+      derive_params_growth_age_waz(waz_lms, WGTBL, AGE_LMS_MO, SEX) |>
+      select(USUBJID, WAZ),
+    by = "USUBJID"
+  ) |>
+  mutate(
+    WASTING_FL = if_else(___ < -2, "Y", "N")   # WAZ < -2
+  ) |>
+  count(ARMCD, WASTING_FL)
+```
+
+```{r ex-nutrit-flags-hint-1}
+# WASTING_FL = if_else(WAZ < -2, "Y", "N")
+```
+
+```{r ex-nutrit-flags-solution}
+advs_peds |>
+  filter(VSTESTCD == "WEIGHT", VISIT == "BASELINE") |>
+  left_join(
+    adsl_peds |> mutate(AGE_LMS_MO = pmin(204, pmax(24, round(AGE_ENR_MO/12)*12))) |>
+      derive_params_growth_age_waz(waz_lms, WGTBL, AGE_LMS_MO, SEX) |>
+      select(USUBJID, WAZ),
+    by = "USUBJID"
+  ) |>
+  mutate(WASTING_FL = if_else(WAZ < -2, "Y", "N")) |>
+  count(ARMCD, WASTING_FL)
+```
+
+### Exercise 2.3 — Z-score change over time
+
+Compute WAZ at every visit (not just baseline) and track mean WAZ change by arm to assess whether treatment affects growth velocity.
+
+```{r ex-waz-time, exercise=TRUE, exercise.lines=22}
+# Derive WAZ for all weight visits
+waz_all_visits <- derive_params_growth_age_waz(
+  dataset    = advs_peds |> filter(VSTESTCD == "WEIGHT"),
+  lms_table  = waz_lms,
+  wt_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+)
+
+# Mean WAZ by arm and visit
+waz_all_visits |>
+  filter(!is.na(WAZ)) |>
+  group_by(___, VISIT, VISITNUM) |>
+  summarise(
+    n        = n(),
+    mean_waz = round(mean(WAZ, na.rm = TRUE), 3),
+    .groups  = "drop"
+  ) |>
+  arrange(ARMCD, ___)
+```
+
+```{r ex-waz-time-hint-1}
+# group by ARMCD and VISIT/VISITNUM; arrange by VISITNUM
+waz_all_visits |>
+  filter(!is.na(WAZ)) |>
+  group_by(ARMCD, VISIT, VISITNUM) |>
+  summarise(n = n(), mean_waz = round(mean(WAZ,na.rm=TRUE),3), .groups = "drop") |>
+  arrange(ARMCD, VISITNUM)
+```
+
+```{r ex-waz-time-solution}
+waz_all_visits <- derive_params_growth_age_waz(
+  dataset    = advs_peds |> filter(VSTESTCD == "WEIGHT"),
+  lms_table  = waz_lms,
+  wt_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+)
+
+waz_all_visits |>
+  filter(!is.na(WAZ)) |>
+  group_by(ARMCD, VISIT, VISITNUM) |>
+  summarise(
+    n        = n(),
+    mean_waz = round(mean(WAZ, na.rm = TRUE), 3),
+    .groups  = "drop"
+  ) |>
+  arrange(ARMCD, VISITNUM)
+```
+
+---
+
+## Section 3 — Weight-Based Dosing
+
+### How paediatric dosing works
+
+Children cannot receive adult fixed doses. The dose is calculated as **mg/kg × body weight** at each dose-review visit, then rounded to a practical tablet/liquid strength, with a **maximum dose cap** to avoid over-dosing heavy adolescents.
+
+```{r quiz-dosing1, echo=FALSE}
+quiz(
+  caption = "Quiz — Weight-Based Dosing",
+
+  question("A 12-year-old weighs 45 kg. The protocol specifies 20 mg/kg/day with a maximum of 750 mg/day. Their calculated dose is:",
+    answer("900 mg/day → capped at 750 mg/day", correct = TRUE,
+           message = "45 × 20 = 900 mg, which exceeds the 750 mg cap. The subject receives 750 mg/day."),
+    answer("900 mg/day — the cap does not apply to adolescents"),
+    answer("750 mg/day — the cap is always applied regardless of weight"),
+    answer("450 mg/day — only half dose for a 12-year-old"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("Why do paediatric protocols require dose recalculation at every visit?",
+    answer("Regulatory requirement only — clinical benefit is minimal"),
+    answer("Children grow during the trial; weight increases should be reflected in higher doses to maintain therapeutic mg/kg exposure",
+           correct = TRUE,
+           message = "A child who gains 3 kg between visits would receive a sub-therapeutic dose if the initial dose were not updated. Conversely, significant weight loss (unlikely but possible) may require dose reduction."),
+    answer("The drug degrades faster in children and requires more frequent adjustments"),
+    answer("To collect more data points for PK modelling"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+```{r ex-wt-dose-calc, exercise=TRUE, exercise.lines=18}
+# Levetiracetam: 20 mg/kg, minimum 125 mg, maximum 1500 mg.
+# Use derive_var_wt_dose() to compute DOSE_MG for every subject.
+# Then categorise: "At minimum", "Weight-proportional", "At maximum".
+
+dose_check <- adsl_peds |>
+  derive_var_wt_dose(
+    wt_var      = ___,
+    dose_per_kg = ___,
+    dose_min    = ___,
+    dose_max    = ___,
+    new_var     = DOSE_MG
+  ) |>
+  mutate(DOSE_TIER = case_when(
+    DOSE_MG == 125  ~ "At minimum (125 mg)",
+    DOSE_MG == 1500 ~ "At maximum (1500 mg)",
+    TRUE            ~ "Weight-proportional"
+  ))
+
+dose_check |> count(ARMCD, DOSE_TIER)
+```
+
+```{r ex-wt-dose-calc-hint-1}
+# wt_var = WGTBL, dose_per_kg = 20, dose_min = 125, dose_max = 1500
+```
+
+```{r ex-wt-dose-calc-solution}
+dose_check <- adsl_peds |>
+  derive_var_wt_dose(
+    wt_var      = WGTBL,
+    dose_per_kg = 20,
+    dose_min    = 125,
+    dose_max    = 1500,
+    new_var     = DOSE_MG
+  ) |>
+  mutate(DOSE_TIER = case_when(
+    DOSE_MG == 125  ~ "At minimum (125 mg)",
+    DOSE_MG == 1500 ~ "At maximum (1500 mg)",
+    TRUE            ~ "Weight-proportional"
+  ))
+
+dose_check |> count(ARMCD, DOSE_TIER)
+```
+
+### Exercise 3.1 — Derive weight-based dose at each visit
+
+The Levetiracetam protocol specifies **20 mg/kg/day** with a minimum of **125 mg/day** and maximum of **1500 mg/day**. Apply `derive_var_wt_dose()` to the treatment arm weight data.
+
+```{r ex-dose, exercise=TRUE, exercise.lines=24}
+# Weight data for VEGF (LEV) arm only — active drug
+dose_data <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", ARMCD == "LEV") |>
+  derive_var_wt_dose(
+    wt_var      = VSSTRESN,
+    dose_per_kg = ___,
+    dose_min    = ___,
+    dose_max    = ___,
+    new_var     = DOSE_MG
+  )
+
+# Summary: mean dose, min/max by visit
+dose_data |>
+  group_by(VISIT, VISITNUM) |>
+  summarise(
+    n         = n(),
+    mean_dose = round(mean(DOSE_MG), 0),
+    min_dose  = min(DOSE_MG),
+    max_dose  = max(DOSE_MG),
+    n_at_cap  = sum(DOSE_MG == 1500),
+    .groups   = "drop"
+  ) |>
+  arrange(___)
+```
+
+```{r ex-dose-hint-1}
+# dose_per_kg = 20; dose_min = 125; dose_max = 1500
+# arrange by VISITNUM
+dose_data <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", ARMCD == "LEV") |>
+  derive_var_wt_dose(wt_var = VSSTRESN, dose_per_kg = 20,
+                     dose_min = 125, dose_max = 1500, new_var = DOSE_MG)
+dose_data |>
+  group_by(VISIT, VISITNUM) |>
+  summarise(n = n(), mean_dose = round(mean(DOSE_MG),0),
+            min_dose = min(DOSE_MG), max_dose = max(DOSE_MG),
+            n_at_cap = sum(DOSE_MG == 1500), .groups = "drop") |>
+  arrange(VISITNUM)
+```
+
+```{r ex-dose-solution}
+dose_data <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", ARMCD == "LEV") |>
+  derive_var_wt_dose(
+    wt_var      = VSSTRESN,
+    dose_per_kg = 20,
+    dose_min    = 125,
+    dose_max    = 1500,
+    new_var     = DOSE_MG
+  )
+
+dose_data |>
+  group_by(VISIT, VISITNUM) |>
+  summarise(
+    n         = n(),
+    mean_dose = round(mean(DOSE_MG), 0),
+    min_dose  = min(DOSE_MG),
+    max_dose  = max(DOSE_MG),
+    n_at_cap  = sum(DOSE_MG == 1500),
+    .groups   = "drop"
+  ) |>
+  arrange(VISITNUM)
+```
+
+### Exercise 3.2 — Dose intensity: actual vs target mg/kg
+
+For subjects receiving the capped dose (1500 mg), compute the actual mg/kg they receive at each visit — the "dose intensity" relative to the nominal 20 mg/kg.
+
+```{r ex-dose-intensity, exercise=TRUE, exercise.lines=18, exercise.setup="ex-dose-solution"}
+dose_intensity <- dose_data |>
+  mutate(
+    DOSE_PER_KG    = DOSE_MG / VSSTRESN,              # actual mg/kg
+    AT_CAP         = DOSE_MG == 1500,
+    INTENSITY_PCT  = round(100 * DOSE_PER_KG / ___, 1)  # % of 20 mg/kg target
+  )
+
+# For capped subjects: mean actual mg/kg at Week 52
+dose_intensity |>
+  filter(AT_CAP, VISIT == "WEEK 52") |>
+  summarise(
+    n             = n(),
+    mean_wt_kg    = round(mean(VSSTRESN), 1),
+    mean_dose_pkg = round(mean(DOSE_PER_KG), 2),
+    mean_intens   = round(mean(INTENSITY_PCT), 1),
+    .groups       = "drop"
+  )
+```
+
+```{r ex-dose-intensity-hint-1}
+# INTENSITY_PCT = 100 * DOSE_PER_KG / 20
+dose_data |>
+  mutate(DOSE_PER_KG = DOSE_MG / VSSTRESN, AT_CAP = DOSE_MG == 1500,
+         INTENSITY_PCT = round(100 * DOSE_PER_KG / 20, 1)) |>
+  filter(AT_CAP, VISIT == "WEEK 52") |>
+  summarise(n = n(), mean_wt_kg = round(mean(VSSTRESN),1),
+            mean_dose_pkg = round(mean(DOSE_PER_KG),2),
+            mean_intens = round(mean(INTENSITY_PCT),1))
+```
+
+```{r ex-dose-intensity-solution}
+dose_intensity <- dose_data |>
+  mutate(
+    DOSE_PER_KG   = DOSE_MG / VSSTRESN,
+    AT_CAP        = DOSE_MG == 1500,
+    INTENSITY_PCT = round(100 * DOSE_PER_KG / 20, 1)
+  )
+
+dose_intensity |>
+  filter(AT_CAP, VISIT == "WEEK 52") |>
+  summarise(
+    n             = n(),
+    mean_wt_kg    = round(mean(VSSTRESN), 1),
+    mean_dose_pkg = round(mean(DOSE_PER_KG), 2),
+    mean_intens   = round(mean(INTENSITY_PCT), 1)
+  )
+```
+
+---
+
+## Section 4 — Seizure Frequency Endpoints
+
+### Primary endpoint: percentage reduction in seizure frequency
+
+In paediatric epilepsy trials, the primary endpoint is typically the **percentage reduction in monthly seizure frequency** from baseline at the end of the maintenance period (Week 52). Responders are defined as ≥50% reduction.
+
+```{r quiz-seizure1, echo=FALSE}
+quiz(
+  caption = "Quiz — Epilepsy Endpoints",
+
+  question("A child has 12 seizures/month at baseline and 5 at Week 52. Their percentage reduction is:",
+    answer("7 — absolute reduction"),
+    answer("58.3%", correct = TRUE,
+           message = "(12 − 5) / 12 × 100 = 7/12 × 100 = 58.3%. Since ≥50%, this child is a responder."),
+    answer("41.7%"),
+    answer("5/12 = 41.7% — the ratio of post to pre"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("The '50% responder rate' in epilepsy trials is defined as:",
+    answer("50% of subjects achieving complete seizure freedom"),
+    answer("The proportion of subjects with ≥50% reduction in seizure frequency from baseline",
+           correct = TRUE),
+    answer("Subjects whose seizures occur on fewer than 50% of study days"),
+    answer("50% reduction in seizure duration"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 4.1 — Percentage reduction in seizures
+
+From `sz_rows`, compute the percentage reduction from baseline in monthly seizure frequency at each visit, and the 50% responder rate at Week 52 by arm.
+
+```{r ex-seizure, exercise=TRUE, exercise.lines=24}
+# sz_rows has USUBJID, VISIT, VISITNUM, AVAL (monthly seizures), BASE, ARMCD
+sz_analysis <- sz_rows |>
+  filter(VISIT != "BASELINE") |>
+  mutate(
+    CHG      = AVAL - BASE,
+    PCT_RED  = round(100 * (BASE - AVAL) / BASE, 1),   # positive = reduction
+    RESPFL   = PCT_RED >= ___
+  )
+
+# 50% responder rate at Week 52
+sz_analysis |>
+  filter(VISIT == ___) |>
+  group_by(___) |>
+  summarise(
+    n            = n(),
+    median_red   = round(median(PCT_RED, na.rm = TRUE), 1),
+    n_responders = sum(RESPFL, na.rm = TRUE),
+    resp_rate    = round(100 * n_responders / n, 1),
+    n_seizfree   = sum(AVAL == 0, na.rm = TRUE),
+    .groups      = "drop"
+  )
+```
+
+```{r ex-seizure-hint-1}
+# RESPFL = PCT_RED >= 50; filter VISIT == "WEEK 52"; group by ARMCD
+sz_rows |>
+  filter(VISIT != "BASELINE") |>
+  mutate(CHG = AVAL - BASE, PCT_RED = round(100*(BASE-AVAL)/BASE,1), RESPFL = PCT_RED >= 50) |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(n = n(), median_red = round(median(PCT_RED,na.rm=TRUE),1),
+            n_responders = sum(RESPFL,na.rm=TRUE), resp_rate = round(100*n_responders/n,1),
+            n_seizfree = sum(AVAL == 0, na.rm=TRUE), .groups = "drop")
+```
+
+```{r ex-seizure-solution}
+sz_analysis <- sz_rows |>
+  filter(VISIT != "BASELINE") |>
+  mutate(
+    CHG     = AVAL - BASE,
+    PCT_RED = round(100 * (BASE - AVAL) / BASE, 1),
+    RESPFL  = PCT_RED >= 50
+  )
+
+sz_analysis |>
+  filter(VISIT == "WEEK 52") |>
+  group_by(ARMCD) |>
+  summarise(
+    n            = n(),
+    median_red   = round(median(PCT_RED, na.rm = TRUE), 1),
+    n_responders = sum(RESPFL, na.rm = TRUE),
+    resp_rate    = round(100 * n_responders / n, 1),
+    n_seizfree   = sum(AVAL == 0, na.rm = TRUE),
+    .groups      = "drop"
+  )
+```
+
+---
+
+## Section 5 — Capstone Problems
+
+### Capstone 1 — Paediatric Growth and Dosing Report
+
+**Scenario:** The DSMB Growth Sub-committee requests an interim report combining growth z-score monitoring with weight-based dosing for the LEV arm. Build a dataset with one row per subject containing:
+
+- Latest weight and height (Week 24 or last observed)
+- WAZ and HAZ at that visit
+- Nutritional status flags (STUNTING, WASTING)
+- Current dose at Week 24 (20 mg/kg, capped at 1500 mg)
+- mg/kg at current dose
+
+```{r capstone1, exercise=TRUE, exercise.lines=56}
+# ── Step 1: Latest available weight and height (Week 24 preferred) ────────────
+latest_measures <- advs_peds |>
+  filter(ARMCD == "LEV") |>
+  group_by(USUBJID, VSTESTCD) |>
+  filter(VISITNUM == max(VISITNUM[VISITNUM <= 5], na.rm = TRUE)) |>  # ≤ Week 24
+  slice(1) |>
+  ungroup() |>
+  select(USUBJID, VSTESTCD, VISIT, VSSTRESN, AGE_LMS_MO, SEX, ARMCD)
+
+latest_wt <- latest_measures |> filter(VSTESTCD == "WEIGHT") |>
+             rename(WEIGHT = VSSTRESN)
+latest_ht <- latest_measures |> filter(VSTESTCD == "HEIGHT") |>
+             select(USUBJID, HEIGHT = VSSTRESN)
+
+# ── Step 2: WAZ for latest weight ─────────────────────────────────────────────
+waz_latest <- derive_params_growth_age_waz(
+  dataset    = latest_wt |> rename(VSSTRESN = WEIGHT),
+  lms_table  = waz_lms,
+  wt_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+) |>
+  select(USUBJID, WAZ, WAZ_PCT)
+
+# ── Step 3: HAZ for latest height ─────────────────────────────────────────────
+haz_latest <- derive_params_growth_age_haz(
+  dataset    = latest_ht |>
+               left_join(select(latest_wt, USUBJID, AGE_LMS_MO, SEX), by="USUBJID") |>
+               rename(VSSTRESN = HEIGHT),
+  lms_table  = haz_lms,
+  ht_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+) |>
+  select(USUBJID, HAZ, HAZ_PCT)
+
+# ── Step 4: Dose at Week 24 ───────────────────────────────────────────────────
+dose_w24 <- latest_wt |>
+  rename(VSSTRESN = WEIGHT) |>
+  derive_var_wt_dose(
+    wt_var = VSSTRESN, dose_per_kg = ___, dose_min = ___, dose_max = ___,
+    new_var = DOSE_MG
+  ) |>
+  mutate(DOSE_PER_KG = round(DOSE_MG / WEIGHT, 2)) |>
+  select(USUBJID, WEIGHT, VISIT, DOSE_MG, DOSE_PER_KG)
+
+# ── Step 5: Assemble ──────────────────────────────────────────────────────────
+growth_dose_report <- dose_w24 |>
+  left_join(latest_ht, by = "USUBJID") |>
+  left_join(waz_latest, by = "USUBJID") |>
+  left_join(haz_latest, by = "USUBJID") |>
+  mutate(BAZ = 0) |>   # placeholder for flag function
+  derive_var_nutrit_flag(haz_var = HAZ, waz_var = WAZ, baz_var = BAZ) |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1, SEX), by = "USUBJID") |>
+  select(USUBJID, AGEGR1, SEX, VISIT, WEIGHT, HEIGHT,
+         WAZ, WAZ_PCT, HAZ, HAZ_PCT, STUNTING, WASTING,
+         DOSE_MG, DOSE_PER_KG)
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+cat("Growth-Dose Report — LEV Arm\n")
+cat("N =", nrow(growth_dose_report), "\n")
+growth_dose_report |>
+  group_by(AGEGR1) |>
+  summarise(
+    n = n(), mean_waz = round(mean(WAZ,na.rm=TRUE),2),
+    n_stunt = sum(STUNTING=="Y",na.rm=TRUE),
+    mean_dose = round(mean(DOSE_MG),0), n_cap = sum(DOSE_MG==1500),
+    .groups = "drop"
+  ) |> print()
+```
+
+```{r capstone1-hint-1}
+# dose_per_kg = 20; dose_min = 125; dose_max = 1500
+```
+
+```{r capstone1-solution}
+latest_measures <- advs_peds |>
+  filter(ARMCD == "LEV") |>
+  group_by(USUBJID, VSTESTCD) |>
+  filter(VISITNUM == max(VISITNUM[VISITNUM <= 5], na.rm = TRUE)) |>
+  slice(1) |>
+  ungroup() |>
+  select(USUBJID, VSTESTCD, VISIT, VSSTRESN, AGE_LMS_MO, SEX, ARMCD)
+
+latest_wt <- latest_measures |> filter(VSTESTCD == "WEIGHT") |> rename(WEIGHT = VSSTRESN)
+latest_ht <- latest_measures |> filter(VSTESTCD == "HEIGHT") |> select(USUBJID, HEIGHT = VSSTRESN)
+
+waz_latest <- derive_params_growth_age_waz(
+  dataset = latest_wt |> rename(VSSTRESN = WEIGHT),
+  lms_table = waz_lms, wt_var = VSSTRESN, age_mo_var = AGE_LMS_MO, sex_var = SEX
+) |> select(USUBJID, WAZ, WAZ_PCT)
+
+haz_latest <- derive_params_growth_age_haz(
+  dataset = latest_ht |>
+    left_join(select(latest_wt, USUBJID, AGE_LMS_MO, SEX), by="USUBJID") |>
+    rename(VSSTRESN = HEIGHT),
+  lms_table = haz_lms, ht_var = VSSTRESN, age_mo_var = AGE_LMS_MO, sex_var = SEX
+) |> select(USUBJID, HAZ, HAZ_PCT)
+
+dose_w24 <- latest_wt |>
+  rename(VSSTRESN = WEIGHT) |>
+  derive_var_wt_dose(wt_var = VSSTRESN, dose_per_kg = 20,
+                     dose_min = 125, dose_max = 1500, new_var = DOSE_MG) |>
+  mutate(DOSE_PER_KG = round(DOSE_MG / WEIGHT, 2)) |>
+  select(USUBJID, WEIGHT, VISIT, DOSE_MG, DOSE_PER_KG)
+
+growth_dose_report <- dose_w24 |>
+  left_join(latest_ht, by = "USUBJID") |>
+  left_join(waz_latest, by = "USUBJID") |>
+  left_join(haz_latest, by = "USUBJID") |>
+  mutate(BAZ = 0) |>
+  derive_var_nutrit_flag(haz_var = HAZ, waz_var = WAZ, baz_var = BAZ) |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1, SEX), by = "USUBJID") |>
+  select(USUBJID, AGEGR1, SEX, VISIT, WEIGHT, HEIGHT,
+         WAZ, WAZ_PCT, HAZ, HAZ_PCT, STUNTING, WASTING, DOSE_MG, DOSE_PER_KG)
+
+cat("Growth-Dose Report — LEV Arm\nN =", nrow(growth_dose_report), "\n")
+growth_dose_report |>
+  group_by(AGEGR1) |>
+  summarise(n = n(), mean_waz = round(mean(WAZ,na.rm=TRUE),2),
+            n_stunt = sum(STUNTING=="Y",na.rm=TRUE),
+            mean_dose = round(mean(DOSE_MG),0), n_cap = sum(DOSE_MG==1500),
+            .groups = "drop") |> print()
+```
+
+### Capstone 2 — Paediatric Efficacy Summary Table
+
+**Scenario:** Build the Week 52 primary analysis table for the DSMB, showing seizure frequency and growth endpoints side by side, stratified by age group.
+
+```{r capstone2, exercise=TRUE, exercise.lines=60}
+# ── Seizure endpoints at Week 52 ──────────────────────────────────────────────
+sz_w52 <- sz_rows |>
+  filter(VISIT == "WEEK 52") |>
+  mutate(PCT_RED = round(100 * (BASE - AVAL) / BASE, 1),
+         RESPFL  = PCT_RED >= 50,
+         SEIZFREE = AVAL == 0)
+
+sz_tbl <- sz_w52 |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1), by = "USUBJID") |>
+  group_by(ARMCD, AGEGR1) |>
+  summarise(
+    n           = n(),
+    med_pct_red = round(median(PCT_RED, na.rm = TRUE), 1),
+    resp_rate   = round(100 * mean(RESPFL, na.rm = TRUE), 1),
+    seizfree    = round(100 * mean(SEIZFREE, na.rm = TRUE), 1),
+    Stat        = "Seizure",
+    .groups     = "drop"
+  )
+
+# ── Growth endpoints at Week 52 ───────────────────────────────────────────────
+waz_w52 <- derive_params_growth_age_waz(
+  dataset    = advs_peds |> filter(VSTESTCD == "WEIGHT", VISIT == "WEEK 52"),
+  lms_table  = waz_lms,
+  wt_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+)
+
+growth_tbl <- waz_w52 |>
+  filter(!is.na(WAZ)) |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1), by = "USUBJID") |>
+  group_by(___, AGEGR1) |>
+  summarise(
+    n        = n(),
+    mean_waz = round(mean(WAZ, na.rm = TRUE), 2),
+    n_wast   = sum(WAZ < -2, na.rm = TRUE),
+    Stat     = "Growth",
+    .groups  = "drop"
+  )
+
+# ── Combined table ────────────────────────────────────────────────────────────
+cat("=== SEIZURE ENDPOINT (Week 52) ===\n")
+print(sz_tbl, n = Inf)
+cat("\n=== GROWTH ENDPOINT (WAZ at Week 52) ===\n")
+print(growth_tbl, n = Inf)
+```
+
+```{r capstone2-hint-1}
+# group by ARMCD and AGEGR1 for both tables
+```
+
+```{r capstone2-solution}
+sz_w52 <- sz_rows |>
+  filter(VISIT == "WEEK 52") |>
+  mutate(PCT_RED = round(100*(BASE-AVAL)/BASE,1), RESPFL = PCT_RED >= 50, SEIZFREE = AVAL==0)
+
+sz_tbl <- sz_w52 |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1), by = "USUBJID") |>
+  group_by(ARMCD, AGEGR1) |>
+  summarise(n = n(), med_pct_red = round(median(PCT_RED,na.rm=TRUE),1),
+            resp_rate = round(100*mean(RESPFL,na.rm=TRUE),1),
+            seizfree = round(100*mean(SEIZFREE,na.rm=TRUE),1),
+            Stat = "Seizure", .groups = "drop")
+
+waz_w52 <- derive_params_growth_age_waz(
+  dataset = advs_peds |> filter(VSTESTCD == "WEIGHT", VISIT == "WEEK 52"),
+  lms_table = waz_lms, wt_var = VSSTRESN, age_mo_var = AGE_LMS_MO, sex_var = SEX
+)
+
+growth_tbl <- waz_w52 |>
+  filter(!is.na(WAZ)) |>
+  left_join(select(adsl_peds, USUBJID, AGEGR1), by = "USUBJID") |>
+  group_by(ARMCD, AGEGR1) |>
+  summarise(n = n(), mean_waz = round(mean(WAZ,na.rm=TRUE),2),
+            n_wast = sum(WAZ < -2,na.rm=TRUE), Stat = "Growth", .groups = "drop")
+
+cat("=== SEIZURE ENDPOINT (Week 52) ===\n"); print(sz_tbl, n = Inf)
+cat("\n=== GROWTH ENDPOINT (WAZ at Week 52) ===\n"); print(growth_tbl, n = Inf)
+```
+
+---
+
+## Section 6 — Hard Challenges
+
+### Challenge 1 — Growth velocity (annualised height gain)
+
+**Scenario:** The protocol requires reporting **height velocity** (cm/year) between consecutive visits, because anti-epileptic drugs can suppress growth hormone secretion. Compute annualised height velocity between each pair of visits per subject.
+
+```{r challenge-velocity, exercise=TRUE, exercise.lines=30}
+ht_visits <- advs_peds |>
+  filter(VSTESTCD == "HEIGHT") |>
+  arrange(USUBJID, VISITNUM) |>
+  group_by(USUBJID, ARMCD) |>
+  mutate(
+    HT_PREV      = lag(VSSTRESN),
+    DAY_PREV     = lag(ADY),
+    DAYS_ELAPSED = ADY - DAY_PREV,
+    HT_GAIN      = VSSTRESN - HT_PREV,
+    HT_VEL_YEAR  = round(___ / (___ / 365.25), 1)  # cm/year
+  ) |>
+  ungroup() |>
+  filter(!is.na(HT_VEL_YEAR))
+
+# Mean annualised height velocity by arm and visit interval
+ht_visits |>
+  group_by(ARMCD, VISIT) |>
+  summarise(
+    n             = n(),
+    mean_vel      = round(mean(HT_VEL_YEAR, na.rm = TRUE), 1),
+    .groups       = "drop"
+  ) |>
+  arrange(ARMCD, VISIT)
+```
+
+```{r challenge-velocity-hint-1}
+# HT_VEL_YEAR = HT_GAIN / (DAYS_ELAPSED / 365.25)
+ht_visits <- advs_peds |>
+  filter(VSTESTCD == "HEIGHT") |>
+  arrange(USUBJID, VISITNUM) |>
+  group_by(USUBJID, ARMCD) |>
+  mutate(HT_PREV = lag(VSSTRESN), DAY_PREV = lag(ADY),
+         DAYS_ELAPSED = ADY - DAY_PREV, HT_GAIN = VSSTRESN - HT_PREV,
+         HT_VEL_YEAR = round(HT_GAIN / (DAYS_ELAPSED / 365.25), 1)) |>
+  ungroup() |>
+  filter(!is.na(HT_VEL_YEAR))
+```
+
+```{r challenge-velocity-solution}
+ht_visits <- advs_peds |>
+  filter(VSTESTCD == "HEIGHT") |>
+  arrange(USUBJID, VISITNUM) |>
+  group_by(USUBJID, ARMCD) |>
+  mutate(
+    HT_PREV      = lag(VSSTRESN),
+    DAY_PREV     = lag(ADY),
+    DAYS_ELAPSED = ADY - DAY_PREV,
+    HT_GAIN      = VSSTRESN - HT_PREV,
+    HT_VEL_YEAR  = round(HT_GAIN / (DAYS_ELAPSED / 365.25), 1)
+  ) |>
+  ungroup() |>
+  filter(!is.na(HT_VEL_YEAR))
+
+ht_visits |>
+  group_by(ARMCD, VISIT) |>
+  summarise(n = n(), mean_vel = round(mean(HT_VEL_YEAR, na.rm = TRUE), 1),
+            .groups = "drop") |>
+  arrange(ARMCD, VISIT)
+```
+
+### Challenge 2 — Age-group crossover subjects
+
+**Scenario:** A regulatory reviewer flags that some subjects entered as "Child (6–11 yr)" but turned 12 during the trial, meaning their Week 52 data falls in the "Adolescent" group. Identify these crossover subjects and report their efficacy and growth outcomes separately.
+
+```{r challenge-crossover, exercise=TRUE, exercise.lines=36}
+# Compute age group at baseline and at Week 52
+age_bl <- adsl_peds |>
+  mutate(AGEGR_BL = AGEGR1) |>
+  select(USUBJID, AGEGR_BL, AGE_ENR_YR)
+
+age_w52 <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", VISIT == "WEEK 52") |>
+  mutate(
+    AGE_W52_YR  = AGE_VISIT_MO / 12,
+    AGEGR_W52   = case_when(
+      AGE_W52_YR <  2 ~ "Infant (< 2 yr)",
+      AGE_W52_YR <  6 ~ "Toddler (2–5 yr)",
+      AGE_W52_YR < 12 ~ "Child (6–11 yr)",
+      TRUE            ~ "Adolescent (12–16 yr)"
+    )
+  ) |>
+  select(USUBJID, ARMCD, AGEGR_W52, AGE_W52_YR)
+
+crossover_subj <- age_bl |>
+  left_join(___, by = "USUBJID") |>
+  filter(___ != ___)   # group changed between baseline and Week 52
+
+cat("Crossover subjects:", nrow(crossover_subj), "\n")
+crossover_subj |>
+  count(AGEGR_BL, AGEGR_W52, ARMCD)
+```
+
+```{r challenge-crossover-hint-1}
+# left_join age_w52; filter AGEGR_BL != AGEGR_W52
+age_bl |>
+  left_join(age_w52, by = "USUBJID") |>
+  filter(AGEGR_BL != AGEGR_W52)
+```
+
+```{r challenge-crossover-solution}
+age_bl <- adsl_peds |>
+  mutate(AGEGR_BL = AGEGR1) |>
+  select(USUBJID, AGEGR_BL, AGE_ENR_YR)
+
+age_w52 <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", VISIT == "WEEK 52") |>
+  mutate(AGE_W52_YR = AGE_VISIT_MO / 12,
+         AGEGR_W52 = case_when(
+           AGE_W52_YR <  2 ~ "Infant (< 2 yr)",
+           AGE_W52_YR <  6 ~ "Toddler (2–5 yr)",
+           AGE_W52_YR < 12 ~ "Child (6–11 yr)",
+           TRUE            ~ "Adolescent (12–16 yr)"
+         )) |>
+  select(USUBJID, ARMCD, AGEGR_W52, AGE_W52_YR)
+
+crossover_subj <- age_bl |>
+  left_join(age_w52, by = "USUBJID") |>
+  filter(AGEGR_BL != AGEGR_W52)
+
+cat("Crossover subjects:", nrow(crossover_subj), "\n")
+crossover_subj |>
+  count(AGEGR_BL, AGEGR_W52, ARMCD)
+```
+
+### Challenge 3 — Preterm vs term: does corrected age alter WAZ classification?
+
+**Scenario:** For preterm subjects in the youngest age group, compute WAZ using both chronological and corrected age, and count how many subjects change nutritional status classification depending on which age is used.
+
+```{r challenge-preterm-waz, exercise=TRUE, exercise.lines=40}
+# Preterm subjects at baseline (VSTESTCD == "WEIGHT")
+preterm_bl <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", VISIT == "BASELINE") |>
+  left_join(select(adsl_peds, USUBJID, PRETERM, AGE_CORR_MO, GA_WKS), by = "USUBJID") |>
+  filter(PRETERM)
+
+# WAZ using chronological age (AGE_LMS_MO)
+waz_chron <- derive_params_growth_age_waz(
+  dataset    = preterm_bl,
+  lms_table  = waz_lms,
+  wt_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+) |>
+  select(USUBJID, WAZ_CHRON = WAZ)
+
+# WAZ using corrected age
+preterm_bl_corr <- preterm_bl |>
+  mutate(AGE_CORR_LMS = pmin(204, pmax(24, round(AGE_CORR_MO / 12) * 12)))
+
+waz_corr <- derive_params_growth_age_waz(
+  dataset    = preterm_bl_corr |> mutate(AGE_LMS_MO = AGE_CORR_LMS),
+  lms_table  = waz_lms,
+  wt_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+) |>
+  select(USUBJID, WAZ_CORR = WAZ)
+
+# Compare classifications
+comparison <- waz_chron |>
+  left_join(___, by = "USUBJID") |>
+  mutate(
+    STATUS_CHRON = if_else(WAZ_CHRON < -2, "Wasting", "Normal"),
+    STATUS_CORR  = if_else(WAZ_CORR  < -2, "Wasting", "Normal"),
+    CLASS_CHANGED = STATUS_CHRON != STATUS_CORR
+  )
+
+cat("Preterm subjects:", nrow(comparison), "\n")
+cat("Classification changed with corrected age:", sum(comparison$CLASS_CHANGED), "\n")
+comparison |>
+  filter(CLASS_CHANGED) |>
+  select(USUBJID, WAZ_CHRON, WAZ_CORR, STATUS_CHRON, STATUS_CORR)
+```
+
+```{r challenge-preterm-waz-hint-1}
+# left_join waz_corr by USUBJID
+```
+
+```{r challenge-preterm-waz-solution}
+preterm_bl <- advs_peds |>
+  filter(VSTESTCD == "WEIGHT", VISIT == "BASELINE") |>
+  left_join(select(adsl_peds, USUBJID, PRETERM, AGE_CORR_MO, GA_WKS), by = "USUBJID") |>
+  filter(PRETERM)
+
+waz_chron <- derive_params_growth_age_waz(
+  dataset = preterm_bl, lms_table = waz_lms,
+  wt_var = VSSTRESN, age_mo_var = AGE_LMS_MO, sex_var = SEX
+) |> select(USUBJID, WAZ_CHRON = WAZ)
+
+preterm_bl_corr <- preterm_bl |>
+  mutate(AGE_CORR_LMS = pmin(204, pmax(24, round(AGE_CORR_MO / 12) * 12)))
+
+waz_corr <- derive_params_growth_age_waz(
+  dataset = preterm_bl_corr |> mutate(AGE_LMS_MO = AGE_CORR_LMS),
+  lms_table = waz_lms, wt_var = VSSTRESN, age_mo_var = AGE_LMS_MO, sex_var = SEX
+) |> select(USUBJID, WAZ_CORR = WAZ)
+
+comparison <- waz_chron |>
+  left_join(waz_corr, by = "USUBJID") |>
+  mutate(STATUS_CHRON = if_else(WAZ_CHRON < -2,"Wasting","Normal"),
+         STATUS_CORR  = if_else(WAZ_CORR  < -2,"Wasting","Normal"),
+         CLASS_CHANGED = STATUS_CHRON != STATUS_CORR)
+
+cat("Preterm subjects:", nrow(comparison), "\n")
+cat("Classification changed with corrected age:", sum(comparison$CLASS_CHANGED), "\n")
+comparison |>
+  filter(CLASS_CHANGED) |>
+  select(USUBJID, WAZ_CHRON, WAZ_CORR, STATUS_CHRON, STATUS_CORR)
+```
+
+---
+
+## Lesson Summary
+
+```{r quiz-final, echo=FALSE}
+quiz(
+  caption = "Final Knowledge Check",
+
+  question("A premature infant born at 34 weeks is 9 months old (chronological). Their corrected age is approximately:",
+    answer("9 months"),
+    answer("7.6 months", correct = TRUE,
+           message = "Weeks premature = 40 − 34 = 6 weeks = 6/4.33 ≈ 1.4 months. Corrected age = 9 − 1.4 ≈ 7.6 months. Growth z-scores should use this corrected age."),
+    answer("11 months — add prematurity weeks"),
+    answer("6 months"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("The LMS method converts raw measurements to z-scores because:",
+    answer("It is faster than other methods"),
+    answer("Paediatric growth measurements are log-normally distributed and age/sex-specific; LMS adjusts for skewness and population reference simultaneously",
+           correct = TRUE),
+    answer("WHO mandates LMS for all clinical trials"),
+    answer("Z-scores make it easier to compute percentiles"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+```{r ex-final-dose-check, exercise=TRUE, exercise.lines=14}
+# A child weighs 38 kg. The protocol specifies 20 mg/kg, min 125 mg, max 1500 mg.
+# Use derive_var_wt_dose() to compute DOSE_MG for all subjects in adsl_peds,
+# then filter to subjects with WGTBL between 35 and 42 kg and show their doses.
+
+adsl_peds |>
+  derive_var_wt_dose(
+    wt_var      = WGTBL,
+    dose_per_kg = ___,
+    dose_min    = ___,
+    dose_max    = ___,
+    new_var     = DOSE_MG
+  ) |>
+  filter(between(WGTBL, 35, 42)) |>
+  select(USUBJID, WGTBL, DOSE_MG, ARMCD) |>
+  arrange(WGTBL)
+```
+
+```{r ex-final-dose-check-hint-1}
+# dose_per_kg = 20, dose_min = 125, dose_max = 1500
+```
+
+```{r ex-final-dose-check-solution}
+adsl_peds |>
+  derive_var_wt_dose(
+    wt_var      = WGTBL,
+    dose_per_kg = 20,
+    dose_min    = 125,
+    dose_max    = 1500,
+    new_var     = DOSE_MG
+  ) |>
+  filter(between(WGTBL, 35, 42)) |>
+  select(USUBJID, WGTBL, DOSE_MG, ARMCD) |>
+  arrange(WGTBL)
+```
+
+```{r ex-final-haz-flag, exercise=TRUE, exercise.lines=14}
+# HAZ < -2 indicates stunting. Derive HAZ at baseline for all subjects,
+# then count the number of stunted subjects by arm.
+
+baseline_ht_all <- advs_peds |>
+  filter(VSTESTCD == "HEIGHT", VISIT == "BASELINE")
+
+derive_params_growth_age_haz(
+  dataset    = baseline_ht_all,
+  lms_table  = haz_lms,
+  ht_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+) |>
+  filter(!is.na(HAZ)) |>
+  mutate(STUNTING_FL = if_else(___ < -2, "Y", "N")) |>
+  count(ARMCD, STUNTING_FL)
+```
+
+```{r ex-final-haz-flag-hint-1}
+# STUNTING_FL = if_else(HAZ < -2, "Y", "N")
+```
+
+```{r ex-final-haz-flag-solution}
+baseline_ht_all <- advs_peds |>
+  filter(VSTESTCD == "HEIGHT", VISIT == "BASELINE")
+
+derive_params_growth_age_haz(
+  dataset    = baseline_ht_all,
+  lms_table  = haz_lms,
+  ht_var     = VSSTRESN,
+  age_mo_var = AGE_LMS_MO,
+  sex_var    = SEX
+) |>
+  filter(!is.na(HAZ)) |>
+  mutate(STUNTING_FL = if_else(HAZ < -2, "Y", "N")) |>
+  count(ARMCD, STUNTING_FL)
+```
+
+```{r ex-final-ht-velocity, exercise=TRUE, exercise.lines=16}
+# Height velocity (cm/year) = height gain between consecutive visits
+# divided by the fraction of a year elapsed.
+# Compute mean annualised height velocity at WEEK 52 by arm.
+
+advs_peds |>
+  filter(VSTESTCD == "HEIGHT") |>
+  arrange(USUBJID, VISITNUM) |>
+  group_by(USUBJID, ARMCD) |>
+  mutate(
+    HT_PREV      = lag(VSSTRESN),
+    DAYS_ELAPSED = ADY - lag(ADY),
+    HT_VEL_YEAR  = round(___ / (___ / 365.25), 1)
+  ) |>
+  ungroup() |>
+  filter(VISIT == "WEEK 52", !is.na(HT_VEL_YEAR)) |>
+  group_by(ARMCD) |>
+  summarise(n = n(), mean_vel = round(mean(HT_VEL_YEAR), 1), .groups = "drop")
+```
+
+```{r ex-final-ht-velocity-hint-1}
+# HT_VEL_YEAR = (VSSTRESN - HT_PREV) / (DAYS_ELAPSED / 365.25)
+```
+
+```{r ex-final-ht-velocity-solution}
+advs_peds |>
+  filter(VSTESTCD == "HEIGHT") |>
+  arrange(USUBJID, VISITNUM) |>
+  group_by(USUBJID, ARMCD) |>
+  mutate(
+    HT_PREV      = lag(VSSTRESN),
+    DAYS_ELAPSED = ADY - lag(ADY),
+    HT_VEL_YEAR  = round((VSSTRESN - HT_PREV) / (DAYS_ELAPSED / 365.25), 1)
+  ) |>
+  ungroup() |>
+  filter(VISIT == "WEEK 52", !is.na(HT_VEL_YEAR)) |>
+  group_by(ARMCD) |>
+  summarise(n = n(), mean_vel = round(mean(HT_VEL_YEAR), 1), .groups = "drop")
+```
+
+### Key takeaways
+
+You have learned to:
+
+- Calculate **chronological and corrected (adjusted) age** for preterm infants in months at each study visit
+- Apply the **LMS (Box-Cox) method** via `derive_params_growth_age_waz/haz/baz()` to compute WAZ, HAZ, and BAZ
+- Use **percentile conversion** (`zscore_to_pct()`) and interpret WHO nutritional status thresholds: stunting (HAZ < −2), wasting (WAZ < −2), overweight (BAZ > 2)
+- Derive **weight-based doses** with floor/ceiling caps using `derive_var_wt_dose()`
+- Calculate **dose intensity** for subjects at the maximum dose cap
+- Track **growth velocity** (annualised cm/year) and detect **age-group crossover** subjects
+- Quantify the impact of **corrected vs chronological age** on WAZ nutritional classification
+
+**Next lesson:** Lesson 24 — `admiralmetabolic` — ADaM derivations for metabolic disease trials (NASH/NAFLD liver endpoints, glycaemia, lipid panels, composite metabolic scores).

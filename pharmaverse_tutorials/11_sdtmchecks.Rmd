@@ -11,6 +11,32 @@ description: >
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 11_sdtmchecks.Rmd
+# PURPOSE       : SDTM data quality validation using the sdtmchecks package: rule
+#                 categories aligned with Pinnacle 21 Community, check
+#                 functions, interpreting check results, and building a
+#                 QC report.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tidyr)
@@ -750,10 +776,23 @@ lapply(names(high_results), function(nm) {
 
 For sharing with non-R stakeholders (data managers, clinical operations), `report_to_xlsx()` produces a multi-tab Excel file: a summary tab and one tab per failed check.
 
+```{r dirty-results-prereq, include=FALSE}
+# Pre-compute dirty_results so report-demo can use it at render time.
+# (Exercise chunks are isolated and don't populate the shared environment.)
+dirty_results <- run_all_checks(
+  metads = sdtmchecksmeta,
+  DM = dm_dirty,
+  AE = ae_dirty,
+  EX = ex,
+  LB = lb_dirty,
+  VS = vs
+)
+```
+
 ```{r report-demo}
 # Generate an Excel QC report
 report_to_xlsx(
-  res     = dirty_results,   # from run_all_checks() above
+  res     = dirty_results,
   outfile = "sdtm_qc_report.xlsx"
 )
 ```

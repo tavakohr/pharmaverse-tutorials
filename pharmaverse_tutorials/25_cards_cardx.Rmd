@@ -1,0 +1,1548 @@
+---
+title: "Lesson 25 — cards & cardx: Analysis Results Datasets (ARDs)"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Build Analysis Results Datasets (ARDs) using the cards and cardx packages:
+  ard_continuous() for descriptive statistics, ard_categorical() for frequency
+  tables, ard_missing() for data completeness, ard_stack() and bind_ard() to
+  combine ARDs, cardx extensions for t-tests, chi-squared, and Wilcoxon tests,
+  and constructing ARDs as machine-readable building blocks for TLF automation.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 25_cards_cardx.Rmd
+# PURPOSE       : cards and cardx packages — Analysis Results Datasets (ARDs):
+#                 ard_continuous(), ard_categorical(), ard_missing(),
+#                 ard_stack(), cardx statistical tests (t-test, chi-
+#                 squared, Wilcoxon), and manual ARD-to-display-table
+#                 assembly as the foundation for tfrmt TLF automation.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo","Xanomeline Low Dose","Xanomeline High Dose"))
+  ) |>
+  filter(SAFFL == "Y")
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARDS / CARDX FUNCTION MOCKS
+# These replicate the real package APIs so exercises run inside learnr
+# without the packages installed. Output structure follows the CDISC ARD spec.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Helper: build one ARD row
+.ard_row <- function(group1=NA_character_, group1_level=NA_character_,
+                     variable, variable_level=NA_character_,
+                     context, stat_name, stat, stat_label) {
+  tibble(
+    group1       = group1,
+    group1_level = group1_level,
+    variable     = variable,
+    variable_level = variable_level,
+    context      = context,
+    stat_name    = stat_name,
+    stat         = list(stat),
+    stat_label   = stat_label
+  )
+}
+
+#' Summarise continuous variables into an ARD
+#'
+#' Returns one row per (variable × by-level × statistic).
+#' Default statistics: N, mean, sd, median, p25, p75, min, max, n_miss, p_miss.
+#'
+#' @param data       A data frame
+#' @param variables  Character vector of numeric column names
+#' @param by         Optional character: grouping column name
+#' @param statistics Named list: stat_name -> function. Defaults provided.
+ard_continuous <- function(data, variables, by = NULL,
+                           statistics = list(
+                             N      = function(x) sum(!is.na(x)),
+                             mean   = function(x) mean(x, na.rm=TRUE),
+                             sd     = function(x) sd(x, na.rm=TRUE),
+                             median = function(x) median(x, na.rm=TRUE),
+                             p25    = function(x) quantile(x, 0.25, na.rm=TRUE),
+                             p75    = function(x) quantile(x, 0.75, na.rm=TRUE),
+                             min    = function(x) min(x, na.rm=TRUE),
+                             max    = function(x) max(x, na.rm=TRUE),
+                             n_miss = function(x) sum(is.na(x)),
+                             p_miss = function(x) round(100*mean(is.na(x)),1)
+                           )) {
+  stat_labels <- c(N="N (non-missing)", mean="Mean", sd="SD", median="Median",
+                   p25="Q1 (25th pctile)", p75="Q3 (75th pctile)",
+                   min="Min", max="Max", n_miss="N missing", p_miss="% missing")
+
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      x   <- sub[[vv]]
+      lapply(names(statistics), function(sn) {
+        val <- tryCatch(statistics[[sn]](x), error=function(e) NA_real_)
+        .ard_row(
+          group1       = if (!is.null(by)) by else NA_character_,
+          group1_level = as.character(gl),
+          variable     = vv,
+          context      = "continuous",
+          stat_name    = sn,
+          stat         = val,
+          stat_label   = stat_labels[sn]
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  structure(rows, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+#' Summarise categorical variables into an ARD
+#'
+#' Returns one row per (variable × level × by-level × statistic).
+#' Statistics: n (count) and p (proportion).
+#'
+#' @param data      A data frame
+#' @param variables Character vector of column names
+#' @param by        Optional grouping column name
+ard_categorical <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+
+  rows <- lapply(variables, function(vv) {
+    levs <- sort(unique(as.character(data[[vv]])))
+    levs <- levs[!is.na(levs)]
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      total <- sum(!is.na(sub[[vv]]))
+      lapply(levs, function(lv) {
+        cnt <- sum(sub[[vv]] == lv, na.rm=TRUE)
+        bind_rows(
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="n", stat=cnt, stat_label="n"),
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="p", stat=round(100*cnt/total,1), stat_label="%")
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  structure(rows, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+#' Summarise missing data into an ARD
+#'
+#' Returns n_miss and p_miss for each variable, optionally by group.
+#'
+#' @param data      A data frame
+#' @param variables Character vector of column names
+#' @param by        Optional grouping column
+ard_missing <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      x   <- sub[[vv]]
+      bind_rows(
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="missing", stat_name="n_miss",
+                 stat=sum(is.na(x)), stat_label="N missing"),
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="missing", stat_name="p_miss",
+                 stat=round(100*mean(is.na(x)),1), stat_label="% missing"),
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="missing", stat_name="n_not_miss",
+                 stat=sum(!is.na(x)), stat_label="N non-missing")
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  structure(rows, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+#' Stack multiple ARDs into one
+#'
+#' Equivalent to bind_rows() but preserves the 'card' class.
+#' @param ... Two or more ARD tibbles (card objects)
+ard_stack <- function(...) {
+  out <- bind_rows(...)
+  structure(out, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+#' Bind ARDs (alias for ard_stack, same behaviour)
+bind_ard <- function(...) ard_stack(...)
+
+#' Extract a numeric statistic value from an ARD list-column
+#'
+#' ARD stat columns are list columns (each element can be any R object).
+#' This helper unlists a single stat to a plain numeric vector for display.
+#'
+#' @param ard      An ARD tibble
+#' @param stat_nm  Character: the stat_name to extract
+#' @param var_nm   Optional character: filter to this variable first
+ard_get_stat <- function(ard, stat_nm, var_nm = NULL) {
+  x <- if (!is.null(var_nm)) filter(ard, variable == var_nm) else ard
+  x |> filter(stat_name == stat_nm) |> pull(stat) |> unlist()
+}
+
+# ── cardx statistical test mocks ─────────────────────────────────────────────
+
+#' Add Welch two-sample t-test result to an ARD
+#'
+#' @param data      A data frame
+#' @param variable  Character: continuous outcome variable
+#' @param by        Character: grouping variable (exactly 2 levels)
+#' @param conf.level Confidence level (default 0.95)
+ard_ttest <- function(data, variable, by, conf.level = 0.95) {
+  levs <- unique(na.omit(data[[by]]))
+  if (length(levs) != 2) stop("ard_ttest() requires exactly 2 levels in 'by'")
+  x1   <- data[[variable]][data[[by]] == levs[1]]
+  x2   <- data[[variable]][data[[by]] == levs[2]]
+  tt   <- t.test(x1, x2, conf.level = conf.level)
+  bind_rows(
+    .ard_row(group1=by, group1_level=paste(levs, collapse=" vs "),
+             variable=variable, context="ttest",
+             stat_name="statistic", stat=round(tt$statistic,4),
+             stat_label="t statistic"),
+    .ard_row(group1=by, group1_level=paste(levs, collapse=" vs "),
+             variable=variable, context="ttest",
+             stat_name="p.value", stat=round(tt$p.value,4),
+             stat_label="p-value"),
+    .ard_row(group1=by, group1_level=paste(levs, collapse=" vs "),
+             variable=variable, context="ttest",
+             stat_name="estimate", stat=round(tt$estimate[1]-tt$estimate[2],4),
+             stat_label="Mean difference"),
+    .ard_row(group1=by, group1_level=paste(levs, collapse=" vs "),
+             variable=variable, context="ttest",
+             stat_name="conf.low",  stat=round(tt$conf.int[1],4),
+             stat_label=paste0(conf.level*100,"% CI lower")),
+    .ard_row(group1=by, group1_level=paste(levs, collapse=" vs "),
+             variable=variable, context="ttest",
+             stat_name="conf.high", stat=round(tt$conf.int[2],4),
+             stat_label=paste0(conf.level*100,"% CI upper"))
+  ) |> structure(class = c("card","tbl_df","tbl","data.frame"))
+}
+
+#' Add chi-squared test result to an ARD
+#'
+#' @param data      A data frame
+#' @param variable  Character: categorical variable
+#' @param by        Character: grouping variable
+ard_chisqtest <- function(data, variable, by) {
+  tbl <- table(data[[variable]], data[[by]])
+  cs  <- chisq.test(tbl)
+  bind_rows(
+    .ard_row(group1=by, group1_level=NA_character_, variable=variable,
+             context="chisqtest", stat_name="statistic",
+             stat=round(cs$statistic,4), stat_label="Chi-squared statistic"),
+    .ard_row(group1=by, group1_level=NA_character_, variable=variable,
+             context="chisqtest", stat_name="p.value",
+             stat=round(cs$p.value,4), stat_label="p-value"),
+    .ard_row(group1=by, group1_level=NA_character_, variable=variable,
+             context="chisqtest", stat_name="df",
+             stat=cs$parameter, stat_label="Degrees of freedom")
+  ) |> structure(class = c("card","tbl_df","tbl","data.frame"))
+}
+
+#' Add Wilcoxon rank-sum (Mann-Whitney) test to an ARD
+#'
+#' @param data      A data frame
+#' @param variable  Character: continuous variable
+#' @param by        Character: grouping variable (2 levels)
+ard_wilcoxtest <- function(data, variable, by) {
+  levs <- unique(na.omit(data[[by]]))
+  if (length(levs) != 2) stop("ard_wilcoxtest() requires exactly 2 levels")
+  x1  <- data[[variable]][data[[by]] == levs[1]]
+  x2  <- data[[variable]][data[[by]] == levs[2]]
+  wt  <- wilcox.test(x1, x2, correct=FALSE)
+  bind_rows(
+    .ard_row(group1=by, group1_level=paste(levs, collapse=" vs "),
+             variable=variable, context="wilcoxtest",
+             stat_name="statistic", stat=round(wt$statistic,4),
+             stat_label="W statistic"),
+    .ard_row(group1=by, group1_level=paste(levs, collapse=" vs "),
+             variable=variable, context="wilcoxtest",
+             stat_name="p.value", stat=round(wt$p.value,4),
+             stat_label="p-value")
+  ) |> structure(class = c("card","tbl_df","tbl","data.frame"))
+}
+
+# ── Pre-built ARDs for exercises ──────────────────────────────────────────────
+
+# Continuous summary of adsl by treatment
+ard_demog_cont <- ard_continuous(
+  data      = adsl,
+  variables = c("AGE","WEIGHTBL","HEIGHTBL","BMIBL"),
+  by        = "TRT01P"
+)
+
+# Categorical summary of adsl by treatment
+ard_demog_cat <- ard_categorical(
+  data      = adsl,
+  variables = c("SEX","RACE","AGEGR1"),
+  by        = "TRT01P"
+)
+```
+
+## Overview
+
+The **cards** and **cardx** packages implement the CDISC Analysis Results Standard (ARS). Instead of generating a formatted table directly, they produce an **Analysis Results Dataset (ARD)** — a machine-readable, long-format tibble where *each row is one statistic*.
+
+This separation of "compute" from "format" is the key idea behind the pharmaverse TLF pipeline:
+
+```
+Data → ARD (cards/cardx) → Formatted table (tfrmt / gtsummary / gt)
+```
+
+**Why ARDs?**
+
+In a traditional SAS workflow, the same means and counts are computed *inside* the PROC that formats them, making it hard to reuse statistics, apply different templates, or compare across studies. An ARD stores results once, independently of formatting, so the same ARD can feed a CSR table, a DSMB slide deck, or an interactive Shiny dashboard without recomputing anything.
+
+**ARD column structure (CDISC standard):**
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `group1` | chr | Stratification variable name (e.g. `"TRT01P"`) |
+| `group1_level` | chr | Stratum value (e.g. `"Placebo"`) |
+| `variable` | chr | Analysis variable name (e.g. `"AGE"`) |
+| `variable_level` | chr | Level — only used for categorical variables |
+| `context` | chr | Type: `"continuous"`, `"categorical"`, `"missing"` |
+| `stat_name` | chr | Statistic identifier: `"mean"`, `"n"`, `"p"`, `"p.value"` … |
+| `stat` | list | The statistic value (list column — can hold any R object) |
+| `stat_label` | chr | Human-readable label for the statistic |
+
+> **Key gotcha:** `stat` is a **list column**. You cannot do arithmetic on it directly. Use `unlist(stat)` or `ard_get_stat()` to pull a plain numeric vector.
+
+### Trial Dataset
+
+All exercises in this lesson use the **CDISCPILOT01** Alzheimer's study from `pharmaverseadam` — the same data you used in lessons 4–19. Three arms: `Placebo`, `Xanomeline Low Dose`, `Xanomeline High Dose` (n = 254 safety population).
+
+---
+
+## Section 1 — ARD Structure: Exploring a Pre-Built ARD
+
+Before building ARDs from scratch, let's explore one already computed for you: `ard_demog_cont` — a continuous summary of AGE, weight, height, and BMI stratified by `TRT01P`.
+
+```{r ex-ard-explore, exercise=TRUE, exercise.lines=10}
+# ard_demog_cont is a pre-built ARD (continuous stats of AGE/WEIGHTBL/HEIGHTBL/BMIBL
+# stratified by TRT01P).
+# How many rows does it have, and what are the unique stat_name values?
+
+nrow(ard_demog_cont)
+ard_demog_cont |> distinct(___)   # all unique stat_name values
+```
+
+```{r ex-ard-explore-hint-1}
+# distinct(stat_name) to see all statistic names in the ARD
+```
+
+```{r ex-ard-explore-solution}
+nrow(ard_demog_cont)
+ard_demog_cont |> distinct(stat_name)
+```
+
+```{r ex-ard-structure, exercise=TRUE, exercise.lines=12}
+# Print the first 6 rows to see the ARD layout.
+# Then pull the mean AGE for the Placebo arm by filtering stat_name and group1_level.
+
+head(ard_demog_cont, 6)
+
+# Mean AGE for Placebo:
+ard_demog_cont |>
+  filter(variable == ___, stat_name == ___, group1_level == ___) |>
+  mutate(stat_value = unlist(stat)) |>
+  select(variable, group1_level, stat_name, stat_value)
+```
+
+```{r ex-ard-structure-hint-1}
+# variable == "AGE", stat_name == "mean", group1_level == "Placebo"
+```
+
+```{r ex-ard-structure-solution}
+head(ard_demog_cont, 6)
+
+ard_demog_cont |>
+  filter(variable == "AGE", stat_name == "mean", group1_level == "Placebo") |>
+  mutate(stat_value = unlist(stat)) |>
+  select(variable, group1_level, stat_name, stat_value)
+```
+
+```{r ex-ard-unlist, exercise=TRUE, exercise.lines=14}
+# The stat column is a LIST column — each cell holds one R value.
+# To compare means across arms you must unlist() it.
+# Extract mean AGE for all three arms as a plain numeric vector.
+
+ard_demog_cont |>
+  filter(variable == "AGE", stat_name == "mean") |>
+  mutate(mean_age = unlist(___)) |>        # unlist the stat list-column
+  select(group1_level, mean_age) |>
+  mutate(mean_age = round(mean_age, 1))
+```
+
+```{r ex-ard-unlist-hint-1}
+# mutate(mean_age = unlist(stat))
+```
+
+```{r ex-ard-unlist-solution}
+ard_demog_cont |>
+  filter(variable == "AGE", stat_name == "mean") |>
+  mutate(mean_age = unlist(stat)) |>
+  select(group1_level, mean_age) |>
+  mutate(mean_age = round(mean_age, 1))
+```
+
+### Quiz — ARD Fundamentals
+
+```{r quiz-ard1, echo=FALSE}
+quiz(caption = "ARD Structure",
+  question("Why is the `stat` column a list column rather than a plain numeric column?",
+    answer("Because ARDs are always stored as nested tibbles"),
+    answer("To allow a single ARD to hold heterogeneous stat types — numerics, character labels, model objects, etc.",
+           correct = TRUE,
+           message = "A list column can hold any R object in each cell. This lets an ARD store a p-value, a mean, an entire confidence interval vector, or even a model object in the same column."),
+    answer("Because dplyr requires list columns for grouped summaries"),
+    answer("To reduce memory usage"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("What does `group1_level` contain when `ard_continuous()` is called WITHOUT a `by` argument?",
+    answer("The variable name"),
+    answer("NA", correct = TRUE,
+           message = "When there is no grouping variable, group1 and group1_level are both NA — the statistic is marginal (unstratified)."),
+    answer("The word 'Overall'"),
+    answer("An empty string"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — ard_continuous(): Descriptive Statistics
+
+`ard_continuous()` computes summary statistics for numeric variables. The default statistics are: N, mean, SD, median, Q1, Q3, min, max, n_miss, p_miss.
+
+```r
+ard_continuous(
+  data       = adsl,
+  variables  = c("AGE", "WEIGHTBL"),   # numeric columns to summarise
+  by         = "TRT01P"                # optional stratification
+)
+```
+
+You can override the default statistics by passing a named list of functions to `statistics`:
+
+```r
+ard_continuous(
+  data       = adsl,
+  variables  = "AGE",
+  statistics = list(
+    n      = function(x) sum(!is.na(x)),
+    mean   = function(x) mean(x, na.rm = TRUE),
+    se     = function(x) sd(x, na.rm=TRUE) / sqrt(sum(!is.na(x)))
+  )
+)
+```
+
+### Practice — Build a Continuous ARD
+
+```{r ex-cont-build, exercise=TRUE, exercise.lines=14}
+# Create an ARD with mean, sd, and median for AGE and BMIBL,
+# stratified by TRT01P.
+
+ard_age_bmi <- ard_continuous(
+  data       = ___,
+  variables  = c(___, ___),
+  by         = ___,
+  statistics = list(
+    mean   = function(x) mean(x, na.rm=TRUE),
+    sd     = function(x) sd(x, na.rm=TRUE),
+    median = function(x) median(x, na.rm=TRUE)
+  )
+)
+
+# How many rows? (3 stats × 2 variables × 3 arms = 18)
+nrow(ard_age_bmi)
+```
+
+```{r ex-cont-build-hint-1}
+# data = adsl, variables = c("AGE","BMIBL"), by = "TRT01P"
+```
+
+```{r ex-cont-build-solution}
+ard_age_bmi <- ard_continuous(
+  data       = adsl,
+  variables  = c("AGE","BMIBL"),
+  by         = "TRT01P",
+  statistics = list(
+    mean   = function(x) mean(x, na.rm=TRUE),
+    sd     = function(x) sd(x, na.rm=TRUE),
+    median = function(x) median(x, na.rm=TRUE)
+  )
+)
+
+nrow(ard_age_bmi)
+```
+
+### Practice — Pivot ARD to Wide for Display
+
+The ARD is in long format. To display statistics side-by-side (e.g., one column per arm), pivot wider on `group1_level`.
+
+```{r ex-cont-pivot, exercise=TRUE, exercise.lines=18}
+# From ard_demog_cont, create a display table of mean (SD) for AGE and WEIGHTBL,
+# one column per treatment arm.
+
+ard_demog_cont |>
+  filter(variable %in% c("AGE","WEIGHTBL"),
+         stat_name %in% c("mean","sd")) |>
+  mutate(stat_val = round(unlist(stat), 1)) |>
+  select(variable, group1_level, stat_name, stat_val) |>
+  pivot_wider(names_from = ___, values_from = stat_val) |>
+  arrange(variable, stat_name)
+```
+
+```{r ex-cont-pivot-hint-1}
+# pivot_wider(names_from = group1_level, values_from = stat_val)
+# This puts Placebo / Low Dose / High Dose as column names.
+```
+
+```{r ex-cont-pivot-solution}
+ard_demog_cont |>
+  filter(variable %in% c("AGE","WEIGHTBL"),
+         stat_name %in% c("mean","sd")) |>
+  mutate(stat_val = round(unlist(stat), 1)) |>
+  select(variable, group1_level, stat_name, stat_val) |>
+  pivot_wider(names_from = group1_level, values_from = stat_val) |>
+  arrange(variable, stat_name)
+```
+
+### Practice — Custom SE Statistic
+
+```{r ex-cont-se, exercise=TRUE, exercise.lines=16}
+# Add a standard error (SE = SD / sqrt(N)) statistic to the ARD for AGE.
+# Then extract the SE for each arm.
+
+ard_age_se <- ard_continuous(
+  data       = adsl,
+  variables  = "AGE",
+  by         = "TRT01P",
+  statistics = list(
+    N    = function(x) sum(!is.na(x)),
+    mean = function(x) mean(x, na.rm=TRUE),
+    se   = function(x) sd(x, na.rm=TRUE) / sqrt(sum(!is.na(x)))
+  )
+)
+
+ard_age_se |>
+  filter(stat_name == ___) |>       # extract SE rows
+  mutate(se_val = round(unlist(stat), 3)) |>
+  select(group1_level, se_val)
+```
+
+```{r ex-cont-se-hint-1}
+# stat_name == "se"
+```
+
+```{r ex-cont-se-solution}
+ard_age_se <- ard_continuous(
+  data       = adsl,
+  variables  = "AGE",
+  by         = "TRT01P",
+  statistics = list(
+    N    = function(x) sum(!is.na(x)),
+    mean = function(x) mean(x, na.rm=TRUE),
+    se   = function(x) sd(x, na.rm=TRUE) / sqrt(sum(!is.na(x)))
+  )
+)
+
+ard_age_se |>
+  filter(stat_name == "se") |>
+  mutate(se_val = round(unlist(stat), 3)) |>
+  select(group1_level, se_val)
+```
+
+---
+
+## Section 3 — ard_categorical(): Frequency Tables
+
+`ard_categorical()` counts levels of categorical variables and computes percentages. It returns two rows per (variable-level × by-level): one for `n` and one for `p`.
+
+```r
+ard_categorical(
+  data      = adsl,
+  variables = c("SEX", "RACE"),
+  by        = "TRT01P"
+)
+```
+
+> **Gotcha:** The `p` statistic is percentage (0–100), not proportion (0–1). This matches the CDISC ARD specification where `p` is labelled "%" and formatted as `"52.3"`.
+
+### Practice — Build a Categorical ARD
+
+```{r ex-cat-build, exercise=TRUE, exercise.lines=14}
+# Create a categorical ARD for SEX and AGEGR1 stratified by TRT01P.
+# Then count how many rows are produced.
+# Expected: 2 stats (n, p) × each level × 3 arms.
+
+ard_sex_age <- ard_categorical(
+  data      = ___,
+  variables = c(___, ___),
+  by        = ___
+)
+
+nrow(ard_sex_age)
+
+# Show SEX frequencies for the Placebo arm
+ard_sex_age |>
+  filter(variable == "SEX", group1_level == "Placebo",
+         stat_name == "n") |>
+  mutate(n_val = unlist(stat)) |>
+  select(variable_level, n_val)
+```
+
+```{r ex-cat-build-hint-1}
+# data = adsl, variables = c("SEX","AGEGR1"), by = "TRT01P"
+```
+
+```{r ex-cat-build-solution}
+ard_sex_age <- ard_categorical(
+  data      = adsl,
+  variables = c("SEX","AGEGR1"),
+  by        = "TRT01P"
+)
+
+nrow(ard_sex_age)
+
+ard_sex_age |>
+  filter(variable == "SEX", group1_level == "Placebo",
+         stat_name == "n") |>
+  mutate(n_val = unlist(stat)) |>
+  select(variable_level, n_val)
+```
+
+### Practice — n (%) Display Format
+
+Clinical tables typically show `n (%)` in a single cell. Build that from two ARD rows.
+
+```{r ex-cat-npct, exercise=TRUE, exercise.lines=18}
+# From ard_demog_cat, construct an "n (%)" display string for SEX
+# in each treatment arm. Format: "n (p%)" e.g. "42 (49.4%)"
+
+ard_demog_cat |>
+  filter(variable == "SEX") |>
+  mutate(val = unlist(stat)) |>
+  select(group1_level, variable_level, stat_name, val) |>
+  pivot_wider(names_from = ___, values_from = val) |>
+  mutate(display = paste0(n, " (", p, "%)")) |>
+  select(group1_level, variable_level, display) |>
+  arrange(group1_level, variable_level)
+```
+
+```{r ex-cat-npct-hint-1}
+# pivot_wider(names_from = stat_name, values_from = val)
+# Then paste0(n, " (", p, "%)")
+```
+
+```{r ex-cat-npct-solution}
+ard_demog_cat |>
+  filter(variable == "SEX") |>
+  mutate(val = unlist(stat)) |>
+  select(group1_level, variable_level, stat_name, val) |>
+  pivot_wider(names_from = stat_name, values_from = val) |>
+  mutate(display = paste0(n, " (", p, "%)")) |>
+  select(group1_level, variable_level, display) |>
+  arrange(group1_level, variable_level)
+```
+
+### Practice — Unstratified Categorical ARD
+
+```{r ex-cat-overall, exercise=TRUE, exercise.lines=12}
+# Build an unstratified (no 'by') ARD for RACE.
+# Note that group1 and group1_level will be NA.
+
+ard_race_overall <- ard_categorical(
+  data      = adsl,
+  variables = ___    # just RACE, no 'by'
+)
+
+ard_race_overall |>
+  filter(stat_name == "n") |>
+  mutate(n_val = unlist(stat)) |>
+  select(variable_level, n_val) |>
+  arrange(desc(n_val))
+```
+
+```{r ex-cat-overall-hint-1}
+# variables = "RACE" — omit the by argument entirely
+```
+
+```{r ex-cat-overall-solution}
+ard_race_overall <- ard_categorical(
+  data      = adsl,
+  variables = "RACE"
+)
+
+ard_race_overall |>
+  filter(stat_name == "n") |>
+  mutate(n_val = unlist(stat)) |>
+  select(variable_level, n_val) |>
+  arrange(desc(n_val))
+```
+
+---
+
+## Section 4 — ard_missing(): Data Completeness
+
+`ard_missing()` reports how many values are missing for each variable, and the percentage of records affected. In clinical trials, data completeness is a regulatory requirement — ISE/ISS submissions include a data completeness appendix.
+
+```r
+ard_missing(data, variables, by = NULL)
+# Returns: n_miss, p_miss, n_not_miss — three rows per variable per stratum
+```
+
+### Practice — Missing Data ARD
+
+```{r ex-miss-build, exercise=TRUE, exercise.lines=14}
+# adsl has some subjects missing BMIBL, DTHDT, or DIABFL values.
+# Build a missing-data ARD for BMIBL, DTHDT, and DIABFL by TRT01P.
+
+ard_miss <- ard_missing(
+  data      = adsl,
+  variables = c(___, ___, ___),
+  by        = "TRT01P"
+)
+
+# Show p_miss for each variable and arm
+ard_miss |>
+  filter(stat_name == "p_miss") |>
+  mutate(pct = unlist(stat)) |>
+  select(group1_level, variable, pct) |>
+  arrange(variable, group1_level)
+```
+
+```{r ex-miss-build-hint-1}
+# variables = c("BMIBL","DTHDT","DIABFL")
+```
+
+```{r ex-miss-build-solution}
+ard_miss <- ard_missing(
+  data      = adsl,
+  variables = c("BMIBL","DTHDT","DIABFL"),
+  by        = "TRT01P"
+)
+
+ard_miss |>
+  filter(stat_name == "p_miss") |>
+  mutate(pct = unlist(stat)) |>
+  select(group1_level, variable, pct) |>
+  arrange(variable, group1_level)
+```
+
+### Practice — Flag Variables with High Missingness
+
+```{r ex-miss-flag, exercise=TRUE, exercise.lines=16}
+# From the overall (unstratified) missing ARD for all numeric adsl columns,
+# flag any variable with p_miss > 10%.
+
+numeric_vars <- adsl |> select(where(is.numeric)) |> names()
+
+ard_miss_all <- ard_missing(
+  data      = adsl,
+  variables = ___   # use numeric_vars
+)
+
+ard_miss_all |>
+  filter(stat_name == "p_miss") |>
+  mutate(pct = unlist(stat)) |>
+  filter(___ > 10) |>            # p_miss > 10
+  select(variable, pct) |>
+  arrange(desc(pct))
+```
+
+```{r ex-miss-flag-hint-1}
+# variables = numeric_vars
+# filter(pct > 10)
+```
+
+```{r ex-miss-flag-solution}
+numeric_vars <- adsl |> select(where(is.numeric)) |> names()
+
+ard_miss_all <- ard_missing(
+  data      = adsl,
+  variables = numeric_vars
+)
+
+ard_miss_all |>
+  filter(stat_name == "p_miss") |>
+  mutate(pct = unlist(stat)) |>
+  filter(pct > 10) |>
+  select(variable, pct) |>
+  arrange(desc(pct))
+```
+
+---
+
+## Section 5 — ard_stack() and bind_ard(): Combining ARDs
+
+A complete demographics table needs continuous stats (mean, SD) AND categorical stats (n, %). These come from separate `ard_continuous()` and `ard_categorical()` calls. `ard_stack()` and `bind_ard()` merge them into one ARD with consistent structure.
+
+```r
+ard_full <- ard_stack(
+  ard_continuous(...),
+  ard_categorical(...),
+  ard_missing(...)
+)
+# or equivalently:
+ard_full <- bind_ard(ard_cont, ard_cat, ard_miss)
+```
+
+The context column (`"continuous"`, `"categorical"`, `"missing"`) lets you filter later.
+
+### Practice — Stack Continuous and Categorical ARDs
+
+```{r ex-stack-build, exercise=TRUE, exercise.lines=20}
+# Build a full demographics ARD by stacking:
+#   - Continuous: AGE, WEIGHTBL, BMIBL  (mean, sd, median)
+#   - Categorical: SEX, RACE
+# both stratified by TRT01P.
+
+ard_demog_full <- ard_stack(
+  ard_continuous(
+    data       = adsl,
+    variables  = c("AGE","WEIGHTBL","BMIBL"),
+    by         = "TRT01P",
+    statistics = list(
+      mean   = function(x) mean(x, na.rm=TRUE),
+      sd     = function(x) sd(x, na.rm=TRUE),
+      median = function(x) median(x, na.rm=TRUE)
+    )
+  ),
+  ard_categorical(
+    data      = ___,
+    variables = c(___),
+    by        = ___
+  )
+)
+
+# Verify both contexts are present
+ard_demog_full |> distinct(context)
+```
+
+```{r ex-stack-build-hint-1}
+# ard_categorical(data=adsl, variables=c("SEX","RACE"), by="TRT01P")
+```
+
+```{r ex-stack-build-solution}
+ard_demog_full <- ard_stack(
+  ard_continuous(
+    data       = adsl,
+    variables  = c("AGE","WEIGHTBL","BMIBL"),
+    by         = "TRT01P",
+    statistics = list(
+      mean   = function(x) mean(x, na.rm=TRUE),
+      sd     = function(x) sd(x, na.rm=TRUE),
+      median = function(x) median(x, na.rm=TRUE)
+    )
+  ),
+  ard_categorical(
+    data      = adsl,
+    variables = c("SEX","RACE"),
+    by        = "TRT01P"
+  )
+)
+
+ard_demog_full |> distinct(context)
+```
+
+### Practice — Add Missing Data to the Stack
+
+```{r ex-stack-miss, exercise=TRUE, exercise.lines=14}
+# Add missingness information for AGE and BMIBL to the existing ard_demog_full.
+# Use bind_ard() to append the missing ARD.
+
+ard_demog_final <- bind_ard(
+  ard_demog_full,
+  ard_missing(
+    data      = adsl,
+    variables = c(___, ___),
+    by        = "TRT01P"
+  )
+)
+
+# All three contexts present?
+ard_demog_final |> count(context)
+```
+
+```{r ex-stack-miss-hint-1}
+# variables = c("AGE","BMIBL")
+```
+
+```{r ex-stack-miss-solution}
+ard_demog_final <- bind_ard(
+  ard_demog_full,
+  ard_missing(
+    data      = adsl,
+    variables = c("AGE","BMIBL"),
+    by        = "TRT01P"
+  )
+)
+
+ard_demog_final |> count(context)
+```
+
+---
+
+## Section 6 — cardx: Statistical Tests
+
+**cardx** extends cards with inferential statistics. Each `ard_*test()` function returns test results in standard ARD format — the same structure as descriptive ARDs, making it trivial to append p-values to a demographics table.
+
+Available in cardx (mocked here):
+- `ard_ttest()` — Welch two-sample t-test
+- `ard_chisqtest()` — Pearson chi-squared test
+- `ard_wilcoxtest()` — Wilcoxon rank-sum (Mann-Whitney)
+
+All return `stat_name` values: `"statistic"`, `"p.value"`, plus test-specific values (e.g. `"estimate"`, `"conf.low"`, `"conf.high"` for t-test).
+
+> **Two-level constraint:** `ard_ttest()` and `ard_wilcoxtest()` require `by` to have exactly 2 levels. For a 3-arm trial, filter to 2 arms first.
+
+### Practice — t-test ARD
+
+```{r ex-ttest, exercise=TRUE, exercise.lines=16}
+# Compare mean AGE between Placebo and Xanomeline High Dose using ard_ttest().
+# Filter adsl to just those two arms first.
+
+adsl_2arm <- adsl |>
+  filter(TRT01P %in% c(___, ___))
+
+ard_age_ttest <- ard_ttest(
+  data     = adsl_2arm,
+  variable = ___,
+  by       = ___
+)
+
+# Show statistic, p.value, estimate, and CI
+ard_age_ttest |>
+  mutate(val = round(unlist(stat), 4)) |>
+  select(stat_name, stat_label, val)
+```
+
+```{r ex-ttest-hint-1}
+# Filter to "Placebo" and "Xanomeline High Dose"
+# variable = "AGE", by = "TRT01P"
+```
+
+```{r ex-ttest-solution}
+adsl_2arm <- adsl |>
+  filter(TRT01P %in% c("Placebo","Xanomeline High Dose"))
+
+ard_age_ttest <- ard_ttest(
+  data     = adsl_2arm,
+  variable = "AGE",
+  by       = "TRT01P"
+)
+
+ard_age_ttest |>
+  mutate(val = round(unlist(stat), 4)) |>
+  select(stat_name, stat_label, val)
+```
+
+### Practice — Chi-squared Test ARD
+
+```{r ex-chisq, exercise=TRUE, exercise.lines=14}
+# Test whether SEX distribution differs across all three treatment arms
+# using ard_chisqtest().
+
+ard_sex_chisq <- ard_chisqtest(
+  data     = ___,
+  variable = ___,
+  by       = ___
+)
+
+ard_sex_chisq |>
+  mutate(val = unlist(stat)) |>
+  select(stat_name, stat_label, val)
+```
+
+```{r ex-chisq-hint-1}
+# data = adsl, variable = "SEX", by = "TRT01P"
+```
+
+```{r ex-chisq-solution}
+ard_sex_chisq <- ard_chisqtest(
+  data     = adsl,
+  variable = "SEX",
+  by       = "TRT01P"
+)
+
+ard_sex_chisq |>
+  mutate(val = unlist(stat)) |>
+  select(stat_name, stat_label, val)
+```
+
+### Practice — Wilcoxon Test for Non-Normal Data
+
+```{r ex-wilcox, exercise=TRUE, exercise.lines=16}
+# BMIBL is right-skewed. Use ard_wilcoxtest() to compare
+# Placebo vs Xanomeline Low Dose.
+
+adsl_2arm_bmi <- adsl |>
+  filter(TRT01P %in% c("Placebo", ___))
+
+ard_bmi_wilcox <- ard_wilcoxtest(
+  data     = adsl_2arm_bmi,
+  variable = ___,
+  by       = ___
+)
+
+ard_bmi_wilcox |>
+  mutate(val = unlist(stat)) |>
+  select(stat_name, stat_label, val)
+```
+
+```{r ex-wilcox-hint-1}
+# "Xanomeline Low Dose" for second arm
+# variable = "BMIBL", by = "TRT01P"
+```
+
+```{r ex-wilcox-solution}
+adsl_2arm_bmi <- adsl |>
+  filter(TRT01P %in% c("Placebo","Xanomeline Low Dose"))
+
+ard_bmi_wilcox <- ard_wilcoxtest(
+  data     = adsl_2arm_bmi,
+  variable = "BMIBL",
+  by       = "TRT01P"
+)
+
+ard_bmi_wilcox |>
+  mutate(val = unlist(stat)) |>
+  select(stat_name, stat_label, val)
+```
+
+### Practice — Combine Descriptive + Test ARD
+
+```{r ex-combine-test, exercise=TRUE, exercise.lines=20}
+# Build a complete AGE summary: descriptive stats for all 3 arms + t-test
+# p-value (Placebo vs High Dose). Stack into one ARD.
+
+adsl_2arm_age <- adsl |>
+  filter(TRT01P %in% c("Placebo","Xanomeline High Dose"))
+
+ard_age_full <- ard_stack(
+  # Continuous summary for all 3 arms
+  ard_continuous(data=adsl, variables="AGE", by="TRT01P",
+                 statistics=list(N=function(x) sum(!is.na(x)),
+                                 mean=function(x) mean(x,na.rm=TRUE),
+                                 sd=function(x) sd(x,na.rm=TRUE))),
+  # t-test between 2 arms
+  ard_ttest(data=___, variable="AGE", by="TRT01P")
+)
+
+# How many contexts?
+ard_age_full |> count(___)
+```
+
+```{r ex-combine-test-hint-1}
+# ard_ttest(data = adsl_2arm_age, ...)
+# count(context)
+```
+
+```{r ex-combine-test-solution}
+adsl_2arm_age <- adsl |>
+  filter(TRT01P %in% c("Placebo","Xanomeline High Dose"))
+
+ard_age_full <- ard_stack(
+  ard_continuous(data=adsl, variables="AGE", by="TRT01P",
+                 statistics=list(N=function(x) sum(!is.na(x)),
+                                 mean=function(x) mean(x,na.rm=TRUE),
+                                 sd=function(x) sd(x,na.rm=TRUE))),
+  ard_ttest(data=adsl_2arm_age, variable="AGE", by="TRT01P")
+)
+
+ard_age_full |> count(context)
+```
+
+### Quiz — cardx Tests
+
+```{r quiz-cardx, echo=FALSE}
+quiz(caption = "cardx Statistical Tests",
+  question("You want to test whether RACE distribution differs across 3 arms. Which cardx function should you use?",
+    answer("ard_ttest() — it handles multiple groups"),
+    answer("ard_chisqtest() — it tests association between two categorical variables",
+           correct = TRUE,
+           message = "Chi-squared tests work with any number of levels in both variables. The t-test and Wilcoxon test are for continuous outcomes and require exactly 2 groups."),
+    answer("ard_wilcoxtest() — for non-normal categorical data"),
+    answer("ard_continuous() — it computes proportions"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("In an ARD from ard_ttest(), which stat_name contains the 95% CI lower bound?",
+    answer("ci_lower"),
+    answer("conf.low", correct = TRUE,
+           message = "cardx follows broom::tidy() naming conventions: conf.low and conf.high for confidence interval bounds."),
+    answer("lower_ci"),
+    answer("ci_lb"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 7 — ARDs as TLF Building Blocks
+
+The ARD is a *source of truth* for a table. Once computed, it is completely independent of formatting. The TLF pipeline looks like this:
+
+```
+ARD  →  tfrmt (shell + ARD) →  formatted gt table  →  RTF / PDF
+     ↘  gtsummary (tbl_ard_summary) →  formatted table
+```
+
+In this lesson we preview the manual assembly step — turning an ARD into a publication-ready display table using plain dplyr/tidyr. Lesson 29 (tfrmt) and Lesson 26 (gtsummary) will cover the automated path.
+
+### Practice — Assemble a Demographics Display Table
+
+```{r ex-demog-table, exercise=TRUE, exercise.lines=40}
+# Build a formatted demographics table from ard_demog_cont and ard_demog_cat.
+# Output: one row per variable/level, one column per arm,
+# with "Mean (SD)" for continuous and "n (%)" for categorical.
+
+# Step 1: Continuous — mean (SD) strings
+cont_display <- ard_demog_cont |>
+  filter(stat_name %in% c("mean","sd")) |>
+  mutate(val = round(unlist(stat), 1)) |>
+  select(variable, group1_level, stat_name, val) |>
+  pivot_wider(names_from = stat_name, values_from = val) |>
+  mutate(
+    display    = paste0(mean, " (", sd, ")"),
+    row_label  = variable,
+    level_label = "Mean (SD)"
+  ) |>
+  select(row_label, level_label, group1_level, display)
+
+# Step 2: Categorical — n (%) strings
+cat_display <- ard_demog_cat |>
+  filter(stat_name %in% c("n","p")) |>
+  mutate(val = unlist(stat)) |>
+  select(variable, variable_level, group1_level, stat_name, val) |>
+  pivot_wider(names_from = ___, values_from = val) |>
+  mutate(
+    display     = paste0(n, " (", p, "%)"),
+    row_label   = variable,
+    level_label = variable_level
+  ) |>
+  select(row_label, level_label, group1_level, display)
+
+# Step 3: Stack and pivot wider to arm columns
+bind_rows(cont_display, cat_display) |>
+  pivot_wider(names_from = ___, values_from = display) |>
+  arrange(row_label, level_label)
+```
+
+```{r ex-demog-table-hint-1}
+# In Step 2: pivot_wider(names_from = stat_name, values_from = val)
+# In Step 3: pivot_wider(names_from = group1_level, values_from = display)
+```
+
+```{r ex-demog-table-solution}
+cont_display <- ard_demog_cont |>
+  filter(stat_name %in% c("mean","sd")) |>
+  mutate(val = round(unlist(stat), 1)) |>
+  select(variable, group1_level, stat_name, val) |>
+  pivot_wider(names_from = stat_name, values_from = val) |>
+  mutate(
+    display     = paste0(mean, " (", sd, ")"),
+    row_label   = variable,
+    level_label = "Mean (SD)"
+  ) |>
+  select(row_label, level_label, group1_level, display)
+
+cat_display <- ard_demog_cat |>
+  filter(stat_name %in% c("n","p")) |>
+  mutate(val = unlist(stat)) |>
+  select(variable, variable_level, group1_level, stat_name, val) |>
+  pivot_wider(names_from = stat_name, values_from = val) |>
+  mutate(
+    display     = paste0(n, " (", p, "%)"),
+    row_label   = variable,
+    level_label = variable_level
+  ) |>
+  select(row_label, level_label, group1_level, display)
+
+bind_rows(cont_display, cat_display) |>
+  pivot_wider(names_from = group1_level, values_from = display) |>
+  arrange(row_label, level_label)
+```
+
+### Practice — Add p-values to the Display Table
+
+```{r ex-pvalue-table, exercise=TRUE, exercise.lines=22}
+# Append a p-value column to the AGE and WEIGHTBL rows.
+# Use chi-squared for SEX, t-test for AGE (Placebo vs High Dose).
+
+adsl_2arm <- adsl |> filter(TRT01P %in% c("Placebo","Xanomeline High Dose"))
+
+pval_ard <- ard_stack(
+  ard_ttest(data=adsl_2arm, variable="AGE",      by="TRT01P"),
+  ard_ttest(data=adsl_2arm, variable="WEIGHTBL", by="TRT01P"),
+  ard_chisqtest(data=adsl,  variable="SEX",      by="TRT01P")
+)
+
+pval_display <- pval_ard |>
+  filter(stat_name == "p.value") |>
+  mutate(
+    p_display = paste0("p=", formatC(unlist(stat), digits=3, format="f")),
+    row_label = variable
+  ) |>
+  select(row_label, p_display)
+
+pval_display
+```
+
+```{r ex-pvalue-table-solution}
+adsl_2arm <- adsl |> filter(TRT01P %in% c("Placebo","Xanomeline High Dose"))
+
+pval_ard <- ard_stack(
+  ard_ttest(data=adsl_2arm, variable="AGE",      by="TRT01P"),
+  ard_ttest(data=adsl_2arm, variable="WEIGHTBL", by="TRT01P"),
+  ard_chisqtest(data=adsl,  variable="SEX",      by="TRT01P")
+)
+
+pval_display <- pval_ard |>
+  filter(stat_name == "p.value") |>
+  mutate(
+    p_display = paste0("p=", formatC(unlist(stat), digits=3, format="f")),
+    row_label = variable
+  ) |>
+  select(row_label, p_display)
+
+pval_display
+```
+
+---
+
+## Section 8 — Capstone: Complete Adverse Event ARD
+
+Build a full AE summary ARD from `adae` covering:
+
+1. Total subjects with ≥ 1 AE (n, %)
+2. Subjects with ≥ 1 serious AE (`AESER == "Y"`)
+3. Subjects with ≥ 1 severe AE (`AESEV == "SEVERE"`)
+4. Most common SOC-level AE rate (top 5 SOCs by overall %)
+5. Chi-squared test comparing overall AE rate across arms
+
+```{r ex-ae-ard, exercise=TRUE, exercise.lines=50}
+# Step 1: One row per subject — did they have any AE?
+ae_any <- adsl |>
+  select(USUBJID, TRT01P) |>
+  left_join(
+    adae |> group_by(USUBJID) |> summarise(ANY_AE = "Y", .groups="drop"),
+    by = "USUBJID"
+  ) |>
+  mutate(
+    ANY_AE  = replace_na(ANY_AE, "N"),
+    SAE     = if_else(USUBJID %in% adae$USUBJID[adae$AESER=="Y"], "Y", "N"),
+    SEV_AE  = if_else(USUBJID %in% adae$USUBJID[adae$AESEV=="SEVERE"], "Y", "N")
+  )
+
+# Step 2: Categorical ARD for AE flags
+ard_ae_flags <- ard_categorical(
+  data      = ae_any,
+  variables = c(___),      # ANY_AE, SAE, SEV_AE
+  by        = ___          # TRT01P
+)
+
+# Step 3: Top-5 SOC frequencies (overall %, one row per subject per SOC)
+soc_subj <- adae |>
+  distinct(USUBJID, AESOC, TRT01A) |>
+  rename(TRT01P = TRT01A)
+
+top5_soc <- soc_subj |>
+  count(AESOC) |>
+  slice_max(n, n=5) |>
+  pull(AESOC)
+
+ard_soc <- ard_categorical(
+  data      = soc_subj |> filter(AESOC %in% top5_soc) |>
+                mutate(AESOC = str_trunc(AESOC, 40)),
+  variables = "AESOC",
+  by        = "TRT01P"
+)
+
+# Step 4: Chi-squared on ANY_AE
+ard_ae_chisq <- ard_chisqtest(
+  data     = ae_any,
+  variable = ___,     # ANY_AE
+  by       = ___      # TRT01P
+)
+
+# Step 5: Stack everything
+ard_ae_complete <- ard_stack(ard_ae_flags, ard_soc, ard_ae_chisq)
+
+# Show the p-value for the ANY_AE chi-squared test
+ard_ae_complete |>
+  filter(context == "chisqtest", stat_name == "p.value") |>
+  mutate(p = round(unlist(stat), 4)) |>
+  select(variable, stat_label, p)
+```
+
+```{r ex-ae-ard-hint-1}
+# Step 2: variables = c("ANY_AE","SAE","SEV_AE"), by = "TRT01P"
+# Step 4: variable = "ANY_AE", by = "TRT01P"
+```
+
+```{r ex-ae-ard-solution}
+ae_any <- adsl |>
+  select(USUBJID, TRT01P) |>
+  left_join(
+    adae |> group_by(USUBJID) |> summarise(ANY_AE = "Y", .groups="drop"),
+    by = "USUBJID"
+  ) |>
+  mutate(
+    ANY_AE = replace_na(ANY_AE, "N"),
+    SAE    = if_else(USUBJID %in% adae$USUBJID[adae$AESER=="Y"], "Y", "N"),
+    SEV_AE = if_else(USUBJID %in% adae$USUBJID[adae$AESEV=="SEVERE"], "Y", "N")
+  )
+
+ard_ae_flags <- ard_categorical(
+  data      = ae_any,
+  variables = c("ANY_AE","SAE","SEV_AE"),
+  by        = "TRT01P"
+)
+
+soc_subj <- adae |>
+  distinct(USUBJID, AESOC, TRT01A) |>
+  rename(TRT01P = TRT01A)
+
+top5_soc <- soc_subj |>
+  count(AESOC) |>
+  slice_max(n, n=5) |>
+  pull(AESOC)
+
+ard_soc <- ard_categorical(
+  data      = soc_subj |> filter(AESOC %in% top5_soc) |>
+                mutate(AESOC = str_trunc(AESOC, 40)),
+  variables = "AESOC",
+  by        = "TRT01P"
+)
+
+ard_ae_chisq <- ard_chisqtest(
+  data     = ae_any,
+  variable = "ANY_AE",
+  by       = "TRT01P"
+)
+
+ard_ae_complete <- ard_stack(ard_ae_flags, ard_soc, ard_ae_chisq)
+
+ard_ae_complete |>
+  filter(context == "chisqtest", stat_name == "p.value") |>
+  mutate(p = round(unlist(stat), 4)) |>
+  select(variable, stat_label, p)
+```
+
+---
+
+## Lesson Summary
+
+```{r final-quiz, echo=FALSE}
+quiz(caption = "Lesson 25 — Final Quiz",
+  question("You compute ard_continuous() and want to display mean and SD together as 'mean (SD)'. What must you do to the stat column before arithmetic?",
+    answer("Call as.numeric(stat)"),
+    answer("Call unlist(stat) to convert the list column to a plain numeric vector",
+           correct = TRUE,
+           message = "The stat column is a list column. unlist() coerces it to a plain vector so you can do arithmetic and string formatting."),
+    answer("Call pull(stat)"),
+    answer("Nothing — dplyr handles list columns automatically"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("What is the key architectural benefit of separating computation (ARD) from formatting (tfrmt/gtsummary)?",
+    answer("It makes computations faster"),
+    answer("The same ARD can feed multiple output formats without recomputing statistics",
+           correct = TRUE,
+           message = "Compute once, format many ways. The same ARD can generate a CSR table in RTF, a DSMB slide, and an interactive Shiny app without rerunning any statistical code."),
+    answer("ARDs are required by CDISC SDTM guidelines"),
+    answer("tfrmt cannot read data frames — it requires ARD format"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Summary Coding Exercise
+
+```{r ex-final-summary, exercise=TRUE, exercise.lines=28}
+# Build a complete lab summary ARD for ALT at Week 24:
+#   - Mean, SD, median ALT by TRT01P
+#   - % subjects with ALT > 40 U/L (flag variable) by TRT01P
+#   - Wilcoxon test: Placebo vs Xanomeline High Dose
+
+adlb_alt_w24 <- adlb |>
+  filter(PARAMCD == "ALT", AVISIT == "Week 24") |>
+  left_join(select(adsl, USUBJID, TRT01P), by="USUBJID") |>
+  filter(!is.na(TRT01P)) |>
+  mutate(ALT_HI = if_else(AVAL > 40, "Y", "N"))
+
+# Continuous ARD
+ard_alt_cont <- ard_continuous(
+  data = adlb_alt_w24, variables = ___, by = "TRT01P",
+  statistics = list(mean=function(x) mean(x,na.rm=T),
+                    sd  =function(x) sd(x,na.rm=T),
+                    median=function(x) median(x,na.rm=T))
+)
+
+# Categorical ARD for flag
+ard_alt_cat <- ard_categorical(
+  data = adlb_alt_w24, variables = ___, by = "TRT01P"
+)
+
+# Wilcoxon test (Placebo vs High Dose)
+adlb_2arm <- adlb_alt_w24 |>
+  filter(TRT01P %in% c("Placebo","Xanomeline High Dose"))
+
+ard_alt_wilcox <- ard_wilcoxtest(
+  data = adlb_2arm, variable = "AVAL", by = ___
+)
+
+# Stack and show the p-value
+ard_stack(ard_alt_cont, ard_alt_cat, ard_alt_wilcox) |>
+  filter(stat_name == "p.value") |>
+  mutate(p = round(unlist(stat), 4)) |>
+  select(variable, stat_label, p)
+```
+
+```{r ex-final-summary-hint-1}
+# ard_continuous: variables = "AVAL"
+# ard_categorical: variables = "ALT_HI"
+# ard_wilcoxtest: by = "TRT01P"
+```
+
+```{r ex-final-summary-solution}
+adlb_alt_w24 <- adlb |>
+  filter(PARAMCD == "ALT", AVISIT == "Week 24") |>
+  left_join(select(adsl, USUBJID, TRT01P), by="USUBJID") |>
+  filter(!is.na(TRT01P)) |>
+  mutate(ALT_HI = if_else(AVAL > 40, "Y", "N"))
+
+ard_alt_cont <- ard_continuous(
+  data = adlb_alt_w24, variables = "AVAL", by = "TRT01P",
+  statistics = list(mean=function(x) mean(x,na.rm=T),
+                    sd  =function(x) sd(x,na.rm=T),
+                    median=function(x) median(x,na.rm=T))
+)
+
+ard_alt_cat <- ard_categorical(
+  data = adlb_alt_w24, variables = "ALT_HI", by = "TRT01P"
+)
+
+adlb_2arm <- adlb_alt_w24 |>
+  filter(TRT01P %in% c("Placebo","Xanomeline High Dose"))
+
+ard_alt_wilcox <- ard_wilcoxtest(
+  data = adlb_2arm, variable = "AVAL", by = "TRT01P"
+)
+
+ard_stack(ard_alt_cont, ard_alt_cat, ard_alt_wilcox) |>
+  filter(stat_name == "p.value") |>
+  mutate(p = round(unlist(stat), 4)) |>
+  select(variable, stat_label, p)
+```
+
+### What You Learned
+
+In this lesson you built the complete **ARD layer** of the pharmaverse TLF pipeline:
+
+- **ARD structure** — long-format tibble with `group1`, `variable`, `stat_name`, `stat` (list column), `stat_label`; the `stat` column must be `unlist()`-ed before arithmetic
+- **`ard_continuous()`** — descriptive stats for numeric variables, customisable statistics list, optional `by` grouping
+- **`ard_categorical()`** — counts and percentages for categorical variables; `p` is 0–100 not 0–1
+- **`ard_missing()`** — n_miss, p_miss, n_not_miss for completeness audits
+- **`ard_stack()` / `bind_ard()`** — combine ARDs from different functions into one; `context` column identifies the source
+- **cardx tests** — `ard_ttest()`, `ard_chisqtest()`, `ard_wilcoxtest()` return test results in ARD format, stackable with descriptive ARDs
+- **Manual display assembly** — `pivot_wider(names_from = group1_level)` to turn the long ARD into a wide display table
+
+### Key Gotchas
+
+> **`stat` is a list column.** Always `unlist(stat)` before using values in `mutate()`, `filter()`, or string formatting. Forgetting this is the most common cards error.
+
+> **`p` is a percentage (0–100), not a proportion.** `ard_categorical()` returns `p = 52.3`, not `0.523`. Do not multiply by 100 again.
+
+> **`ard_ttest()` / `ard_wilcoxtest()` need exactly 2 levels.** Always `filter()` to 2 arms before calling these on a 3-arm trial. `ard_chisqtest()` handles any number of levels.
+
+> **`by` variable must be a character or factor.** If `TRT01P` is a factor, the mock (and real package) will coerce levels to character — verify arm labels match your filter strings exactly.
+
+---
+
+**Next lesson:** Lesson 26 — gtsummary — automated clinical summary tables using `tbl_summary()`, `tbl_svysummary()`, `add_p()`, `add_overall()`, and integrating ARDs via `tbl_ard_summary()`.
+```

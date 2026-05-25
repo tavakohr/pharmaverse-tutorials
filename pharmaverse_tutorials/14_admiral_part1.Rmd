@@ -11,6 +11,31 @@ description: >
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 14_admiral_part1.Rmd
+# PURPOSE       : admiral Part 1 — package architecture, derivation function taxonomy,
+#                 template-driven workflow, derive_vars_merged(), and
+#                 foundational ADaM dataset construction patterns.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tidyr)
@@ -72,7 +97,7 @@ convert_blanks_to_na <- function(dataset) {
 derive_vars_dt <- function(dataset, dtc, new_vars_prefix,
                             date_imputation = "none",
                             flag_imputation = "auto") {
-  dtc_nm  <- deparse(substitute(dtc))
+  .e <- substitute(dtc); dtc_nm <- if (is.character(.e)) .e else deparse(.e)
   dt_nm   <- paste0(new_vars_prefix, "DT")
   dtf_nm  <- paste0(new_vars_prefix, "DTF")
   raw_dtc <- dataset[[dtc_nm]]
@@ -87,7 +112,7 @@ derive_vars_dtm <- function(dataset, dtc, new_vars_prefix,
                              date_imputation = "none",
                              time_imputation = "none",
                              flag_imputation = "auto") {
-  dtc_nm  <- deparse(substitute(dtc))
+  .e <- substitute(dtc); dtc_nm <- if (is.character(.e)) .e else deparse(.e)
   dtm_nm  <- paste0(new_vars_prefix, "DTM")
   dtf_nm  <- paste0(new_vars_prefix, "DTF")
   tmf_nm  <- paste0(new_vars_prefix, "TMF")
@@ -134,8 +159,8 @@ derive_vars_dy <- function(dataset, reference_date, source_vars) {
   dataset
 }
 
-# exprs: pass through (rlang::exprs is available via dplyr; this is a stub for quiz demos)
-# In real code, exprs() from dplyr/rlang works natively.
+# exprs: capture unevaluated arguments as a list of expressions (mirrors rlang::exprs)
+exprs <- function(...) as.list(substitute(list(...)))[-1]
 
 # derive_vars_merged: left-join with filter, order, first/last
 derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
@@ -278,8 +303,11 @@ call_derivation <- function(dataset, derivation, variable_params, ...) {
   dataset
 }
 
-# params: helper that just returns its arguments as a named list
-params <- function(...) list(...)
+# params: capture bare column names as strings so do.call() can pass them safely
+params <- function(...) {
+  dots <- as.list(substitute(list(...)))[-1]
+  lapply(dots, function(x) if (is.symbol(x)) deparse(x) else x)
+}
 
 # ── Sample data ───────────────────────────────────────────────────────────────
 
@@ -332,6 +360,12 @@ dm_with_blanks <- dm_raw |>
 dm  <- convert_blanks_to_na(dm_raw)
 ex  <- convert_blanks_to_na(ex_raw)
 lb  <- convert_blanks_to_na(lb_raw)
+
+# ── Real pharmaversesdtm data ─────────────────────────────────────────────────
+library(pharmaversesdtm)
+dm_real <- pharmaversesdtm::dm
+ex_real <- pharmaversesdtm::ex
+lb_real <- pharmaversesdtm::lb
 ```
 
 ## Welcome
@@ -461,6 +495,53 @@ cat("NAs in RACE (after):", sum(is.na(test_clean$RACE)), "\n")
 test_clean
 ```
 
+### Exercise: Blank audit on real pharmaversesdtm DM
+
+The real `dm_real` arrives as if read from a SAS XPT. Check whether it carries any blank strings, then apply `convert_blanks_to_na()` defensively. This pattern belongs at the top of every admiral script regardless of whether blanks are expected.
+
+```{r blanks-real-dm, exercise=TRUE, exercise.lines=18}
+# Count blank strings per character column in dm_real
+blank_counts <- dm_real |>
+  select(where(is.character)) |>
+  summarise(across(everything(), ~ sum(.x == "", na.rm = TRUE))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "n_blanks") |>
+  filter(n_blanks > 0)
+
+cat("Columns with blank strings in dm_real:\n")
+if (nrow(blank_counts) == 0) cat("  (none found — dataset is already clean)\n") else print(blank_counts)
+
+# Apply defensively anyway
+dm_real_clean <- convert_blanks_to_na(dm_real)
+
+# How many NAs exist per character column?
+na_summary <- sapply(select(dm_real_clean, where(is.character)),
+                     function(x) sum(is.na(x)))
+cat("\nNA counts in character columns after conversion:\n")
+print(na_summary[na_summary > 0])
+```
+
+```{r blanks-real-dm-hint-1}
+# summarise(across(everything(), ~ sum(.x == "", na.rm = TRUE)))
+# The real value: even if zero blanks exist today, a study database refresh
+# could introduce them — calling convert_blanks_to_na() costs nothing.
+```
+
+```{r blanks-real-dm-solution}
+blank_counts <- dm_real |>
+  select(where(is.character)) |>
+  summarise(across(everything(), ~ sum(.x == "", na.rm = TRUE))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "n_blanks") |>
+  filter(n_blanks > 0)
+
+if (nrow(blank_counts) == 0) cat("(none found)\n") else print(blank_counts)
+
+dm_real_clean <- convert_blanks_to_na(dm_real)
+
+na_summary <- sapply(select(dm_real_clean, where(is.character)),
+                     function(x) sum(is.na(x)))
+print(na_summary[na_summary > 0])
+```
+
 ---
 
 ## 4 — `derive_vars_dt()`: ISO 8601 DTC → numeric Date
@@ -534,6 +615,56 @@ partial_dm2 |>
     date_imputation = "last"
   ) |>
   mutate(STARTDT_human = as.Date(STARTDT, origin = "1970-01-01"))
+```
+
+### Exercise: Derive numeric dates from real pharmaversesdtm DM
+
+`dm_real` contains `RFXSTDTC` — the reference date for first treatment exposure. Derive `RFXSTDT` from it, then check how many subjects had partial dates that triggered the imputation flag.
+
+```{r derive-dt-real, exercise=TRUE, exercise.lines=18}
+# Preview the raw RFXSTDTC values
+cat("RFXSTDTC sample (first 8):\n")
+cat(paste(head(dm_real$RFXSTDTC, 8), collapse = ", "), "\n\n")
+
+# How many look partial (< 10 chars = missing day or month)?
+partial_n <- sum(nchar(dm_real$RFXSTDTC) < 10 & !is.na(dm_real$RFXSTDTC))
+cat("Partial RFXSTDTC values:", partial_n, "\n\n")
+
+# Derive RFXSTDT (numeric date) with first-day imputation
+dm_real_dates <- dm_real |>
+  derive_vars_dt(
+    dtc             = ___,
+    new_vars_prefix = "RFXST",
+    date_imputation = "first"
+  )
+
+# How many imputation flags were set?
+cat("RFXSTDTF imputation flag counts:\n")
+table(dm_real_dates$RFXSTDTF, useNA = "ifany")
+```
+
+```{r derive-dt-real-hint-1}
+# dtc = RFXSTDTC
+# A DTF flag of NA means the date was complete — no imputation needed.
+# A flag of "D" means the day was missing and imputed.
+```
+
+```{r derive-dt-real-solution}
+cat("RFXSTDTC sample (first 8):\n")
+cat(paste(head(dm_real$RFXSTDTC, 8), collapse = ", "), "\n\n")
+
+partial_n <- sum(nchar(dm_real$RFXSTDTC) < 10 & !is.na(dm_real$RFXSTDTC))
+cat("Partial RFXSTDTC values:", partial_n, "\n\n")
+
+dm_real_dates <- dm_real |>
+  derive_vars_dt(
+    dtc             = RFXSTDTC,
+    new_vars_prefix = "RFXST",
+    date_imputation = "first"
+  )
+
+cat("RFXSTDTF imputation flag counts:\n")
+table(dm_real_dates$RFXSTDTF, useNA = "ifany")
 ```
 
 ---
@@ -761,6 +892,74 @@ adsl_trte |>
   )
 ```
 
+### Exercise: derive_vars_merged on real pharmaversesdtm data
+
+Build a minimal ADSL skeleton from `dm_real` and derive `TRTSDT` (first treatment start date) from `ex_real`. This mirrors the first `derive_vars_merged()` call in every real ADSL program.
+
+```{r derive-merged-real, exercise=TRUE, exercise.lines=22}
+# Step 1: convert blanks and add numeric EXSTDT to real EX
+ex_real_dt <- convert_blanks_to_na(ex_real) |>
+  derive_vars_dt(
+    dtc             = EXSTDTC,
+    new_vars_prefix = "EXST",
+    date_imputation = "first"
+  )
+
+# Step 2: ADSL skeleton — keep first 10 treated subjects from real DM
+adsl_real_skel <- convert_blanks_to_na(dm_real) |>
+  filter(!is.na(RFXSTDTC)) |>
+  slice_head(n = 10) |>
+  select(STUDYID, USUBJID, ARM, ACTARM)
+
+# Step 3: merge first exposure date per subject
+adsl_real_trts <- adsl_real_skel |>
+  derive_vars_merged(
+    dataset_add = ex_real_dt,
+    filter_add  = !is.na(EXSTDT),
+    new_vars    = exprs(TRTSDT = ___),
+    order       = exprs(___),
+    mode        = "first",
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_real_trts |>
+  mutate(TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01")) |>
+  select(USUBJID, ARM, TRTSDT_human)
+```
+
+```{r derive-merged-real-hint-1}
+# new_vars = exprs(TRTSDT = EXSTDT)
+# order    = exprs(EXSTDT)
+```
+
+```{r derive-merged-real-solution}
+ex_real_dt <- convert_blanks_to_na(ex_real) |>
+  derive_vars_dt(
+    dtc             = EXSTDTC,
+    new_vars_prefix = "EXST",
+    date_imputation = "first"
+  )
+
+adsl_real_skel <- convert_blanks_to_na(dm_real) |>
+  filter(!is.na(RFXSTDTC)) |>
+  slice_head(n = 10) |>
+  select(STUDYID, USUBJID, ARM, ACTARM)
+
+adsl_real_trts <- adsl_real_skel |>
+  derive_vars_merged(
+    dataset_add = ex_real_dt,
+    filter_add  = !is.na(EXSTDT),
+    new_vars    = exprs(TRTSDT = EXSTDT),
+    order       = exprs(EXSTDT),
+    mode        = "first",
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_real_trts |>
+  mutate(TRTSDT_human = as.Date(TRTSDT, origin = "1970-01-01")) |>
+  select(USUBJID, ARM, TRTSDT_human)
+```
+
 ---
 
 ## 8 — `derive_var_extreme_flag()`: first/last record flags
@@ -952,6 +1151,48 @@ quiz(
     answer("When the filter condition uses only variables from the source dataset", correct = TRUE),
     answer("When the filter involves comparing dates from both datasets"),
     answer("Always — derive_vars_joined() is deprecated"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The `DTF` imputation flag produced by `derive_vars_dt()` is `NA` when:",
+    answer("Imputation failed"),
+    answer("The original DTC was complete — no day or month was missing, so no imputation was needed", correct = TRUE),
+    answer("date_imputation = 'none' was specified"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`convert_blanks_to_na()` is always called first because SAS XPT files represent missing character values as:",
+    answer("NA in R"),
+    answer("NULL"),
+    answer('Empty strings (\"\") — which R\'s is.na() returns FALSE for, silently corrupting downstream derivations', correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`derive_vars_duration()` with `add_one = TRUE` is correct for treatment duration because:",
+    answer("A subject treated for exactly one day (start == end) should have duration 1, not 0 — the inclusive counting convention requires adding 1", correct = TRUE),
+    answer("CDISC forbids duration of zero"),
+    answer("add_one adjusts for the no-Day-0 convention"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A subject has a study day of -3. This means the event occurred:",
+    answer("3 days after the reference date"),
+    answer("3 days before the reference date — Day -1 is immediately before Day 1, and Day -3 is two days further back", correct = TRUE),
+    answer("On the reference date (Day 1 and Day -3 are equivalent)"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`derive_var_extreme_flag()` with `mode = 'first'` is used to derive ABLFL because:",
+    answer("'first' means alphabetically first USUBJID"),
+    answer("The baseline record is defined as the earliest (first in date order) pre-treatment observation", correct = TRUE),
+    answer("ABLFL must always be the record with the highest ADT"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`call_derivation()` is most useful when:",
+    answer("You need to debug a single derive_vars_dtm() call"),
+    answer("You need to apply the same derivation function to multiple sets of variables (e.g., EXSTDTC and EXENDTC) with shared arguments, avoiding copy-paste", correct = TRUE),
+    answer("You are calling admiral functions from a loop in base R"),
     random_answer_order = TRUE
   )
 )

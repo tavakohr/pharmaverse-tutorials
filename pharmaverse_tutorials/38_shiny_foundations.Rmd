@@ -1,0 +1,2439 @@
+---
+title: "Lesson 38 — Shiny Foundations for Clinical Programmers"
+output:
+  learnr::tutorial:
+    theme: flatly
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 38_shiny_foundations.Rmd
+# PURPOSE       : Shiny foundations for clinical programmers: reactive
+#                 programming model, UI layout, input/output widgets,
+#                 reactive expressions, validation, dynamic UI, modules,
+#                 download handlers, clinical ADaM data explorers, and
+#                 bslib theming — with real pharmaverseadam examples.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(shiny)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(pharmaverseadam)
+tryCatch(library(bslib), error = function(e) NULL)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ── ADSL ──────────────────────────────────────────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n, 161, 7)), round(rnorm(n, 174, 8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n, 68, 12), 1), round(rnorm(n, 82, 14), 1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL = ht, WEIGHTBL = wt,
+                                  BMIBL = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+}
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    TRT01P = factor(TRT01P, levels = c("Placebo", "Xanomeline Low Dose",
+                                        "Xanomeline High Dose"))
+  ) |>
+  filter(SAFFL == "Y")
+
+# ── ADAE ──────────────────────────────────────────────────────────────────────
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE ~ NA_integer_
+  ))
+
+# ── ADLB ──────────────────────────────────────────────────────────────────────
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+adlb <- adlb |> select(-any_of("TRT01P"))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb,
+                    select(adsl, USUBJID, TRTSDT, TRT01P = TRT01P),
+                    by = "USUBJID")
+```
+
+## Overview
+
+Welcome to **Lesson 38 — Shiny Foundations for Clinical Programmers**.
+
+This lesson bridges your SAS programming experience to building interactive clinical data applications in R using Shiny. By the end you will be able to:
+
+- Explain the **reactive programming model** and how it differs from SAS batch execution
+- Build **UI layouts** using `fluidPage()`, `navbarPage()`, and Bootstrap grid columns
+- Wire **input widgets** (dropdowns, sliders, date ranges, action buttons) to server logic
+- Write **server functions** with `reactive()`, `observe()`, `observeEvent()`, and render functions
+- Apply **validation** patterns with `req()`, `validate()`, and `need()`
+- Build **dynamic UI** with `renderUI()` and `updateSelectInput()`
+- Handle **file downloads** with `downloadHandler()` and **uploads** with `fileInput()`
+- Structure large apps with **Shiny modules** and namespace isolation
+- Polish apps with **notifications**, **modal dialogs**, **progress bars**, and `bslib` theming
+- Read and extend a complete **clinical data explorer** for CDISCPILOT01
+
+All examples use real `pharmaverseadam` data: `adsl` (254 subjects, 3 treatment arms), `adae`, and `adlb`.
+
+> **SAS analogy**: Shiny is to R what SAS/AF or Stored Process Web Applications were to SAS — but far more accessible, and the standard for clinical exploratory tools in modern pharma.
+
+---
+
+## Section 1 — The Reactive Programming Model (SAS vs Shiny)
+
+### Paradigm shift: batch vs reactive
+
+In SAS, a program runs **top-to-bottom, once**, producing static output. Every change means re-submitting the entire job.
+
+In Shiny, code lives in a **reactive graph**. Think of it as a live spreadsheet:
+
+- **Inputs** are the source cells (user controls: dropdowns, sliders, buttons)
+- **Reactive expressions** are intermediate calculated cells — they cache their value and only recalculate when their dependencies change
+- **Outputs** are the result cells (tables, plots, text rendered in the browser)
+
+When a user changes an input, Shiny automatically re-runs **only the downstream portions of the graph** that depend on it.
+
+```
+[User selects treatment arm]
+         |
+         v  input$trt_arm
+[reactive() filters adsl]     <- cached reactive expression
+         |
+         +---> [renderTable()  -> output$demog_table]
+         +---> [renderPlot()   -> output$age_plot]
+```
+
+### The three server objects
+
+Every Shiny server function receives three arguments:
+
+```r
+server <- function(input, output, session) { ... }
+```
+
+| Object | Role | Access |
+|--------|------|--------|
+| `input` | Named list of current widget values | Read-only; creates reactive dependency |
+| `output` | Named list of render function assignments | Write-only from server |
+| `session` | Connection to the user's browser | Used for `update*Input()`, modules, URLs |
+
+### `reactive()` vs `observe()`
+
+| Function | Returns | Runs when | Use for |
+|----------|---------|-----------|---------|
+| `reactive({...})` | A value (call with `()`) | Called from reactive context, dependencies changed | Shared computed data |
+| `observe({...})` | Nothing (side effect) | Dependencies change, eagerly | Logging, updating inputs |
+| `observeEvent(ev, {...})` | Nothing | `ev` fires (e.g., button click) | Gating on button press |
+| `eventReactive(ev, {...})` | A value | `ev` fires | Value that only updates on click |
+
+### Reactive expressions are lazy and cached
+
+A `reactive()` expression does **not** run when it is defined. It runs the first time it is called from a reactive context, caches the result, and only invalidates (and recalculates) when one of its dependencies changes. This is why putting expensive operations in a shared `reactive()` — rather than repeating them inside each `renderPlot()` and `renderTable()` — is the correct pattern.
+
+### Exercises
+
+**Exercise 1.1** — UI functions return R tag objects. Inspect the classes returned by `fluidPage()` and `selectInput()`:
+
+```{r ex-tag-class, exercise=TRUE, exercise.lines=8}
+# What class does fluidPage() return?
+cls_page <- class(fluidPage())
+
+# What class does selectInput() return?
+cls_input <- class(selectInput("arm", "Treatment Arm",
+                               choices = c("Placebo", "Xanomeline Low Dose")))
+
+cat("fluidPage class: ", cls_page,  "\n")
+cat("selectInput class:", cls_input, "\n")
+```
+
+```{r ex-tag-class-solution}
+cls_page  <- class(fluidPage())
+cls_input <- class(selectInput("arm", "Treatment Arm",
+                               choices = c("Placebo", "Xanomeline Low Dose")))
+cat("fluidPage class: ", cls_page,  "\n")
+cat("selectInput class:", cls_input, "\n")
+```
+
+---
+
+**Exercise 1.2** — `shiny::isolate()` reads a reactive value without creating a dependency. Create a `reactive()` and call it safely outside an app context:
+
+```{r ex-isolate, exercise=TRUE, exercise.lines=10}
+# Create a reactive expression
+mean_age_r <- reactive({
+  mean(adsl$AGE, na.rm = TRUE)
+})
+
+# Call it safely outside a reactive context using isolate()
+result <- isolate(mean_age_r())
+cat("Mean age:", round(result, 1), "\n")
+```
+
+```{r ex-isolate-solution}
+mean_age_r <- reactive({
+  mean(adsl$AGE, na.rm = TRUE)
+})
+result <- isolate(mean_age_r())
+cat("Mean age:", round(result, 1), "\n")
+```
+
+---
+
+**Exercise 1.3** — `observe()` runs for side effects. Write an `observe()` that records the subject count, then trigger it once with `isolate()`:
+
+```{r ex-observe, exercise=TRUE, exercise.lines=12}
+n_subjects <- 0L
+
+obs <- observe({
+  n_subjects <<- nrow(adsl)
+  cat("Side effect triggered: n =", n_subjects, "\n")
+})
+
+# Trigger the observer once
+isolate(obs)
+cat("n_subjects after observe:", n_subjects, "\n")
+```
+
+```{r ex-observe-solution}
+n_subjects <- 0L
+obs <- observe({
+  n_subjects <<- nrow(adsl)
+  cat("Side effect triggered: n =", n_subjects, "\n")
+})
+isolate(obs)
+cat("n_subjects after observe:", n_subjects, "\n")
+```
+
+---
+
+**Exercise 1.4** — Reactive chains: create a `reactive()` that filters `adsl` to subjects aged 70 or older, and a second `reactive()` that computes the mean BMI of that filtered subset. Call both with `isolate()`:
+
+```{r ex-reactive-chain-basic, exercise=TRUE, exercise.lines=14}
+older_subjects <- reactive({
+  adsl |> filter(AGE >= ___)
+})
+
+mean_bmi_older <- reactive({
+  mean(older_subjects()$BMIBL, na.rm = TRUE)
+})
+
+cat("N subjects age >= 70:", isolate(nrow(older_subjects())), "\n")
+cat("Mean BMI (age >= 70):", isolate(round(mean_bmi_older(), 1)), "\n")
+```
+
+```{r ex-reactive-chain-basic-solution}
+older_subjects <- reactive({
+  adsl |> filter(AGE >= 70)
+})
+mean_bmi_older <- reactive({
+  mean(older_subjects()$BMIBL, na.rm = TRUE)
+})
+cat("N subjects age >= 70:", isolate(nrow(older_subjects())), "\n")
+cat("Mean BMI (age >= 70):", isolate(round(mean_bmi_older(), 1)), "\n")
+```
+
+---
+
+## Section 2 — UI Layout Functions
+
+### Building UI from nested function calls
+
+Shiny UI is constructed by nesting R function calls that generate HTML. The result is a tag tree that Shiny serialises and sends to the browser.
+
+**Core layout hierarchy:**
+
+```r
+fluidPage(                         # responsive Bootstrap page
+  titlePanel("My App"),            # page title bar
+  sidebarLayout(                   # two-column layout
+    sidebarPanel(...),             # left panel: filters & controls
+    mainPanel(                     # right panel: outputs
+      tabsetPanel(                 # in-page tabs
+        tabPanel("Tab A", ...),
+        tabPanel("Tab B", ...)
+      )
+    )
+  )
+)
+```
+
+**Multi-tab navigation** (`navbarPage`) is the standard structure for clinical study dashboards:
+
+```r
+navbarPage(
+  title = "Clinical Study Report",
+  tabPanel("Demographics", ...),
+  tabPanel("Safety",        ...),
+  tabPanel("Lab Data",      ...)
+)
+```
+
+**Bootstrap 12-column grid** — use `fluidRow()` + `column(width, ...)` for custom layouts. Column widths must sum to 12:
+
+```r
+fluidRow(
+  column(4, wellPanel(...)),   # 1/3 width
+  column(8, plotOutput(...))   # 2/3 width
+)
+```
+
+**Useful HTML helpers:** `tags$h3()`, `tags$p()`, `tags$br()`, `hr()`, `HTML()`, `wellPanel()`.
+
+### Exercises
+
+**Exercise 2.1** — Complete the sidebarLayout skeleton for a clinical data explorer. Fill in the two blanks:
+
+```{r ex-sidebar-layout, exercise=TRUE, exercise.eval=FALSE, exercise.lines=20}
+# Note: exercise.eval=FALSE — copy to RStudio to run the app.
+# Here we inspect the tag structure only.
+
+ui <- fluidPage(
+  titlePanel("CDISCPILOT01 — Clinical Data Explorer"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("trt_arm", "Treatment Arm",
+                  choices = c("All", "Placebo",
+                              "Xanomeline Low Dose",
+                              "Xanomeline High Dose")),
+      # Use sliderInput for the age range (min 50, max 90)
+      ___(  "age_range", "Age Range",
+            min = 50, max = 90, value = c(50, 90)),
+      actionButton("update_btn", "Update", class = "btn-primary")
+    ),
+    mainPanel(
+      # Use tabsetPanel with two tabPanels: "Table" and "Plot"
+      ___(
+        tabPanel("Table", tableOutput("demog_table")),
+        tabPanel("Plot",  plotOutput("age_hist"))
+      )
+    )
+  )
+)
+class(ui)
+```
+
+```{r ex-sidebar-layout-solution}
+ui <- fluidPage(
+  titlePanel("CDISCPILOT01 — Clinical Data Explorer"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("trt_arm", "Treatment Arm",
+                  choices = c("All", "Placebo",
+                              "Xanomeline Low Dose",
+                              "Xanomeline High Dose")),
+      sliderInput("age_range", "Age Range",
+                  min = 50, max = 90, value = c(50, 90)),
+      actionButton("update_btn", "Update", class = "btn-primary")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Table", tableOutput("demog_table")),
+        tabPanel("Plot",  plotOutput("age_hist"))
+      )
+    )
+  )
+)
+class(ui)
+```
+
+---
+
+**Exercise 2.2** — Build a `navbarPage` with three clinical tabs. Fill in the tab names:
+
+```{r ex-navbar, exercise=TRUE, exercise.eval=FALSE, exercise.lines=22}
+ui <- navbarPage(
+  title = "Clinical Study Report",
+
+  tabPanel("Demographics",
+    fluidRow(
+      column(4, wellPanel(
+        selectInput("demog_trt", "Treatment", choices = levels(adsl$TRT01P))
+      )),
+      column(8, tableOutput("demog_out"))
+    )
+  ),
+
+  tabPanel("___",         # Safety / AE tab
+    plotOutput("ae_plot")
+  ),
+
+  tabPanel("___",         # Lab Data tab
+    selectInput("param", "Parameter", choices = c("ALT", "AST", "WBC")),
+    plotOutput("lab_plot")
+  )
+)
+cat("navbarPage tabs defined\n")
+```
+
+```{r ex-navbar-solution}
+ui <- navbarPage(
+  title = "Clinical Study Report",
+  tabPanel("Demographics",
+    fluidRow(
+      column(4, wellPanel(
+        selectInput("demog_trt", "Treatment", choices = levels(adsl$TRT01P))
+      )),
+      column(8, tableOutput("demog_out"))
+    )
+  ),
+  tabPanel("Safety",
+    plotOutput("ae_plot")
+  ),
+  tabPanel("Lab Data",
+    selectInput("param", "Parameter", choices = c("ALT", "AST", "WBC")),
+    plotOutput("lab_plot")
+  )
+)
+cat("navbarPage tabs defined\n")
+```
+
+---
+
+**Exercise 2.3** — `column()` grid — place two equal-width panels side by side in the 12-column Bootstrap grid:
+
+```{r ex-column-grid, exercise=TRUE, exercise.eval=FALSE, exercise.lines=12}
+# Two equal-width columns: each takes half the 12-column grid
+row <- fluidRow(
+  column(___, plotOutput("plot_left")),
+  column(___, plotOutput("plot_right"))
+)
+
+# How many Bootstrap columns wide is each panel?
+cat("Each panel width:", ___, "of 12\n")
+```
+
+```{r ex-column-grid-solution}
+row <- fluidRow(
+  column(6, plotOutput("plot_left")),
+  column(6, plotOutput("plot_right"))
+)
+cat("Each panel width:", 6, "of 12\n")
+```
+
+---
+
+**Exercise 2.4** — `wellPanel()` and `tags$` helpers — build a styled information box:
+
+```{r ex-well-panel, exercise=TRUE, exercise.lines=14}
+info_box <- wellPanel(
+  tags$h4("Study: CDISCPILOT01"),
+  tags$p("Indication: Alzheimer's Disease"),
+  tags$p(paste("Total subjects (Safety population):", nrow(adsl))),
+  hr(),
+  tags$small("Data source: pharmaverseadam")
+)
+
+# wellPanel returns a shiny.tag — check its class and name
+cat("class:", class(info_box), "\n")
+cat("tag name:", info_box$name, "\n")
+```
+
+```{r ex-well-panel-solution}
+info_box <- wellPanel(
+  tags$h4("Study: CDISCPILOT01"),
+  tags$p("Indication: Alzheimer's Disease"),
+  tags$p(paste("Total subjects (Safety population):", nrow(adsl))),
+  hr(),
+  tags$small("Data source: pharmaverseadam")
+)
+cat("class:", class(info_box), "\n")
+cat("tag name:", info_box$name, "\n")
+```
+
+---
+
+## Section 3 — Input Widgets
+
+### Widget anatomy
+
+Every Shiny input widget follows the same pattern:
+
+```r
+widgetFunction(inputId, label, ...)
+```
+
+The `inputId` string becomes the key in the `input` list on the server side. If you write `selectInput("trt_arm", ...)` in the UI, the server reads `input$trt_arm`.
+
+> **Rule**: all `inputId` values must be unique within an app.
+
+### Clinically relevant widgets
+
+| Widget | Function | Clinical Use |
+|--------|----------|-------------|
+| Dropdown | `selectInput()` | Treatment arm, analysis parameter |
+| Multi-select | `selectInput(..., multiple=TRUE)` | Multiple SOC / PT filter |
+| Checkbox group | `checkboxGroupInput()` | Flag filters (SAFFL, ITTFL) |
+| Slider | `sliderInput()` | Age range, visit window |
+| Date range | `dateRangeInput()` | Study date window filter |
+| Text | `textInput()` | Subject ID search |
+| Numeric | `numericInput()` | Threshold or grade value |
+| Radio buttons | `radioButtons()` | Plot type selection |
+| Action button | `actionButton()` | "Run analysis" / event gate |
+| File upload | `fileInput()` | Upload external dataset |
+| Download | `downloadButton()` | Export filtered data |
+
+### Exercises
+
+**Exercise 3.1** — Build a complete filter panel using four widgets. Fill in the blanks:
+
+```{r ex-input-panel, exercise=TRUE, exercise.eval=FALSE, exercise.lines=26}
+filter_panel <- sidebarPanel(
+
+  # Treatment arm selector
+  selectInput(
+    inputId  = "___",
+    label    = "Treatment Arm",
+    choices  = c("All Patients", levels(adsl$TRT01P)),
+    selected = "All Patients"
+  ),
+
+  # Age range slider: 50 to 90, default full range
+  sliderInput("age_range", "Age Range (years)",
+              min = ___, max = ___, value = c(50, 90), step = 1),
+
+  # Sex checkbox group — select both by default
+  checkboxGroupInput("sex_filter", "Sex",
+                     choices  = c("Male" = "M", "Female" = "F"),
+                     selected = ___),
+
+  # Action button
+  actionButton("run_btn", "Apply Filters",
+               icon = icon("filter"), class = "btn-success")
+)
+
+cat("sidebarPanel children:", length(filter_panel$children[[1]]), "\n")
+```
+
+```{r ex-input-panel-solution}
+filter_panel <- sidebarPanel(
+  selectInput(
+    inputId  = "trt_arm",
+    label    = "Treatment Arm",
+    choices  = c("All Patients", levels(adsl$TRT01P)),
+    selected = "All Patients"
+  ),
+  sliderInput("age_range", "Age Range (years)",
+              min = 50, max = 90, value = c(50, 90), step = 1),
+  checkboxGroupInput("sex_filter", "Sex",
+                     choices  = c("Male" = "M", "Female" = "F"),
+                     selected = c("M", "F")),
+  actionButton("run_btn", "Apply Filters",
+               icon = icon("filter"), class = "btn-success")
+)
+cat("sidebarPanel children:", length(filter_panel$children[[1]]), "\n")
+```
+
+---
+
+**Exercise 3.2** — `dateRangeInput()` for the CDISCPILOT01 study window:
+
+```{r ex-date-range, exercise=TRUE, exercise.lines=14}
+dr <- dateRangeInput(
+  inputId   = "study_window",
+  label     = "Study Date Window",
+  start     = as.Date("___"),    # CDISCPILOT01 start ~ 2012-01-01
+  end       = as.Date("___"),    # End ~ 2014-12-31
+  format    = "yyyy-mm-dd",
+  separator = " to "
+)
+
+# The inputId is stored in the attribs list
+cat("inputId:", dr$attribs$id, "\n")
+```
+
+```{r ex-date-range-solution}
+dr <- dateRangeInput(
+  inputId   = "study_window",
+  label     = "Study Date Window",
+  start     = as.Date("2012-01-01"),
+  end       = as.Date("2014-12-31"),
+  format    = "yyyy-mm-dd",
+  separator = " to "
+)
+cat("inputId:", dr$attribs$id, "\n")
+```
+
+---
+
+**Exercise 3.3** — `selectInput` with `multiple = TRUE` for multi-parameter lab selection:
+
+```{r ex-multi-select, exercise=TRUE, exercise.lines=14}
+lab_params <- sort(unique(adlb$PARAMCD))
+
+param_input <- selectInput(
+  inputId  = "lab_params",
+  label    = "Lab Parameters",
+  choices  = ___,                    # use the lab_params vector
+  selected = c("ALT", "AST"),
+  multiple = ___                     # allow multiple selections
+)
+
+cat("Total available parameters:", length(lab_params), "\n")
+cat("Default selected: ALT, AST\n")
+```
+
+```{r ex-multi-select-solution}
+lab_params <- sort(unique(adlb$PARAMCD))
+param_input <- selectInput(
+  inputId  = "lab_params",
+  label    = "Lab Parameters",
+  choices  = lab_params,
+  selected = c("ALT", "AST"),
+  multiple = TRUE
+)
+cat("Total available parameters:", length(lab_params), "\n")
+cat("Default selected: ALT, AST\n")
+```
+
+---
+
+**Exercise 3.4** — `radioButtons()` for plot type selection. Fill in the default selection:
+
+```{r ex-radio, exercise=TRUE, exercise.lines=14}
+plot_type_input <- radioButtons(
+  inputId  = "plot_type",
+  label    = "Display Type",
+  choices  = c(
+    "Box Plot"   = "box",
+    "Violin Plot" = "violin",
+    "Mean +/- SD" = "mean_sd"
+  ),
+  selected = "___",   # default to box plot
+  inline   = TRUE
+)
+
+cat("inputId:", plot_type_input$attribs$id, "\n")
+```
+
+```{r ex-radio-solution}
+plot_type_input <- radioButtons(
+  inputId  = "plot_type",
+  label    = "Display Type",
+  choices  = c(
+    "Box Plot"   = "box",
+    "Violin Plot" = "violin",
+    "Mean +/- SD" = "mean_sd"
+  ),
+  selected = "box",
+  inline   = TRUE
+)
+cat("inputId:", plot_type_input$attribs$id, "\n")
+```
+
+---
+
+## Section 4 — Server Basics and Render Functions
+
+### How the server populates outputs
+
+The server assigns render functions to output slots:
+
+```r
+output$my_table <- renderTable({ ... })
+output$my_plot  <- renderPlot({ ... })
+```
+
+The body of each render function is a **reactive expression**: it automatically tracks any `input$...` values it reads and re-runs when those values change.
+
+### Render function pairing
+
+| Render function | Output function | Use |
+|-----------------|----------------|-----|
+| `renderTable()` | `tableOutput()` | Simple HTML table |
+| `renderDataTable()` | `dataTableOutput()` | Searchable/pageable DT |
+| `renderPlot()` | `plotOutput()` | ggplot2 or base R |
+| `renderText()` | `textOutput()` | Inline text value |
+| `renderPrint()` | `verbatimTextOutput()` | Console/`glimpse()` output |
+| `renderUI()` | `uiOutput()` | Dynamically generated UI |
+| `downloadHandler()` | `downloadButton()` | File download |
+
+### `shiny::testServer()`
+
+`testServer()` lets you test server logic without launching a browser. It creates a mock session, lets you set input values with `session$setInputs()`, and then read output values. It **does not** start a full Shiny server — it runs fine inside learnr exercises.
+
+```r
+testServer(my_server, {
+  session$setInputs(param = "ALT")
+  cat("Output:", output$my_text, "\n")
+})
+```
+
+### Exercises
+
+**Exercise 4.1** — Write a server function that filters `adsl` by treatment arm and renders a summary table. Fill in the reactive reference:
+
+```{r ex-server-table, exercise=TRUE, exercise.lines=30}
+server <- function(input, output, session) {
+
+  # Reactive: filter adsl by selected treatment arm
+  filtered_adsl <- reactive({
+    if (input$trt_arm == "All Patients") return(adsl)
+    adsl |> filter(as.character(TRT01P) == ___)
+  })
+
+  # Render summary table
+  output$demog_table <- renderTable({
+    filtered_adsl() |>
+      summarise(
+        N        = n(),
+        Age_Mean = round(mean(AGE, na.rm = TRUE), 1),
+        Age_SD   = round(sd(AGE,  na.rm = TRUE), 1),
+        Pct_F    = round(100 * mean(SEX == "F"), 1),
+        .groups  = "drop"
+      )
+  })
+}
+
+# Test with testServer
+testServer(server, args = list(), {
+  session$setInputs(trt_arm = "Placebo")
+  result <- filtered_adsl()
+  cat("Placebo N:", nrow(result), "\n")   # should be ~86
+})
+```
+
+```{r ex-server-table-solution}
+server <- function(input, output, session) {
+  filtered_adsl <- reactive({
+    if (input$trt_arm == "All Patients") return(adsl)
+    adsl |> filter(as.character(TRT01P) == input$trt_arm)
+  })
+  output$demog_table <- renderTable({
+    filtered_adsl() |>
+      summarise(
+        N        = n(),
+        Age_Mean = round(mean(AGE, na.rm = TRUE), 1),
+        Age_SD   = round(sd(AGE,  na.rm = TRUE), 1),
+        Pct_F    = round(100 * mean(SEX == "F"), 1),
+        .groups  = "drop"
+      )
+  })
+}
+testServer(server, args = list(), {
+  session$setInputs(trt_arm = "Placebo")
+  result <- filtered_adsl()
+  cat("Placebo N:", nrow(result), "\n")
+})
+```
+
+---
+
+**Exercise 4.2** — Write a `renderPlot()` for an AGE histogram. Fill in the bin width:
+
+```{r ex-render-plot, exercise=TRUE, exercise.lines=22}
+server_plot <- function(input, output, session) {
+
+  output$age_hist <- renderPlot({
+    df <- adsl |>
+      filter(input$trt_arm == "All Patients" |
+             as.character(TRT01P) == input$trt_arm)
+
+    ggplot(df, aes(x = AGE, fill = as.character(TRT01P))) +
+      geom_histogram(binwidth = ___, colour = "white", alpha = 0.8) +
+      labs(title = paste("Age Distribution —", input$trt_arm),
+           x = "Age (years)", y = "Count", fill = "Treatment") +
+      theme_minimal()
+  })
+}
+
+testServer(server_plot, {
+  session$setInputs(trt_arm = "All Patients")
+  output$age_hist   # triggers the render; no error = pass
+  cat("renderPlot: OK\n")
+})
+```
+
+```{r ex-render-plot-solution}
+server_plot <- function(input, output, session) {
+  output$age_hist <- renderPlot({
+    df <- adsl |>
+      filter(input$trt_arm == "All Patients" |
+             as.character(TRT01P) == input$trt_arm)
+    ggplot(df, aes(x = AGE, fill = as.character(TRT01P))) +
+      geom_histogram(binwidth = 5, colour = "white", alpha = 0.8) +
+      labs(title = paste("Age Distribution —", input$trt_arm),
+           x = "Age (years)", y = "Count", fill = "Treatment") +
+      theme_minimal()
+  })
+}
+testServer(server_plot, {
+  session$setInputs(trt_arm = "All Patients")
+  output$age_hist
+  cat("renderPlot: OK\n")
+})
+```
+
+---
+
+**Exercise 4.3** — `renderPrint()` for a `glimpse()` output. Fill in the render function name:
+
+```{r ex-render-print, exercise=TRUE, exercise.lines=14}
+server_print <- function(input, output, session) {
+  output$data_glimpse <- ___(
+    dplyr::glimpse(adsl |> select(USUBJID, TRT01P, AGE, SEX, RACE))
+  )
+}
+
+testServer(server_print, {
+  out <- output$data_glimpse
+  cat("renderPrint output class:", class(out), "\n")
+})
+```
+
+```{r ex-render-print-solution}
+server_print <- function(input, output, session) {
+  output$data_glimpse <- renderPrint(
+    dplyr::glimpse(adsl |> select(USUBJID, TRT01P, AGE, SEX, RACE))
+  )
+}
+testServer(server_print, {
+  out <- output$data_glimpse
+  cat("renderPrint output class:", class(out), "\n")
+})
+```
+
+---
+
+**Exercise 4.4** — `renderText()` for a dynamic subject count display:
+
+```{r ex-render-text, exercise=TRUE, exercise.lines=16}
+server_text <- function(input, output, session) {
+
+  output$subject_count <- renderText({
+    n_total <- nrow(adsl)
+    n_arm   <- adsl |>
+      filter(as.character(TRT01P) == input$trt_arm) |>
+      nrow()
+    paste0("Arm: ", input$trt_arm,
+           " | N = ", n_arm,
+           " of ", n_total, " total")
+  })
+}
+
+testServer(server_text, {
+  session$setInputs(trt_arm = "Placebo")
+  cat(output$subject_count, "\n")
+})
+```
+
+```{r ex-render-text-solution}
+server_text <- function(input, output, session) {
+  output$subject_count <- renderText({
+    n_total <- nrow(adsl)
+    n_arm   <- adsl |>
+      filter(as.character(TRT01P) == input$trt_arm) |>
+      nrow()
+    paste0("Arm: ", input$trt_arm,
+           " | N = ", n_arm,
+           " of ", n_total, " total")
+  })
+}
+testServer(server_text, {
+  session$setInputs(trt_arm = "Placebo")
+  cat(output$subject_count, "\n")
+})
+```
+
+---
+
+## Section 5 — Reactive Expressions, observe(), and observeEvent()
+
+### Three reactive consumer types
+
+**`reactive()`** — memoised, returns a value, called like a function:
+
+```r
+filtered_data <- reactive({
+  adsl |> filter(as.character(TRT01P) == input$arm)
+})
+# Consumed by outputs:
+output$table <- renderTable(filtered_data())
+output$plot  <- renderPlot(ggplot(filtered_data(), ...))
+```
+
+**`observe()`** — runs for side effects (logging, file writes, `update*Input()` calls); returns nothing:
+
+```r
+observe({
+  cat("Input changed to:", input$arm, "\n")
+})
+```
+
+**`observeEvent(eventExpr, handlerExpr)`** — runs `handlerExpr` only when `eventExpr` fires. Essential for gating expensive computations behind a button:
+
+```r
+observeEvent(input$run_btn, {
+  showNotification("Analysis running...")
+})
+```
+
+**`eventReactive(eventExpr, valueExpr)`** — like `reactive()` but only recalculates when the event fires:
+
+```r
+results <- eventReactive(input$run_btn, {
+  adlb |> group_by(TRT01P, PARAMCD) |> summarise(Mean = mean(AVAL, na.rm=TRUE))
+})
+```
+
+> **Performance rule**: put expensive operations (large merges, model fits) inside `eventReactive()` gated by an `actionButton`. Use plain `reactive()` for lightweight, sub-second filtering.
+
+**`reactiveValues()`** — a mutable list of reactive values, analogous to a named environment that Shiny watches:
+
+```r
+rv <- reactiveValues(log = character(0), count = 0L)
+observeEvent(input$btn, { rv$count <- rv$count + 1L })
+output$count_text <- renderText(rv$count)
+```
+
+### Exercises
+
+**Exercise 5.1** — Create a reactive filter chain where a single `reactive()` feeds two outputs. Fill in the reactive reference (both blanks are the same):
+
+```{r ex-reactive-chain, exercise=TRUE, exercise.lines=24}
+server <- function(input, output, session) {
+
+  # Step 1: one reactive filter used by both outputs
+  filtered <- reactive({
+    adsl |> filter(
+      AGE >= input$age_min,
+      AGE <= input$age_max
+    )
+  })
+
+  output$n_subjects <- renderText({
+    paste("N =", nrow(___()))      # call the reactive
+  })
+
+  output$mean_age <- renderText({
+    paste("Mean Age =", round(mean(___()$AGE), 1))
+  })
+}
+
+testServer(server, {
+  session$setInputs(age_min = 70, age_max = 90)
+  cat("n_subjects:", output$n_subjects, "\n")
+  cat("mean_age:  ", output$mean_age,   "\n")
+})
+```
+
+```{r ex-reactive-chain-solution}
+server <- function(input, output, session) {
+  filtered <- reactive({
+    adsl |> filter(
+      AGE >= input$age_min,
+      AGE <= input$age_max
+    )
+  })
+  output$n_subjects <- renderText({
+    paste("N =", nrow(filtered()))
+  })
+  output$mean_age <- renderText({
+    paste("Mean Age =", round(mean(filtered()$AGE), 1))
+  })
+}
+testServer(server, {
+  session$setInputs(age_min = 70, age_max = 90)
+  cat("n_subjects:", output$n_subjects, "\n")
+  cat("mean_age:  ", output$mean_age,   "\n")
+})
+```
+
+---
+
+**Exercise 5.2** — `observeEvent()` with `actionButton` — only recompute when the button is clicked. Fill in the event expression:
+
+```{r ex-observe-event, exercise=TRUE, exercise.lines=24}
+server <- function(input, output, session) {
+
+  # eventReactive: only fires when run_btn is clicked
+  analysis_result <- eventReactive(___, {
+    adsl |>
+      filter(input$trt_arm == "All" |
+             as.character(TRT01P) == input$trt_arm) |>
+      summarise(N = n(), Mean_Age = round(mean(AGE, na.rm = TRUE), 1))
+  })
+
+  output$result_table <- renderTable(analysis_result())
+
+  # Log each button click as a side effect
+  observeEvent(input$run_btn, {
+    cat("Button clicked at:", format(Sys.time()), "\n")
+  })
+}
+
+testServer(server, {
+  session$setInputs(trt_arm = "Placebo", run_btn = 0)
+  session$setInputs(run_btn = 1)      # simulate button click
+  cat("After click, result rows:", nrow(analysis_result()), "\n")
+})
+```
+
+```{r ex-observe-event-solution}
+server <- function(input, output, session) {
+  analysis_result <- eventReactive(input$run_btn, {
+    adsl |>
+      filter(input$trt_arm == "All" |
+             as.character(TRT01P) == input$trt_arm) |>
+      summarise(N = n(), Mean_Age = round(mean(AGE, na.rm = TRUE), 1))
+  })
+  output$result_table <- renderTable(analysis_result())
+  observeEvent(input$run_btn, {
+    cat("Button clicked at:", format(Sys.time()), "\n")
+  })
+}
+testServer(server, {
+  session$setInputs(trt_arm = "Placebo", run_btn = 0)
+  session$setInputs(run_btn = 1)
+  cat("After click, result rows:", nrow(analysis_result()), "\n")
+})
+```
+
+---
+
+**Exercise 5.3** — `reactiveValues()` — accumulate a log of subject IDs viewed. Fill in the increment value:
+
+```{r ex-reactive-values, exercise=TRUE, exercise.lines=24}
+server <- function(input, output, session) {
+
+  rv <- reactiveValues(
+    viewed_ids  = character(0),
+    click_count = 0L
+  )
+
+  observeEvent(input$select_id, {
+    rv$viewed_ids  <- c(rv$viewed_ids, input$select_id)
+    rv$click_count <- rv$click_count + ___    # increment by 1
+  })
+
+  output$log_text <- renderText({
+    paste("Clicks:", rv$click_count,
+          "| Last ID:", tail(rv$viewed_ids, 1))
+  })
+}
+
+testServer(server, {
+  session$setInputs(select_id = "CDISCPILOT01-01-701-1015")
+  session$setInputs(select_id = "CDISCPILOT01-01-701-1023")
+  cat("click_count:", rv$click_count, "\n")   # should be 2
+  cat("viewed_ids: ", paste(rv$viewed_ids, collapse = ", "), "\n")
+})
+```
+
+```{r ex-reactive-values-solution}
+server <- function(input, output, session) {
+  rv <- reactiveValues(
+    viewed_ids  = character(0),
+    click_count = 0L
+  )
+  observeEvent(input$select_id, {
+    rv$viewed_ids  <- c(rv$viewed_ids, input$select_id)
+    rv$click_count <- rv$click_count + 1L
+  })
+  output$log_text <- renderText({
+    paste("Clicks:", rv$click_count,
+          "| Last ID:", tail(rv$viewed_ids, 1))
+  })
+}
+testServer(server, {
+  session$setInputs(select_id = "CDISCPILOT01-01-701-1015")
+  session$setInputs(select_id = "CDISCPILOT01-01-701-1023")
+  cat("click_count:", rv$click_count, "\n")
+  cat("viewed_ids: ", paste(rv$viewed_ids, collapse = ", "), "\n")
+})
+```
+
+---
+
+## Section 6 — Validation with req(), validate(), and need()
+
+### Three layers of graceful validation
+
+**`req(x)`** — "require" that `x` is truthy. If not, silently stops the reactive chain and shows a blank output (no error message, no red traceback). This is the first line of every render function:
+
+```r
+output$plot <- renderPlot({
+  req(input$param)    # nothing selected yet? show blank, not an error
+  ...
+})
+```
+
+**`validate(need(condition, message))`** — shows a friendly user-facing message in the output area when `condition` is `FALSE`. Not an R error — renders as grey text in the output panel:
+
+```r
+validate(
+  need(nrow(df) > 0,
+       paste("No records found for parameter:", input$param))
+)
+```
+
+**`req()` with multiple arguments** — all must be truthy:
+
+```r
+req(input$trt_arm, input$param)   # both must be non-NULL and non-empty
+```
+
+**File upload guard:**
+
+```r
+req(input$upload_file)            # blocks until file has been uploaded
+df <- read.csv(input$upload_file$datapath)
+```
+
+### Clinical validation pattern
+
+```r
+output$lab_plot <- renderPlot({
+  req(input$param)                         # 1. guard: widget populated?
+  df <- adlb |> filter(PARAMCD == input$param)
+  validate(                                # 2. guard: data exists?
+    need(nrow(df) > 0,
+         paste("No data for parameter:", input$param))
+  )
+  ggplot(df, aes(x = AVISIT, y = AVAL, fill = TRT01P)) +
+    geom_boxplot() + theme_minimal()
+})
+```
+
+### Exercises
+
+**Exercise 6.1** — Add `req()` and `validate()` to a render function. Fill in the two blanks:
+
+```{r ex-validation, exercise=TRUE, exercise.lines=22}
+server <- function(input, output, session) {
+
+  output$lab_plot <- renderPlot({
+
+    # Require that a parameter has been selected (1st blank)
+    ___(input$param)
+
+    df <- adlb |> filter(PARAMCD == input$param)
+
+    # Friendly message if no data (2nd blank = the bad input)
+    validate(
+      need(nrow(df) > 0,
+           paste("No records found for parameter:", ___))
+    )
+
+    ggplot(df, aes(x = AVISIT, y = AVAL, fill = TRT01P)) +
+      geom_boxplot() + theme_minimal() +
+      labs(title = paste("Lab Values —", input$param))
+  })
+}
+
+testServer(server, {
+  session$setInputs(param = "ALT")
+  cat("ALT render: OK\n")
+})
+```
+
+```{r ex-validation-solution}
+server <- function(input, output, session) {
+  output$lab_plot <- renderPlot({
+    req(input$param)
+    df <- adlb |> filter(PARAMCD == input$param)
+    validate(
+      need(nrow(df) > 0,
+           paste("No records found for parameter:", input$param))
+    )
+    ggplot(df, aes(x = AVISIT, y = AVAL, fill = TRT01P)) +
+      geom_boxplot() + theme_minimal() +
+      labs(title = paste("Lab Values —", input$param))
+  })
+}
+testServer(server, {
+  session$setInputs(param = "ALT")
+  cat("ALT render: OK\n")
+})
+```
+
+---
+
+**Exercise 6.2** — `req()` with multiple conditions — both treatment arm and parameter must be selected before rendering:
+
+```{r ex-req-multi, exercise=TRUE, exercise.lines=16}
+server <- function(input, output, session) {
+
+  output$filtered_n <- renderText({
+    req(input$trt_arm, input$param)   # BOTH must be truthy
+    n <- adlb |>
+      filter(PARAMCD == input$param,
+             as.character(TRT01P) == input$trt_arm) |>
+      nrow()
+    paste("N records:", ___)
+  })
+}
+
+testServer(server, {
+  session$setInputs(trt_arm = "Placebo", param = "ALT")
+  cat(output$filtered_n, "\n")
+})
+```
+
+```{r ex-req-multi-solution}
+server <- function(input, output, session) {
+  output$filtered_n <- renderText({
+    req(input$trt_arm, input$param)
+    n <- adlb |>
+      filter(PARAMCD == input$param,
+             as.character(TRT01P) == input$trt_arm) |>
+      nrow()
+    paste("N records:", n)
+  })
+}
+testServer(server, {
+  session$setInputs(trt_arm = "Placebo", param = "ALT")
+  cat(output$filtered_n, "\n")
+})
+```
+
+---
+
+**Exercise 6.3** — `validate()` with multiple `need()` calls — check two conditions and report both failures:
+
+```{r ex-validate-multi, exercise=TRUE, exercise.lines=18}
+server <- function(input, output, session) {
+
+  output$ae_table <- renderTable({
+    df <- adae |>
+      filter(as.character(TRT01A) == input$ae_trt | input$ae_trt == "All")
+
+    validate(
+      need(nrow(df) > 0,
+           "No adverse events found for the selected treatment arm."),
+      need("AEBODSYS" %in% names(df),
+           "___")   # message if body system column is missing
+    )
+
+    df |> count(AEBODSYS, sort = TRUE) |> head(10)
+  })
+}
+
+testServer(server, {
+  session$setInputs(ae_trt = "All")
+  cat("AE table rows:", nrow(adae |> count(AEBODSYS) |> head(10)), "\n")
+})
+```
+
+```{r ex-validate-multi-solution}
+server <- function(input, output, session) {
+  output$ae_table <- renderTable({
+    df <- adae |>
+      filter(as.character(TRT01A) == input$ae_trt | input$ae_trt == "All")
+    validate(
+      need(nrow(df) > 0,
+           "No adverse events found for the selected treatment arm."),
+      need("AEBODSYS" %in% names(df),
+           "Column AEBODSYS not found in the AE dataset.")
+    )
+    df |> count(AEBODSYS, sort = TRUE) |> head(10)
+  })
+}
+testServer(server, {
+  session$setInputs(ae_trt = "All")
+  cat("AE table rows:", nrow(adae |> count(AEBODSYS) |> head(10)), "\n")
+})
+```
+
+---
+
+## Section 7 — Dynamic UI with renderUI() and updateInput()
+
+### Two ways to make UI dynamic
+
+**1. `renderUI()` / `uiOutput()`** — generate entire UI widgets from the server. Use when widget choices depend on filtered data (e.g., the PT list changes as the body system changes):
+
+```r
+# UI:
+uiOutput("pt_selector")
+
+# Server:
+output$pt_selector <- renderUI({
+  pt_choices <- adae |> filter(AEBODSYS == input$soc) |>
+    pull(AEDECOD) |> unique() |> sort()
+  selectInput("pt", "Preferred Term", choices = pt_choices)
+})
+```
+
+**2. `update*Input()`** — update an existing widget's choices or value without recreating it. More efficient for simple changes:
+
+```r
+observeEvent(input$soc, {
+  pt_choices <- adae |> filter(AEBODSYS == input$soc) |>
+    pull(AEDECOD) |> unique() |> sort()
+  updateSelectInput(session, "pt", choices = pt_choices)
+})
+```
+
+**Cascading filter pattern** (common in clinical apps): SOC dropdown drives PT dropdown which drives the output table.
+
+> **When to use which**: use `renderUI()` when you need to change the *type* of widget or its *structure*. Use `update*Input()` when you only need to change the *choices* or *selected value* of an existing widget.
+
+### Exercises
+
+**Exercise 7.1** — Build a `renderUI()` that generates a PT `selectInput` whose choices derive from filtering `adae` by body system. Fill in the two blanks:
+
+```{r ex-render-ui, exercise=TRUE, exercise.lines=22}
+server <- function(input, output, session) {
+
+  output$pt_selector <- ___(   # which render function for dynamic UI?
+    {
+      req(input$soc)
+
+      pt_choices <- adae |>
+        filter(AEBODSYS == input$soc) |>
+        pull(AEDECOD) |>
+        unique() |> sort()
+
+      selectInput("pt", "Preferred Term",
+                  choices  = ___,     # use pt_choices
+                  multiple = TRUE)
+    }
+  )
+}
+
+testServer(server, {
+  soc_val <- adae$AEBODSYS[1]
+  session$setInputs(soc = soc_val)
+  ui_out <- output$pt_selector
+  cat("renderUI class:", class(ui_out), "\n")
+})
+```
+
+```{r ex-render-ui-solution}
+server <- function(input, output, session) {
+  output$pt_selector <- renderUI({
+    req(input$soc)
+    pt_choices <- adae |>
+      filter(AEBODSYS == input$soc) |>
+      pull(AEDECOD) |>
+      unique() |> sort()
+    selectInput("pt", "Preferred Term",
+                choices  = pt_choices,
+                multiple = TRUE)
+  })
+}
+testServer(server, {
+  soc_val <- adae$AEBODSYS[1]
+  session$setInputs(soc = soc_val)
+  ui_out <- output$pt_selector
+  cat("renderUI class:", class(ui_out), "\n")
+})
+```
+
+---
+
+**Exercise 7.2** — `updateSelectInput()` — update treatment arm choices to only include arms with at least one subject older than a minimum age. Fill in the blank:
+
+```{r ex-update-input, exercise=TRUE, exercise.lines=20}
+server <- function(input, output, session) {
+
+  observeEvent(input$min_age, {
+    # Arms with at least one subject at or above min_age
+    eligible_arms <- adsl |>
+      filter(AGE >= input$min_age) |>
+      pull(TRT01P) |>
+      as.character() |>
+      unique() |> sort()
+
+    updateSelectInput(
+      session  = ___,       # session object
+      inputId  = "trt_arm",
+      choices  = eligible_arms,
+      selected = eligible_arms[1]
+    )
+  })
+}
+
+testServer(server, {
+  session$setInputs(min_age = 75, trt_arm = "Placebo")
+  cat("updateSelectInput test: OK\n")
+})
+```
+
+```{r ex-update-input-solution}
+server <- function(input, output, session) {
+  observeEvent(input$min_age, {
+    eligible_arms <- adsl |>
+      filter(AGE >= input$min_age) |>
+      pull(TRT01P) |>
+      as.character() |>
+      unique() |> sort()
+    updateSelectInput(
+      session  = session,
+      inputId  = "trt_arm",
+      choices  = eligible_arms,
+      selected = eligible_arms[1]
+    )
+  })
+}
+testServer(server, {
+  session$setInputs(min_age = 75, trt_arm = "Placebo")
+  cat("updateSelectInput test: OK\n")
+})
+```
+
+---
+
+**Exercise 7.3** — Cascading SOC → PT filter using `observeEvent()` and `updateSelectInput()`:
+
+```{r ex-cascading-filter, exercise=TRUE, exercise.lines=22}
+server <- function(input, output, session) {
+
+  # When SOC changes, update the PT choices
+  observeEvent(input$soc, {
+    pt_choices <- if (input$soc == "All") {
+      sort(unique(adae$AEDECOD))
+    } else {
+      adae |>
+        filter(AEBODSYS == ___) |>    # filter to selected SOC
+        pull(AEDECOD) |>
+        unique() |> sort()
+    }
+    updateSelectInput(session, "pt",
+                      choices  = c("All", pt_choices),
+                      selected = "All")
+  })
+
+  output$ae_n <- renderText({
+    req(input$soc, input$pt)
+    paste("Filtered AE records: (select SOC and PT)")
+  })
+}
+
+testServer(server, {
+  first_soc <- adae$AEBODSYS[1]
+  session$setInputs(soc = first_soc, pt = "All")
+  cat("Cascading filter test: OK\n")
+})
+```
+
+```{r ex-cascading-filter-solution}
+server <- function(input, output, session) {
+  observeEvent(input$soc, {
+    pt_choices <- if (input$soc == "All") {
+      sort(unique(adae$AEDECOD))
+    } else {
+      adae |>
+        filter(AEBODSYS == input$soc) |>
+        pull(AEDECOD) |>
+        unique() |> sort()
+    }
+    updateSelectInput(session, "pt",
+                      choices  = c("All", pt_choices),
+                      selected = "All")
+  })
+  output$ae_n <- renderText({
+    req(input$soc, input$pt)
+    paste("Filtered AE records: (select SOC and PT)")
+  })
+}
+testServer(server, {
+  first_soc <- adae$AEBODSYS[1]
+  session$setInputs(soc = first_soc, pt = "All")
+  cat("Cascading filter test: OK\n")
+})
+```
+
+---
+
+## Section 8 — Download Handlers and File Upload
+
+### Exporting data: `downloadHandler()`
+
+```r
+# UI
+downloadButton("dl_csv", "Export CSV", class = "btn-success")
+
+# Server
+output$dl_csv <- downloadHandler(
+  filename = function() paste0("ADSL_filtered_", Sys.Date(), ".csv"),
+  content  = function(file) {
+    write.csv(filtered_adsl(), file, row.names = FALSE)
+  }
+)
+```
+
+Key points:
+- `filename` is a **function**, not a string — so it can reference `input$...` to make the name dynamic
+- `content` receives a `file` path and **must write to it** (write.csv, write_xlsx, ggsave, etc.)
+- Works for any file type: CSV, XLSX, PDF, PNG
+
+### Receiving data: `fileInput()`
+
+```r
+# UI
+fileInput("upload", "Upload ADSL CSV", accept = ".csv")
+
+# Server
+uploaded <- reactive({
+  req(input$upload)
+  read.csv(input$upload$datapath)
+})
+```
+
+`input$upload` is a data frame with columns: `name` (original filename), `size` (bytes), `type` (MIME), `datapath` (temp file path on server).
+
+### Exercises
+
+**Exercise 8.1** — Write a complete `downloadHandler()` for filtered adsl as CSV. Fill in the two blanks:
+
+```{r ex-download, exercise=TRUE, exercise.lines=22}
+server <- function(input, output, session) {
+
+  filtered <- reactive({
+    if (input$trt_arm == "All") return(adsl)
+    adsl |> filter(as.character(TRT01P) == input$trt_arm)
+  })
+
+  output$download_adsl <- downloadHandler(
+    filename = function() {
+      paste0("ADSL_", gsub(" ", "_", input$trt_arm),
+             "_", ___, ".csv")       # append today's date
+    },
+    content = function(file) {
+      write.csv(___, file,            # write the filtered data
+                row.names = FALSE)
+    }
+  )
+}
+
+testServer(server, {
+  session$setInputs(trt_arm = "Placebo")
+  cat("downloadHandler defined:", !is.null(output$download_adsl), "\n")
+})
+```
+
+```{r ex-download-solution}
+server <- function(input, output, session) {
+  filtered <- reactive({
+    if (input$trt_arm == "All") return(adsl)
+    adsl |> filter(as.character(TRT01P) == input$trt_arm)
+  })
+  output$download_adsl <- downloadHandler(
+    filename = function() {
+      paste0("ADSL_", gsub(" ", "_", input$trt_arm),
+             "_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      write.csv(filtered(), file, row.names = FALSE)
+    }
+  )
+}
+testServer(server, {
+  session$setInputs(trt_arm = "Placebo")
+  cat("downloadHandler defined:", !is.null(output$download_adsl), "\n")
+})
+```
+
+---
+
+**Exercise 8.2** — Handle an uploaded file with column validation. Fill in the blank:
+
+```{r ex-file-upload, exercise=TRUE, exercise.lines=22}
+server <- function(input, output, session) {
+
+  uploaded <- reactive({
+    req(input$upload_file)
+    df <- read.csv(input$upload_file$datapath, stringsAsFactors = FALSE)
+
+    required_cols <- c("USUBJID", "TRT01P", "AGE", "SEX")
+    missing_cols  <- setdiff(required_cols, names(df))
+
+    validate(
+      need(length(missing_cols) == 0,
+           paste("Missing required columns:",
+                 paste(___, collapse = ", ")))   # list the missing columns
+    )
+    df
+  })
+
+  output$upload_summary <- renderPrint({
+    dplyr::glimpse(uploaded())
+  })
+}
+
+cat("File upload server: defined OK\n")
+```
+
+```{r ex-file-upload-solution}
+server <- function(input, output, session) {
+  uploaded <- reactive({
+    req(input$upload_file)
+    df <- read.csv(input$upload_file$datapath, stringsAsFactors = FALSE)
+    required_cols <- c("USUBJID", "TRT01P", "AGE", "SEX")
+    missing_cols  <- setdiff(required_cols, names(df))
+    validate(
+      need(length(missing_cols) == 0,
+           paste("Missing required columns:",
+                 paste(missing_cols, collapse = ", ")))
+    )
+    df
+  })
+  output$upload_summary <- renderPrint({
+    dplyr::glimpse(uploaded())
+  })
+}
+cat("File upload server: defined OK\n")
+```
+
+---
+
+**Exercise 8.3** — Dynamic filename in `downloadHandler()` — generate a filename that includes the selected parameter and the current date:
+
+```{r ex-download-dynamic, exercise=TRUE, exercise.lines=18}
+server <- function(input, output, session) {
+
+  output$dl_lab <- downloadHandler(
+    filename = function() {
+      # Format: "ADLB_ALT_2026-05-24.csv"
+      paste0("ADLB_", ___, "_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      df <- adlb |> filter(PARAMCD == input$param)
+      write.csv(df, file, row.names = FALSE)
+    }
+  )
+}
+
+testServer(server, {
+  session$setInputs(param = "ALT")
+  cat("Dynamic filename handler: OK\n")
+})
+```
+
+```{r ex-download-dynamic-solution}
+server <- function(input, output, session) {
+  output$dl_lab <- downloadHandler(
+    filename = function() {
+      paste0("ADLB_", input$param, "_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      df <- adlb |> filter(PARAMCD == input$param)
+      write.csv(df, file, row.names = FALSE)
+    }
+  )
+}
+testServer(server, {
+  session$setInputs(param = "ALT")
+  cat("Dynamic filename handler: OK\n")
+})
+```
+
+---
+
+## Section 9 — Shiny Modules
+
+### Why modules?
+
+Large clinical Shiny apps — a demographics tab, a safety tab, a lab tab, a data export tab — grow unwieldy without structure. **Modules** let you package a UI + server pair into a reusable, namespaced unit.
+
+### Module anatomy
+
+A module has two R functions:
+
+```r
+# 1. UI function — wrap all inputIds/outputIds in NS(id)
+myModuleUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    selectInput(ns("arm"), "Treatment Arm", choices = levels(adsl$TRT01P)),
+    textOutput(ns("n_display"))
+  )
+}
+
+# 2. Server function — use moduleServer()
+myModuleServer <- function(id, data) {
+  moduleServer(id, function(input, output, session) {
+    # inside here, input$arm refers to ns("arm") automatically
+    filtered <- reactive({
+      data() |> filter(as.character(TRT01P) == input$arm)
+    })
+    output$n_display <- renderText(paste("N =", nrow(filtered())))
+    return(filtered)   # return reactive to parent app
+  })
+}
+```
+
+**Using the module in the main app:**
+
+```r
+# UI:    myModuleUI("mod1")
+# Server: filtered_data <- myModuleServer("mod1", reactive(adsl))
+```
+
+### Namespace isolation
+
+`NS("demog")` returns a function that prepends `"demog-"` to any string:
+
+```r
+ns <- NS("demog")
+ns("age_range")   # → "demog-age_range"
+```
+
+This means two modules with internal input `"arm"` become `"mod1-arm"` and `"mod2-arm"` — completely isolated.
+
+### Exercises
+
+**Exercise 9.1** — What does `NS()` produce? Inspect the namespaced ID:
+
+```{r ex-ns, exercise=TRUE, exercise.lines=10}
+# NS() creates a namespace function for a given module id
+ns <- NS("demog")
+
+# Apply the namespace to an inputId
+namespaced_id <- ns("age_range")
+cat("Namespaced ID:", namespaced_id, "\n")
+# Expected: "demog-age_range"
+
+cat("NS function class:", class(ns), "\n")
+```
+
+```{r ex-ns-solution}
+ns <- NS("demog")
+namespaced_id <- ns("age_range")
+cat("Namespaced ID:", namespaced_id, "\n")
+cat("NS function class:", class(ns), "\n")
+```
+
+---
+
+**Exercise 9.2** — Complete a module UI function for a lab parameter selector panel. Fill in the two blanks:
+
+```{r ex-module-ui, exercise=TRUE, exercise.lines=22}
+labParamUI <- function(id) {
+  ns <- ___(id)       # create the namespace function
+
+  tagList(
+    selectInput(
+      inputId  = ns(___),     # namespace the "param" inputId
+      label    = "Lab Parameter",
+      choices  = sort(unique(adlb$PARAMCD)),
+      selected = "ALT"
+    ),
+    sliderInput(
+      inputId = ns("visit_range"),
+      label   = "Visit number range",
+      min = 1, max = 20, value = c(1, 20)
+    ),
+    tableOutput(ns("param_summary"))
+  )
+}
+
+# Test: confirm the UI can be created without error
+ui_lab <- labParamUI("lab1")
+cat("Module UI created: OK\n")
+```
+
+```{r ex-module-ui-solution}
+labParamUI <- function(id) {
+  ns <- NS(id)
+  tagList(
+    selectInput(
+      inputId  = ns("param"),
+      label    = "Lab Parameter",
+      choices  = sort(unique(adlb$PARAMCD)),
+      selected = "ALT"
+    ),
+    sliderInput(
+      inputId = ns("visit_range"),
+      label   = "Visit number range",
+      min = 1, max = 20, value = c(1, 20)
+    ),
+    tableOutput(ns("param_summary"))
+  )
+}
+ui_lab <- labParamUI("lab1")
+cat("Module UI created: OK\n")
+```
+
+---
+
+**Exercise 9.3** — Write a complete module server that returns a filtered reactive for the parent app. Fill in the blank:
+
+```{r ex-module-server, exercise=TRUE, exercise.lines=26}
+labParamServer <- function(id, adlb_data) {
+  moduleServer(id, function(input, output, session) {
+
+    # Filter lab data to the selected parameter
+    param_data <- reactive({
+      req(input$param)
+      adlb_data() |> filter(PARAMCD == ___)   # use input$param
+    })
+
+    output$param_summary <- renderTable({
+      param_data() |>
+        group_by(TRT01P) |>
+        summarise(N    = n(),
+                  Mean = round(mean(AVAL, na.rm = TRUE), 1),
+                  .groups = "drop")
+    })
+
+    return(param_data)   # expose to parent app
+  })
+}
+
+# Smoke test
+testServer(labParamServer, args = list(adlb_data = reactive(adlb)), {
+  session$setInputs(param = "ALT")
+  df <- param_data()
+  cat("ALT rows:", nrow(df), "\n")
+})
+```
+
+```{r ex-module-server-solution}
+labParamServer <- function(id, adlb_data) {
+  moduleServer(id, function(input, output, session) {
+    param_data <- reactive({
+      req(input$param)
+      adlb_data() |> filter(PARAMCD == input$param)
+    })
+    output$param_summary <- renderTable({
+      param_data() |>
+        group_by(TRT01P) |>
+        summarise(N    = n(),
+                  Mean = round(mean(AVAL, na.rm = TRUE), 1),
+                  .groups = "drop")
+    })
+    return(param_data)
+  })
+}
+testServer(labParamServer, args = list(adlb_data = reactive(adlb)), {
+  session$setInputs(param = "ALT")
+  df <- param_data()
+  cat("ALT rows:", nrow(df), "\n")
+})
+```
+
+---
+
+## Section 10 — Clinical App Polish: Theming, Notifications, Modals, Progress
+
+### Production-quality clinical apps need polish
+
+**1. bslib theming** — Bootstrap 5 support via `bslib`:
+
+```r
+library(bslib)
+ui <- fluidPage(
+  theme = bs_theme(version = 5, bootswatch = "flatly",
+                   primary = "#0066CC", font_scale = 0.9),
+  ...
+)
+```
+
+Replace `shinythemes::themeSelector()` with `bslib::bs_theme()` for all new apps.
+
+**2. Notifications** — brief banner messages:
+
+```r
+showNotification("Data exported successfully", type = "message", duration = 4)
+showNotification("No data for selection",      type = "warning")
+showNotification("Server error: contact admin", type = "error")
+```
+
+**3. Modal dialogs** — used for confirmations, subject drill-down, help text:
+
+```r
+showModal(modalDialog(
+  title  = "Confirm: Delete Filter",
+  "Are you sure you want to reset all filters?",
+  footer = tagList(
+    modalButton("Cancel"),
+    actionButton("confirm_delete", "Yes, reset", class = "btn-danger")
+  )
+))
+removeModal()   # close it programmatically
+```
+
+**4. Progress bars** — for long-running computations:
+
+```r
+withProgress(message = "Computing summary...", value = 0, {
+  incProgress(0.3, detail = "Filtering")
+  ...
+  incProgress(0.7, detail = "Summarising")
+  ...
+  incProgress(1.0, detail = "Done")
+})
+```
+
+**5. `conditionalPanel()`** — show/hide UI server-free, based on JS condition:
+
+```r
+conditionalPanel(
+  condition = "input.show_advanced == true",
+  numericInput("grade_threshold", "Min toxicity grade", value = 2)
+)
+```
+
+### Exercises
+
+**Exercise 10.1** — Write a `showNotification()` inside `observeEvent()` when the export button is clicked. Fill in the notification type:
+
+```{r ex-notification, exercise=TRUE, exercise.lines=16}
+server <- function(input, output, session) {
+
+  observeEvent(input$export_btn, {
+    showNotification(
+      ui       = paste("Exported", nrow(adsl), "subjects to CSV"),
+      type     = "___",    # "message", "warning", or "error"
+      duration = 4
+    )
+  })
+}
+
+testServer(server, {
+  session$setInputs(export_btn = 1)
+  cat("showNotification test: OK\n")
+})
+```
+
+```{r ex-notification-solution}
+server <- function(input, output, session) {
+  observeEvent(input$export_btn, {
+    showNotification(
+      ui       = paste("Exported", nrow(adsl), "subjects to CSV"),
+      type     = "message",
+      duration = 4
+    )
+  })
+}
+testServer(server, {
+  session$setInputs(export_btn = 1)
+  cat("showNotification test: OK\n")
+})
+```
+
+---
+
+**Exercise 10.2** — Write a confirmation `modalDialog()` before a destructive operation. Fill in the modal title:
+
+```{r ex-modal, exercise=TRUE, exercise.lines=26}
+server <- function(input, output, session) {
+
+  observeEvent(input$clear_filters_btn, {
+    showModal(
+      modalDialog(
+        title     = "___",    # "Confirm: Clear All Filters"
+        "This will reset all treatment arm and date filters to defaults.",
+        footer    = tagList(
+          modalButton("Cancel"),
+          actionButton("confirm_clear", "Yes, clear filters",
+                       class = "btn-danger")
+        ),
+        easyClose = TRUE
+      )
+    )
+  })
+
+  observeEvent(input$confirm_clear, {
+    updateSelectInput(session, "trt_arm", selected = "All Patients")
+    removeModal()
+    showNotification("Filters cleared", type = "message")
+  })
+}
+
+cat("Modal server: defined OK\n")
+```
+
+```{r ex-modal-solution}
+server <- function(input, output, session) {
+  observeEvent(input$clear_filters_btn, {
+    showModal(
+      modalDialog(
+        title     = "Confirm: Clear All Filters",
+        "This will reset all treatment arm and date filters to defaults.",
+        footer    = tagList(
+          modalButton("Cancel"),
+          actionButton("confirm_clear", "Yes, clear filters",
+                       class = "btn-danger")
+        ),
+        easyClose = TRUE
+      )
+    )
+  })
+  observeEvent(input$confirm_clear, {
+    updateSelectInput(session, "trt_arm", selected = "All Patients")
+    removeModal()
+    showNotification("Filters cleared", type = "message")
+  })
+}
+cat("Modal server: defined OK\n")
+```
+
+---
+
+**Exercise 10.3** — `withProgress()` wrapping a multi-step summarise. Fill in the progress message:
+
+```{r ex-progress, exercise=TRUE, exercise.lines=20}
+server <- function(input, output, session) {
+
+  output$heavy_table <- renderTable({
+    withProgress(
+      message = "___",   # "Computing summary..."
+      value   = 0,
+      {
+        incProgress(0.3, detail = "Filtering data")
+        df <- adlb |> filter(PARAMCD %in% c("ALT", "AST", "WBC"))
+
+        incProgress(0.6, detail = "Summarising by treatment and parameter")
+        result <- df |>
+          group_by(PARAMCD, TRT01P) |>
+          summarise(N    = n(),
+                    Mean = round(mean(AVAL, na.rm = TRUE), 1),
+                    .groups = "drop")
+
+        incProgress(1.0, detail = "Done")
+        result
+      }
+    )
+  })
+}
+
+cat("withProgress server: defined OK\n")
+```
+
+```{r ex-progress-solution}
+server <- function(input, output, session) {
+  output$heavy_table <- renderTable({
+    withProgress(
+      message = "Computing summary...",
+      value   = 0,
+      {
+        incProgress(0.3, detail = "Filtering data")
+        df <- adlb |> filter(PARAMCD %in% c("ALT", "AST", "WBC"))
+        incProgress(0.6, detail = "Summarising by treatment and parameter")
+        result <- df |>
+          group_by(PARAMCD, TRT01P) |>
+          summarise(N    = n(),
+                    Mean = round(mean(AVAL, na.rm = TRUE), 1),
+                    .groups = "drop")
+        incProgress(1.0, detail = "Done")
+        result
+      }
+    )
+  })
+}
+cat("withProgress server: defined OK\n")
+```
+
+---
+
+## Section 11 — Capstone: Complete Clinical Data Explorer App
+
+The block below is a complete, production-style clinical data explorer for CDISCPILOT01. It demonstrates all patterns from this lesson working together: `navbarPage`, cascading filters, `reactive()`, `renderUI()`, `downloadHandler()`, `validate()`, and `bslib` theming.
+
+> **Note**: This code uses `exercise.eval=FALSE` — it will not execute inside the learnr tutorial. Copy the entire block into a file called `app.R` in RStudio and run it with `shiny::runApp()`.
+
+```{r capstone-full-app, exercise=TRUE, exercise.eval=FALSE, exercise.lines=175}
+# ==================================================================
+# CDISCPILOT01 Clinical Data Explorer
+# Copy this entire block to app.R and run in RStudio:
+#   shiny::runApp("app.R")
+# ==================================================================
+library(shiny)
+library(dplyr)
+library(ggplot2)
+library(pharmaverseadam)
+tryCatch(library(bslib), error = function(e) NULL)
+
+# ── Data preparation ───────────────────────────────────────────────
+adsl_app <- pharmaverseadam::adsl |>
+  mutate(TRT01P = factor(TRT01P, levels = c(
+    "Placebo", "Xanomeline Low Dose", "Xanomeline High Dose"
+  ))) |>
+  filter(SAFFL == "Y")
+
+adae_app <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_app) && !"TRT01A" %in% names(adae_app))
+  adae_app <- rename(adae_app, TRT01A = TRTA)
+
+adlb_app <- pharmaverseadam::adlb |>
+  filter(is.na(DTYPE)) |>
+  select(-any_of("TRT01P")) |>
+  left_join(select(adsl_app, USUBJID, TRT01P), by = "USUBJID")
+if (is.character(adlb_app$ATOXGR))
+  adlb_app <- mutate(adlb_app,
+                     ATOXGR = as.integer(ATOXGR),
+                     BTOXGR = as.integer(BTOXGR))
+
+# ── UI ─────────────────────────────────────────────────────────────
+app_theme <- if (requireNamespace("bslib", quietly = TRUE)) {
+  bslib::bs_theme(version = 5, bootswatch = "flatly")
+} else {
+  NULL
+}
+
+ui <- navbarPage(
+  title = "CDISCPILOT01 Clinical Explorer",
+  theme = app_theme,
+
+  # ── Tab 1: Demographics ─────────────────────────────────────────
+  tabPanel("Demographics",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("demog_trt", "Treatment Arm",
+                    choices  = c("All", levels(adsl_app$TRT01P)),
+                    selected = "All"),
+        sliderInput("demog_age", "Age Range",
+                    min = 50, max = 90, value = c(50, 90)),
+        checkboxGroupInput("demog_sex", "Sex",
+                           choices  = c("Male" = "M", "Female" = "F"),
+                           selected = c("M", "F")),
+        hr(),
+        downloadButton("dl_adsl", "Export ADSL CSV",
+                       class = "btn-sm btn-success")
+      ),
+      mainPanel(
+        tabsetPanel(
+          tabPanel("Summary Table", tableOutput("demog_table")),
+          tabPanel("Age Distribution", plotOutput("demog_age_plot",
+                                                   height = "350px"))
+        )
+      )
+    )
+  ),
+
+  # ── Tab 2: Safety (AEs) ─────────────────────────────────────────
+  tabPanel("Safety",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("ae_trt", "Treatment Arm",
+                    choices  = c("All", sort(unique(adae_app$TRT01A))),
+                    selected = "All"),
+        selectInput("ae_soc", "Body System (SOC)",
+                    choices  = c("All", sort(unique(adae_app$AEBODSYS))),
+                    selected = "All"),
+        uiOutput("ae_pt_selector"),
+        radioButtons("ae_severity", "Minimum Severity",
+                     choices  = c("Any"        = "any",
+                                  "Moderate+"  = "moderate",
+                                  "Severe only" = "severe"),
+                     selected = "any")
+      ),
+      mainPanel(
+        tabsetPanel(
+          tabPanel("AE Summary",  tableOutput("ae_summary_table")),
+          tabPanel("AE Bar Chart", plotOutput("ae_bar_plot", height = "400px"))
+        )
+      )
+    )
+  ),
+
+  # ── Tab 3: Lab Data ─────────────────────────────────────────────
+  tabPanel("Lab Data",
+    sidebarLayout(
+      sidebarPanel(
+        selectInput("lab_param", "Parameter",
+                    choices  = sort(unique(adlb_app$PARAMCD)),
+                    selected = "ALT"),
+        selectInput("lab_trt", "Treatment Arm",
+                    choices  = c("All", levels(adsl_app$TRT01P)),
+                    selected = "All"),
+        radioButtons("lab_plot_type", "Plot Type",
+                     choices  = c("Boxplot"    = "box",
+                                  "Violin"     = "violin",
+                                  "Mean +/- SE" = "mean_se"),
+                     selected = "box")
+      ),
+      mainPanel(
+        plotOutput("lab_plot", height = "400px"),
+        verbatimTextOutput("lab_stats")
+      )
+    )
+  )
+)
+
+# ── Server ─────────────────────────────────────────────────────────
+server <- function(input, output, session) {
+
+  # ── Demographics ──────────────────────────────────────────────
+  filtered_adsl <- reactive({
+    df <- adsl_app
+    if (input$demog_trt != "All")
+      df <- df |> filter(as.character(TRT01P) == input$demog_trt)
+    df <- df |>
+      filter(AGE >= input$demog_age[1],
+             AGE <= input$demog_age[2],
+             SEX %in% input$demog_sex)
+    df
+  })
+
+  output$demog_table <- renderTable({
+    req(nrow(filtered_adsl()) > 0)
+    filtered_adsl() |>
+      group_by(TRT01P) |>
+      summarise(
+        N       = n(),
+        Age_Mean = round(mean(AGE, na.rm = TRUE), 1),
+        Age_SD   = round(sd(AGE,  na.rm = TRUE), 1),
+        Pct_F    = round(100 * mean(SEX == "F"), 1),
+        .groups = "drop"
+      )
+  })
+
+  output$demog_age_plot <- renderPlot({
+    req(nrow(filtered_adsl()) > 0)
+    ggplot(filtered_adsl(), aes(x = TRT01P, y = AGE, fill = TRT01P)) +
+      geom_boxplot(alpha = 0.7) + coord_flip() +
+      labs(title = "Age by Treatment Arm", x = "", y = "Age (years)") +
+      theme_minimal() + theme(legend.position = "none")
+  })
+
+  output$dl_adsl <- downloadHandler(
+    filename = function() paste0("ADSL_", Sys.Date(), ".csv"),
+    content  = function(f) write.csv(filtered_adsl(), f, row.names = FALSE)
+  )
+
+  # ── Safety ────────────────────────────────────────────────────
+  output$ae_pt_selector <- renderUI({
+    choices <- if (input$ae_soc == "All") {
+      sort(unique(adae_app$AEDECOD))
+    } else {
+      adae_app |> filter(AEBODSYS == input$ae_soc) |>
+        pull(AEDECOD) |> unique() |> sort()
+    }
+    selectInput("ae_pt", "Preferred Term",
+                choices = c("All", choices), selected = "All")
+  })
+
+  filtered_ae <- reactive({
+    df <- adae_app
+    if (input$ae_trt != "All")
+      df <- df |> filter(TRT01A == input$ae_trt)
+    if (input$ae_soc != "All")
+      df <- df |> filter(AEBODSYS == input$ae_soc)
+    if (input$ae_severity == "moderate")
+      df <- df |> filter(AESEV %in% c("MODERATE", "SEVERE"))
+    if (input$ae_severity == "severe")
+      df <- df |> filter(AESEV == "SEVERE")
+    df
+  })
+
+  output$ae_summary_table <- renderTable({
+    req(nrow(filtered_ae()) > 0)
+    filtered_ae() |>
+      group_by(AEBODSYS) |>
+      summarise(
+        N_Events   = n(),
+        N_Subjects = n_distinct(USUBJID),
+        .groups    = "drop"
+      ) |>
+      arrange(desc(N_Subjects)) |>
+      head(15)
+  })
+
+  output$ae_bar_plot <- renderPlot({
+    req(nrow(filtered_ae()) > 0)
+    top_soc <- filtered_ae() |>
+      count(AEBODSYS, sort = TRUE) |>
+      head(10) |>
+      pull(AEBODSYS)
+    filtered_ae() |>
+      filter(AEBODSYS %in% top_soc) |>
+      count(AEBODSYS, TRT01A) |>
+      ggplot(aes(x = reorder(AEBODSYS, n), y = n, fill = TRT01A)) +
+      geom_col(position = "dodge") + coord_flip() +
+      labs(title = "AE Count by Body System (Top 10)",
+           x = "", y = "N Events", fill = "Treatment") +
+      theme_minimal()
+  })
+
+  # ── Lab Data ──────────────────────────────────────────────────
+  filtered_lab <- reactive({
+    req(input$lab_param)
+    df <- adlb_app |> filter(PARAMCD == input$lab_param)
+    if (input$lab_trt != "All")
+      df <- df |> filter(as.character(TRT01P) == input$lab_trt)
+    validate(need(nrow(df) > 0,
+                  paste("No records for parameter:", input$lab_param)))
+    df
+  })
+
+  output$lab_plot <- renderPlot({
+    df <- filtered_lab()
+    if (input$lab_plot_type == "box") {
+      ggplot(df, aes(x = AVISIT, y = AVAL, fill = TRT01P)) +
+        geom_boxplot(alpha = 0.7) + theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(title = paste(input$lab_param, "— Boxplot"),
+             x = "Visit", y = "Value", fill = "Treatment")
+    } else if (input$lab_plot_type == "violin") {
+      ggplot(df, aes(x = AVISIT, y = AVAL, fill = TRT01P)) +
+        geom_violin(alpha = 0.6) + theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(title = paste(input$lab_param, "— Violin Plot"),
+             x = "Visit", y = "Value", fill = "Treatment")
+    } else {
+      ggplot(df, aes(x = AVISIT, y = AVAL,
+                     colour = TRT01P, group = TRT01P)) +
+        stat_summary(fun = mean, geom = "line") +
+        stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(title = paste(input$lab_param, "— Mean +/- SE"),
+             x = "Visit", y = "Value", colour = "Treatment")
+    }
+  })
+
+  output$lab_stats <- renderPrint({
+    filtered_lab() |>
+      group_by(TRT01P) |>
+      summarise(
+        N    = n(),
+        Mean = round(mean(AVAL, na.rm = TRUE), 2),
+        SD   = round(sd(AVAL,   na.rm = TRUE), 2),
+        Min  = round(min(AVAL,  na.rm = TRUE), 2),
+        Max  = round(max(AVAL,  na.rm = TRUE), 2),
+        .groups = "drop"
+      )
+  })
+}
+
+shinyApp(ui, server)
+```
+
+### Capstone exercises
+
+**Exercise 11.1** — From the capstone app server, `filtered_adsl()` is consumed by three output IDs. List all three:
+
+```{r ex-capstone-deps, exercise=TRUE, exercise.lines=8}
+# From the capstone app, filtered_adsl() feeds which three output IDs?
+dependent_outputs <- c("___", "___", "___")
+cat(paste(dependent_outputs, collapse = ", "), "\n")
+```
+
+```{r ex-capstone-deps-solution}
+dependent_outputs <- c("demog_table", "demog_age_plot", "dl_adsl")
+cat(paste(dependent_outputs, collapse = ", "), "\n")
+```
+
+---
+
+**Exercise 11.2** — The AE dynamic PT selector uses `renderUI()`. What should the `req()` call guard against?
+
+```{r ex-capstone-req, exercise=TRUE, exercise.lines=12}
+# The dynamic PT selector renderUI needs input$ae_soc to be populated.
+# Write the req() call that guards it:
+
+output_pt_selector_stub <- function(input, output, session) {
+  output$ae_pt_selector <- renderUI({
+    req(___)   # what input must be available?
+    choices <- sort(unique(adae$AEDECOD))
+    selectInput("ae_pt", "Preferred Term", choices = c("All", choices))
+  })
+}
+
+cat("req() should guard: input$ae_soc\n")
+```
+
+```{r ex-capstone-req-solution}
+output_pt_selector_stub <- function(input, output, session) {
+  output$ae_pt_selector <- renderUI({
+    req(input$ae_soc)
+    choices <- sort(unique(adae$AEDECOD))
+    selectInput("ae_pt", "Preferred Term", choices = c("All", choices))
+  })
+}
+cat("req() should guard: input$ae_soc\n")
+```
+
+---
+
+**Exercise 11.3** — The capstone lab plot uses three different plot types controlled by `input$lab_plot_type`. What are the three string values that trigger each branch?
+
+```{r ex-capstone-plot-types, exercise=TRUE, exercise.lines=8}
+# The radioButtons in the capstone lab tab uses three choice values.
+# What are the three internal values (not the labels)?
+plot_type_values <- c("___", "___", "___")
+cat(paste(plot_type_values, collapse = ", "), "\n")
+```
+
+```{r ex-capstone-plot-types-solution}
+plot_type_values <- c("box", "violin", "mean_se")
+cat(paste(plot_type_values, collapse = ", "), "\n")
+```
+
+---
+
+## Lesson Summary
+
+### Shiny function quick-reference
+
+| Function | Category | Clinical use case |
+|----------|----------|-------------------|
+| `fluidPage()`, `navbarPage()` | Layout | App shell; multi-tab clinical dashboard |
+| `sidebarLayout()` | Layout | Filter panel + output panel |
+| `fluidRow()` + `column()` | Layout | Bootstrap grid for custom panel arrangements |
+| `selectInput()` | Input | Treatment arm, parameter selection |
+| `sliderInput()` | Input | Age range, visit window |
+| `checkboxGroupInput()` | Input | Population flag filters (SAFFL, ITTFL) |
+| `dateRangeInput()` | Input | Study date window |
+| `actionButton()` | Input | Gate expensive computations |
+| `downloadButton()` | Input/Output | Export filtered dataset |
+| `fileInput()` | Input | Upload external data |
+| `reactive()` | Reactivity | Shared filtered dataset used by multiple outputs |
+| `observe()` | Reactivity | Logging, `update*Input()` side effects |
+| `observeEvent()` | Reactivity | Respond to button clicks |
+| `eventReactive()` | Reactivity | Value that only updates on button click |
+| `reactiveValues()` | Reactivity | Mutable state (session log, counter) |
+| `req()` | Validation | Guard: widget not yet populated |
+| `validate()` + `need()` | Validation | Friendly user-facing error message |
+| `renderTable()` | Output | Demographics or AE summary table |
+| `renderPlot()` | Output | ggplot2 boxplot, histogram |
+| `renderText()` | Output | Inline subject count, status message |
+| `renderPrint()` | Output | `glimpse()`, `summary()` console output |
+| `renderUI()` | Output | Dynamic widget (cascading SOC → PT filter) |
+| `downloadHandler()` | Output | CSV/XLSX export |
+| `NS()` + `moduleServer()` | Modules | Reusable namespaced UI + server pairs |
+| `updateSelectInput()` | Dynamic UI | Update dropdown choices from server |
+| `showNotification()` | Polish | Export confirmation, warning banner |
+| `showModal()` / `removeModal()` | Polish | Confirmation dialog, subject drill-down |
+| `withProgress()` | Polish | Progress bar for long computations |
+| `bslib::bs_theme()` | Theming | Bootstrap 5 styling, corporate colours |
+
+### Key rules to remember
+
+1. **`req()` first** — put `req(input$x)` as the first line of every render function
+2. **`reactive()` for shared data** — if two outputs need the same filtered data, compute it once in a `reactive()`
+3. **`eventReactive()` for expensive ops** — gate model fits and large merges behind an `actionButton`
+4. **Module namespacing** — every inputId and outputId inside a module must go through `ns()` in the UI function
+5. **`exercise.eval=FALSE` for `shinyApp()`** — full apps cannot run inside learnr; inspect structure in exercises, run in RStudio
+6. **`testServer()` works in learnr** — use it to test server logic and reactive expressions without a browser
+
+### Next steps
+
+- Official Shiny documentation and function reference: <https://shiny.posit.co/r/reference/shiny/>
+- Mastering Shiny (free online book): <https://mastering-shiny.org/>
+- Shiny modules deep-dive: <https://shiny.posit.co/r/articles/improve/modules/>
+- bslib theming gallery: <https://rstudio.github.io/bslib/>
+- Lesson 39 will cover **teal architecture** — the pharmaverse framework for building standardised clinical study explorers on top of Shiny modules.

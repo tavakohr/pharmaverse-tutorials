@@ -1,0 +1,1884 @@
+---
+title: "Lesson 48 — Capstone Part 2: ADaM → TLF → Submission Package"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Tie together the entire Pharmaverse10 toolchain: derive ADLB from pharmaversesdtm,
+  produce submission-ready Tables/Listings/Figures with gtsummary + tfrmt, export
+  with r2rtf, log every program with logrx, QC outputs with diffdf, export ADaMs as
+  XPT and Dataset-JSON, and assemble a complete eCTD submission package.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 48_capstone_part2.Rmd
+# PURPOSE       : Capstone Part 2 — ADaM → TLF → Submission Package: demographics
+#                 and TEAE tables (gtsummary + tfrmt), RTF export
+#                 (r2rtf), logrx logging, diffdf QC, XPT + Dataset-JSON.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(pharmaverseadam)
+
+# ── learnr options ──────────────────────────────────────────────────────────
+tutorial_options(exercise.timelimit = 120, exercise.lines = 30)
+knitr::opts_chunk$set(echo = FALSE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION A — pharmaverseadam datasets (real data, pre-cleaned)
+# ══════════════════════════════════════════════════════════════════════════════
+
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n, 161, 7)), round(rnorm(n, 174, 8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n, 68, 12), 1), round(rnorm(n, 82, 14), 1))
+  adsl_raw <- adsl_raw |>
+    mutate(HEIGHTBL = ht, WEIGHTBL = wt,
+           BMIBL = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+}
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo", "Xanomeline Low Dose", "Xanomeline High Dose"))
+  )
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION B — gtsummary mock (API-compatible)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Internal helpers
+.fmt_mean_sd <- function(x) {
+  x <- x[!is.na(x)]
+  sprintf("%.1f (%.2f)", mean(x), sd(x))
+}
+.fmt_n_pct <- function(flag, denom) {
+  n <- sum(flag == "Y", na.rm = TRUE)
+  sprintf("%d (%.1f%%)", n, 100 * n / denom)
+}
+
+# tbl_summary — summarise a dataset by a grouping column
+tbl_summary <- function(data, by = NULL, include = NULL,
+                        label = list(), statistic = list(),
+                        digits = NULL, missing = "no", ...) {
+  # Capture 'by' via substitute() BEFORE any is.null() check to avoid
+  # forcing the promise (which would error if 'by' is a bare column name)
+  by_expr <- substitute(by)
+  by_col  <- if (!identical(by_expr, quote(NULL)) && length(by_expr) > 0) {
+    as.character(by_expr)
+  } else NULL
+
+  # resolve 'include' to column names
+  inc_expr <- substitute(include)
+  inc_is_null <- identical(inc_expr, quote(NULL)) || length(inc_expr) == 0
+  if (!inc_is_null) {
+    if (is.call(inc_expr)) {
+      inc_vars <- eval(inc_expr, envir = list(c = c), enclos = baseenv())
+      if (is.character(inc_vars)) {
+        data <- data[, c(if (!is.null(by_col)) by_col, inc_vars), drop = FALSE]
+      }
+    } else if (is.character(eval(inc_expr))) {
+      data <- data[, c(if (!is.null(by_col)) by_col, eval(inc_expr)), drop = FALSE]
+    }
+  }
+
+  vars <- setdiff(names(data), by_col)
+  if (!is.null(by_col)) {
+    groups <- sort(unique(data[[by_col]]))
+  } else {
+    groups <- "Overall"
+  }
+
+  rows <- list()
+  for (v in vars) {
+    col <- data[[v]]
+    lbl <- if (!is.null(label[[v]])) label[[v]] else v
+    if (is.numeric(col)) {
+      if (!is.null(by_col)) {
+        vals <- sapply(groups, function(g) {
+          sub <- col[data[[by_col]] == g]
+          .fmt_mean_sd(sub)
+        })
+        rows[[length(rows) + 1]] <- c(Variable = lbl, setNames(vals, as.character(groups)))
+      } else {
+        rows[[length(rows) + 1]] <- c(Variable = lbl, Overall = .fmt_mean_sd(col))
+      }
+    } else {
+      levs <- if (is.factor(col)) levels(col) else sort(unique(col[!is.na(col)]))
+      for (lv in levs) {
+        flag_n <- sum(col == lv, na.rm = TRUE)
+        lbl_lv <- sprintf("  %s", lv)
+        if (!is.null(by_col)) {
+          vals <- sapply(groups, function(g) {
+            n <- sum(col[data[[by_col]] == g] == lv, na.rm = TRUE)
+            tot <- sum(data[[by_col]] == g, na.rm = TRUE)
+            sprintf("%d (%.1f%%)", n, 100 * n / max(tot, 1))
+          })
+          rows[[length(rows) + 1]] <- c(Variable = lbl_lv, setNames(vals, as.character(groups)))
+        } else {
+          tot <- length(col[!is.na(col)])
+          rows[[length(rows) + 1]] <- c(Variable = lbl_lv,
+                                         Overall = sprintf("%d (%.1f%%)", flag_n,
+                                                           100 * flag_n / max(tot, 1)))
+        }
+      }
+    }
+  }
+
+  tbl <- as_tibble(bind_rows(rows))
+  structure(list(table_body = tbl, by = by_col, groups = as.character(groups),
+                 n = nrow(data)),
+            class = "tbl_summary")
+}
+
+add_overall <- function(x, ...) {
+  # append an Overall column
+  tbl  <- x$table_body
+  data <- environment(tbl_summary)  # not accessible; just fake it
+  x$has_overall <- TRUE
+  x
+}
+
+add_p <- function(x, ...) { x$has_p <- TRUE; x }
+add_n <- function(x, ...) { x$has_n <- TRUE; x }
+
+bold_labels   <- function(x, ...) { x$bold_labels   <- TRUE; x }
+italicize_labels <- function(x, ...) { x$italicize  <- TRUE; x }
+
+modify_header <- function(x, ...) { x$custom_header <- list(...); x }
+modify_caption <- function(x, caption = NULL, ...) { x$caption <- caption; x }
+modify_spanning_header <- function(x, ...) { x }
+modify_footnote <- function(x, ...) { x }
+
+as_gt <- function(x, ...) {
+  structure(list(tbl_summary_obj = x), class = c("gt_tbl", "tbl_summary_gt"))
+}
+as_flex_table <- function(x, ...) {
+  structure(list(tbl_summary_obj = x), class = "flextable")
+}
+
+print.tbl_summary <- function(x, ...) {
+  if (!is.null(x$caption)) cat(sprintf("\nTable: %s\n", x$caption))
+  cat(sprintf("N = %d\n\n", x$n))
+  print(x$table_body, n = 40)
+  invisible(x)
+}
+
+# tbl_merge — merge two tbl_summary objects side-by-side
+tbl_merge <- function(tbls, tab_spanner = NULL) {
+  combined <- reduce(map(tbls, "table_body"), function(a, b) {
+    bind_cols(a, select(b, -any_of("Variable")))
+  })
+  structure(list(table_body = combined, merged = TRUE), class = "tbl_summary")
+}
+
+tbl_stack <- function(tbls, group_header = NULL) {
+  combined <- bind_rows(map(tbls, "table_body"))
+  structure(list(table_body = combined), class = "tbl_summary")
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION C — tfrmt mock (submission formatting layer)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Core tfrmt objects
+tfrmt <- function(label = NULL, param = NULL, column = NULL, value = NULL,
+                  sorting_cols = NULL, body_plan = NULL, col_plan = NULL,
+                  col_style_plan = NULL, row_grp_plan = NULL,
+                  title = NULL, subtitle = NULL, footnote_plan = NULL, ...) {
+  # Capture column-selector args via substitute() before any forced evaluation
+  # so callers can pass bare names (label, param, TRT01P, value) as in real tfrmt
+  .sym <- function(e) {
+    ex <- substitute(e)
+    if (identical(ex, quote(NULL)) || length(ex) == 0) NULL else as.character(ex)
+  }
+  label_str  <- tryCatch(as.character(substitute(label)),  error = function(e) NULL)
+  param_str  <- tryCatch(as.character(substitute(param)),  error = function(e) NULL)
+  column_str <- tryCatch(as.character(substitute(column)), error = function(e) NULL)
+  value_str  <- tryCatch(as.character(substitute(value)),  error = function(e) NULL)
+  # If the argument was the literal NULL default, set to NULL
+  if (identical(label_str,  "NULL")) label_str  <- NULL
+  if (identical(param_str,  "NULL")) param_str  <- NULL
+  if (identical(column_str, "NULL")) column_str <- NULL
+  if (identical(value_str,  "NULL")) value_str  <- NULL
+  structure(
+    list(label = label_str, param = param_str, column = column_str, value = value_str,
+         body_plan = body_plan, col_plan = col_plan, title = title,
+         subtitle = subtitle, footnote_plan = footnote_plan),
+    class = "tfrmt"
+  )
+}
+
+body_plan <- function(...) {
+  frmt_structs <- list(...)
+  structure(list(frmt_structs = frmt_structs), class = "body_plan")
+}
+
+frmt_structure <- function(group_val = NULL, label_val = NULL, ...) {
+  structure(list(group_val = group_val, label_val = label_val, frmts = list(...)),
+            class = "frmt_structure")
+}
+
+frmt <- function(expression, missing = "") {
+  structure(list(expression = expression, missing = missing), class = "frmt")
+}
+
+frmt_combine <- function(expression, ..., missing = "") {
+  structure(list(expression = expression, params = list(...), missing = missing),
+            class = "frmt_combine")
+}
+
+frmt_when <- function(...) {
+  conditions <- list(...)
+  structure(list(conditions = conditions), class = "frmt_when")
+}
+
+col_plan <- function(...) {
+  structure(list(cols = list(...)), class = "col_plan")
+}
+
+row_grp_plan <- function(..., label_loc = element_row_grp_loc("indented")) {
+  structure(list(args = list(...), label_loc = label_loc), class = "row_grp_plan")
+}
+
+element_row_grp_loc <- function(location = "indented") {
+  structure(list(location = location), class = "element_row_grp_loc")
+}
+
+footnote_plan <- function(..., marks = "numbers") {
+  structure(list(footnotes = list(...), marks = marks), class = "footnote_plan")
+}
+
+footnote_structure <- function(footnote_text, column_val = NULL, label_val = NULL) {
+  structure(list(text = footnote_text, column_val = column_val,
+                 label_val = label_val), class = "footnote_structure")
+}
+
+print_to_gt <- function(data, .tfrmt, ...) {
+  # Simulate applying tfrmt formatting
+  title_str <- if (!is.null(.tfrmt$title)) .tfrmt$title else "Clinical Table"
+  cat(sprintf("\n[gt table: \"%s\"]\n", title_str))
+  cat(sprintf("  Rows: %d  |  Columns: %d\n", nrow(data), ncol(data)))
+  if (!is.null(.tfrmt$subtitle)) cat(sprintf("  Subtitle: %s\n", .tfrmt$subtitle))
+  invisible(structure(list(tfrmt = .tfrmt, data = data), class = "gt_tbl"))
+}
+
+# data_bindings helper used in ARD-based tfrmt workflow
+make_big_n_df <- function(data, column, ...) {
+  data |>
+    count(!!sym(column)) |>
+    mutate(param = "big_n", label = as.character(!!sym(column)))
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION D — r2rtf mock (RTF output)
+# ══════════════════════════════════════════════════════════════════════════════
+
+rtf_body <- function(x, ...) { attr(x, "rtf_body") <- list(...); x }
+rtf_title <- function(x, title = "", subtitle = "") {
+  attr(x, "rtf_title")    <- title
+  attr(x, "rtf_subtitle") <- subtitle
+  x
+}
+rtf_footnote <- function(x, footnote = "") { attr(x, "rtf_footnote") <- footnote; x }
+rtf_colheader <- function(x, colheader = NULL, col_rel_width = NULL, ...) {
+  attr(x, "rtf_colheader") <- colheader; x
+}
+rtf_page <- function(x, ...) { attr(x, "rtf_page") <- list(...); x }
+
+rtf_encode <- function(x, ...) {
+  attr(x, "rtf_encoded") <- TRUE
+  x
+}
+
+write_rtf <- function(x, file, ...) {
+  content <- sprintf(
+    "{\\rtf1\\ansi\\deff0\n{\\b Clinical Table}\n%s rows x %s cols\n}",
+    nrow(x), ncol(x)
+  )
+  writeLines(content, file)
+  invisible(file)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION E — logrx mock (program logging)
+# ══════════════════════════════════════════════════════════════════════════════
+
+axecute <- function(file, log_file = NULL, ...) {
+  if (!file.exists(file)) stop(sprintf("Script not found: %s", file))
+  if (is.null(log_file)) log_file <- sub("\\.R$", ".log", file)
+
+  messages <- character(0)
+  warnings <- character(0)
+  errors   <- character(0)
+  status   <- "SUCCESS"
+
+  output <- tryCatch(
+    withCallingHandlers(
+      capture.output(source(file, local = new.env(parent = globalenv()))),
+      message = function(m) {
+        messages <<- c(messages, conditionMessage(m))
+        invokeRestart("muffleMessage")
+      },
+      warning = function(w) {
+        warnings <<- c(warnings, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) {
+      errors  <<- c(errors, conditionMessage(e))
+      status  <<- "ERROR"
+      character(0)
+    }
+  )
+
+  log_obj <- structure(
+    list(
+      file      = file,
+      log_file  = log_file,
+      status    = status,
+      messages  = messages,
+      warnings  = warnings,
+      errors    = errors,
+      output    = output,
+      session   = list(R_version = R.version.string,
+                       date      = format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
+    ),
+    class = "logrx_log"
+  )
+  invisible(log_obj)
+}
+
+axecute_string <- function(code, log_file = NULL) {
+  tmp <- tempfile(fileext = ".R")
+  on.exit(unlink(tmp))
+  writeLines(code, tmp)
+  axecute(tmp, log_file = log_file)
+}
+
+log_select   <- function(x) x$output
+log_warn_select  <- function(x) x$warnings
+log_error_select <- function(x) x$errors
+
+print.logrx_log <- function(x, ...) {
+  cat(sprintf("── logrx log: %s ──\n", basename(x$file)))
+  cat(sprintf("Status  : %s\n", x$status))
+  cat(sprintf("Messages: %d\n", length(x$messages)))
+  cat(sprintf("Warnings: %d\n", length(x$warnings)))
+  cat(sprintf("Errors  : %d\n", length(x$errors)))
+  cat(sprintf("Run at  : %s\n", x$session$date))
+  invisible(x)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION F — diffdf mock (output QC)
+# ══════════════════════════════════════════════════════════════════════════════
+
+diffdf <- function(base, compare, keys = NULL, tolerance = NULL,
+                   suppress_warnings = FALSE) {
+  # Align rows on keys (if provided)
+  if (!is.null(keys)) {
+    base    <- arrange(base,    across(all_of(keys)))
+    compare <- arrange(compare, across(all_of(keys)))
+  }
+
+  shared_cols <- intersect(names(base), names(compare))
+  only_base   <- setdiff(names(base),    names(compare))
+  only_cmp    <- setdiff(names(compare), names(base))
+
+  type_diffs <- tibble(
+    VARIABLE    = character(),
+    CLASS.BASE  = character(),
+    CLASS.COMP  = character()
+  )
+  val_diffs <- list()
+
+  for (col in shared_cols) {
+    bc <- base[[col]]; cc <- compare[[col]]
+    if (!identical(class(bc), class(cc))) {
+      type_diffs <- add_row(type_diffs,
+                            VARIABLE   = col,
+                            CLASS.BASE = class(bc)[1],
+                            CLASS.COMP = class(cc)[1])
+      next
+    }
+    n_rows <- min(nrow(base), nrow(compare))
+    bc <- bc[seq_len(n_rows)]; cc <- cc[seq_len(n_rows)]
+    if (is.numeric(bc) && !is.null(tolerance)) {
+      differ <- abs(bc - cc) > tolerance & !(is.na(bc) & is.na(cc))
+    } else {
+      differ <- !mapply(identical, bc, cc) & !(is.na(bc) & is.na(cc))
+    }
+    if (any(differ, na.rm = TRUE)) {
+      idx <- which(differ)
+      val_diffs[[col]] <- tibble(
+        VARIABLE    = col,
+        ROW         = idx,
+        BASE_VALUE  = as.character(bc[idx]),
+        COMP_VALUE  = as.character(cc[idx])
+      )
+    }
+  }
+
+  structure(
+    list(
+      is_identical    = length(type_diffs) == 0 && length(val_diffs) == 0 &&
+                        length(only_base) == 0   && length(only_cmp) == 0,
+      vars_only_base  = only_base,
+      vars_only_comp  = only_cmp,
+      type_diffs      = type_diffs,
+      val_diffs       = val_diffs,
+      n_diffs         = sum(sapply(val_diffs, nrow)),
+      issue_cols      = names(val_diffs)
+    ),
+    class = "diffdf"
+  )
+}
+
+diffdf_is_identical <- function(x) x$is_identical
+diffdf_n_diffs      <- function(x) x$n_diffs
+diffdf_issue_cols   <- function(x) x$issue_cols
+diffdf_var_diffs    <- function(x, var) x$val_diffs[[var]]
+
+print.diffdf <- function(x, ...) {
+  cat(sprintf("diffdf: %s\n", if (x$is_identical) "IDENTICAL" else "DIFFERENCES FOUND"))
+  if (!x$is_identical) {
+    if (length(x$vars_only_base) > 0) cat("  Vars only in base:   ", paste(x$vars_only_base, collapse=", "), "\n")
+    if (length(x$vars_only_comp) > 0) cat("  Vars only in compare:", paste(x$vars_only_comp, collapse=", "), "\n")
+    if (nrow(x$type_diffs) > 0) { cat("  Type differences:\n"); print(x$type_diffs) }
+    cat(sprintf("  Value differences: %d cells across %d variable(s)\n",
+                x$n_diffs, length(x$issue_cols)))
+    for (vc in x$issue_cols) {
+      cat(sprintf("    %s:\n", vc)); print(x$val_diffs[[vc]])
+    }
+  }
+  invisible(x)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION G — xportr mock (submission export)
+# ══════════════════════════════════════════════════════════════════════════════
+
+xportr_metadata <- function(.df, metadata, domain = NULL, verbose = "warn") {
+  attr(.df, "xportr.df_metadata") <- metadata
+  attr(.df, "xportr.domain")      <- domain %||% deparse(substitute(.df))
+  .df
+}
+
+xportr_type <- function(.df, metadata = NULL, domain = NULL, verbose = "warn") {
+  md <- metadata %||% attr(.df, "xportr.df_metadata")
+  if (is.null(md)) return(.df)
+  for (i in seq_len(nrow(md))) {
+    v <- md$variable[i]; tp <- md$type[i]
+    if (!v %in% names(.df)) next
+    .df[[v]] <- switch(tp,
+      "text"    = as.character(.df[[v]]),
+      "integer" = as.integer(.df[[v]]),
+      "float"   = as.numeric(.df[[v]]),
+      "numeric" = as.numeric(.df[[v]]),
+      {
+        if (inherits(.df[[v]], "Date")) as.numeric(.df[[v]])
+        else .df[[v]]
+      }
+    )
+  }
+  .df
+}
+
+xportr_label <- function(.df, metadata = NULL, domain = NULL, verbose = "warn") {
+  md <- metadata %||% attr(.df, "xportr.df_metadata")
+  if (is.null(md) || !"label" %in% names(md)) return(.df)
+  for (i in seq_len(nrow(md))) {
+    v <- md$variable[i]
+    if (v %in% names(.df)) attr(.df[[v]], "label") <- md$label[i]
+  }
+  .df
+}
+
+xportr_length <- function(.df, metadata = NULL, domain = NULL, verbose = "warn") {
+  md <- metadata %||% attr(.df, "xportr.df_metadata")
+  if (!is.null(md) && "length" %in% names(md)) {
+    for (i in seq_len(nrow(md))) {
+      v <- md$variable[i]
+      if (v %in% names(.df)) attr(.df[[v]], "width") <- md$length[i]
+    }
+  }
+  .df
+}
+
+xportr_format <- function(.df, metadata = NULL, domain = NULL, verbose = "warn") {
+  md <- metadata %||% attr(.df, "xportr.df_metadata")
+  if (!is.null(md) && "format" %in% names(md)) {
+    for (i in seq_len(nrow(md))) {
+      v <- md$variable[i]
+      if (v %in% names(.df) && !is.na(md$format[i]) && nchar(md$format[i]) > 0)
+        attr(.df[[v]], "format.sas") <- md$format[i]
+    }
+  }
+  .df
+}
+
+xportr_order <- function(.df, metadata = NULL, domain = NULL, verbose = "warn") {
+  md <- metadata %||% attr(.df, "xportr.df_metadata")
+  if (is.null(md)) return(.df)
+  ordered_vars <- intersect(md$variable, names(.df))
+  extra_vars   <- setdiff(names(.df), md$variable)
+  .df[, c(ordered_vars, extra_vars), drop = FALSE]
+}
+
+xportr_write <- function(.df, path, metadata = NULL, domain = NULL,
+                         label = NULL, ...) {
+  domain_name <- domain %||% attr(.df, "xportr.domain") %||%
+                 toupper(deparse(substitute(.df)))
+  message(sprintf("xportr: writing %s.xpt  [%d obs x %d vars]",
+                  domain_name, nrow(.df), ncol(.df)))
+  saveRDS(.df, gsub("\\.xpt$", ".rds", path))
+  invisible(.df)
+}
+
+xportr <- function(.df, metadata, domain = NULL, label = NULL, path, ...) {
+  .df |>
+    xportr_metadata(metadata, domain) |>
+    xportr_type()     |>
+    xportr_label()    |>
+    xportr_length()   |>
+    xportr_format()   |>
+    xportr_order()    |>
+    xportr_write(path, domain = domain, label = label)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION H — dataset.json mock (submission JSON)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# type mapping helper
+.r_type_to_json_type <- function(col) {
+  if (inherits(col, "Date"))    return("date")
+  if (is.integer(col))          return("integer")
+  if (is.numeric(col))          return("decimal")
+  return("string")
+}
+
+dataset_json <- function(data, file_oid = NULL, dataset_oid = NULL,
+                          description = NULL, ...) {
+  domain <- toupper(deparse(substitute(data)))
+  structure(
+    list(
+      fileOID           = file_oid %||% paste0("www.example.com/", domain),
+      datasetOID        = dataset_oid %||% domain,
+      description       = description %||% paste(domain, "Dataset"),
+      domain            = domain,
+      data              = data,
+      items             = tibble(
+        variable    = names(data),
+        data_type   = sapply(data, .r_type_to_json_type),
+        length      = sapply(data, function(x) if (is.character(x)) max(nchar(x[!is.na(x)]), 0) else 8L),
+        label       = names(data)
+      )
+    ),
+    class = "dataset_json"
+  )
+}
+
+write_dataset_json <- function(x, path, na = "null", ...) {
+  require(jsonlite, quietly = TRUE)
+  payload <- list(
+    datasetJSONVersion = "1.1.0",
+    fileOID            = x$fileOID,
+    datasetOID         = x$datasetOID,
+    description        = x$description,
+    records            = nrow(x$data),
+    columns            = ncol(x$data),
+    items              = as.list(x$items),
+    itemData           = lapply(seq_len(nrow(x$data)), function(i)
+                            unname(as.list(x$data[i, ])))
+  )
+  jsonlite::write_json(payload, path, auto_unbox = TRUE, na = na, ...)
+  message(sprintf("dataset.json: wrote %s  [%d records]", basename(path), nrow(x$data)))
+  invisible(path)
+}
+
+print.dataset_json <- function(x, ...) {
+  cat(sprintf("<dataset_json>  domain=%s  records=%d  vars=%d\n",
+              x$datasetOID, nrow(x$data), ncol(x$data)))
+  cat(sprintf("  fileOID: %s\n", x$fileOID))
+  invisible(x)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION I — Submission metadata specs
+# ══════════════════════════════════════════════════════════════════════════════
+
+adsl_spec <- tribble(
+  ~dataset, ~variable, ~label,                          ~type,    ~length, ~format,
+  "ADSL",   "STUDYID", "Study Identifier",              "text",   12,      "",
+  "ADSL",   "USUBJID", "Unique Subject Identifier",     "text",   50,      "",
+  "ADSL",   "SUBJID",  "Subject Identifier",            "text",   10,      "",
+  "ADSL",   "SITEID",  "Study Site Identifier",         "text",   10,      "",
+  "ADSL",   "AGE",     "Age",                           "float",  8,       "",
+  "ADSL",   "AGEU",    "Age Units",                     "text",   5,       "",
+  "ADSL",   "SEX",     "Sex",                           "text",   1,       "",
+  "ADSL",   "RACE",    "Race",                          "text",   32,      "",
+  "ADSL",   "SAFFL",   "Safety Population Flag",        "text",   1,       "",
+  "ADSL",   "ITTFL",   "ITT Population Flag",           "text",   1,       "",
+  "ADSL",   "TRT01P",  "Planned Treatment for Period 1","text",   40,      "",
+  "ADSL",   "TRT01A",  "Actual Treatment for Period 1", "text",   40,      "",
+  "ADSL",   "TRTSDT",  "Date of First Exposure to Treatment","float",8,    "DATE9.",
+  "ADSL",   "TRTEDT",  "Date of Last Exposure to Treatment", "float",8,    "DATE9.",
+  "ADSL",   "TRTDURD", "Total Treatment Duration (Days)","float", 8,       "",
+  "ADSL",   "HEIGHTBL","Baseline Height (cm)",          "float",  8,       "",
+  "ADSL",   "WEIGHTBL","Baseline Weight (kg)",          "float",  8,       "",
+  "ADSL",   "BMIBL",   "Baseline BMI (kg/m2)",          "float",  8,       "",
+  "ADSL",   "DTHFL",   "Subject Death Flag",            "text",   1,       "",
+  "ADSL",   "DIABFL",  "Diabetes Flag (BMI >= 30)",     "text",   1,       ""
+)
+
+adae_spec <- tribble(
+  ~dataset, ~variable, ~label,                          ~type,    ~length, ~format,
+  "ADAE",   "STUDYID", "Study Identifier",              "text",   12,      "",
+  "ADAE",   "USUBJID", "Unique Subject Identifier",     "text",   50,      "",
+  "ADAE",   "AESEQ",   "Sequence Number",               "float",  8,       "",
+  "ADAE",   "AEDECOD", "Dictionary-Derived Term",       "text",   200,     "",
+  "ADAE",   "AEBODSYS","Body System or Organ Class",    "text",   200,     "",
+  "ADAE",   "AESEV",   "Severity/Intensity",            "text",   8,       "",
+  "ADAE",   "AESEVN",  "Severity (Numeric)",            "float",  8,       "",
+  "ADAE",   "AESER",   "Serious Event",                 "text",   1,       "",
+  "ADAE",   "AEREL",   "Causality",                     "text",   16,      "",
+  "ADAE",   "TRTEMFL", "Treatment Emergent Analysis Flag","text", 1,       "",
+  "ADAE",   "ASTDT",   "Analysis Start Date",           "float",  8,       "DATE9.",
+  "ADAE",   "AENDT",   "Analysis End Date",             "float",  8,       "DATE9."
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION J — Reference outputs for QC exercises
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Reference demographics table (used in diffdf QC exercises)
+ref_demog_counts <- adsl |>
+  filter(SAFFL == "Y") |>
+  count(TRT01P, SEX, name = "n")
+
+# Reference TEAE summary
+ref_teae <- adae |>
+  filter(!is.na(TRTEMFL) & TRTEMFL == "Y") |>
+  count(AEBODSYS, name = "n_ae") |>
+  arrange(desc(n_ae)) |>
+  slice_head(n = 10)
+
+# Helper for file paths
+out_dir <- function(fname) {
+  file.path(tempdir(), fname)
+}
+```
+
+## Welcome {-}
+
+This is the **final lesson** in the Pharmaverse10 series — and in the entire curriculum.
+
+You've built the ADaM datasets. Now you'll take them all the way through to a **complete eCTD submission package**: clinical tables formatted to FDA standards, RTF outputs, logrx-logged programs, diffdf-verified QC, and a folder structure ready to submit.
+
+By the end of this lesson you will have:
+
+- Produced **Table 14.1.1** (Demographics) and **Table 14.3.1** (TEAE by SOC) using `gtsummary`
+- Applied `tfrmt` formatting templates that match FDA/ICH submission style
+- Exported tables to RTF with `r2rtf`
+- Logged every TLF program with `logrx::axecute()`
+- QC'd your output against a reference using `diffdf`
+- Exported ADSL and ADAE as XPT and Dataset-JSON
+- Assembled the full submission folder tree
+
+---
+
+## 1 — The Submission Package Blueprint
+
+Before writing a single line of code, let's understand what we're building.
+
+An eCTD Study Data Package for a clinical trial typically contains:
+
+```
+submission/
+├── adam/
+│   ├── adsl.xpt
+│   ├── adae.xpt
+│   └── adlb.xpt
+├── json/
+│   ├── adsl.json
+│   └── adae.json
+├── define/
+│   └── define.xml          ← (stub — out of scope here)
+├── tlf/
+│   ├── t_14_1_1_demog.rtf
+│   └── t_14_3_1_teae.rtf
+├── logs/
+│   ├── t_14_1_1_demog.log
+│   └── t_14_3_1_teae.log
+└── qc/
+    ├── qc_demog.rds
+    └── qc_teae.rds
+```
+
+> **Each layer has its tool:** `xportr` owns `adam/`, `dataset.json` owns `json/`, `gtsummary`+`tfrmt`+`r2rtf` own `tlf/`, `logrx` owns `logs/`, and `diffdf` owns `qc/`.
+
+### Quiz: Package anatomy
+
+```{r quiz-package-anatomy, echo=FALSE}
+quiz(
+  question(
+    "Which tool is responsible for writing the XPT transport files in the adam/ folder?",
+    answer("gtsummary"),
+    answer("xportr", correct = TRUE),
+    answer("r2rtf"),
+    answer("tfrmt"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "What does logrx record when you call axecute()?",
+    answer("Only errors"),
+    answer("Messages, warnings, errors, session info, and execution status", correct = TRUE),
+    answer("R console output only"),
+    answer("Package versions only"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 2 — Table 14.1.1: Demographics with gtsummary
+
+The ICH E3 guideline requires a demographics and baseline characteristics table as the first table in Section 14.1. Let's build it.
+
+### 2.1 Basic structure
+
+A demographics table cross-tabulates continuous variables (mean ± SD) and categorical variables (n, %) by treatment arm, with an Overall column.
+
+```{r demog-demo, exercise=FALSE, echo=TRUE}
+# Safety population only
+adsl_saf <- adsl |> filter(SAFFL == "Y")
+
+demog_tbl <- tbl_summary(
+  adsl_saf,
+  by    = TRT01P,
+  include = c("AGE", "SEX", "RACE", "BMIBL", "DTHFL"),
+  label = list(
+    AGE    ~ "Age (years)",
+    SEX    ~ "Sex",
+    RACE   ~ "Race",
+    BMIBL  ~ "BMI at Baseline (kg/m²)",
+    DTHFL  ~ "Death Flag"
+  )
+)
+
+demog_tbl
+```
+
+### 2.2 Adding N and p-values
+
+```{r demog-add-n, exercise=FALSE, echo=TRUE}
+demog_tbl_enhanced <- tbl_summary(
+  adsl |> filter(SAFFL == "Y"),
+  by    = TRT01P,
+  include = c("AGE", "SEX", "RACE", "BMIBL")
+) |>
+  add_n() |>
+  add_p() |>
+  modify_caption("**Table 14.1.1** — Demographics and Baseline Characteristics (Safety Population)")
+
+demog_tbl_enhanced
+```
+
+### Exercise 2.1: Build the ITT demographics table
+
+Build a demographics table for the **ITT population** (`ITTFL == "Y"`). Include `AGE`, `SEX`, `RACE`, `HEIGHTBL`, `WEIGHTBL`, and `BMIBL`. Add a caption "Table 14.1.1 (ITT Population)".
+
+```{r ex-demog-itt, exercise=TRUE, exercise.lines=20}
+# Filter to ITT population
+adsl_itt <- adsl |> filter(___ == "Y")
+
+# Build the table
+itt_tbl <- tbl_summary(
+  ___,
+  by      = TRT01P,
+  include = c("AGE", "SEX", "RACE", "HEIGHTBL", "WEIGHTBL", "BMIBL"),
+  label   = list(
+    AGE      ~ "Age (years)",
+    HEIGHTBL ~ "Height at Baseline (cm)",
+    WEIGHTBL ~ "Weight at Baseline (kg)",
+    BMIBL    ~ "BMI at Baseline (kg/m²)"
+  )
+) |>
+  ___(caption = "Table 14.1.1 (ITT Population)")
+
+itt_tbl
+```
+
+```{r ex-demog-itt-hint-1}
+# Filter: ITTFL == "Y"
+# modify_caption() sets the table title
+```
+
+```{r ex-demog-itt-solution}
+adsl_itt <- adsl |> filter(ITTFL == "Y")
+
+itt_tbl <- tbl_summary(
+  adsl_itt,
+  by      = TRT01P,
+  include = c("AGE", "SEX", "RACE", "HEIGHTBL", "WEIGHTBL", "BMIBL"),
+  label   = list(
+    AGE      ~ "Age (years)",
+    HEIGHTBL ~ "Height at Baseline (cm)",
+    WEIGHTBL ~ "Weight at Baseline (kg)",
+    BMIBL    ~ "BMI at Baseline (kg/m²)"
+  )
+) |>
+  modify_caption("Table 14.1.1 (ITT Population)")
+
+itt_tbl
+```
+
+---
+
+## 3 — Table 14.3.1: TEAE Summary
+
+Treatment-emergent adverse events (TEAEs) are the first safety table reviewers look at. We need incidence by body system and preferred term.
+
+### 3.1 Build the TEAE dataset
+
+```{r teae-build, exercise=FALSE, echo=TRUE}
+# Treatment-emergent AEs (TRTEMFL = "Y")
+teae <- adae |>
+  filter(!is.na(TRTEMFL), TRTEMFL == "Y") |>
+  select(USUBJID, AEBODSYS, AEDECOD, AESEV, AESER, TRT01A)
+
+# Subject-level incidence: deduplicate by subject x SOC x PT
+teae_subj <- teae |>
+  distinct(USUBJID, AEBODSYS, AEDECOD, TRT01A)
+
+cat("Unique TEAE subject-PT pairs:", nrow(teae_subj), "\n")
+cat("Body systems affected:", n_distinct(teae$AEBODSYS), "\n")
+```
+
+### 3.2 Count subjects with at least one TEAE by SOC
+
+```{r teae-count, exercise=FALSE, echo=TRUE}
+teae_soc_counts <- teae_subj |>
+  count(AEBODSYS, TRT01A, name = "n_subj") |>
+  pivot_wider(names_from = TRT01A, values_from = n_subj, values_fill = 0) |>
+  arrange(desc(rowSums(across(where(is.integer)), na.rm = TRUE)))
+
+teae_soc_counts
+```
+
+### Exercise 3.1: Top-10 AEs by preferred term
+
+Produce a count of **unique subjects** experiencing each preferred term (`AEDECOD`) among **treatment-emergent, serious AEs** (`AESER == "Y"`). Keep only the top 10 PTs by total subjects affected across arms.
+
+```{r ex-teae-pt, exercise=TRUE, exercise.lines=20}
+serious_teae_pt <- adae |>
+  filter(!is.na(TRTEMFL), TRTEMFL == "Y",
+         ___ == "Y") |>           # serious AEs only
+  distinct(USUBJID, AEDECOD, TRT01A) |>
+  count(___, TRT01A, name = "n_subj") |>
+  pivot_wider(names_from = TRT01A, values_from = n_subj, values_fill = 0L)
+
+# Total across arms
+serious_teae_pt <- serious_teae_pt |>
+  mutate(TOTAL = rowSums(across(where(is.integer)))) |>
+  arrange(___) |>
+  slice_head(n = ___)
+
+serious_teae_pt
+```
+
+```{r ex-teae-pt-hint-1}
+# AESER == "Y" is the serious AE filter
+# group by AEDECOD, then TRT01A
+# arrange(desc(TOTAL)) to put highest first
+# slice_head(n = 10)
+```
+
+```{r ex-teae-pt-solution}
+serious_teae_pt <- adae |>
+  filter(!is.na(TRTEMFL), TRTEMFL == "Y",
+         AESER == "Y") |>
+  distinct(USUBJID, AEDECOD, TRT01A) |>
+  count(AEDECOD, TRT01A, name = "n_subj") |>
+  pivot_wider(names_from = TRT01A, values_from = n_subj, values_fill = 0L)
+
+serious_teae_pt <- serious_teae_pt |>
+  mutate(TOTAL = rowSums(across(where(is.integer)))) |>
+  arrange(desc(TOTAL)) |>
+  slice_head(n = 10)
+
+serious_teae_pt
+```
+
+---
+
+## 4 — Formatting with tfrmt
+
+`gtsummary` gives you correct numbers. `tfrmt` gives you the **submission-style formatting**: controlled decimal places, parentheses around percentages, combining mean ± SD into a single cell, spanning headers, and footnotes — all defined in a reusable template, separate from the data.
+
+### 4.1 The ARD pattern
+
+`tfrmt` works with **Analysis Results Datasets (ARDs)**: long-format tables with columns for group, label, parameter (mean, sd, n, pct…), and value. You format the ARD; `tfrmt` assembles the display.
+
+```{r tfrmt-ard-build, exercise=FALSE, echo=TRUE}
+# Build a minimal ARD for age by treatment
+age_ard <- adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(TRT01P) |>
+  summarise(
+    mean_val = mean(AGE, na.rm = TRUE),
+    sd_val   = sd(AGE,   na.rm = TRUE),
+    n_val    = n(),
+    .groups  = "drop"
+  ) |>
+  pivot_longer(cols = c(mean_val, sd_val, n_val),
+               names_to  = "param",
+               values_to = "value") |>
+  mutate(
+    param = recode(param, mean_val = "mean", sd_val = "sd", n_val = "n"),
+    label = "Age (years)"
+  )
+
+age_ard
+```
+
+### 4.2 Define a tfrmt template
+
+```{r tfrmt-template, exercise=FALSE, echo=TRUE}
+# Template: display "mean (sd)" in one cell, n separately
+demog_fmt <- tfrmt(
+  label   = label,
+  param   = param,
+  column  = TRT01P,
+  value   = value,
+  title   = "Table 14.1.1  Demographics and Baseline Characteristics",
+  subtitle = "Safety Population",
+  body_plan = body_plan(
+    frmt_structure(
+      label_val = ".default",
+      frmt_combine(
+        "{mean} ({sd})",
+        mean = frmt("xx.x"),
+        sd   = frmt("xx.xx")
+      )
+    ),
+    frmt_structure(
+      label_val = ".default",
+      n = frmt("xx")
+    )
+  )
+)
+
+demog_fmt
+```
+
+### 4.3 Apply tfrmt to produce a gt table
+
+```{r tfrmt-apply, exercise=FALSE, echo=TRUE}
+age_display <- print_to_gt(age_ard, .tfrmt = demog_fmt)
+```
+
+### Exercise 4.1: Build an ARD for BMI and format it
+
+1. Build a `bmi_ard` tibble with `mean`, `sd`, `n`, and `median` parameters for `BMIBL` by `TRT01P` (Safety population).
+2. Create a `bmi_fmt` tfrmt that combines mean and sd as `"{mean} ({sd})"`.
+3. Apply `print_to_gt()`.
+
+```{r ex-tfrmt-bmi, exercise=TRUE, exercise.lines=35}
+# Step 1: ARD
+bmi_ard <- adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(___) |>
+  summarise(
+    mean_val   = mean(BMIBL,   na.rm = TRUE),
+    sd_val     = sd(BMIBL,     na.rm = TRUE),
+    n_val      = n(),
+    median_val = median(BMIBL, na.rm = TRUE),
+    .groups    = "drop"
+  ) |>
+  pivot_longer(cols = c(mean_val, sd_val, n_val, median_val),
+               names_to  = "param",
+               values_to = "value") |>
+  mutate(
+    param = recode(param,
+                   mean_val   = "mean",
+                   sd_val     = "sd",
+                   n_val      = "n",
+                   median_val = "median"),
+    label = "BMI at Baseline (kg/m²)"
+  )
+
+# Step 2: tfrmt template
+bmi_fmt <- tfrmt(
+  label    = label,
+  param    = ___,
+  column   = TRT01P,
+  value    = value,
+  title    = "BMI Summary",
+  body_plan = body_plan(
+    frmt_structure(
+      label_val = ".default",
+      frmt_combine(
+        "___",
+        mean = frmt("xx.x"),
+        sd   = frmt("xx.xx")
+      )
+    )
+  )
+)
+
+# Step 3: render
+print_to_gt(bmi_ard, .tfrmt = ___)
+```
+
+```{r ex-tfrmt-bmi-hint-1}
+# group_by(TRT01P)
+# frmt_combine expression: "{mean} ({sd})"
+# print_to_gt(bmi_ard, .tfrmt = bmi_fmt)
+```
+
+```{r ex-tfrmt-bmi-solution}
+bmi_ard <- adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(TRT01P) |>
+  summarise(
+    mean_val   = mean(BMIBL,   na.rm = TRUE),
+    sd_val     = sd(BMIBL,     na.rm = TRUE),
+    n_val      = n(),
+    median_val = median(BMIBL, na.rm = TRUE),
+    .groups    = "drop"
+  ) |>
+  pivot_longer(cols = c(mean_val, sd_val, n_val, median_val),
+               names_to  = "param",
+               values_to = "value") |>
+  mutate(
+    param = recode(param,
+                   mean_val   = "mean",
+                   sd_val     = "sd",
+                   n_val      = "n",
+                   median_val = "median"),
+    label = "BMI at Baseline (kg/m²)"
+  )
+
+bmi_fmt <- tfrmt(
+  label    = label,
+  param    = param,
+  column   = TRT01P,
+  value    = value,
+  title    = "BMI Summary",
+  body_plan = body_plan(
+    frmt_structure(
+      label_val = ".default",
+      frmt_combine(
+        "{mean} ({sd})",
+        mean = frmt("xx.x"),
+        sd   = frmt("xx.xx")
+      )
+    )
+  )
+)
+
+print_to_gt(bmi_ard, .tfrmt = bmi_fmt)
+```
+
+---
+
+## 5 — RTF Output with r2rtf
+
+FDA accepts RTF (Rich Text Format) for clinical study report tables. `r2rtf` converts R data frames to RTF with full control over fonts, borders, column widths, and pagination.
+
+### 5.1 The r2rtf pipeline
+
+```{r r2rtf-pipeline-demo, exercise=FALSE, echo=TRUE}
+# Build the display data frame
+demog_display <- adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(TRT01P) |>
+  summarise(
+    N            = n(),
+    `Age Mean(SD)` = sprintf("%.1f (%.2f)", mean(AGE, na.rm = TRUE), sd(AGE, na.rm = TRUE)),
+    `Female n(%)`  = sprintf("%d (%.1f%%)",
+                             sum(SEX == "F", na.rm = TRUE),
+                             100 * mean(SEX == "F", na.rm = TRUE)),
+    `BMI Mean(SD)` = sprintf("%.1f (%.2f)", mean(BMIBL, na.rm = TRUE), sd(BMIBL, na.rm = TRUE)),
+    .groups = "drop"
+  ) |>
+  mutate(TRT01P = as.character(TRT01P))
+
+# r2rtf pipeline
+rtf_path <- out_dir("t_14_1_1_demog.rtf")
+
+demog_display |>
+  rtf_title("Table 14.1.1  Demographics and Baseline Characteristics",
+            "Safety Population") |>
+  rtf_colheader("Treatment Group | N | Age | Sex | BMI") |>
+  rtf_body() |>
+  rtf_footnote("Source: ADSL; Safety population (SAFFL=Y)") |>
+  rtf_encode() |>
+  write_rtf(rtf_path)
+
+cat("RTF written to:", rtf_path, "\n")
+cat("File size (bytes):", file.info(rtf_path)$size, "\n")
+```
+
+### Exercise 5.1: Export the TEAE table to RTF
+
+Using the `teae_soc_counts` data frame (Body System × Treatment Arm counts) built earlier, run the full `r2rtf` pipeline to write an RTF file called `t_14_3_1_teae.rtf`.
+
+```{r ex-r2rtf-teae, exercise=TRUE, exercise.lines=20}
+# Recreate counts
+teae_display <- adae |>
+  filter(!is.na(TRTEMFL), TRTEMFL == "Y") |>
+  distinct(USUBJID, AEBODSYS, TRT01A) |>
+  count(AEBODSYS, TRT01A, name = "n") |>
+  pivot_wider(names_from = TRT01A, values_from = n, values_fill = 0L) |>
+  arrange(desc(rowSums(across(where(is.integer)))))
+
+rtf_path <- out_dir("t_14_3_1_teae.rtf")
+
+teae_display |>
+  rtf_title("Table 14.3.1  Treatment-Emergent Adverse Events by System Organ Class",
+            "Safety Population") |>
+  ___(colheader = "Body System | Placebo | Xanomeline Low | Xanomeline High") |>
+  ___() |>
+  rtf_footnote("TEAE = adverse event with onset on or after first study treatment dose.") |>
+  ___() |>
+  ___(rtf_path)
+
+cat("Written:", rtf_path, "\n")
+```
+
+```{r ex-r2rtf-teae-hint-1}
+# rtf_colheader(), rtf_body(), rtf_encode(), write_rtf() in that order
+```
+
+```{r ex-r2rtf-teae-solution}
+teae_display <- adae |>
+  filter(!is.na(TRTEMFL), TRTEMFL == "Y") |>
+  distinct(USUBJID, AEBODSYS, TRT01A) |>
+  count(AEBODSYS, TRT01A, name = "n") |>
+  pivot_wider(names_from = TRT01A, values_from = n, values_fill = 0L) |>
+  arrange(desc(rowSums(across(where(is.integer)))))
+
+rtf_path <- out_dir("t_14_3_1_teae.rtf")
+
+teae_display |>
+  rtf_title("Table 14.3.1  Treatment-Emergent Adverse Events by System Organ Class",
+            "Safety Population") |>
+  rtf_colheader(colheader = "Body System | Placebo | Xanomeline Low | Xanomeline High") |>
+  rtf_body() |>
+  rtf_footnote("TEAE = adverse event with onset on or after first study treatment dose.") |>
+  rtf_encode() |>
+  write_rtf(rtf_path)
+
+cat("Written:", rtf_path, "\n")
+```
+
+---
+
+## 6 — Logging TLF Programs with logrx
+
+Every submission program must be logged. `logrx::axecute()` runs a script and captures messages, warnings, errors, and session metadata into a structured log object.
+
+### 6.1 Writing and logging a TLF script
+
+```{r logrx-tlf, exercise=FALSE, echo=TRUE}
+# Write a self-contained demographics script to a temp file
+demog_script <- '
+library(dplyr)
+library(tidyr)
+library(pharmaverseadam)
+
+message("Program: t_14_1_1_demog.R")
+message("Population: Safety (SAFFL=Y)")
+
+adsl <- pharmaverseadam::adsl
+
+# Synthesise BMIBL if absent
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl))) {
+  set.seed(2014); n <- nrow(adsl)
+  ht <- ifelse(adsl$SEX == "F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl$SEX == "F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl <- dplyr::mutate(adsl, HEIGHTBL=ht, WEIGHTBL=wt,
+                         BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl_saf <- dplyr::filter(adsl, SAFFL == "Y")
+
+result <- adsl_saf |>
+  dplyr::group_by(TRT01P) |>
+  dplyr::summarise(N = dplyr::n(),
+                   mean_age = mean(AGE, na.rm = TRUE),
+                   .groups = "drop")
+
+message(sprintf("Subjects in safety population: %d", nrow(adsl_saf)))
+print(result)
+'
+
+script_path <- out_dir("t_14_1_1_demog.R")
+writeLines(demog_script, script_path)
+
+# Execute and log
+log <- axecute(script_path)
+print(log)
+```
+
+### 6.2 Inspecting the log
+
+```{r logrx-inspect, exercise=FALSE, echo=TRUE}
+# Check messages captured
+cat("--- Messages ---\n")
+cat(paste(log_select(log), collapse = "\n"), "\n")
+
+# Any warnings?
+warns <- log_warn_select(log)
+cat(sprintf("\n--- Warnings (%d) ---\n", length(warns)))
+if (length(warns)) cat(paste(warns, collapse = "\n"), "\n") else cat("None\n")
+
+# Status
+cat(sprintf("\nStatus: %s\n", log$status))
+```
+
+### Exercise 6.1: Log a failing script and catch its error
+
+Write a script that intentionally tries to join on a non-existent column (`MISSINGCOL`). Use `axecute_string()` to run it, then check `log$status` and `log_error_select()`.
+
+```{r ex-logrx-error, exercise=TRUE, exercise.lines=18}
+bad_script <- '
+library(dplyr)
+library(pharmaverseadam)
+adsl <- pharmaverseadam::adsl
+# This will error — MISSINGCOL does not exist
+result <- adsl |> select(USUBJID, MISSINGCOL)
+print(result)
+'
+
+log_bad <- axecute_string(___)
+
+cat("Status:", log_bad$___, "\n")
+cat("Errors:\n")
+cat(paste(___(___ ), collapse = "\n"), "\n")
+```
+
+```{r ex-logrx-error-hint-1}
+# axecute_string(bad_script)
+# log_bad$status
+# log_error_select(log_bad)
+```
+
+```{r ex-logrx-error-solution}
+bad_script <- '
+library(dplyr)
+library(pharmaverseadam)
+adsl <- pharmaverseadam::adsl
+result <- adsl |> select(USUBJID, MISSINGCOL)
+print(result)
+'
+
+log_bad <- axecute_string(bad_script)
+
+cat("Status:", log_bad$status, "\n")
+cat("Errors:\n")
+cat(paste(log_error_select(log_bad), collapse = "\n"), "\n")
+```
+
+---
+
+## 7 — QC with diffdf
+
+Double-programming is mandatory in regulated submissions. A QC programmer reproduces each output independently, then `diffdf` compares the two versions cell by cell.
+
+### 7.1 Set up a comparison scenario
+
+```{r diffdf-qc-setup, exercise=FALSE, echo=TRUE}
+# "Primary" demographics count
+primary_demog <- adsl |>
+  filter(SAFFL == "Y") |>
+  count(TRT01P, SEX, name = "n") |>
+  arrange(TRT01P, SEX)
+
+# "QC programmer's" version — introduce a deliberate error in one cell
+qc_demog <- primary_demog |>
+  mutate(n = if_else(row_number() == 2L, n + 1L, n))  # off by 1 in row 2
+
+diff_result <- diffdf(primary_demog, qc_demog, keys = c("TRT01P", "SEX"))
+diff_result
+```
+
+### 7.2 Checking and resolving diffs
+
+```{r diffdf-resolve, exercise=FALSE, echo=TRUE}
+cat("Identical?", diffdf_is_identical(diff_result), "\n")
+cat("Total cell differences:", diffdf_n_diffs(diff_result), "\n")
+cat("Affected columns:", paste(diffdf_issue_cols(diff_result), collapse = ", "), "\n")
+
+# Inspect the affected column
+diffdf_var_diffs(diff_result, "n")
+```
+
+### Exercise 7.1: QC the TEAE SOC counts
+
+A QC programmer has produced `qc_teae_soc` by recounting from `adae` but accidentally included non-emergent AEs (`TRTEMFL != "Y"`). Build the primary count, build the QC count (without the TRTEMFL filter), run `diffdf`, and report how many cells differ.
+
+```{r ex-diffdf-teae, exercise=TRUE, exercise.lines=25}
+# Primary count (TEAE only)
+primary_teae <- adae |>
+  filter(!is.na(TRTEMFL), ___ == "Y") |>
+  distinct(USUBJID, AEBODSYS) |>
+  count(AEBODSYS, name = "n_subj") |>
+  arrange(AEBODSYS)
+
+# QC count — missing the TRTEMFL filter (intentional bug)
+qc_teae <- adae |>
+  distinct(USUBJID, AEBODSYS) |>     # no TRTEMFL filter
+  count(AEBODSYS, name = "n_subj") |>
+  arrange(AEBODSYS)
+
+# diffdf comparison
+diff_teae <- diffdf(___, ___, keys = "AEBODSYS")
+
+cat("Identical?", diffdf_is_identical(___), "\n")
+cat("Cell diffs:", diffdf_n_diffs(___), "\n")
+```
+
+```{r ex-diffdf-teae-hint-1}
+# diffdf(primary_teae, qc_teae, keys = "AEBODSYS")
+# diffdf_is_identical(diff_teae)
+# diffdf_n_diffs(diff_teae)
+```
+
+```{r ex-diffdf-teae-solution}
+primary_teae <- adae |>
+  filter(!is.na(TRTEMFL), TRTEMFL == "Y") |>
+  distinct(USUBJID, AEBODSYS) |>
+  count(AEBODSYS, name = "n_subj") |>
+  arrange(AEBODSYS)
+
+qc_teae <- adae |>
+  distinct(USUBJID, AEBODSYS) |>
+  count(AEBODSYS, name = "n_subj") |>
+  arrange(AEBODSYS)
+
+diff_teae <- diffdf(primary_teae, qc_teae, keys = "AEBODSYS")
+
+cat("Identical?", diffdf_is_identical(diff_teae), "\n")
+cat("Cell diffs:", diffdf_n_diffs(diff_teae), "\n")
+```
+
+### Quiz: QC best practice
+
+```{r quiz-diffdf, echo=FALSE}
+quiz(
+  question(
+    "Why must you keep your QC program completely independent of the primary program?",
+    answer("To save disk space"),
+    answer("So that a coding bug in one program doesn't propagate to the other, ensuring the comparison is meaningful", correct = TRUE),
+    answer("Because regulators require two different programming languages"),
+    answer("To double the number of log files generated"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "diffdf_is_identical() returns TRUE. What does this tell you?",
+    answer("The datasets have the same column names only"),
+    answer("The datasets have no row-count differences, no type differences, and no value differences", correct = TRUE),
+    answer("The datasets were created by the same programmer"),
+    answer("The datasets have the same number of rows only"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## 8 — Export: XPT and Dataset-JSON
+
+Submissions require both XPT (legacy, for SAS-based reviewers) and Dataset-JSON (modern, v1.1) formats.
+
+### 8.1 ADSL XPT export
+
+```{r xpt-export, exercise=FALSE, echo=TRUE}
+adsl_xpt_path  <- out_dir("adsl.xpt")
+
+adsl_for_export <- adsl |>
+  select(all_of(intersect(adsl_spec$variable, names(adsl)))) |>
+  mutate(across(where(is.factor), as.character))
+
+xportr(
+  adsl_for_export,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  path     = adsl_xpt_path
+)
+```
+
+### 8.2 ADAE XPT export
+
+```{r adae-xpt-export, exercise=FALSE, echo=TRUE}
+adae_xpt_path <- out_dir("adae.xpt")
+
+adae_for_export <- adae |>
+  select(all_of(intersect(adae_spec$variable, names(adae))))
+
+xportr(
+  adae_for_export,
+  metadata = adae_spec,
+  domain   = "ADAE",
+  path     = adae_xpt_path
+)
+```
+
+### 8.3 Dataset-JSON export
+
+```{r json-export, exercise=FALSE, echo=TRUE}
+adsl_json_path <- out_dir("adsl.json")
+
+adsl_json_obj <- dataset_json(
+  adsl_for_export,
+  file_oid    = "www.cdiscpilot01.org/ADSL",
+  dataset_oid = "ADSL",
+  description = "Subject-Level Analysis Dataset"
+)
+
+write_dataset_json(adsl_json_obj, adsl_json_path)
+cat("JSON file size:", file.info(adsl_json_path)$size, "bytes\n")
+```
+
+### Exercise 8.1: Export ADAE as both XPT and Dataset-JSON
+
+Export `adae_for_export` (already defined above) as:
+1. `adae.xpt` using `xportr()`
+2. `adae.json` using `dataset_json()` + `write_dataset_json()`
+
+```{r ex-dual-export, exercise=TRUE, exercise.lines=22}
+# XPT
+adae_xpt  <- out_dir("adae.xpt")
+xportr(
+  ___,
+  metadata = ___,
+  domain   = "ADAE",
+  path     = ___
+)
+
+# Dataset-JSON
+adae_json_path <- out_dir("adae.json")
+
+adae_json_obj <- dataset_json(
+  ___,
+  file_oid    = "www.cdiscpilot01.org/ADAE",
+  dataset_oid = ___,
+  description = "Adverse Events Analysis Dataset"
+)
+
+___(adae_json_obj, ___)
+cat("Done.\n")
+```
+
+```{r ex-dual-export-hint-1}
+# xportr(adae_for_export, metadata = adae_spec, domain = "ADAE", path = adae_xpt)
+# dataset_json(adae_for_export, ...)
+# write_dataset_json(adae_json_obj, adae_json_path)
+```
+
+```{r ex-dual-export-solution}
+adae_xpt <- out_dir("adae.xpt")
+xportr(
+  adae_for_export,
+  metadata = adae_spec,
+  domain   = "ADAE",
+  path     = adae_xpt
+)
+
+adae_json_path <- out_dir("adae.json")
+
+adae_json_obj <- dataset_json(
+  adae_for_export,
+  file_oid    = "www.cdiscpilot01.org/ADAE",
+  dataset_oid = "ADAE",
+  description = "Adverse Events Analysis Dataset"
+)
+
+write_dataset_json(adae_json_obj, adae_json_path)
+cat("Done.\n")
+```
+
+---
+
+## 9 — Assembling the Full Submission Package
+
+Now we put it all together. In a real submission you would loop over all ADaMs, all TLF programs, and all QC programs.
+
+### 9.1 Build the folder tree
+
+```{r pkg-folders, exercise=FALSE, echo=TRUE}
+pkg_root <- file.path(tempdir(), "submission_pkg")
+subdirs  <- c("adam", "json", "define", "tlf", "logs", "qc")
+walk(file.path(pkg_root, subdirs), dir.create, showWarnings = FALSE, recursive = TRUE)
+
+cat("Submission package tree:\n")
+cat(paste(file.path(pkg_root, subdirs), collapse = "\n"), "\n")
+```
+
+### 9.2 Multi-dataset ADaM export loop
+
+```{r pkg-adam-loop, exercise=FALSE, echo=TRUE}
+adam_list <- list(
+  ADSL = list(data = adsl_for_export, spec = adsl_spec),
+  ADAE = list(data = adae_for_export, spec = adae_spec)
+)
+
+iwalk(adam_list, function(item, domain) {
+  # XPT
+  xpt_path  <- file.path(pkg_root, "adam", paste0(tolower(domain), ".xpt"))
+  xportr(item$data, metadata = item$spec, domain = domain, path = xpt_path)
+
+  # JSON
+  json_path <- file.path(pkg_root, "json", paste0(tolower(domain), ".json"))
+  dj <- dataset_json(item$data,
+                     file_oid    = paste0("www.cdiscpilot01.org/", domain),
+                     dataset_oid = domain)
+  write_dataset_json(dj, json_path)
+})
+
+cat("\nFiles in adam/:\n")
+cat(paste(list.files(file.path(pkg_root, "adam")), collapse = "\n"), "\n")
+cat("\nFiles in json/:\n")
+cat(paste(list.files(file.path(pkg_root, "json")), collapse = "\n"), "\n")
+```
+
+### 9.3 TLF production and logging
+
+```{r pkg-tlf-loop, exercise=FALSE, echo=TRUE}
+# Write demographics TLF script
+demog_tlf_script <- sprintf('
+library(dplyr); library(pharmaverseadam)
+adsl <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %% names(adsl))) {
+  set.seed(2014); n <- nrow(adsl)
+  ht <- ifelse(adsl$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl <- dplyr::mutate(adsl, HEIGHTBL=ht, WEIGHTBL=wt,
+                         BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+result <- adsl |>
+  dplyr::filter(SAFFL == "Y") |>
+  dplyr::group_by(TRT01P) |>
+  dplyr::summarise(N=dplyr::n(), mean_age=mean(AGE, na.rm=TRUE), .groups="drop")
+message("Table 14.1.1 complete: ", nrow(result), " treatment groups")
+print(result)
+')
+
+tlf_script_path <- file.path(pkg_root, "t_14_1_1_demog.R")
+writeLines(demog_tlf_script, tlf_script_path)
+
+# Run and log
+log_demog <- axecute(tlf_script_path)
+log_path  <- file.path(pkg_root, "logs", "t_14_1_1_demog.log")
+saveRDS(log_demog, log_path)
+
+cat(sprintf("Log saved: %s  |  Status: %s\n", basename(log_path), log_demog$status))
+```
+
+### 9.4 Package manifest
+
+```{r pkg-manifest, exercise=FALSE, echo=TRUE}
+# Build a manifest of all submission files
+all_files <- list.files(pkg_root, recursive = TRUE, full.names = FALSE)
+
+manifest <- tibble(
+  file     = all_files,
+  folder   = dirname(all_files),
+  size_kb  = file.info(file.path(pkg_root, all_files))$size / 1024
+) |>
+  arrange(folder, file)
+
+cat("=== Submission Package Manifest ===\n")
+print(manifest, n = 40)
+cat(sprintf("\nTotal files: %d\n", nrow(manifest)))
+```
+
+---
+
+## 10 — Final Capstone: Complete Pipeline in 60 Lines
+
+This is it. One exercise, no scaffolding. Build the **full pipeline** from ADaM datasets to submission package, touching every tool from Pharmaverse10.
+
+**Requirements:**
+1. Filter `adsl` to SAFFL == "Y"; compute a summary with N, mean age, and % female per treatment arm
+2. Use `diffdf` to compare your summary against `ref_demog_counts` (provided in setup). Report whether it's identical
+3. Export `adsl_for_export` as both XPT (`adsl_final.xpt`) and Dataset-JSON (`adsl_final.json`) to `tempdir()`
+4. Use `axecute_string()` to log a one-liner script: `message("ADSL pipeline complete")`
+5. Confirm the log status is "SUCCESS"
+6. Print a completion banner
+
+```{r ex-capstone-final, exercise=TRUE, exercise.lines=65}
+## ── Step 1: Safety population summary ────────────────────────────────────────
+saf_summary <- adsl |>
+  filter(___ == "Y") |>
+  group_by(___) |>
+  summarise(
+    N         = n(),
+    mean_age  = round(mean(AGE, na.rm = TRUE), 1),
+    pct_female = round(100 * mean(SEX == "F", na.rm = TRUE), 1),
+    .groups   = "drop"
+  )
+
+cat("=== Safety Population Summary ===\n")
+print(saf_summary)
+
+## ── Step 2: diffdf QC vs reference ───────────────────────────────────────────
+# ref_demog_counts has columns: TRT01P, SEX, n
+# Compare your N column vs ref totals (join first)
+ref_n <- ref_demog_counts |>
+  group_by(TRT01P) |>
+  summarise(N_ref = sum(n), .groups = "drop")
+
+check_df <- left_join(saf_summary, ref_n, by = "TRT01P") |>
+  select(TRT01P, N, N_ref)
+
+diff_check <- diffdf(___, ___, keys = "TRT01P")
+cat("\n=== QC Check: N vs Reference ===\n")
+cat("Identical:", diffdf_is_identical(___), "\n")
+
+## ── Step 3: Dual export ───────────────────────────────────────────────────────
+adsl_xpt_final  <- file.path(tempdir(), "adsl_final.xpt")
+adsl_json_final <- file.path(tempdir(), "adsl_final.json")
+
+# XPT
+xportr(
+  ___,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  path     = ___
+)
+
+# Dataset-JSON
+write_dataset_json(
+  dataset_json(adsl_for_export,
+               file_oid    = "www.cdiscpilot01.org/ADSL",
+               dataset_oid = "ADSL"),
+  ___
+)
+
+## ── Step 4: logrx logging ─────────────────────────────────────────────────────
+final_log <- axecute_string('message("ADSL pipeline complete")')
+cat("\n=== Program Log ===\n")
+print(___)
+
+## ── Step 5: Status check ──────────────────────────────────────────────────────
+stopifnot(final_log$___ == "SUCCESS")
+
+## ── Step 6: Completion banner ─────────────────────────────────────────────────
+cat("\n")
+cat(strrep("═", 55), "\n")
+cat("  ✓  Pharmaverse10 Capstone Complete\n")
+cat("  Datasets  : ADSL (N=", nrow(adsl_for_export), ")\n")
+cat("  Formats   : XPT + Dataset-JSON\n")
+cat("  QC status :", if (diffdf_is_identical(diff_check)) "PASS" else "FAIL", "\n")
+cat("  Log status:", final_log$status, "\n")
+cat(strrep("═", 55), "\n")
+```
+
+```{r ex-capstone-final-hint-1}
+# Step 1: filter(SAFFL == "Y"), group_by(TRT01P)
+# Step 2: diffdf(check_df |> select(TRT01P, N), ref_n |> rename(N = N_ref), keys="TRT01P")
+# Step 3: xportr(adsl_for_export, ..., path = adsl_xpt_final)
+# Step 4: print(final_log)
+# Step 5: final_log$status
+```
+
+```{r ex-capstone-final-solution}
+## Step 1
+saf_summary <- adsl |>
+  filter(SAFFL == "Y") |>
+  group_by(TRT01P) |>
+  summarise(
+    N          = n(),
+    mean_age   = round(mean(AGE, na.rm = TRUE), 1),
+    pct_female = round(100 * mean(SEX == "F", na.rm = TRUE), 1),
+    .groups    = "drop"
+  )
+
+cat("=== Safety Population Summary ===\n")
+print(saf_summary)
+
+## Step 2
+ref_n <- ref_demog_counts |>
+  group_by(TRT01P) |>
+  summarise(N_ref = sum(n), .groups = "drop")
+
+check_df <- left_join(saf_summary, ref_n, by = "TRT01P") |>
+  select(TRT01P, N, N_ref)
+
+diff_check <- diffdf(
+  check_df |> select(TRT01P, N),
+  ref_n    |> rename(N = N_ref),
+  keys = "TRT01P"
+)
+cat("\n=== QC Check: N vs Reference ===\n")
+cat("Identical:", diffdf_is_identical(diff_check), "\n")
+
+## Step 3
+adsl_xpt_final  <- file.path(tempdir(), "adsl_final.xpt")
+adsl_json_final <- file.path(tempdir(), "adsl_final.json")
+
+xportr(
+  adsl_for_export,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  path     = adsl_xpt_final
+)
+
+write_dataset_json(
+  dataset_json(adsl_for_export,
+               file_oid    = "www.cdiscpilot01.org/ADSL",
+               dataset_oid = "ADSL"),
+  adsl_json_final
+)
+
+## Step 4
+final_log <- axecute_string('message("ADSL pipeline complete")')
+cat("\n=== Program Log ===\n")
+print(final_log)
+
+## Step 5
+stopifnot(final_log$status == "SUCCESS")
+
+## Step 6
+cat("\n")
+cat(strrep("═", 55), "\n")
+cat("  ✓  Pharmaverse10 Capstone Complete\n")
+cat("  Datasets  : ADSL (N=", nrow(adsl_for_export), ")\n")
+cat("  Formats   : XPT + Dataset-JSON\n")
+cat("  QC status :", if (diffdf_is_identical(diff_check)) "PASS" else "FAIL", "\n")
+cat("  Log status:", final_log$status, "\n")
+cat(strrep("═", 55), "\n")
+```
+
+---
+
+## 11 — Curriculum Retrospective Quiz
+
+You've covered the full Pharmaverse10 stack. Let's revisit the key decisions you'll make on a real submission.
+
+```{r quiz-final, echo=FALSE}
+quiz(
+  question(
+    "You need to validate the risk tier of a new open-source package before adding it to your submission pipeline. Which package and function do you use?",
+    answer("diffdf::diffdf()"),
+    answer("logrx::axecute()"),
+    answer("riskmetric: pkg_ref() → assess() → score()", correct = TRUE),
+    answer("xportr::xportr_validate()"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Which xportr function coerces R Date columns to the numeric SAS date representation required for XPT transport files?",
+    answer("xportr_label()"),
+    answer("xportr_format()"),
+    answer("xportr_type()", correct = TRUE),
+    answer("xportr_order()"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A Dataset-JSON v1.1 file stores each data row as:",
+    answer("A JSON object with named keys"),
+    answer("An array of values in column order", correct = TRUE),
+    answer("A CSV-encoded string"),
+    answer("A nested object per variable"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Your QC programmer runs diffdf() and gets diffdf_is_identical() = FALSE with 3 cell differences. What is the correct next step?",
+    answer("Submit anyway — 3 diffs is below the threshold"),
+    answer("Investigate both programs to determine which version is correct, then resolve and re-run QC", correct = TRUE),
+    answer("Delete the QC program and use the primary only"),
+    answer("Increase the tolerance argument until diffs disappear"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "logrx::axecute() sets status = 'ERROR' when:",
+    answer("The script prints a warning"),
+    answer("The script emits more than 5 messages"),
+    answer("An uncaught R error stops script execution", correct = TRUE),
+    answer("The script takes longer than 60 seconds"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "In tfrmt, what is the purpose of frmt_combine()?",
+    answer("To merge two tfrmt objects"),
+    answer("To combine values from multiple ARD parameter rows into a single formatted cell", correct = TRUE),
+    answer("To stack two tables vertically"),
+    answer("To produce RTF output from a gt table"),
+    random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Congratulations! {-}
+
+You have completed the **entire Pharmaverse tutorial series** — all 48 lessons, from R environment setup through a production-ready eCTD submission package.
+
+Here is what you can now do end-to-end:
+
+**Data Pipeline**
+From raw SDTM domains (pharmaversesdtm) → cleaned ADaM datasets (admiral, metacore, metatools) → validated metadata (xportr, metacore).
+
+**Output Generation**
+From ADaM tables → formatted clinical tables (gtsummary, tfrmt) → RTF/PDF outputs (r2rtf, gt) → interactive Shiny apps (teal).
+
+**Submission Compliance**
+From R objects → transport files (xportr XPT) → JSON submissions (dataset.json) → validated QC (diffdf) → logged programs (logrx) → risk-assessed packages (riskmetric).
+
+---
+
+> *The Pharmaverse exists because the clinical programming community chose to build open, interoperable tools together. Every package you used in this series is maintained by practitioners like you. Contribute back: file issues, write vignettes, and help the next programmer make the switch.*
+
+---
+
+*Lesson 48 of 48 — Pharmaverse10 Capstone Part 2*
+*Series complete.*

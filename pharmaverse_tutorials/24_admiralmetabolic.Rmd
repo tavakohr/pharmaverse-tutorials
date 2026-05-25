@@ -1,0 +1,2170 @@
+---
+title: "Lesson 24 — admiral Metabolic Disease Extension (admiralmetabolic): NASH, Glycaemia & Lipids"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Metabolic disease ADaM derivations using the admiralmetabolic package:
+  liver histology endpoints for NASH/NAFLD (NAS score, fibrosis stage,
+  histological response), glycaemic parameters (HbA1c, fasting glucose,
+  HOMA-IR), lipid panel derivations (LDL-C via Friedewald equation, non-HDL-C,
+  LDL/HDL ratio), composite metabolic syndrome flags, and cardiometabolic
+  risk scoring. Includes NASH Phase IIb and T2DM capstone problems.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 24_admiralmetabolic.Rmd
+# PURPOSE       : admiralmetabolic extension — metabolic disease ADaM: NASH/NAFLD liver
+#                 histology (NAS score, fibrosis stage, histological
+#                 response), HOMA-IR, Friedewald LDL-C, HbA1c
+#                 categories, composite metabolic syndrome flags, and
+#                 Hy's Law DILI signal detection.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNTHETIC METABOLIC TRIAL DATA — NASH Phase IIb
+# Drug: semaglutide-like GLP-1 RA  (GLPx 2.4 mg s.c. weekly)  vs Placebo
+# 120 adults with biopsy-confirmed NASH; 72-week treatment; biopsy at W0 & W72.
+# Primary endpoint: ≥2-point NAS reduction with no worsening of fibrosis, OR
+#                   fibrosis improvement ≥ 1 stage.
+# ══════════════════════════════════════════════════════════════════════════════
+set.seed(2025)
+n_sub <- 120
+
+adsl_meta <- tibble(
+  STUDYID = "NASH2025",
+  USUBJID = sprintf("NASH2025-%03d", seq_len(n_sub)),
+  SUBJID  = sprintf("%03d", seq_len(n_sub)),
+  SEX     = sample(c("M","F"), n_sub, replace = TRUE, prob = c(.55,.45)),
+  RACE    = sample(c("WHITE","ASIAN","BLACK OR AFRICAN AMERICAN","OTHER"),
+                   n_sub, replace = TRUE, prob = c(.50,.25,.15,.10)),
+  ARM     = rep(c("GLPx 2.4 mg","Placebo"), each = n_sub/2),
+  ARMCD   = rep(c("GLP","PBO"), each = n_sub/2),
+  SAFFL   = "Y",
+  ITTFL   = "Y"
+) |>
+  mutate(
+    AGE       = sample(38:68, n_sub, replace = TRUE),
+    # Baseline body weight (kg) — NASH subjects are typically overweight/obese
+    WGTBL     = round(rnorm(n_sub, 98, 18), 1),
+    HGTBL     = round(rnorm(n_sub, 170, 9), 1),
+    BMIBL     = round(WGTBL / (HGTBL / 100)^2, 1),
+    # Comorbidities
+    DIABFL    = if_else(BMIBL >= 30 & sample(c(TRUE,FALSE), n_sub, replace = TRUE,
+                                              prob = c(.60,.40)), "Y", "N"),
+    HTNFL     = sample(c("Y","N"), n_sub, replace = TRUE, prob = c(.55,.45)),
+    TRTSDT    = as.Date("2025-03-01") + sample(0:60, n_sub, replace = TRUE),
+    TRTEDT    = TRTSDT + 504L  # 72 weeks
+  )
+
+# ── Visit schedule ────────────────────────────────────────────────────────────
+meta_visits <- tibble(
+  VISIT    = c("BASELINE","WEEK 12","WEEK 24","WEEK 48","WEEK 72"),
+  VISITNUM = 1:5,
+  VISITDY  = c(1L, 85L, 169L, 337L, 505L)
+)
+
+# ── Lab parameters ────────────────────────────────────────────────────────────
+# Parameters: HbA1c (%), Fasting Glucose (mg/dL), Fasting Insulin (μIU/mL),
+#             Total Cholesterol (mg/dL), LDL-C (mg/dL), HDL-C (mg/dL),
+#             Triglycerides (mg/dL), ALT (U/L), AST (U/L), GGT (U/L)
+
+lab_params <- tribble(
+  ~PARAMCD, ~PARAM,                           ~PARAMU,  ~LBSTRESU,
+  "HBA1C",  "Haemoglobin A1c",               "%",      "%",
+  "GLUC",   "Fasting Glucose",               "mg/dL",  "mg/dL",
+  "INS",    "Fasting Insulin",               "uIU/mL", "uIU/mL",
+  "CHOL",   "Total Cholesterol",             "mg/dL",  "mg/dL",
+  "LDL",    "LDL Cholesterol (calculated)",  "mg/dL",  "mg/dL",
+  "HDLC",   "HDL Cholesterol",               "mg/dL",  "mg/dL",
+  "TRIG",   "Triglycerides",                 "mg/dL",  "mg/dL",
+  "ALT",    "Alanine Aminotransferase",      "U/L",    "U/L",
+  "AST",    "Aspartate Aminotransferase",    "U/L",    "U/L",
+  "GGT",    "Gamma-Glutamyl Transferase",    "U/L",    "U/L"
+)
+
+# Baseline lab values — plausible NASH/pre-diabetic population
+gen_lab_base <- function(paramcd, arm, n) {
+  switch(paramcd,
+    HBA1C = round(rnorm(n, ifelse(arm=="GLP", 6.8, 6.7), 0.8), 1),
+    GLUC  = round(rnorm(n, 112, 22)),
+    INS   = round(rnorm(n, 18, 7), 1),
+    CHOL  = round(rnorm(n, 205, 35)),
+    LDL   = round(rnorm(n, 128, 30)),
+    HDLC  = round(rnorm(n, 44, 9)),
+    TRIG  = round(rnorm(n, 185, 55)),
+    ALT   = round(rnorm(n, 68, 28)),
+    AST   = round(rnorm(n, 55, 22)),
+    GGT   = round(rnorm(n, 62, 32)),
+    rep(NA_real_, n)
+  )
+}
+
+# Treatment effect multipliers by visit (relative to baseline)
+trt_fx <- function(paramcd, arm, visitdy) {
+  base_mult <- switch(paramcd,
+    HBA1C = if (arm=="GLP") -0.012 else -0.001,   # per day
+    GLUC  = if (arm=="GLP") -0.08  else -0.005,
+    INS   = if (arm=="GLP") -0.07  else -0.003,
+    CHOL  = if (arm=="GLP") -0.04  else -0.001,
+    LDL   = if (arm=="GLP") -0.035 else -0.001,
+    HDLC  = if (arm=="GLP") +0.02  else +0.001,
+    TRIG  = if (arm=="GLP") -0.05  else -0.003,
+    ALT   = if (arm=="GLP") -0.06  else -0.002,
+    AST   = if (arm=="GLP") -0.05  else -0.002,
+    GGT   = if (arm=="GLP") -0.04  else -0.001,
+    0
+  )
+  pmax(0.10, 1 + base_mult * visitdy)  # floor at 10% of baseline
+}
+
+# Build longitudinal lab dataset
+lab_rows <- lapply(seq_len(n_sub), function(i) {
+  subj <- adsl_meta$USUBJID[i]
+  arm  <- adsl_meta$ARMCD[i]
+  trtdt<- adsl_meta$TRTSDT[i]
+
+  lapply(lab_params$PARAMCD, function(pc) {
+    base_val <- gen_lab_base(pc, arm, 1)
+    lapply(seq_len(nrow(meta_visits)), function(v) {
+      vrow <- meta_visits[v, ]
+      fx   <- trt_fx(pc, arm, vrow$VISITDY)
+      val  <- round(base_val * fx + rnorm(1, 0, abs(base_val) * 0.04), 1)
+      val  <- pmax(0.1, val)   # no negative lab values
+      if (pc %in% c("HBA1C","INS")) val <- round(val, 1)
+      else val <- round(val)
+      tibble(
+        STUDYID  = "NASH2025", USUBJID = subj,
+        VISIT    = vrow$VISIT, VISITNUM = vrow$VISITNUM, VISITDY = vrow$VISITDY,
+        PARAMCD  = pc,
+        PARAM    = lab_params$PARAM[lab_params$PARAMCD == pc],
+        PARAMU   = lab_params$PARAMU[lab_params$PARAMCD == pc],
+        AVAL     = val,
+        ADT      = trtdt + vrow$VISITDY - 1L,
+        ADY      = vrow$VISITDY,
+        ARMCD    = arm
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+}) |> bind_rows()
+
+# ── Derive BASE, ABLFL, CHG, PCHG ────────────────────────────────────────────
+adlb_meta <- lab_rows |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(
+    BASE  = AVAL[VISIT == "BASELINE"][1],
+    ABLFL = if_else(VISIT == "BASELINE", "Y", NA_character_),
+    CHG   = AVAL - BASE,
+    PCHG  = round(100 * CHG / BASE, 2)
+  ) |>
+  ungroup()
+
+# ── Body weight at each visit ─────────────────────────────────────────────────
+wt_rows_meta <- lapply(seq_len(n_sub), function(i) {
+  subj <- adsl_meta$USUBJID[i]
+  arm  <- adsl_meta$ARMCD[i]
+  bwt  <- adsl_meta$WGTBL[i]
+  trtdt<- adsl_meta$TRTSDT[i]
+
+  lapply(seq_len(nrow(meta_visits)), function(v) {
+    vrow <- meta_visits[v, ]
+    # GLP arm loses ~12% body weight over 72 wk; PBO ~2%
+    wt_chg_pct <- if (arm=="GLP") -0.12 * vrow$VISITDY/505 else -0.02 * vrow$VISITDY/505
+    wt <- round(bwt * (1 + wt_chg_pct) + rnorm(1, 0, 0.8), 1)
+    tibble(STUDYID="NASH2025", USUBJID=subj, VISIT=vrow$VISIT,
+           VISITNUM=vrow$VISITNUM, VISITDY=vrow$VISITDY,
+           PARAMCD="WEIGHT", PARAM="Body Weight", PARAMU="kg",
+           AVAL=wt, ADT=trtdt+vrow$VISITDY-1L, ADY=vrow$VISITDY, ARMCD=arm)
+  }) |> bind_rows()
+}) |> bind_rows()
+
+wt_rows_meta <- wt_rows_meta |>
+  group_by(USUBJID, PARAMCD) |>
+  mutate(BASE=AVAL[VISIT=="BASELINE"][1], ABLFL=if_else(VISIT=="BASELINE","Y",NA_character_),
+         CHG=AVAL-BASE, PCHG=round(100*CHG/BASE,2)) |>
+  ungroup()
+
+# ── Liver biopsy data (W0 and W72) ───────────────────────────────────────────
+# NAS = NAFLD Activity Score: Steatosis (0-3) + Lobular Inflammation (0-3) +
+#        Hepatocyte Ballooning (0-2).  Total 0-8.
+# Fibrosis stage: 0 (none) to 4 (cirrhosis)
+set.seed(2025)
+biopsy_rows <- lapply(seq_len(n_sub), function(i) {
+  subj <- adsl_meta$USUBJID[i]
+  arm  <- adsl_meta$ARMCD[i]
+  trtdt<- adsl_meta$TRTSDT[i]
+
+  # Baseline scores (NASH patients have NAS ≥ 4)
+  steat_b  <- sample(1:3, 1, prob=c(.20,.45,.35))
+  inflam_b <- sample(1:3, 1, prob=c(.25,.45,.30))
+  balloon_b<- sample(1:2, 1, prob=c(.35,.65))
+  nas_b    <- steat_b + inflam_b + balloon_b
+  fib_b    <- sample(1:3, 1, prob=c(.30,.40,.30))  # Stage 1-3 at baseline
+
+  # W72 scores: GLP arm shows meaningful improvement
+  delta_nas  <- if (arm=="GLP") sample(-3:0, 1, prob=c(.25,.35,.25,.15))
+                else sample(-1:1, 1, prob=c(.15,.60,.25))
+  delta_fib  <- if (arm=="GLP") sample(-1:0, 1, prob=c(.40,.60))
+                else sample(-1:1, 1, prob=c(.10,.75,.15))
+
+  steat_w72  <- pmax(0L, pmin(3L, as.integer(steat_b  + round(delta_nas*0.45))))
+  inflam_w72 <- pmax(0L, pmin(3L, as.integer(inflam_b + round(delta_nas*0.35))))
+  balloon_w72<- pmax(0L, pmin(2L, as.integer(balloon_b+ round(delta_nas*0.20))))
+  nas_w72    <- steat_w72 + inflam_w72 + balloon_w72
+  fib_w72    <- pmax(0L, pmin(4L, as.integer(fib_b + delta_fib)))
+
+  bind_rows(
+    tibble(STUDYID="NASH2025", USUBJID=subj, VISIT="BASELINE", VISITNUM=1L, VISITDY=1L,
+           ADT=trtdt, ARMCD=arm,
+           NAS_STEAT=steat_b, NAS_INFLAM=inflam_b, NAS_BALLOON=balloon_b,
+           NAS_TOTAL=nas_b, FIB_STAGE=fib_b),
+    tibble(STUDYID="NASH2025", USUBJID=subj, VISIT="WEEK 72", VISITNUM=5L, VISITDY=505L,
+           ADT=trtdt+504L, ARMCD=arm,
+           NAS_STEAT=steat_w72, NAS_INFLAM=inflam_w72, NAS_BALLOON=balloon_w72,
+           NAS_TOTAL=nas_w72, FIB_STAGE=fib_w72)
+  )
+}) |> bind_rows()
+
+# Wide biopsy (one row per subject with baseline and W72 columns)
+biopsy_wide <- biopsy_rows |>
+  pivot_wider(
+    id_cols   = c(STUDYID, USUBJID, ARMCD),
+    names_from = VISIT,
+    values_from = c(NAS_STEAT, NAS_INFLAM, NAS_BALLOON, NAS_TOTAL, FIB_STAGE),
+    names_sep  = "_"
+  ) |>
+  rename_with(~ gsub(" ", "_", .x))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIRALMETABOLIC FUNCTION MOCKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' Derive HOMA-IR from fasting glucose and insulin
+#' Formula: HOMA-IR = (Glucose_mmol/L × Insulin_uIU/mL) / 22.5
+#' Glucose conversion: mg/dL ÷ 18.016 = mmol/L
+#'
+#' @param dataset A data frame containing glucose and insulin values (wide format)
+#' @param gluc_var Unquoted column name for fasting glucose (mg/dL)
+#' @param ins_var  Unquoted column name for fasting insulin (μIU/mL)
+#' @param new_var  Unquoted name for the output HOMA-IR variable
+derive_var_homa_ir <- function(dataset,
+                               gluc_var = GLUC,
+                               ins_var  = INS,
+                               new_var  = HOMAIR) {
+  gluc_col <- deparse(substitute(gluc_var))
+  ins_col  <- deparse(substitute(ins_var))
+  out_col  <- deparse(substitute(new_var))
+  dataset |>
+    mutate(!!out_col := round(
+      ((.data[[gluc_col]] / 18.016) * .data[[ins_col]]) / 22.5, 2
+    ))
+}
+
+#' Derive LDL-C via the Friedewald equation
+#' LDL = Total Cholesterol - HDL - Triglycerides/5
+#' Valid only when Triglycerides < 400 mg/dL (set NA otherwise)
+#'
+#' @param dataset   A data frame containing CHOL, HDL, and TRIG columns
+#' @param chol_var  Unquoted column name for Total Cholesterol
+#' @param hdl_var   Unquoted column name for HDL-C
+#' @param trig_var  Unquoted column name for Triglycerides
+#' @param new_var   Unquoted output column name
+#' @param trig_limit Upper TG limit for Friedewald validity (default 400)
+derive_var_ldlc_friedewald <- function(dataset,
+                                       chol_var   = CHOL,
+                                       hdl_var    = HDLC,
+                                       trig_var   = TRIG,
+                                       new_var    = LDL_CALC,
+                                       trig_limit = 400) {
+  chol_col <- deparse(substitute(chol_var))
+  hdl_col  <- deparse(substitute(hdl_var))
+  trig_col <- deparse(substitute(trig_var))
+  out_col  <- deparse(substitute(new_var))
+  dataset |>
+    mutate(!!out_col := if_else(
+      .data[[trig_col]] < trig_limit,
+      round(.data[[chol_col]] - .data[[hdl_col]] - .data[[trig_col]] / 5, 1),
+      NA_real_
+    ))
+}
+
+#' Derive Non-HDL Cholesterol
+#' Non-HDL-C = Total Cholesterol - HDL-C
+derive_var_non_hdlc <- function(dataset,
+                                chol_var = CHOL,
+                                hdl_var  = HDLC,
+                                new_var  = NON_HDLC) {
+  chol_col <- deparse(substitute(chol_var))
+  hdl_col  <- deparse(substitute(hdl_var))
+  out_col  <- deparse(substitute(new_var))
+  dataset |>
+    mutate(!!out_col := round(.data[[chol_col]] - .data[[hdl_col]], 1))
+}
+
+#' Derive NAS histological response flag
+#' Responder: NAS reduction ≥ 2 points from baseline with no worsening of fibrosis
+#' OR fibrosis improvement ≥ 1 stage (regardless of NAS change)
+#'
+#' @param dataset   A wide biopsy data frame (one row per subject)
+#' @param nas_base  Unquoted column name: baseline NAS total
+#' @param nas_post  Unquoted column name: post-treatment NAS total
+#' @param fib_base  Unquoted column name: baseline fibrosis stage
+#' @param fib_post  Unquoted column name: post-treatment fibrosis stage
+#' @param new_var   Unquoted output flag variable ("Y"/"N")
+derive_var_nash_responder <- function(dataset,
+                                      nas_base = NAS_TOTAL_BASELINE,
+                                      nas_post = `NAS_TOTAL_WEEK 72`,
+                                      fib_base = FIB_STAGE_BASELINE,
+                                      fib_post = `FIB_STAGE_WEEK 72`,
+                                      new_var  = NASHRSFL) {
+  nas_base_col <- deparse(substitute(nas_base))
+  nas_post_col <- deparse(substitute(nas_post))
+  fib_base_col <- deparse(substitute(fib_base))
+  fib_post_col <- deparse(substitute(fib_post))
+  out_col      <- deparse(substitute(new_var))
+
+  dataset |>
+    mutate(!!out_col := if_else(
+      # Criterion 1: ≥2-point NAS drop with no fibrosis worsening
+      (.data[[nas_base_col]] - .data[[nas_post_col]] >= 2 &
+         .data[[fib_post_col]] >= .data[[fib_base_col]] - 1) |
+        # Criterion 2: fibrosis improvement ≥1 stage
+        (.data[[fib_base_col]] - .data[[fib_post_col]] >= 1),
+      "Y", "N"
+    ))
+}
+
+#' Derive fibrosis improvement flag (≥1 stage improvement)
+derive_var_fib_improvement <- function(dataset,
+                                       fib_base = FIB_STAGE_BASELINE,
+                                       fib_post = `FIB_STAGE_WEEK 72`,
+                                       new_var  = FIBIMPFL) {
+  fib_base_col <- deparse(substitute(fib_base))
+  fib_post_col <- deparse(substitute(fib_post))
+  out_col      <- deparse(substitute(new_var))
+  dataset |>
+    mutate(!!out_col := if_else(
+      .data[[fib_base_col]] - .data[[fib_post_col]] >= 1, "Y", "N"
+    ))
+}
+
+#' Derive NAS resolution flag (NAS ≤ 1 at post-treatment biopsy)
+derive_var_nas_resolution <- function(dataset,
+                                      nas_post = `NAS_TOTAL_WEEK 72`,
+                                      new_var  = NASRESFL) {
+  nas_post_col <- deparse(substitute(nas_post))
+  out_col      <- deparse(substitute(new_var))
+  dataset |>
+    mutate(!!out_col := if_else(.data[[nas_post_col]] <= 1L, "Y", "N"))
+}
+
+#' Derive metabolic syndrome flag
+#' ATP-III criteria (3 of 5 required):
+#'   1. Waist circumference (proxy: BMI ≥ 30 in this dataset)
+#'   2. Triglycerides ≥ 150 mg/dL
+#'   3. HDL-C < 40 (M) or < 50 (F)
+#'   4. Blood pressure ≥ 130/85 (use HTNFL = "Y" as proxy)
+#'   5. Fasting glucose ≥ 100 mg/dL
+#'
+#' @param dataset  A wide-format data frame with one row per subject/visit
+#' @param bmi_var  BMI column
+#' @param trig_var Triglycerides column
+#' @param hdl_var  HDL-C column
+#' @param gluc_var Fasting glucose column
+#' @param htn_var  Hypertension flag column ("Y"/"N")
+#' @param sex_var  Sex column ("M"/"F")
+#' @param new_var  Output flag ("Y"/"N")
+derive_var_metsyn <- function(dataset,
+                               bmi_var  = BMIBL,
+                               trig_var = TRIG_BASE,
+                               hdl_var  = HDLC_BASE,
+                               gluc_var = GLUC_BASE,
+                               htn_var  = HTNFL,
+                               sex_var  = SEX,
+                               new_var  = METSYNFL) {
+  bmi_col  <- deparse(substitute(bmi_var))
+  trig_col <- deparse(substitute(trig_var))
+  hdl_col  <- deparse(substitute(hdl_var))
+  gluc_col <- deparse(substitute(gluc_var))
+  htn_col  <- deparse(substitute(htn_var))
+  sex_col  <- deparse(substitute(sex_var))
+  out_col  <- deparse(substitute(new_var))
+
+  dataset |>
+    mutate(
+      .crit_waist = .data[[bmi_col]] >= 30,
+      .crit_trig  = .data[[trig_col]] >= 150,
+      .crit_hdl   = if_else(.data[[sex_col]] == "M",
+                            .data[[hdl_col]] < 40,
+                            .data[[hdl_col]] < 50),
+      .crit_bp    = .data[[htn_col]] == "Y",
+      .crit_gluc  = .data[[gluc_col]] >= 100,
+      .n_crit     = .crit_waist + .crit_trig + .crit_hdl + .crit_bp + .crit_gluc,
+      !!out_col   := if_else(.n_crit >= 3L, "Y", "N")
+    ) |>
+    select(-starts_with(".crit_"), -.n_crit)
+}
+
+#' Derive percent weight loss category
+#' Thresholds: < 0%, 0–<5%, 5–<10%, ≥10%
+derive_var_wt_loss_cat <- function(dataset,
+                                   pchg_var = PCHG,
+                                   new_var  = WTLSSCAT) {
+  pchg_col <- deparse(substitute(pchg_var))
+  out_col  <- deparse(substitute(new_var))
+  dataset |>
+    mutate(!!out_col := case_when(
+      .data[[pchg_col]] < 0     ~ "Weight loss",
+      .data[[pchg_col]] < 5     ~ "0 to <5% loss",
+      .data[[pchg_col]] < 10    ~ "5 to <10% loss",
+      TRUE                      ~ ">=10% loss"
+    ))
+}
+
+#' Derive HbA1c glycaemic response category (ADA 2024 targets)
+#' < 5.7%: Normal; 5.7–<6.5%: Prediabetes; ≥6.5%: Diabetes threshold;
+#' <7.0%: ADA target (for known T2DM); <8.0%: acceptable
+derive_var_hba1c_cat <- function(dataset,
+                                 hba1c_var = AVAL,
+                                 new_var   = HBA1CCAT) {
+  hba1c_col <- deparse(substitute(hba1c_var))
+  out_col   <- deparse(substitute(new_var))
+  dataset |>
+    mutate(!!out_col := case_when(
+      .data[[hba1c_col]] <  5.7 ~ "Normal (<5.7%)",
+      .data[[hba1c_col]] <  6.5 ~ "Prediabetes (5.7-<6.5%)",
+      .data[[hba1c_col]] <  7.0 ~ "Diabetes - At target (<7.0%)",
+      .data[[hba1c_col]] <  8.0 ~ "Diabetes - Acceptable (7.0-<8.0%)",
+      TRUE                      ~ "Diabetes - Above target (>=8.0%)"
+    ))
+}
+
+#' Derive lipid panel shift: any lipid-lowering category threshold crossing
+#' NCEP ATP-III LDL categories: <100 optimal, 100-129 near-optimal,
+#' 130-159 borderline-high, 160-189 high, >=190 very high
+derive_var_ldl_cat <- function(dataset,
+                               ldl_var = AVAL,
+                               new_var = LDLCAT) {
+  ldl_col <- deparse(substitute(ldl_var))
+  out_col <- deparse(substitute(new_var))
+  dataset |>
+    mutate(!!out_col := case_when(
+      .data[[ldl_col]] < 100 ~ "Optimal (<100 mg/dL)",
+      .data[[ldl_col]] < 130 ~ "Near-optimal (100-129 mg/dL)",
+      .data[[ldl_col]] < 160 ~ "Borderline-high (130-159 mg/dL)",
+      .data[[ldl_col]] < 190 ~ "High (160-189 mg/dL)",
+      TRUE                   ~ "Very high (>=190 mg/dL)"
+    ))
+}
+
+# ── Pre-derived helper objects for exercises ──────────────────────────────────
+
+# Wide baseline labs (one row per subject, one column per parameter)
+baseline_labs <- adlb_meta |>
+  filter(VISIT == "BASELINE") |>
+  select(USUBJID, PARAMCD, AVAL) |>
+  pivot_wider(names_from = PARAMCD, values_from = AVAL) |>
+  left_join(select(adsl_meta, USUBJID, SEX, ARMCD, BMIBL, HTNFL, DIABFL),
+            by = "USUBJID") |>
+  rename(CHOL_BASE=CHOL, LDL_BASE=LDL, HDLC_BASE=HDLC,
+         TRIG_BASE=TRIG, GLUC_BASE=GLUC, INS_BASE=INS,
+         HBA1C_BASE=HBA1C, ALT_BASE=ALT, AST_BASE=AST)
+
+# W72 biopsy with baseline joined (for responder derivations)
+biopsy_response <- biopsy_wide  # already has both BASELINE and WEEK 72 columns
+
+# HbA1c over time (GLP arm only, for trend exercises)
+hba1c_glp <- adlb_meta |>
+  filter(PARAMCD == "HBA1C", ARMCD == "GLP")
+
+# Lipid panel at all visits (wide per subject-visit)
+lipid_wide <- adlb_meta |>
+  filter(PARAMCD %in% c("CHOL","HDLC","TRIG","LDL")) |>
+  select(USUBJID, VISIT, VISITNUM, VISITDY, PARAMCD, AVAL, ARMCD) |>
+  pivot_wider(names_from=PARAMCD, values_from=AVAL)
+```
+
+## Overview
+
+This lesson covers **admiralmetabolic** — the admiral extension package for metabolic disease trials including NASH/NAFLD, type 2 diabetes (T2DM), and cardiometabolic indications.
+
+Metabolic trials are distinct from classic ADaM territory in several ways:
+
+- **Liver histology** requires paired biopsy reading and multi-component composite endpoint logic (NAS score, fibrosis stage)
+- **Glycaemic endpoints** (HbA1c, HOMA-IR, fasting glucose) have clinically established category thresholds from ADA/IDF guidelines
+- **Lipid calculations** — particularly LDL-C via the Friedewald equation — are *derived* variables with an important validity constraint (TG < 400 mg/dL)
+- **Composite metabolic syndrome** flags combine five distinct physiological criteria requiring careful coding logic
+- **Weight loss** is often both a safety endpoint and a mediating variable for all other improvements
+
+By the end of this lesson you will be able to: derive HOMA-IR, apply the Friedewald equation safely, compute NAS and fibrosis response flags, classify HbA1c and LDL-C into guideline categories, derive a composite metabolic syndrome flag, and build a complete ADLB and biopsy response dataset for a NASH trial.
+
+### Trial Context
+
+Our teaching dataset is a Phase IIb randomised controlled trial of **GLPx 2.4 mg** (a semaglutide-like GLP-1 RA, weekly subcutaneous injection) vs **Placebo** in 120 adults with biopsy-confirmed NASH (NAFLD Activity Score ≥ 4 and fibrosis stage 1–3).
+
+The primary biopsy endpoint is assessed at **Week 72**; metabolic labs are collected at Weeks 0, 12, 24, 48, and 72.
+
+---
+
+## Section 1 — Insulin Resistance: HOMA-IR
+
+**HOMA-IR** (Homeostatic Model Assessment of Insulin Resistance) is the standard surrogate for hepatic insulin resistance in NASH trials. It is derived from two simultaneously measured fasting values:
+
+$$\text{HOMA-IR} = \frac{\text{Glucose (mmol/L)} \times \text{Insulin (μIU/mL)}}{22.5}$$
+
+Because glucose is often reported in **mg/dL**, you must convert:
+
+$$\text{Glucose (mmol/L)} = \frac{\text{Glucose (mg/dL)}}{18.016}$$
+
+The `derive_var_homa_ir()` function handles both the unit conversion and the formula:
+
+```r
+derive_var_homa_ir(dataset, gluc_var = GLUC, ins_var = INS, new_var = HOMAIR)
+```
+
+### Practice — Apply the HOMA-IR Formula
+
+```{r ex-homa-formula, exercise=TRUE, exercise.lines=10}
+# HOMA-IR = (Glucose_mmol * Insulin_uIU/mL) / 22.5
+# Glucose (mg/dL) -> mmol/L: divide by 18.016
+# Compute HOMA-IR for a subject with glucose = 118 mg/dL and insulin = 22 uIU/mL.
+
+gluc_mgdl <- 118
+ins_uiu   <- 22
+
+homa_ir <- (___ / 18.016 * ___) / 22.5
+cat("HOMA-IR =", round(homa_ir, 2))
+```
+
+```{r ex-homa-formula-hint-1}
+# homa_ir = (gluc_mgdl / 18.016 * ins_uiu) / 22.5
+```
+
+```{r ex-homa-formula-solution}
+gluc_mgdl <- 118
+ins_uiu   <- 22
+
+homa_ir <- (gluc_mgdl / 18.016 * ins_uiu) / 22.5
+cat("HOMA-IR =", round(homa_ir, 2))
+```
+
+### Quiz — HOMA-IR Formula
+
+```{r homa-quiz-1, echo=FALSE}
+quiz(caption = "HOMA-IR Fundamentals",
+  question("A subject has fasting glucose = 126 mg/dL and fasting insulin = 15 μIU/mL. What is HOMA-IR (rounded to 2 dp)?",
+    answer("7.87"),
+    answer("4.66", correct = TRUE,
+           message = "Correct! HOMA-IR = (126/18.016 × 15) / 22.5 = (6.994 × 15) / 22.5 ≈ 4.66."),
+    answer("10.50"),
+    answer("2.33"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("Why does the Friedewald LDL equation become invalid when TG ≥ 400 mg/dL?",
+    answer("The HDL assay is unreliable at high TG levels"),
+    answer("VLDL-C is no longer well approximated by TG/5 at very high TG concentrations",
+           correct = TRUE,
+           message = "Friedewald assumes VLDL-C ≈ TG/5. At TG ≥ 400 mg/dL, VLDL particles change composition and this approximation breaks down, causing LDL to be underestimated."),
+    answer("Total cholesterol measurement is affected by triglycerides"),
+    answer("The formula was derived only for subjects with TG < 200 mg/dL"),
+    allow_retry = TRUE
+  )
+)
+```
+
+### Practice — Derive HOMA-IR
+
+```{r homa-derive, exercise=TRUE, exercise.lines=14}
+# baseline_labs has one row per subject with columns:
+# GLUC_BASE (mg/dL), INS_BASE (μIU/mL), plus SEX, ARMCD, BMIBL ...
+
+# Step 1: Use derive_var_homa_ir() to compute HOMA-IR at baseline
+# The function accepts gluc_var and ins_var arguments.
+# Our columns are named GLUC_BASE and INS_BASE.
+
+homa_baseline <- baseline_labs |>
+  derive_var_homa_ir(
+    gluc_var = ___,
+    ins_var  = ___,
+    new_var  = HOMAIR
+  )
+
+# Step 2: Report mean HOMA-IR by treatment arm
+homa_baseline |>
+  group_by(ARMCD) |>
+  summarise(mean_HOMAIR = round(mean(HOMAIR, na.rm = TRUE), 2),
+            n = n())
+```
+
+```{r homa-derive-hint-1}
+# gluc_var should point to the baseline glucose column
+# ins_var  should point to the baseline insulin column
+```
+
+```{r homa-derive-solution}
+homa_baseline <- baseline_labs |>
+  derive_var_homa_ir(
+    gluc_var = GLUC_BASE,
+    ins_var  = INS_BASE,
+    new_var  = HOMAIR
+  )
+
+homa_baseline |>
+  group_by(ARMCD) |>
+  summarise(mean_HOMAIR = round(mean(HOMAIR, na.rm = TRUE), 2),
+            n = n())
+```
+
+### Practice — Manual HOMA-IR and CHG
+
+```{r homa-chg, exercise=TRUE, exercise.lines=18}
+# adlb_meta has longitudinal lab values (long format).
+# Create a wide-per-visit dataset for GLUC and INS,
+# then compute HOMA-IR at each visit and derive CHG from baseline.
+
+homa_wide <- adlb_meta |>
+  filter(PARAMCD %in% c("GLUC","INS")) |>
+  select(USUBJID, VISIT, VISITNUM, PARAMCD, AVAL, BASE, ARMCD) |>
+  pivot_wider(names_from = PARAMCD, values_from = c(AVAL, BASE)) |>
+  derive_var_homa_ir(
+    gluc_var = ___,    # AVAL column for glucose (AVAL_GLUC)
+    ins_var  = ___,    # AVAL column for insulin  (AVAL_INS)
+    new_var  = HOMAIR
+  ) |>
+  mutate(
+    HOMAIR_BASE = (___ / 18.016 * ___) / 22.5,   # baseline HOMA-IR
+    HOMAIR_CHG  = round(HOMAIR - HOMAIR_BASE, 2)
+  )
+
+# Mean HOMA-IR change at Week 72 by arm
+homa_wide |>
+  filter(VISIT == "WEEK 72") |>
+  group_by(ARMCD) |>
+  summarise(mean_chg = round(mean(HOMAIR_CHG, na.rm=TRUE), 2))
+```
+
+```{r homa-chg-hint-1}
+# After pivot_wider the glucose AVAL becomes AVAL_GLUC
+# and insulin AVAL becomes AVAL_INS.
+# Similarly the BASE columns become BASE_GLUC and BASE_INS.
+```
+
+```{r homa-chg-solution}
+homa_wide <- adlb_meta |>
+  filter(PARAMCD %in% c("GLUC","INS")) |>
+  select(USUBJID, VISIT, VISITNUM, PARAMCD, AVAL, BASE, ARMCD) |>
+  pivot_wider(names_from = PARAMCD, values_from = c(AVAL, BASE)) |>
+  derive_var_homa_ir(
+    gluc_var = AVAL_GLUC,
+    ins_var  = AVAL_INS,
+    new_var  = HOMAIR
+  ) |>
+  mutate(
+    HOMAIR_BASE = (BASE_GLUC / 18.016 * BASE_INS) / 22.5,
+    HOMAIR_CHG  = round(HOMAIR - HOMAIR_BASE, 2)
+  )
+
+homa_wide |>
+  filter(VISIT == "WEEK 72") |>
+  group_by(ARMCD) |>
+  summarise(mean_chg = round(mean(HOMAIR_CHG, na.rm=TRUE), 2))
+```
+
+---
+
+## Section 2 — Lipid Panel: Friedewald LDL-C
+
+The **Friedewald equation** calculates LDL-C indirectly from three directly measured lipid values:
+
+$$\text{LDL-C} = \text{Total Cholesterol} - \text{HDL-C} - \frac{\text{Triglycerides}}{5}$$
+
+This approximation relies on VLDL-C ≈ TG/5. When TG ≥ 400 mg/dL, the approximation fails and LDL-C must be measured directly or flagged as missing.
+
+> **Gotcha:** Always check `TRIG` before accepting a Friedewald LDL. The `derive_var_ldlc_friedewald()` function returns `NA` automatically when TG ≥ the specified limit.
+
+**Non-HDL Cholesterol** = Total Cholesterol − HDL-C. This is an alternative lipid target that captures all atherogenic particles (LDL + VLDL + IDL) and does *not* require fasting.
+
+### Practice — Manual Friedewald Calculation
+
+```{r ex-friedewald-manual, exercise=TRUE, exercise.lines=14}
+# Friedewald: LDL = CHOL - HDL - TG/5  (valid only when TG < 400)
+# Apply this manually to lipid_wide at BASELINE.
+# Set LDL_CALC = NA when TG >= 400.
+
+lipid_wide |>
+  filter(VISIT == "BASELINE") |>
+  mutate(
+    LDL_CALC = if_else(
+      ___ < 400,
+      round(CHOL - HDLC - ___ / 5, 1),
+      NA_real_
+    )
+  ) |>
+  select(USUBJID, CHOL, HDLC, TRIG, LDL_CALC, ARMCD) |>
+  head(8)
+```
+
+```{r ex-friedewald-manual-hint-1}
+# Condition: TRIG < 400
+# Formula: CHOL - HDLC - TRIG / 5
+```
+
+```{r ex-friedewald-manual-solution}
+lipid_wide |>
+  filter(VISIT == "BASELINE") |>
+  mutate(
+    LDL_CALC = if_else(
+      TRIG < 400,
+      round(CHOL - HDLC - TRIG / 5, 1),
+      NA_real_
+    )
+  ) |>
+  select(USUBJID, CHOL, HDLC, TRIG, LDL_CALC, ARMCD) |>
+  head(8)
+```
+
+### Practice — Derive LDL-C and Non-HDL-C
+
+```{r ldl-derive, exercise=TRUE, exercise.lines=18}
+# lipid_wide has columns: USUBJID, VISIT, VISITNUM, CHOL, HDLC, TRIG, LDL, ARMCD
+# LDL is the "directly measured" value in our dataset.
+# Derive LDL_CALC (Friedewald) and NON_HDLC, then compare LDL vs LDL_CALC.
+
+lipid_derived <- lipid_wide |>
+  derive_var_ldlc_friedewald(
+    chol_var = ___,
+    hdl_var  = ___,
+    trig_var = ___,
+    new_var  = LDL_CALC,
+    trig_limit = 400
+  ) |>
+  derive_var_non_hdlc(
+    chol_var = CHOL,
+    hdl_var  = HDLC,
+    new_var  = NON_HDLC
+  )
+
+# How many rows have TG >= 400 (Friedewald invalid)?
+lipid_derived |>
+  summarise(
+    n_total       = n(),
+    n_trig_hi     = sum(TRIG >= 400, na.rm = TRUE),
+    n_ldl_missing = sum(is.na(LDL_CALC))
+  )
+```
+
+```{r ldl-derive-hint-1}
+# The column names in lipid_wide are CHOL, HDLC, TRIG (from pivot_wider).
+```
+
+```{r ldl-derive-solution}
+lipid_derived <- lipid_wide |>
+  derive_var_ldlc_friedewald(
+    chol_var   = CHOL,
+    hdl_var    = HDLC,
+    trig_var   = TRIG,
+    new_var    = LDL_CALC,
+    trig_limit = 400
+  ) |>
+  derive_var_non_hdlc(
+    chol_var = CHOL,
+    hdl_var  = HDLC,
+    new_var  = NON_HDLC
+  )
+
+lipid_derived |>
+  summarise(
+    n_total       = n(),
+    n_trig_hi     = sum(TRIG >= 400, na.rm = TRUE),
+    n_ldl_missing = sum(is.na(LDL_CALC))
+  )
+```
+
+### Practice — LDL Category and Change
+
+```{r ldl-cat, exercise=TRUE, exercise.lines=20}
+# Classify LDL_CALC into NCEP ATP-III categories using derive_var_ldl_cat().
+# Then compute the shift from baseline LDL category to Week 72 LDL category.
+
+# Step 1: Classify
+lipid_cat <- lipid_derived |>
+  derive_var_ldl_cat(ldl_var = ___, new_var = LDLCAT)
+
+# Step 2: Baseline and W72 categories side by side
+ldl_shift <- lipid_cat |>
+  filter(VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, LDLCAT, ARMCD) |>
+  pivot_wider(names_from = VISIT, values_from = LDLCAT,
+              names_repair = "universal") |>
+  rename(LDLCAT_BASE = BASELINE, LDLCAT_W72 = WEEK.72)
+
+# Count shift combinations by arm
+ldl_shift |>
+  count(ARMCD, LDLCAT_BASE, LDLCAT_W72, sort = TRUE)
+```
+
+```{r ldl-cat-hint-1}
+# LDL_CALC is the Friedewald-derived variable.
+# Use ldl_var = LDL_CALC in derive_var_ldl_cat().
+```
+
+```{r ldl-cat-solution}
+lipid_cat <- lipid_derived |>
+  derive_var_ldl_cat(ldl_var = LDL_CALC, new_var = LDLCAT)
+
+ldl_shift <- lipid_cat |>
+  filter(VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, LDLCAT, ARMCD) |>
+  pivot_wider(names_from = VISIT, values_from = LDLCAT,
+              names_repair = "universal") |>
+  rename(LDLCAT_BASE = BASELINE, LDLCAT_W72 = WEEK.72)
+
+ldl_shift |>
+  count(ARMCD, LDLCAT_BASE, LDLCAT_W72, sort = TRUE)
+```
+
+---
+
+## Section 3 — Glycaemic Endpoints: HbA1c
+
+**HbA1c** (glycated haemoglobin) reflects average plasma glucose over ~90 days. It is the cornerstone endpoint for glycaemic control in T2DM and a key secondary endpoint in NASH trials (given the strong T2DM comorbidity).
+
+ADA 2024 category thresholds:
+
+| Range | Category |
+|-------|----------|
+| < 5.7% | Normal |
+| 5.7–<6.5% | Prediabetes |
+| ≥ 6.5% | Diabetes diagnostic threshold |
+| < 7.0% | ADA glycaemic target (for known T2DM) |
+
+A clinically meaningful HbA1c reduction is generally ≥ 0.5 percentage points.
+
+### Practice — Manual HbA1c Categories
+
+```{r ex-hba1c-manual, exercise=TRUE, exercise.lines=16}
+# Apply ADA HbA1c categories manually using case_when.
+# Thresholds: <5.7 Normal; 5.7-<6.5 Prediabetes; 6.5-<7.0 Diabetes-at-target;
+#             7.0-<8.0 Diabetes-acceptable; >=8.0 Diabetes-above-target.
+
+adlb_meta |>
+  filter(PARAMCD == "HBA1C", VISIT == "WEEK 72") |>
+  mutate(
+    HBA1CCAT = case_when(
+      AVAL <  5.7 ~ "Normal (<5.7%)",
+      AVAL <  6.5 ~ ___,
+      AVAL <  7.0 ~ ___,
+      AVAL <  8.0 ~ "Diabetes - Acceptable (7.0-<8.0%)",
+      TRUE        ~ "Diabetes - Above target (>=8.0%)"
+    )
+  ) |>
+  count(ARMCD, HBA1CCAT) |>
+  arrange(ARMCD, HBA1CCAT)
+```
+
+```{r ex-hba1c-manual-hint-1}
+# 5.7-<6.5: "Prediabetes (5.7-<6.5%)"
+# 6.5-<7.0: "Diabetes - At target (<7.0%)"
+```
+
+```{r ex-hba1c-manual-solution}
+adlb_meta |>
+  filter(PARAMCD == "HBA1C", VISIT == "WEEK 72") |>
+  mutate(
+    HBA1CCAT = case_when(
+      AVAL < 5.7 ~ "Normal (<5.7%)",
+      AVAL < 6.5 ~ "Prediabetes (5.7-<6.5%)",
+      AVAL < 7.0 ~ "Diabetes - At target (<7.0%)",
+      AVAL < 8.0 ~ "Diabetes - Acceptable (7.0-<8.0%)",
+      TRUE       ~ "Diabetes - Above target (>=8.0%)"
+    )
+  ) |>
+  count(ARMCD, HBA1CCAT) |>
+  arrange(ARMCD, HBA1CCAT)
+```
+
+### Quiz — HbA1c
+
+```{r hba1c-quiz, echo=FALSE}
+quiz(caption = "HbA1c Endpoints",
+  question("A subject with T2DM achieves HbA1c = 6.8% at Week 72 vs 8.2% at baseline. Which statement is TRUE?",
+    answer("The subject has achieved the ADA target of < 7.0%", correct = TRUE),
+    answer("The subject is now classified as prediabetes"),
+    answer("The reduction of 1.4 pp is not considered clinically meaningful"),
+    answer("HbA1c < 7.0% means T2DM has resolved"),
+    allow_retry = TRUE
+  ),
+  question("In NASH trials, why is HbA1c collected even when patients do not have diabetes?",
+    answer("Regulatory requirement for all Phase IIb trials"),
+    answer("NASH and insulin resistance are tightly linked; HbA1c tracks metabolic improvement",
+           correct = TRUE),
+    answer("HbA1c predicts liver fibrosis stage"),
+    answer("To ensure blinding is maintained"),
+    allow_retry = TRUE
+  )
+)
+```
+
+### Practice — HbA1c Categories and Responders
+
+```{r hba1c-cat, exercise=TRUE, exercise.lines=20}
+# adlb_meta filtered to PARAMCD == "HBA1C" contains longitudinal HbA1c.
+# 1. Classify each observation into ADA category using derive_var_hba1c_cat().
+# 2. Flag subjects who achieve HbA1c < 7.0% at Week 72 (among DIABFL == "Y").
+
+hba1c_data <- adlb_meta |>
+  filter(PARAMCD == "HBA1C") |>
+  derive_var_hba1c_cat(hba1c_var = ___, new_var = HBA1CCAT)
+
+# Proportion in each category at baseline vs Week 72 by arm
+hba1c_data |>
+  filter(VISIT %in% c("BASELINE","WEEK 72")) |>
+  count(ARMCD, VISIT, HBA1CCAT) |>
+  group_by(ARMCD, VISIT) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+```{r hba1c-cat-hint-1}
+# The AVAL column contains the HbA1c value — pass hba1c_var = AVAL.
+```
+
+```{r hba1c-cat-solution}
+hba1c_data <- adlb_meta |>
+  filter(PARAMCD == "HBA1C") |>
+  derive_var_hba1c_cat(hba1c_var = AVAL, new_var = HBA1CCAT)
+
+hba1c_data |>
+  filter(VISIT %in% c("BASELINE","WEEK 72")) |>
+  count(ARMCD, VISIT, HBA1CCAT) |>
+  group_by(ARMCD, VISIT) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+---
+
+## Section 4 — Liver Histology: NAS Score and Fibrosis Stage
+
+The **NAFLD Activity Score (NAS)** is the primary histological endpoint in NASH trials. It is a sum of three independent components scored by a pathologist:
+
+| Component | Range | Description |
+|-----------|-------|-------------|
+| Steatosis | 0–3 | < 5% / 5–33% / 33–66% / > 66% hepatocyte involvement |
+| Lobular inflammation | 0–3 | Foci per 20× field |
+| Hepatocyte ballooning | 0–2 | None / few / many |
+| **NAS Total** | **0–8** | ≥ 4 required for NASH diagnosis |
+
+**Fibrosis stage** (Kleiner system) is a *separate* but equally important endpoint:
+
+| Stage | Description |
+|-------|-------------|
+| 0 | No fibrosis |
+| 1 | Perisinusoidal or periportal fibrosis |
+| 2 | Perisinusoidal + periportal fibrosis |
+| 3 | Bridging fibrosis |
+| 4 | Cirrhosis |
+
+> **Key concept:** NAS and fibrosis stage are *not* the same axis. Fibrosis tends to improve more slowly than NAS. The primary composite endpoint typically requires *both* NAS improvement *and* fibrosis non-worsening (or fibrosis improvement alone).
+
+### Practice — Verify NAS Composite Score
+
+```{r ex-nas-composite, exercise=TRUE, exercise.lines=16}
+# NAS = Steatosis (0-3) + Lobular Inflammation (0-3) + Ballooning (0-2)
+# biopsy_rows (long format) has all three component scores at BASELINE and WEEK 72.
+# Verify NAS_TOTAL is correctly computed as the sum of components.
+
+biopsy_rows |>
+  mutate(
+    NAS_CHECK = ___ + ___ + ___   # Steat + Inflam + Balloon
+  ) |>
+  mutate(NAS_MATCH = NAS_TOTAL == NAS_CHECK) |>
+  summarise(
+    all_match = all(NAS_MATCH),
+    n_rows    = n()
+  )
+```
+
+```{r ex-nas-composite-hint-1}
+# NAS_CHECK = NAS_STEAT + NAS_INFLAM + NAS_BALLOON
+```
+
+```{r ex-nas-composite-solution}
+biopsy_rows |>
+  mutate(NAS_CHECK = NAS_STEAT + NAS_INFLAM + NAS_BALLOON) |>
+  mutate(NAS_MATCH = NAS_TOTAL == NAS_CHECK) |>
+  summarise(
+    all_match = all(NAS_MATCH),
+    n_rows    = n()
+  )
+```
+
+### Quiz — Histological Endpoints
+
+```{r biopsy-quiz, echo=FALSE}
+quiz(caption = "NASH Histology",
+  question("A subject has NAS 6 at baseline (steatosis 2, inflammation 2, ballooning 2) and NAS 3 at Week 72 (steatosis 1, inflammation 1, ballooning 1). Fibrosis stage goes from 2 → 2. Are they a primary endpoint responder?",
+    answer("Yes — NAS dropped ≥ 2 points with no fibrosis worsening",
+           correct = TRUE,
+           message = "NAS change = 6−3 = 3 ≥ 2, and fibrosis did not worsen (2→2 = no change). This satisfies criterion 1."),
+    answer("No — fibrosis did not improve"),
+    answer("No — ballooning must reach 0 for NASH resolution"),
+    answer("Yes, but only if NAS drops to ≤ 2"),
+    allow_retry = TRUE
+  ),
+  question("Which two biopsy timepoints are standard in Phase IIb NASH trials?",
+    answer("Screening and Week 24"),
+    answer("Baseline (Week 0) and end-of-treatment (e.g., Week 72)",
+           correct = TRUE),
+    answer("Week 12 and Week 52"),
+    answer("Screening and Week 52"),
+    allow_retry = TRUE
+  )
+)
+```
+
+### Practice — NAS Response Flag
+
+```{r nash-resp, exercise=TRUE, exercise.lines=20}
+# biopsy_response is a wide data frame with one row per subject.
+# Columns: USUBJID, ARMCD,
+#          NAS_TOTAL_BASELINE, NAS_TOTAL_WEEK 72,
+#          FIB_STAGE_BASELINE, FIB_STAGE_WEEK 72
+
+# Use derive_var_nash_responder() to create NASHRSFL.
+# Then use derive_var_fib_improvement() to create FIBIMPFL.
+# Report response rates by arm.
+
+biopsy_flagged <- biopsy_response |>
+  derive_var_nash_responder(
+    nas_base = ___,
+    nas_post = `NAS_TOTAL_WEEK 72`,
+    fib_base = ___,
+    fib_post = `FIB_STAGE_WEEK 72`,
+    new_var  = NASHRSFL
+  ) |>
+  derive_var_fib_improvement(
+    fib_base = ___,
+    fib_post = `FIB_STAGE_WEEK 72`,
+    new_var  = FIBIMPFL
+  )
+
+biopsy_flagged |>
+  group_by(ARMCD) |>
+  summarise(
+    n_total   = n(),
+    nash_resp = sum(NASHRSFL == "Y"),
+    fib_impr  = sum(FIBIMPFL == "Y"),
+    pct_nash  = round(100 * nash_resp / n_total, 1),
+    pct_fib   = round(100 * fib_impr  / n_total, 1)
+  )
+```
+
+```{r nash-resp-hint-1}
+# Column names with spaces need backtick quoting: `NAS_TOTAL_WEEK 72`
+# For nas_base and fib_base use the BASELINE-suffix columns.
+```
+
+```{r nash-resp-solution}
+biopsy_flagged <- biopsy_response |>
+  derive_var_nash_responder(
+    nas_base = NAS_TOTAL_BASELINE,
+    nas_post = `NAS_TOTAL_WEEK 72`,
+    fib_base = FIB_STAGE_BASELINE,
+    fib_post = `FIB_STAGE_WEEK 72`,
+    new_var  = NASHRSFL
+  ) |>
+  derive_var_fib_improvement(
+    fib_base = FIB_STAGE_BASELINE,
+    fib_post = `FIB_STAGE_WEEK 72`,
+    new_var  = FIBIMPFL
+  )
+
+biopsy_flagged |>
+  group_by(ARMCD) |>
+  summarise(
+    n_total   = n(),
+    nash_resp = sum(NASHRSFL == "Y"),
+    fib_impr  = sum(FIBIMPFL == "Y"),
+    pct_nash  = round(100 * nash_resp / n_total, 1),
+    pct_fib   = round(100 * fib_impr  / n_total, 1)
+  )
+```
+
+### Practice — NAS Resolution
+
+```{r nas-resol, exercise=TRUE, exercise.lines=12}
+# NAS resolution is defined as post-treatment NAS ≤ 1.
+# Use derive_var_nas_resolution() on biopsy_response.
+# Compare NAS resolution rate across arms.
+
+biopsy_resol <- biopsy_response |>
+  derive_var_nas_resolution(
+    nas_post = `NAS_TOTAL_WEEK 72`,
+    new_var  = NASRESFL
+  )
+
+biopsy_resol |>
+  group_by(ARMCD) |>
+  summarise(
+    n = n(),
+    n_resolved = sum(NASRESFL == "Y"),
+    pct = round(100 * n_resolved / n, 1)
+  )
+```
+
+```{r nas-resol-solution}
+biopsy_resol <- biopsy_response |>
+  derive_var_nas_resolution(
+    nas_post = `NAS_TOTAL_WEEK 72`,
+    new_var  = NASRESFL
+  )
+
+biopsy_resol |>
+  group_by(ARMCD) |>
+  summarise(
+    n = n(),
+    n_resolved = sum(NASRESFL == "Y"),
+    pct = round(100 * n_resolved / n, 1)
+  )
+```
+
+---
+
+## Section 5 — Metabolic Syndrome and Weight Loss
+
+### Composite Metabolic Syndrome Flag
+
+ATP-III defines **metabolic syndrome** as ≥ 3 of these 5 criteria present simultaneously:
+
+1. Abdominal obesity: waist circumference > 102 cm (M) / > 88 cm (F) — proxied here by BMI ≥ 30
+2. Triglycerides ≥ 150 mg/dL
+3. HDL-C < 40 mg/dL (M) / < 50 mg/dL (F)
+4. Blood pressure ≥ 130/85 mmHg (proxied by `HTNFL = "Y"`)
+5. Fasting glucose ≥ 100 mg/dL
+
+The function `derive_var_metsyn()` evaluates all five and sets the flag.
+
+### Practice — Manual Metabolic Syndrome Flag
+
+```{r ex-metsyn-manual, exercise=TRUE, exercise.lines=22}
+# ATP-III metabolic syndrome: 3 of 5 criteria present.
+# Criteria in baseline_labs:
+#   1. BMIBL >= 30 (abdominal obesity proxy)
+#   2. TRIG_BASE >= 150
+#   3. HDLC_BASE < 40 (M) or < 50 (F)
+#   4. HTNFL == "Y"
+#   5. GLUC_BASE >= 100
+
+baseline_labs |>
+  mutate(
+    c_obesity = BMIBL >= 30,
+    c_trig    = TRIG_BASE >= 150,
+    c_hdl     = if_else(SEX == "M", HDLC_BASE < 40, HDLC_BASE < 50),
+    c_bp      = HTNFL == "Y",
+    c_gluc    = ___ >= 100,
+    N_CRIT    = c_obesity + c_trig + c_hdl + c_bp + c_gluc,
+    METSYNFL  = if_else(N_CRIT >= ___, "Y", "N")
+  ) |>
+  count(ARMCD, METSYNFL) |>
+  group_by(ARMCD) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+```{r ex-metsyn-manual-hint-1}
+# c_gluc = GLUC_BASE >= 100
+# METSYNFL: N_CRIT >= 3
+```
+
+```{r ex-metsyn-manual-solution}
+baseline_labs |>
+  mutate(
+    c_obesity = BMIBL >= 30,
+    c_trig    = TRIG_BASE >= 150,
+    c_hdl     = if_else(SEX == "M", HDLC_BASE < 40, HDLC_BASE < 50),
+    c_bp      = HTNFL == "Y",
+    c_gluc    = GLUC_BASE >= 100,
+    N_CRIT    = c_obesity + c_trig + c_hdl + c_bp + c_gluc,
+    METSYNFL  = if_else(N_CRIT >= 3, "Y", "N")
+  ) |>
+  count(ARMCD, METSYNFL) |>
+  group_by(ARMCD) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+### Practice — Metabolic Syndrome Flag
+
+```{r metsyn-derive, exercise=TRUE, exercise.lines=20}
+# baseline_labs has: BMIBL, TRIG_BASE, HDLC_BASE, GLUC_BASE, HTNFL, SEX, ARMCD
+
+metsyn_data <- baseline_labs |>
+  derive_var_metsyn(
+    bmi_var  = ___,
+    trig_var = ___,
+    hdl_var  = ___,
+    gluc_var = ___,
+    htn_var  = ___,
+    sex_var  = SEX,
+    new_var  = METSYNFL
+  )
+
+# What proportion of subjects meet metabolic syndrome criteria?
+metsyn_data |>
+  group_by(ARMCD) |>
+  summarise(
+    n_total  = n(),
+    n_metsyn = sum(METSYNFL == "Y"),
+    pct      = round(100 * n_metsyn / n_total, 1)
+  )
+```
+
+```{r metsyn-derive-hint-1}
+# Check the column names in baseline_labs:
+# BMIBL, TRIG_BASE, HDLC_BASE, GLUC_BASE, HTNFL
+```
+
+```{r metsyn-derive-solution}
+metsyn_data <- baseline_labs |>
+  derive_var_metsyn(
+    bmi_var  = BMIBL,
+    trig_var = TRIG_BASE,
+    hdl_var  = HDLC_BASE,
+    gluc_var = GLUC_BASE,
+    htn_var  = HTNFL,
+    sex_var  = SEX,
+    new_var  = METSYNFL
+  )
+
+metsyn_data |>
+  group_by(ARMCD) |>
+  summarise(
+    n_total  = n(),
+    n_metsyn = sum(METSYNFL == "Y"),
+    pct      = round(100 * n_metsyn / n_total, 1)
+  )
+```
+
+### Practice — Weight Loss Categories
+
+Weight loss is both a **primary mediator** (GLP-1 RAs reduce liver fat via weight reduction) and a **safety signal** (excessive weight loss in cirrhotic patients is a concern).
+
+```{r wt-loss-cat, exercise=TRUE, exercise.lines=20}
+# wt_rows_meta has PARAMCD == "WEIGHT", with CHG and PCHG already derived.
+# The PCHG column is negative for weight loss (convention: PCHG = (post−base)/base × 100).
+# Flip sign so positive = loss.
+
+wt_final <- wt_rows_meta |>
+  filter(VISIT == "WEEK 72") |>
+  mutate(PCHG_LOSS = -PCHG) |>   # positive = weight loss
+  derive_var_wt_loss_cat(pchg_var = ___, new_var = WTLSSCAT)
+
+wt_final |>
+  count(ARMCD, WTLSSCAT) |>
+  group_by(ARMCD) |>
+  mutate(pct = round(100 * n / sum(n), 1)) |>
+  arrange(ARMCD, WTLSSCAT)
+```
+
+```{r wt-loss-cat-hint-1}
+# PCHG_LOSS is positive for subjects who lost weight (i.e., -PCHG when PCHG < 0).
+# Pass pchg_var = PCHG_LOSS.
+```
+
+```{r wt-loss-cat-solution}
+wt_final <- wt_rows_meta |>
+  filter(VISIT == "WEEK 72") |>
+  mutate(PCHG_LOSS = -PCHG) |>
+  derive_var_wt_loss_cat(pchg_var = PCHG_LOSS, new_var = WTLSSCAT)
+
+wt_final |>
+  count(ARMCD, WTLSSCAT) |>
+  group_by(ARMCD) |>
+  mutate(pct = round(100 * n / sum(n), 1)) |>
+  arrange(ARMCD, WTLSSCAT)
+```
+
+---
+
+## Section 6 — Liver Enzyme Trends (ALT/AST/GGT)
+
+In NASH trials, liver enzyme normalisation is a secondary endpoint. ALT and AST elevation is a marker of hepatocyte injury; GGT reflects biliary and oxidative stress. Normalisation thresholds vary by sex:
+
+| Analyte | Male ULN | Female ULN |
+|---------|----------|------------|
+| ALT | 40 U/L | 35 U/L |
+| AST | 40 U/L | 35 U/L |
+| GGT | 55 U/L | 38 U/L |
+
+### Practice — ALT Normalisation Rate
+
+```{r alt-norm, exercise=TRUE, exercise.lines=22}
+# adlb_meta contains ALT values over time.
+# Join SEX from adsl_meta, then flag observations where ALT is within normal limits (WNL):
+#   ALTWFL = "Y" if ALT <= ULN for sex.
+# Report % WNL at baseline and Week 72 by arm.
+
+alt_uln <- tibble(SEX = c("M","F"), ALT_ULN = c(40L, 35L))
+
+alt_norm <- adlb_meta |>
+  filter(PARAMCD == "ALT") |>
+  left_join(select(adsl_meta, USUBJID, SEX), by = "USUBJID") |>
+  left_join(___, by = "SEX") |>     # join ULN table
+  mutate(ALTWFL = if_else(___ <= ___, "Y", "N"))  # ALT <= ULN?
+
+alt_norm |>
+  filter(VISIT %in% c("BASELINE","WEEK 72")) |>
+  group_by(ARMCD, VISIT) |>
+  summarise(
+    n_wnl = sum(ALTWFL == "Y"),
+    n     = n(),
+    pct   = round(100 * n_wnl / n, 1),
+    .groups = "drop"
+  )
+```
+
+```{r alt-norm-hint-1}
+# left_join(alt_uln, by = "SEX") to attach ALT_ULN.
+# Then: ALTWFL = if_else(AVAL <= ALT_ULN, "Y", "N")
+```
+
+```{r alt-norm-solution}
+alt_uln <- tibble(SEX = c("M","F"), ALT_ULN = c(40L, 35L))
+
+alt_norm <- adlb_meta |>
+  filter(PARAMCD == "ALT") |>
+  left_join(select(adsl_meta, USUBJID, SEX), by = "USUBJID") |>
+  left_join(alt_uln, by = "SEX") |>
+  mutate(ALTWFL = if_else(AVAL <= ALT_ULN, "Y", "N"))
+
+alt_norm |>
+  filter(VISIT %in% c("BASELINE","WEEK 72")) |>
+  group_by(ARMCD, VISIT) |>
+  summarise(
+    n_wnl = sum(ALTWFL == "Y"),
+    n     = n(),
+    pct   = round(100 * n_wnl / n, 1),
+    .groups = "drop"
+  )
+```
+
+### Hard Challenge — AST/ALT Ratio (De Ritis Ratio)
+
+The **De Ritis ratio** (AST/ALT) provides additional histological information. Values > 1 suggest more advanced fibrosis or alcoholic hepatitis; values < 1 are typical of NASH and viral hepatitis.
+
+```{r deritis, exercise=TRUE, exercise.lines=24}
+# Compute AST/ALT ratio at each visit for each subject.
+# Flag subjects whose ratio crosses from <1 to >=1 between baseline and Week 72
+# (suggesting worsening histological pattern despite treatment).
+
+deritis <- adlb_meta |>
+  filter(PARAMCD %in% c("ALT","AST")) |>
+  select(USUBJID, VISIT, VISITNUM, PARAMCD, AVAL, ARMCD) |>
+  pivot_wider(names_from = PARAMCD, values_from = AVAL) |>
+  mutate(DERITIS = round(AST / ALT, 3)) |>
+  group_by(USUBJID) |>
+  mutate(
+    DERITIS_BASE = DERITIS[VISIT == "BASELINE"][1],
+    DERITIS_W72  = DERITIS[VISIT == "WEEK 72"][1],
+    # Flag: ratio was <1 at baseline but >=1 at W72 (worsening pattern)
+    DERITIS_WORSE = DERITIS_BASE < 1 & DERITIS_W72 >= 1
+  ) |>
+  ungroup()
+
+# Summarise: how many subjects show this worsening pattern?
+deritis |>
+  filter(VISIT == "WEEK 72") |>
+  group_by(ARMCD) |>
+  summarise(
+    n = n(),
+    n_worse = sum(DERITIS_WORSE, na.rm = TRUE),
+    median_ratio_base = round(median(DERITIS_BASE, na.rm=TRUE), 2),
+    median_ratio_w72  = round(median(DERITIS_W72,  na.rm=TRUE), 2)
+  )
+```
+
+```{r deritis-solution}
+deritis <- adlb_meta |>
+  filter(PARAMCD %in% c("ALT","AST")) |>
+  select(USUBJID, VISIT, VISITNUM, PARAMCD, AVAL, ARMCD) |>
+  pivot_wider(names_from = PARAMCD, values_from = AVAL) |>
+  mutate(DERITIS = round(AST / ALT, 3)) |>
+  group_by(USUBJID) |>
+  mutate(
+    DERITIS_BASE  = DERITIS[VISIT == "BASELINE"][1],
+    DERITIS_W72   = DERITIS[VISIT == "WEEK 72"][1],
+    DERITIS_WORSE = DERITIS_BASE < 1 & DERITIS_W72 >= 1
+  ) |>
+  ungroup()
+
+deritis |>
+  filter(VISIT == "WEEK 72") |>
+  group_by(ARMCD) |>
+  summarise(
+    n = n(),
+    n_worse = sum(DERITIS_WORSE, na.rm = TRUE),
+    median_ratio_base = round(median(DERITIS_BASE, na.rm=TRUE), 2),
+    median_ratio_w72  = round(median(DERITIS_W72,  na.rm=TRUE), 2)
+  )
+```
+
+---
+
+## Section 7 — Hard Challenges
+
+### Hard Challenge 1 — Composite Metabolic Score
+
+Build a **Composite Metabolic Improvement Score (CMIS)** that counts the number of metabolic improvements a subject achieves from baseline to Week 72. Criteria:
+
+- HbA1c reduction ≥ 0.5 percentage points
+- HOMA-IR reduction ≥ 15%
+- LDL-C reduction ≥ 10%
+- Triglycerides reduction ≥ 20%
+- Body weight reduction ≥ 5%
+
+Score each criterion 1 point; sum to CMIS (0–5). Subjects with CMIS ≥ 3 are considered **comprehensive metabolic responders**.
+
+```{r cmis, exercise=TRUE, exercise.lines=50}
+# Step 1: Compute baseline and W72 values for each subject across parameters
+hba1c_bl_w72 <- adlb_meta |>
+  filter(PARAMCD == "HBA1C", VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, AVAL) |>
+  pivot_wider(names_from=VISIT, values_from=AVAL,names_repair="universal") |>
+  rename(HBA1C_BL=BASELINE, HBA1C_W72=WEEK.72) |>
+  mutate(HBA1C_RESP = (HBA1C_BL - HBA1C_W72) >= 0.5)
+
+ldl_bl_w72 <- adlb_meta |>
+  filter(PARAMCD == "LDL", VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, AVAL) |>
+  pivot_wider(names_from=VISIT, values_from=AVAL,names_repair="universal") |>
+  rename(LDL_BL=BASELINE, LDL_W72=WEEK.72) |>
+  mutate(LDL_RESP = (LDL_BL - LDL_W72) / LDL_BL >= 0.10)
+
+trig_bl_w72 <- adlb_meta |>
+  filter(PARAMCD == "TRIG", VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, AVAL) |>
+  pivot_wider(names_from=VISIT, values_from=AVAL,names_repair="universal") |>
+  rename(TRIG_BL=BASELINE, TRIG_W72=WEEK.72) |>
+  mutate(TRIG_RESP = (TRIG_BL - TRIG_W72) / TRIG_BL >= 0.20)
+
+wt_bl_w72 <- wt_rows_meta |>
+  filter(VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, AVAL, ARMCD) |>
+  pivot_wider(names_from=VISIT, values_from=AVAL,names_repair="universal") |>
+  rename(WT_BL=BASELINE, WT_W72=WEEK.72) |>
+  mutate(WT_RESP = (WT_BL - WT_W72) / WT_BL >= 0.05)
+
+# Step 2: Build HOMA-IR baseline and W72 (using the formula directly)
+homa_bl_w72 <- adlb_meta |>
+  filter(PARAMCD %in% c("GLUC","INS"), VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, PARAMCD, AVAL) |>
+  pivot_wider(names_from=c(VISIT,PARAMCD), values_from=AVAL, names_sep="_") |>
+  mutate(
+    HOMA_BL  = (BASELINE_GLUC / 18.016 * BASELINE_INS) / 22.5,
+    HOMA_W72 = (`WEEK 72_GLUC` / 18.016 * `WEEK 72_INS`) / 22.5,
+    HOMA_RESP = (HOMA_BL - HOMA_W72) / HOMA_BL >= 0.15
+  )
+
+# Step 3: Join all criteria and compute CMIS
+cmis_data <- wt_bl_w72 |>
+  left_join(hba1c_bl_w72, by="USUBJID") |>
+  left_join(ldl_bl_w72,   by="USUBJID") |>
+  left_join(trig_bl_w72,  by="USUBJID") |>
+  left_join(select(homa_bl_w72, USUBJID, HOMA_RESP), by="USUBJID") |>
+  mutate(
+    CMIS = as.integer(WT_RESP) + as.integer(HBA1C_RESP) +
+           as.integer(LDL_RESP) + as.integer(TRIG_RESP) + as.integer(HOMA_RESP),
+    CMIS_RESP = CMIS >= 3L
+  )
+
+# Report CMIS distribution and comprehensive responder rate by arm
+cmis_data |>
+  group_by(ARMCD) |>
+  summarise(
+    n              = n(),
+    mean_cmis      = round(mean(CMIS, na.rm=TRUE), 2),
+    pct_resp       = round(100 * mean(CMIS_RESP, na.rm=TRUE), 1),
+    .groups = "drop"
+  )
+```
+
+```{r cmis-solution}
+hba1c_bl_w72 <- adlb_meta |>
+  filter(PARAMCD == "HBA1C", VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, AVAL) |>
+  pivot_wider(names_from=VISIT, values_from=AVAL, names_repair="universal") |>
+  rename(HBA1C_BL=BASELINE, HBA1C_W72=WEEK.72) |>
+  mutate(HBA1C_RESP = (HBA1C_BL - HBA1C_W72) >= 0.5)
+
+ldl_bl_w72 <- adlb_meta |>
+  filter(PARAMCD == "LDL", VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, AVAL) |>
+  pivot_wider(names_from=VISIT, values_from=AVAL, names_repair="universal") |>
+  rename(LDL_BL=BASELINE, LDL_W72=WEEK.72) |>
+  mutate(LDL_RESP = (LDL_BL - LDL_W72) / LDL_BL >= 0.10)
+
+trig_bl_w72 <- adlb_meta |>
+  filter(PARAMCD == "TRIG", VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, AVAL) |>
+  pivot_wider(names_from=VISIT, values_from=AVAL, names_repair="universal") |>
+  rename(TRIG_BL=BASELINE, TRIG_W72=WEEK.72) |>
+  mutate(TRIG_RESP = (TRIG_BL - TRIG_W72) / TRIG_BL >= 0.20)
+
+wt_bl_w72 <- wt_rows_meta |>
+  filter(VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, AVAL, ARMCD) |>
+  pivot_wider(names_from=VISIT, values_from=AVAL, names_repair="universal") |>
+  rename(WT_BL=BASELINE, WT_W72=WEEK.72) |>
+  mutate(WT_RESP = (WT_BL - WT_W72) / WT_BL >= 0.05)
+
+homa_bl_w72 <- adlb_meta |>
+  filter(PARAMCD %in% c("GLUC","INS"), VISIT %in% c("BASELINE","WEEK 72")) |>
+  select(USUBJID, VISIT, PARAMCD, AVAL) |>
+  pivot_wider(names_from=c(VISIT,PARAMCD), values_from=AVAL, names_sep="_") |>
+  mutate(
+    HOMA_BL   = (BASELINE_GLUC / 18.016 * BASELINE_INS) / 22.5,
+    HOMA_W72  = (`WEEK 72_GLUC` / 18.016 * `WEEK 72_INS`) / 22.5,
+    HOMA_RESP = (HOMA_BL - HOMA_W72) / HOMA_BL >= 0.15
+  )
+
+cmis_data <- wt_bl_w72 |>
+  left_join(hba1c_bl_w72, by="USUBJID") |>
+  left_join(ldl_bl_w72,   by="USUBJID") |>
+  left_join(trig_bl_w72,  by="USUBJID") |>
+  left_join(select(homa_bl_w72, USUBJID, HOMA_RESP), by="USUBJID") |>
+  mutate(
+    CMIS = as.integer(WT_RESP) + as.integer(HBA1C_RESP) +
+           as.integer(LDL_RESP) + as.integer(TRIG_RESP) + as.integer(HOMA_RESP),
+    CMIS_RESP = CMIS >= 3L
+  )
+
+cmis_data |>
+  group_by(ARMCD) |>
+  summarise(
+    n         = n(),
+    mean_cmis = round(mean(CMIS, na.rm=TRUE), 2),
+    pct_resp  = round(100 * mean(CMIS_RESP, na.rm=TRUE), 1),
+    .groups = "drop"
+  )
+```
+
+### Hard Challenge 2 — Mediation Analysis Proxy: Weight Loss Subgroup
+
+A common question in GLP-1 RA NASH trials: *Is the histological benefit mediated by weight loss, or is there a weight-loss-independent hepatic effect?*
+
+A standard analysis stratifies NASH responders by weight loss category (≥ 5% vs < 5%) and compares response rates within each stratum.
+
+```{r mediation, exercise=TRUE, exercise.lines=30}
+# Merge: biopsy_flagged (NASHRSFL), wt_bl_w72 (WT_RESP), ARMCD
+mediation <- biopsy_flagged |>
+  left_join(select(wt_bl_w72, USUBJID, WT_BL, WT_W72, WT_RESP), by="USUBJID") |>
+  mutate(
+    WT_LOSS_CAT = if_else(WT_RESP, ">=5% weight loss", "<5% weight loss")
+  )
+
+# NASH response rate stratified by arm AND weight loss category
+mediation |>
+  group_by(ARMCD, WT_LOSS_CAT) |>
+  summarise(
+    n          = n(),
+    n_resp     = sum(NASHRSFL == "Y"),
+    pct_resp   = round(100 * n_resp / n, 1),
+    .groups = "drop"
+  ) |>
+  arrange(ARMCD, WT_LOSS_CAT)
+```
+
+```{r mediation-solution}
+mediation <- biopsy_flagged |>
+  left_join(select(wt_bl_w72, USUBJID, WT_BL, WT_W72, WT_RESP), by="USUBJID") |>
+  mutate(WT_LOSS_CAT = if_else(WT_RESP, ">=5% weight loss", "<5% weight loss"))
+
+mediation |>
+  group_by(ARMCD, WT_LOSS_CAT) |>
+  summarise(
+    n        = n(),
+    n_resp   = sum(NASHRSFL == "Y"),
+    pct_resp = round(100 * n_resp / n, 1),
+    .groups = "drop"
+  ) |>
+  arrange(ARMCD, WT_LOSS_CAT)
+```
+
+### Hard Challenge 3 — Hy's Law Signal Detection
+
+**Hy's Law** is the FDA/EMA criterion for drug-induced liver injury (DILI) risk. A Hy's Law case requires *all three simultaneously*:
+
+- ALT or AST > 3× ULN
+- Total bilirubin > 2× ULN (TBL; not in our dataset — use ALT + AST as a composite proxy)
+- No other cause identified (cannot be assessed computationally — flag for medical review)
+
+For this exercise use a simplified criterion: **ALT > 3× ULN AND AST > 3× ULN** at the same visit.
+
+```{r hys-law, exercise=TRUE, exercise.lines=30}
+# ULN: ALT 40/35 U/L (M/F); AST 40/35 U/L (M/F)
+uln_tbl <- tibble(
+  SEX     = c("M","F"),
+  ALT_ULN = c(40L, 35L),
+  AST_ULN = c(40L, 35L)
+)
+
+hys_data <- adlb_meta |>
+  filter(PARAMCD %in% c("ALT","AST")) |>
+  select(USUBJID, VISIT, VISITNUM, PARAMCD, AVAL, ARMCD) |>
+  pivot_wider(names_from=PARAMCD, values_from=AVAL) |>
+  left_join(select(adsl_meta, USUBJID, SEX), by="USUBJID") |>
+  left_join(uln_tbl, by="SEX") |>
+  mutate(
+    ALT_3ULN = ALT > 3 * ALT_ULN,
+    AST_3ULN = AST > 3 * AST_ULN,
+    HYS_FLAG = ALT_3ULN & AST_3ULN
+  )
+
+# Subjects with ≥1 Hy's Law flagged visit, by arm
+hys_subjects <- hys_data |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(ANY_HYS = any(HYS_FLAG, na.rm=TRUE), .groups="drop")
+
+hys_subjects |>
+  group_by(ARMCD) |>
+  summarise(
+    n       = n(),
+    n_hys   = sum(ANY_HYS),
+    pct_hys = round(100 * n_hys / n, 1)
+  )
+```
+
+```{r hys-law-solution}
+uln_tbl <- tibble(SEX=c("M","F"), ALT_ULN=c(40L,35L), AST_ULN=c(40L,35L))
+
+hys_data <- adlb_meta |>
+  filter(PARAMCD %in% c("ALT","AST")) |>
+  select(USUBJID, VISIT, VISITNUM, PARAMCD, AVAL, ARMCD) |>
+  pivot_wider(names_from=PARAMCD, values_from=AVAL) |>
+  left_join(select(adsl_meta, USUBJID, SEX), by="USUBJID") |>
+  left_join(uln_tbl, by="SEX") |>
+  mutate(
+    ALT_3ULN = ALT > 3 * ALT_ULN,
+    AST_3ULN = AST > 3 * AST_ULN,
+    HYS_FLAG = ALT_3ULN & AST_3ULN
+  )
+
+hys_subjects <- hys_data |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(ANY_HYS = any(HYS_FLAG, na.rm=TRUE), .groups="drop")
+
+hys_subjects |>
+  group_by(ARMCD) |>
+  summarise(
+    n       = n(),
+    n_hys   = sum(ANY_HYS),
+    pct_hys = round(100 * n_hys / n, 1)
+  )
+```
+
+---
+
+## Section 8 — Capstone 1: Full ADLB for NASH Trial
+
+Build a production-ready **ADLB** dataset from `adlb_meta`, adding all derived variables expected for a NASH metabolic ADaM submission.
+
+Requirements:
+- All standard ADLB columns: STUDYID, USUBJID, VISIT, VISITNUM, PARAMCD, PARAM, PARAMU, AVAL, BASE, ABLFL, CHG, PCHG
+- DTYPE = NA (no imputation records in this dataset)
+- SEX from adsl_meta (needed for ULN derivation)
+- ATOXGR (NCI CTCAE grade based on ULN multiples for ALT/AST/GGT; NA for other parameters)
+- HBA1CCAT for HbA1c records
+- LDLCAT for LDL records
+- A flag HIFL = "Y" if AVAL > 2 × ULN (relevant for ALT, AST, GGT)
+
+```{r capstone-adlb, exercise=TRUE, exercise.lines=60}
+# ULN reference (simplified — use same ULN for all ages)
+uln_ref <- tribble(
+  ~PARAMCD, ~SEX, ~ULN,
+  "ALT",    "M",  40,
+  "ALT",    "F",  35,
+  "AST",    "M",  40,
+  "AST",    "F",  35,
+  "GGT",    "M",  55,
+  "GGT",    "F",  38
+)
+
+# NCI CTCAE ALT/AST grading (multiples of ULN)
+# Grade 1: >ULN–3×; Grade 2: >3–5×; Grade 3: >5–20×; Grade 4: >20×
+ctcae_grade <- function(val, uln) {
+  case_when(
+    val <= uln       ~ 0L,
+    val <= 3 * uln   ~ 1L,
+    val <= 5 * uln   ~ 2L,
+    val <= 20 * uln  ~ 3L,
+    TRUE             ~ 4L
+  )
+}
+
+adlb_final <- adlb_meta |>
+  # Join subject-level variables
+  left_join(select(adsl_meta, USUBJID, SEX), by = "USUBJID") |>
+  # Join ULN where applicable
+  left_join(___, by = c("PARAMCD","SEX")) |>
+  # HIFL: >2×ULN for liver enzymes
+  mutate(
+    HIFL = if_else(!is.na(ULN) & ___ > 2 * ULN, "Y", NA_character_)
+  ) |>
+  # ATOXGR for liver enzyme parameters
+  mutate(
+    ATOXGR = if_else(
+      PARAMCD %in% c("ALT","AST","GGT") & !is.na(ULN),
+      ctcae_grade(___, ULN),
+      NA_integer_
+    )
+  ) |>
+  # HbA1c category
+  derive_var_hba1c_cat(hba1c_var = AVAL, new_var = HBA1CCAT) |>
+  mutate(HBA1CCAT = if_else(PARAMCD == "HBA1C", HBA1CCAT, NA_character_)) |>
+  # LDL category
+  derive_var_ldl_cat(ldl_var = AVAL, new_var = LDLCAT) |>
+  mutate(LDLCAT = if_else(PARAMCD == "LDL", LDLCAT, NA_character_)) |>
+  # Standard columns only
+  select(STUDYID, USUBJID, VISIT, VISITNUM, VISITDY, ADT, ADY,
+         PARAMCD, PARAM, PARAMU, AVAL, BASE, ABLFL, CHG, PCHG,
+         HIFL, ATOXGR, HBA1CCAT, LDLCAT, SEX, ARMCD)
+
+# Spot-check: ALT rows with ATOXGR ≥ 2
+adlb_final |>
+  filter(PARAMCD == "ALT", !is.na(ATOXGR), ATOXGR >= 2) |>
+  select(USUBJID, VISIT, AVAL, ATOXGR, HIFL, ARMCD) |>
+  arrange(desc(AVAL)) |>
+  head(10)
+```
+
+```{r capstone-adlb-hint-1}
+# left_join(uln_ref, by = c("PARAMCD","SEX"))
+# HIFL: AVAL > 2 * ULN
+# ATOXGR: ctcae_grade(AVAL, ULN)
+```
+
+```{r capstone-adlb-solution}
+uln_ref <- tribble(
+  ~PARAMCD, ~SEX, ~ULN,
+  "ALT",    "M",  40,
+  "ALT",    "F",  35,
+  "AST",    "M",  40,
+  "AST",    "F",  35,
+  "GGT",    "M",  55,
+  "GGT",    "F",  38
+)
+
+ctcae_grade <- function(val, uln) {
+  case_when(
+    val <= uln       ~ 0L,
+    val <= 3 * uln   ~ 1L,
+    val <= 5 * uln   ~ 2L,
+    val <= 20 * uln  ~ 3L,
+    TRUE             ~ 4L
+  )
+}
+
+adlb_final <- adlb_meta |>
+  left_join(select(adsl_meta, USUBJID, SEX), by = "USUBJID") |>
+  left_join(uln_ref, by = c("PARAMCD","SEX")) |>
+  mutate(
+    HIFL   = if_else(!is.na(ULN) & AVAL > 2 * ULN, "Y", NA_character_),
+    ATOXGR = if_else(
+      PARAMCD %in% c("ALT","AST","GGT") & !is.na(ULN),
+      ctcae_grade(AVAL, ULN),
+      NA_integer_
+    )
+  ) |>
+  derive_var_hba1c_cat(hba1c_var = AVAL, new_var = HBA1CCAT) |>
+  mutate(HBA1CCAT = if_else(PARAMCD == "HBA1C", HBA1CCAT, NA_character_)) |>
+  derive_var_ldl_cat(ldl_var = AVAL, new_var = LDLCAT) |>
+  mutate(LDLCAT = if_else(PARAMCD == "LDL", LDLCAT, NA_character_)) |>
+  select(STUDYID, USUBJID, VISIT, VISITNUM, VISITDY, ADT, ADY,
+         PARAMCD, PARAM, PARAMU, AVAL, BASE, ABLFL, CHG, PCHG,
+         HIFL, ATOXGR, HBA1CCAT, LDLCAT, SEX, ARMCD)
+
+adlb_final |>
+  filter(PARAMCD == "ALT", !is.na(ATOXGR), ATOXGR >= 2) |>
+  select(USUBJID, VISIT, AVAL, ATOXGR, HIFL, ARMCD) |>
+  arrange(desc(AVAL)) |>
+  head(10)
+```
+
+---
+
+## Section 9 — Capstone 2: DSMB Metabolic Safety Summary
+
+Produce a **Data Safety Monitoring Board (DSMB) metabolic safety table** for the Week 48 interim analysis. This is the kind of output a clinical programmer must produce under time pressure for a live DSMB meeting.
+
+Required rows:
+1. Mean HbA1c (%) ± SD at Week 48
+2. Subjects with HbA1c ≥ 8.0% at Week 48 (n, %)
+3. Mean HOMA-IR at baseline and Week 48, with mean change
+4. Subjects with any ALT > 3× ULN during the study
+5. Subjects with any Hy's Law event (ALT + AST both > 3× ULN)
+6. Mean body weight change (kg) and % change at Week 48
+7. NASH primary endpoint response rate at Week 72 (from biopsy_flagged)
+
+```{r capstone-dsmb, exercise=TRUE, exercise.lines=70}
+# ── HbA1c rows ────────────────────────────────────────────────────────────────
+hba1c_w48 <- adlb_meta |>
+  filter(PARAMCD == "HBA1C", VISIT == "WEEK 48") |>
+  group_by(ARMCD) |>
+  summarise(
+    stat   = "Mean HbA1c at Wk48 (%)",
+    value  = paste0(round(mean(AVAL),2), " (SD ", round(sd(AVAL),2), ")"),
+    .groups = "drop"
+  )
+
+hba1c_hi_w48 <- adlb_meta |>
+  filter(PARAMCD == "HBA1C", VISIT == "WEEK 48") |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "HbA1c >= 8.0% at Wk48, n (%)",
+    value = paste0(sum(AVAL >= 8.0), " (", round(100*mean(AVAL >= 8.0),1), "%)"),
+    .groups = "drop"
+  )
+
+# ── HOMA-IR change ────────────────────────────────────────────────────────────
+homa_w48 <- adlb_meta |>
+  filter(PARAMCD %in% c("GLUC","INS"), VISIT %in% c("BASELINE","WEEK 48")) |>
+  select(USUBJID, VISIT, PARAMCD, AVAL, ARMCD) |>
+  pivot_wider(names_from=c(VISIT,PARAMCD), values_from=AVAL, names_sep="_") |>
+  mutate(
+    HOMA_BL  = (BASELINE_GLUC/18.016 * BASELINE_INS) / 22.5,
+    HOMA_W48 = (`WEEK 48_GLUC`/18.016 * `WEEK 48_INS`) / 22.5,
+    HOMA_CHG = HOMA_W48 - HOMA_BL
+  ) |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "Mean HOMA-IR change at Wk48",
+    value = paste0(round(mean(HOMA_BL,na.rm=T),2),
+                   " → ", round(mean(HOMA_W48,na.rm=T),2),
+                   " (chg: ", round(mean(HOMA_CHG,na.rm=T),2), ")"),
+    .groups = "drop"
+  )
+
+# ── ALT > 3×ULN (any visit) ──────────────────────────────────────────────────
+uln_vals <- c(M=40, F=35)
+alt_hi <- adlb_meta |>
+  filter(PARAMCD == "ALT") |>
+  left_join(select(adsl_meta, USUBJID, SEX), by="USUBJID") |>
+  mutate(ULN = uln_vals[SEX], ALT_3X = AVAL > 3 * ULN) |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(ANY_ALT3X = any(ALT_3X, na.rm=TRUE), .groups="drop") |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "Any ALT > 3xULN, n (%)",
+    value = paste0(sum(ANY_ALT3X), " (", round(100*mean(ANY_ALT3X),1), "%)"),
+    .groups = "drop"
+  )
+
+# ── Weight change at W48 ──────────────────────────────────────────────────────
+wt_w48 <- wt_rows_meta |>
+  filter(VISIT == "WEEK 48") |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "Mean weight change at Wk48 (kg, %)",
+    value = paste0(round(mean(CHG,na.rm=T),1), " kg (",
+                   round(mean(PCHG,na.rm=T),1), "%)"),
+    .groups = "drop"
+  )
+
+# ── Primary endpoint ──────────────────────────────────────────────────────────
+nash_ep <- biopsy_flagged |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "NASH primary responders at Wk72, n (%)",
+    value = paste0(sum(NASHRSFL=="Y"), " (",
+                   round(100*mean(NASHRSFL=="Y"),1), "%)"),
+    .groups = "drop"
+  )
+
+# ── Assemble DSMB table ───────────────────────────────────────────────────────
+dsmb_table <- bind_rows(
+  hba1c_w48, hba1c_hi_w48, homa_w48, alt_hi, wt_w48, nash_ep
+) |>
+  pivot_wider(names_from=ARMCD, values_from=value) |>
+  select(stat, GLP, PBO)
+
+print(dsmb_table, n=Inf)
+```
+
+```{r capstone-dsmb-solution}
+hba1c_w48 <- adlb_meta |>
+  filter(PARAMCD == "HBA1C", VISIT == "WEEK 48") |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "Mean HbA1c at Wk48 (%)",
+    value = paste0(round(mean(AVAL),2), " (SD ", round(sd(AVAL),2), ")"),
+    .groups = "drop"
+  )
+
+hba1c_hi_w48 <- adlb_meta |>
+  filter(PARAMCD == "HBA1C", VISIT == "WEEK 48") |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "HbA1c >= 8.0% at Wk48, n (%)",
+    value = paste0(sum(AVAL >= 8.0), " (", round(100*mean(AVAL >= 8.0),1), "%)"),
+    .groups = "drop"
+  )
+
+homa_w48 <- adlb_meta |>
+  filter(PARAMCD %in% c("GLUC","INS"), VISIT %in% c("BASELINE","WEEK 48")) |>
+  select(USUBJID, VISIT, PARAMCD, AVAL, ARMCD) |>
+  pivot_wider(names_from=c(VISIT,PARAMCD), values_from=AVAL, names_sep="_") |>
+  mutate(
+    HOMA_BL  = (BASELINE_GLUC/18.016 * BASELINE_INS) / 22.5,
+    HOMA_W48 = (`WEEK 48_GLUC`/18.016 * `WEEK 48_INS`) / 22.5,
+    HOMA_CHG = HOMA_W48 - HOMA_BL
+  ) |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "Mean HOMA-IR change at Wk48",
+    value = paste0(round(mean(HOMA_BL,na.rm=T),2),
+                   " → ", round(mean(HOMA_W48,na.rm=T),2),
+                   " (chg: ", round(mean(HOMA_CHG,na.rm=T),2), ")"),
+    .groups = "drop"
+  )
+
+uln_vals <- c(M=40, F=35)
+alt_hi <- adlb_meta |>
+  filter(PARAMCD == "ALT") |>
+  left_join(select(adsl_meta, USUBJID, SEX), by="USUBJID") |>
+  mutate(ULN = uln_vals[SEX], ALT_3X = AVAL > 3 * ULN) |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(ANY_ALT3X = any(ALT_3X, na.rm=TRUE), .groups="drop") |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "Any ALT > 3xULN, n (%)",
+    value = paste0(sum(ANY_ALT3X), " (", round(100*mean(ANY_ALT3X),1), "%)"),
+    .groups = "drop"
+  )
+
+wt_w48 <- wt_rows_meta |>
+  filter(VISIT == "WEEK 48") |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "Mean weight change at Wk48 (kg, %)",
+    value = paste0(round(mean(CHG,na.rm=T),1), " kg (",
+                   round(mean(PCHG,na.rm=T),1), "%)"),
+    .groups = "drop"
+  )
+
+nash_ep <- biopsy_flagged |>
+  group_by(ARMCD) |>
+  summarise(
+    stat  = "NASH primary responders at Wk72, n (%)",
+    value = paste0(sum(NASHRSFL=="Y"), " (",
+                   round(100*mean(NASHRSFL=="Y"),1), "%)"),
+    .groups = "drop"
+  )
+
+dsmb_table <- bind_rows(
+  hba1c_w48, hba1c_hi_w48, homa_w48, alt_hi, wt_w48, nash_ep
+) |>
+  pivot_wider(names_from=ARMCD, values_from=value) |>
+  select(stat, GLP, PBO)
+
+print(dsmb_table, n=Inf)
+```
+
+---
+
+## Lesson Summary
+
+```{r final-quiz, echo=FALSE}
+quiz(caption = "Lesson 24 — Final Quiz",
+  question("A NASH trial subject has NAS = 7 at baseline (fibrosis stage 2) and NAS = 5 at Week 72 (fibrosis stage 2). Are they a primary endpoint responder under the standard dual composite criterion?",
+    answer("Yes — NAS dropped ≥ 2 points"),
+    answer("No — NAS must drop to ≤ 2 for response"),
+    answer("No — NAS dropped by only 2 points and fibrosis did not improve",
+           message = "Close! The criterion is NAS drop ≥ 2 AND no worsening of fibrosis. Since fibrosis went 2→2 (no worsening), they DO qualify under criterion 1 (NAS −2 + fibrosis not worsened)."),
+    answer("Yes — NAS dropped ≥ 2 points with no worsening of fibrosis",
+           correct = TRUE),
+    allow_retry = TRUE
+  ),
+  question("The De Ritis ratio (AST/ALT) > 1 is associated with:",
+    answer("Active NASH with predominant steatosis"),
+    answer("More advanced fibrosis or alcoholic hepatitis", correct = TRUE),
+    answer("Improved glycaemic control"),
+    answer("Seroconversion to anti-HBs"),
+    allow_retry = TRUE
+  )
+)
+```
+
+### Summary Coding Exercise 1 — HOMA-IR and Friedewald Check
+
+```{r summary-homa-friedewald, exercise=TRUE, exercise.lines=20}
+# Compute HOMA-IR at BASELINE for all subjects and flag subjects where
+# the Friedewald LDL would be invalid (TG >= 400 at baseline).
+
+# Part 1: HOMA-IR at baseline
+homa_check <- baseline_labs |>
+  mutate(
+    HOMAIR = (___ / 18.016 * ___) / 22.5
+  ) |>
+  group_by(ARMCD) |>
+  summarise(mean_HOMAIR = round(mean(HOMAIR, na.rm = TRUE), 2), n = n())
+
+# Part 2: subjects with invalid Friedewald at baseline
+friedewald_invalid <- baseline_labs |>
+  filter(___ >= 400) |>
+  select(USUBJID, ARMCD, TRIG_BASE)
+
+cat("Subjects with TG >= 400 at baseline:", nrow(friedewald_invalid), "\n")
+homa_check
+```
+
+```{r summary-homa-friedewald-hint-1}
+# HOMA-IR: (GLUC_BASE / 18.016 * INS_BASE) / 22.5
+# Friedewald invalid: TRIG_BASE >= 400
+```
+
+```{r summary-homa-friedewald-solution}
+homa_check <- baseline_labs |>
+  mutate(
+    HOMAIR = (GLUC_BASE / 18.016 * INS_BASE) / 22.5
+  ) |>
+  group_by(ARMCD) |>
+  summarise(mean_HOMAIR = round(mean(HOMAIR, na.rm = TRUE), 2), n = n())
+
+friedewald_invalid <- baseline_labs |>
+  filter(TRIG_BASE >= 400) |>
+  select(USUBJID, ARMCD, TRIG_BASE)
+
+cat("Subjects with TG >= 400 at baseline:", nrow(friedewald_invalid), "\n")
+homa_check
+```
+
+### Summary Coding Exercise 2 — CTCAE Grade and MetSyn Count
+
+```{r summary-ctcae-metsyn, exercise=TRUE, exercise.lines=20}
+# 1. Count subjects with ALT CTCAE Grade >= 2 at any visit (ULN = 40 M / 35 F).
+# 2. Count subjects meeting metabolic syndrome criteria (from baseline_labs).
+
+# CTCAE: Grade 0 <= ULN, Grade 1 >ULN-3x, Grade 2 >3-5x, Grade 3 >5-20x, Grade 4 >20x
+alt_grade2_plus <- adlb_meta |>
+  filter(PARAMCD == "ALT") |>
+  left_join(select(adsl_meta, USUBJID, SEX), by = "USUBJID") |>
+  mutate(
+    ULN    = if_else(SEX == "M", 40, 35),
+    ATOXGR = case_when(
+      AVAL <= ULN      ~ 0L,
+      AVAL <= 3 * ULN  ~ 1L,
+      AVAL <= 5 * ULN  ~ ___,
+      AVAL <= 20 * ULN ~ 3L,
+      TRUE             ~ 4L
+    )
+  ) |>
+  filter(___ >= 2) |>
+  distinct(USUBJID, ARMCD) |>
+  count(ARMCD, name = "n_grade2plus")
+
+# MetSyn count
+metsyn_count <- baseline_labs |>
+  mutate(
+    N_CRIT   = (BMIBL >= 30) + (TRIG_BASE >= 150) +
+               if_else(SEX == "M", HDLC_BASE < 40, HDLC_BASE < 50) +
+               (HTNFL == "Y") + (GLUC_BASE >= 100),
+    METSYNFL = if_else(N_CRIT >= 3, "Y", "N")
+  ) |>
+  count(ARMCD, METSYNFL)
+
+list(alt_grade2plus = alt_grade2_plus, metsyn = metsyn_count)
+```
+
+```{r summary-ctcae-metsyn-hint-1}
+# ATOXGR Grade 2: AVAL <= 5 * ULN -> 2L
+# Filter: ATOXGR >= 2
+```
+
+```{r summary-ctcae-metsyn-solution}
+alt_grade2_plus <- adlb_meta |>
+  filter(PARAMCD == "ALT") |>
+  left_join(select(adsl_meta, USUBJID, SEX), by = "USUBJID") |>
+  mutate(
+    ULN    = if_else(SEX == "M", 40, 35),
+    ATOXGR = case_when(
+      AVAL <= ULN      ~ 0L,
+      AVAL <= 3 * ULN  ~ 1L,
+      AVAL <= 5 * ULN  ~ 2L,
+      AVAL <= 20 * ULN ~ 3L,
+      TRUE             ~ 4L
+    )
+  ) |>
+  filter(ATOXGR >= 2) |>
+  distinct(USUBJID, ARMCD) |>
+  count(ARMCD, name = "n_grade2plus")
+
+metsyn_count <- baseline_labs |>
+  mutate(
+    N_CRIT   = (BMIBL >= 30) + (TRIG_BASE >= 150) +
+               if_else(SEX == "M", HDLC_BASE < 40, HDLC_BASE < 50) +
+               (HTNFL == "Y") + (GLUC_BASE >= 100),
+    METSYNFL = if_else(N_CRIT >= 3, "Y", "N")
+  ) |>
+  count(ARMCD, METSYNFL)
+
+list(alt_grade2plus = alt_grade2_plus, metsyn = metsyn_count)
+```
+
+### What You Learned
+
+In this lesson you built ADaM derivations specific to **metabolic disease trials**:
+
+- **HOMA-IR** — glucose × insulin formula with mg/dL → mmol/L conversion
+- **Friedewald LDL-C** — indirect LDL calculation valid only when TG < 400 mg/dL; `NA` otherwise
+- **Non-HDL-C** — simple Total − HDL, no fasting required
+- **NAS score and fibrosis stage** — histological paired-biopsy endpoints and the dual composite NASH response definition
+- **HbA1c and LDL category flags** — ADA 2024 and NCEP ATP-III guideline thresholds
+- **Metabolic syndrome flag** — ATP-III five-criterion composite with sex-dependent HDL threshold
+- **Liver enzyme normalisation and Hy's Law** — safety flags using NCI CTCAE grading and the FDA Hy's Law criterion
+- **De Ritis ratio** — AST/ALT diagnostic ratio for histological pattern assessment
+- **Composite Metabolic Improvement Score (CMIS)** — multi-domain improvement scoring
+- **DSMB safety table** — integrated summary across glycaemia, liver enzymes, weight, and histology
+
+### Key Gotchas
+
+> **TG validity gate:** Always filter or `NA` Friedewald LDL when TG ≥ 400 mg/dL. Missing this in production code leads to erroneous LDL values in TG-high patients.
+
+> **NAS vs Fibrosis:** These are independent axes. NAS improvement alone is not sufficient for the primary NASH endpoint — fibrosis must not worsen.
+
+> **HOMA-IR units:** Glucose must be in mmol/L, not mg/dL. Forgetting the ÷18.016 conversion inflates HOMA-IR by 18-fold.
+
+> **HbA1c thresholds:** The 5.7%, 6.5%, and 7.0% thresholds serve different clinical purposes. 6.5% is the *diagnostic* threshold; 7.0% is the *treatment target* for known T2DM.
+
+---
+
+**Next lesson:** Lesson 25 — cards & cardx — ARD (Analysis Results Dataset) creation with the `cards` package: `ard_continuous()`, `ard_categorical()`, `ard_missing()`, stratified summaries, and linking ARDs to TLF shells via tfrmt.
+```

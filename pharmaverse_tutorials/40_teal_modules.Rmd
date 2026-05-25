@@ -1,0 +1,1491 @@
+---
+title: "Lesson 40 — teal: Custom Modules"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Learn to write your own teal modules. Understand the module API (ui_args /
+  server_args), accessing filtered datasets, interacting with teal.code for
+  reproducibility, and using teal.widgets helpers inside custom modules.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 40_teal_modules.Rmd
+# PURPOSE       : Custom teal module authoring — teal_module() constructor,
+#                 ui_args/server_args pattern, reactive data access
+#                 (data()[[...]]), qenv reproducibility, testServer().
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+library(learnr)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(shiny)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.eval = FALSE)
+
+# ── Pharmaverseadam datasets ────────────────────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+adsl <- adsl_raw |> mutate(
+  ITTFL  = SAFFL,
+  DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"))
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw)) {
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+}
+adae <- adae_raw |> mutate(AESEVN = case_when(
+  AESEV == "MILD"     ~ 1L, AESEV == "MODERATE" ~ 2L,
+  AESEV == "SEVERE"   ~ 3L, TRUE ~ NA_integer_))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+advs <- pharmaverseadam::advs
+
+# ── Mock teal infrastructure ────────────────────────────────────────────────
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# teal.data mocks
+cdisc_dataset <- function(dataname, x, keys = character(0), label = NULL) {
+  structure(list(dataname=dataname, data=x, keys=keys,
+                 label=label %||% dataname),
+            class=c("cdisc_dataset","teal_dataset"))
+}
+
+cdisc_data <- function(..., check = FALSE) {
+  datasets <- list(...)
+  names(datasets) <- vapply(datasets, function(d) d$dataname, character(1))
+  structure(list(datasets=datasets, check=check),
+            class=c("cdisc_data","teal_data"))
+}
+
+teal_slice <- function(dataname, varname, selected=NULL, keep_na=FALSE, ...) {
+  structure(list(dataname=dataname, varname=varname,
+                 selected=selected, keep_na=keep_na),
+            class="teal_slice")
+}
+
+teal_slices <- function(..., include_varnames=NULL, exclude_varnames=NULL) {
+  slices <- list(...)
+  structure(list(slices=slices,
+                 include_varnames=include_varnames,
+                 exclude_varnames=exclude_varnames),
+            class="teal_slices")
+}
+
+modules <- function(..., label="root") {
+  mods <- list(...)
+  if (length(mods)==1 && is.list(mods[[1]]) && !inherits(mods[[1]],"teal_module"))
+    mods <- mods[[1]]
+  structure(list(modules=mods, label=label), class="teal_modules")
+}
+
+tab_group <- function(label, ...) {
+  children <- list(...)
+  structure(list(label=label, children=children),
+            class=c("tab_group","teal_module"))
+}
+
+# ── teal_module() — the custom module constructor ───────────────────────────
+# In real teal, you call teal_module() to register your module.
+# Signature:  teal_module(label, ui, server, datanames="all", ui_args=list(), server_args=list(), ...)
+teal_module <- function(label,
+                        ui,
+                        server,
+                        datanames  = "all",
+                        ui_args    = list(),
+                        server_args = list(),
+                        ...) {
+  structure(
+    list(label       = label,
+         ui          = ui,
+         server      = server,
+         datanames   = datanames,
+         ui_args     = ui_args,
+         server_args = server_args,
+         extra       = list(...)),
+    class = c("teal_module_custom", "teal_module")
+  )
+}
+
+# print method for custom modules
+print.teal_module_custom <- function(x, ...) {
+  cat("── Custom teal Module ──────────────────────────────────\n")
+  cat("  Label:       ", x$label, "\n")
+  cat("  Datanames:   ", paste(x$datanames, collapse=", "), "\n")
+  cat("  UI args:     ", paste(names(x$ui_args), collapse=", "),
+      if (length(x$ui_args)==0) "(none)" else "", "\n")
+  cat("  Server args: ", paste(names(x$server_args), collapse=", "),
+      if (length(x$server_args)==0) "(none)" else "", "\n")
+  invisible(x)
+}
+
+# teal main app mock
+teal <- function(data, modules, title="teal app",
+                 filter=NULL, header=NULL, footer=NULL, ...) {
+  structure(
+    list(data=data, modules=modules, title=title,
+         filter=filter, header=header, footer=footer),
+    class=c("teal_app","shiny.appobj"))
+}
+
+print.teal_app <- function(x, ...) {
+  cat("── teal Application ──────────────────────────────────\n")
+  cat("  Title:", x$title, "\n")
+  n_ds <- length(x$data$datasets)
+  cat("  Datasets:", n_ds, "—", paste(names(x$data$datasets), collapse=", "), "\n")
+  mods <- if (inherits(x$modules, "teal_modules")) x$modules$modules else list(x$modules)
+  cat("  Modules:\n")
+  for (m in mods) {
+    if (inherits(m, "tab_group")) {
+      cat("    [group]", m$label, "\n")
+      for (c in m$children) cat("      •", c$label, "\n")
+    } else {
+      cat("    •", m$label, "\n")
+    }
+  }
+  invisible(x)
+}
+
+# Mock filtered_data accessor (simulates what teal passes to server)
+# In real teal, the server receives `data` as a reactive filtered_data object.
+make_filtered_data <- function(cdisc_data_obj) {
+  # Returns a reactive-like environment; in exercises we use a simple function
+  env <- new.env(parent = emptyenv())
+  env$datasets <- cdisc_data_obj$datasets
+  env$get_data <- function(dataname) {
+    if (dataname %in% names(env$datasets))
+      env$datasets[[dataname]]$data
+    else
+      stop(sprintf("Dataset '%s' not found in filtered_data", dataname))
+  }
+  env
+}
+
+# teal.code mock — qenv (quoted environment)
+qenv <- function() {
+  env <- new.env(parent = baseenv())
+  env$.code_log <- character(0)
+  env$eval <- function(expr_str) {
+    env$.code_log <- c(env$.code_log, expr_str)
+    eval(parse(text = expr_str), envir = env)
+    invisible(env)
+  }
+  env$get_code <- function() paste(env$.code_log, collapse = "\n")
+  class(env) <- c("qenv", "environment")
+  env
+}
+
+print.qenv <- function(x, ...) {
+  cat("── qenv (reproducible code log) ──────────────────────\n")
+  if (length(x$.code_log) == 0) {
+    cat("  (empty)\n")
+  } else {
+    for (i in seq_along(x$.code_log)) cat(sprintf("  [%d] %s\n", i, x$.code_log[i]))
+  }
+  invisible(x)
+}
+```
+
+## Overview
+
+Lesson 39 showed how to wire together ready-made modules. This lesson teaches you to **write your own**. Custom teal modules are essential when:
+
+- You need analysis logic not covered by `teal.modules.clinical`
+- Your statistical team has house-style outputs that differ from the defaults
+- You are embedding a validated R package output directly into the app
+
+By the end of this lesson you will be able to author a teal module from scratch, pass configuration through `ui_args` / `server_args`, access filtered data, and log reproducible code with `teal.code`.
+
+---
+
+## 1 — Module Anatomy
+
+### 1.1 The three-part structure
+
+Every custom teal module has three parts:
+
+```{r module-anatomy, eval=FALSE}
+my_module <- teal_module(
+
+  # 1. Label (appears as the tab title)
+  label = "My Analysis",
+
+  # 2. UI function — receives id and any ui_args
+  ui = function(id, ...) {
+    ns <- NS(id)
+    tagList(
+      selectInput(ns("arm"), "Treatment Arm",
+                  choices = c("Placebo", "Xanomeline Low Dose",
+                              "Xanomeline High Dose")),
+      plotOutput(ns("plot"))
+    )
+  },
+
+  # 3. Server function — receives id, data (reactive), reporter, ...
+  server = function(id, data, reporter, ...) {
+    moduleServer(id, function(input, output, session) {
+
+      # data() returns the filtered cdisc_data object
+      adsl <- reactive(data()[["ADSL"]])
+
+      output$plot <- renderPlot({
+        adsl() |>
+          filter(TRT01P == input$arm) |>
+          ggplot(aes(AGE)) +
+          geom_histogram(bins = 20)
+      })
+    })
+  },
+
+  # 4. Which datasets this module needs (enables optimised lazy loading)
+  datanames = "ADSL"
+)
+```
+
+### 1.2 The `data` argument
+
+Inside the server function, `data` is a **reactive** that returns the filtered data. Access individual datasets by name:
+
+```{r data-access, eval=FALSE}
+server = function(id, data, reporter, ...) {
+  moduleServer(id, function(input, output, session) {
+
+    # Correct: data is reactive — call it with ()
+    adsl_filtered <- reactive(data()[["ADSL"]])
+    adae_filtered <- reactive(data()[["ADAE"]])
+
+    # Wrong: data[["ADSL"]] without () — not reactive
+    # adsl_wrong <- data[["ADSL"]]   # <- static, won't update when filters change
+  })
+}
+```
+
+> **Key insight:** `data` is a reactive expression, not a list. Always call `data()` with parentheses inside reactive contexts (`reactive()`, `observe()`, `render*()`).
+
+### 1.3 Quiz
+
+```{r quiz-anatomy, echo=FALSE}
+quiz(
+  question(
+    "Inside a teal module server, how do you get the filtered ADSL data?",
+    answer("`data[[\"ADSL\"]]`"),
+    answer("`data()[\"ADSL\"]`"),
+    answer("`data()[[\"ADSL\"]]`", correct = TRUE),
+    answer("`filtered_data(\"ADSL\")`"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What does the `datanames` argument in `teal_module()` control?",
+    answer("The column names that the module can use"),
+    answer("Which datasets teal pre-loads for this module, enabling optimised lazy loading", correct = TRUE),
+    answer("The datasets that the filter panel shows"),
+    answer("The order of tabs in the app"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 2 — Building Your First Custom Module
+
+### 2.1 A demographics bar chart module
+
+Let's build a module that shows a bar chart of a chosen demographic variable by treatment arm.
+
+```{r first-module-build, eval=FALSE}
+# ── Module definition ──────────────────────────────────────────────────────
+tm_demographics_bar <- function(label    = "Demographics Bar Chart",
+                                dataname = "ADSL",
+                                arm_var  = "TRT01P",
+                                vars     = c("SEX", "RACE", "AGEGR1")) {
+  teal_module(
+    label      = label,
+    datanames  = dataname,
+
+    # Pass configuration as ui_args / server_args
+    ui_args    = list(vars = vars),
+    server_args = list(dataname = dataname,
+                       arm_var  = arm_var,
+                       vars     = vars),
+
+    ui = function(id, vars, ...) {
+      ns <- NS(id)
+      tagList(
+        fluidRow(
+          column(4,
+            selectInput(ns("var"), "Variable",
+                        choices  = vars,
+                        selected = vars[1])
+          )
+        ),
+        plotOutput(ns("bar_chart"), height = "400px")
+      )
+    },
+
+    server = function(id, data, reporter, dataname, arm_var, vars, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[[dataname]])
+
+        output$bar_chart <- renderPlot({
+          req(adsl_r(), input$var)
+          adsl_r() |>
+            count(.data[[arm_var]], .data[[input$var]]) |>
+            ggplot(aes(x = .data[[arm_var]],
+                       y = n,
+                       fill = .data[[input$var]])) +
+            geom_col(position = "dodge") +
+            labs(x = arm_var, y = "Count",
+                 fill = input$var,
+                 title = paste("Distribution of", input$var)) +
+            theme_minimal(base_size = 14) +
+            theme(axis.text.x = element_text(angle = 30, hjust = 1))
+        })
+      })
+    }
+  )
+}
+```
+
+### 2.2 `ui_args` and `server_args`
+
+Configuration flows from the module constructor to `ui` and `server` via named argument lists:
+
+```{r args-flow, eval=FALSE}
+# How args flow:
+#
+#  tm_my_module(arm_var = "TRT01P", ...)
+#          │
+#          ├─ ui_args    = list(arm_var = "TRT01P")
+#          │       └──────────► ui(id, arm_var, ...)
+#          │
+#          └─ server_args = list(arm_var = "TRT01P")
+#                  └──────────► server(id, data, reporter, arm_var, ...)
+```
+
+This pattern means:
+- Module constructors become simple **wrappers** with documented arguments
+- The same `teal_module()` core can be re-used with different configurations
+- Argument names in `ui` and `server` **must match** the names in `ui_args` / `server_args`
+
+### 2.3 Exercise — complete the module definition
+
+Complete the `tm_ae_severity_bar` module. It should show a bar chart of AE severity counts by treatment arm.
+
+```{r module-complete-ex, exercise=TRUE, exercise.lines=45}
+tm_ae_severity_bar <- function(label    = "AE Severity",
+                               dataname = "ADAE",
+                               arm_var  = "TRT01A") {
+  teal_module(
+    label       = label,
+    datanames   = ___,
+    ui_args     = list(),
+    server_args = list(dataname = ___, arm_var = ___),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        plotOutput(ns("sev_plot"), height = "400px")
+      )
+    },
+
+    server = function(id, data, reporter, dataname, arm_var, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adae_r <- reactive(___[[___]])
+
+        output$sev_plot <- renderPlot({
+          req(adae_r())
+          adae_r() |>
+            count(.data[[arm_var]], AESEV) |>
+            ggplot(aes(x = .data[[arm_var]],
+                       y = n,
+                       fill = AESEV)) +
+            geom_col(position = "stack") +
+            labs(x = arm_var, y = "Number of AEs",
+                 fill = "Severity",
+                 title = "AE Severity by Treatment Arm") +
+            theme_minimal(base_size = 14)
+        })
+      })
+    }
+  )
+}
+
+# Test: print the module definition
+mod <- tm_ae_severity_bar()
+print(mod)
+```
+
+```{r module-complete-ex-solution}
+tm_ae_severity_bar <- function(label    = "AE Severity",
+                               dataname = "ADAE",
+                               arm_var  = "TRT01A") {
+  teal_module(
+    label       = label,
+    datanames   = dataname,
+    ui_args     = list(),
+    server_args = list(dataname = dataname, arm_var = arm_var),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        plotOutput(ns("sev_plot"), height = "400px")
+      )
+    },
+
+    server = function(id, data, reporter, dataname, arm_var, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adae_r <- reactive(data()[[dataname]])
+
+        output$sev_plot <- renderPlot({
+          req(adae_r())
+          adae_r() |>
+            count(.data[[arm_var]], AESEV) |>
+            ggplot(aes(x = .data[[arm_var]],
+                       y = n,
+                       fill = AESEV)) +
+            geom_col(position = "stack") +
+            labs(x = arm_var, y = "Number of AEs",
+                 fill = "Severity",
+                 title = "AE Severity by Treatment Arm") +
+            theme_minimal(base_size = 14)
+        })
+      })
+    }
+  )
+}
+
+mod <- tm_ae_severity_bar()
+print(mod)
+```
+
+---
+
+## 3 — Accessing Multiple Datasets
+
+### 3.1 Cross-dataset modules
+
+Some modules need data from more than one dataset — for example, merging ADLB with ADSL to display treatment labels.
+
+```{r multi-dataset-module, eval=FALSE}
+tm_lab_by_arm <- function(label    = "Lab by Arm",
+                          param    = "ALT") {
+  teal_module(
+    label       = label,
+    datanames   = c("ADSL", "ADLB"),   # declare both
+    server_args = list(param = param),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        plotOutput(ns("lab_plot"), height = "400px")
+      )
+    },
+
+    server = function(id, data, reporter, param, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[["ADSL"]])
+        adlb_r <- reactive(data()[["ADLB"]])
+
+        # Merged dataset — both adsl_r() and adlb_r() are reactive
+        lab_data <- reactive({
+          req(adsl_r(), adlb_r())
+          adlb_r() |>
+            filter(PARAMCD == param) |>
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID")
+        })
+
+        output$lab_plot <- renderPlot({
+          req(lab_data())
+          lab_data() |>
+            filter(!is.na(AVAL), !is.na(AVISIT)) |>
+            ggplot(aes(x = AVISIT, y = AVAL,
+                       colour = TRT01P, group = TRT01P)) +
+            stat_summary(fun = mean, geom = "line", linewidth = 1) +
+            stat_summary(fun = mean, geom = "point", size = 3) +
+            labs(title = paste("Mean", param, "over Time"),
+                 x = "Visit", y = "Observed Value",
+                 colour = "Treatment") +
+            theme_minimal(base_size = 14) +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1))
+        })
+      })
+    }
+  )
+}
+```
+
+### 3.2 The `select(-any_of(...))` guard
+
+Always remove any column that already exists in the receiving dataset before a join:
+
+```{r join-guard, eval=FALSE}
+# ADLB already has TRT01P (from admiral derivation)
+# Joining adsl's TRT01P without removing it first creates TRT01P.x / TRT01P.y
+
+# WRONG:
+adlb_r() |>
+  left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID")
+  # → TRT01P.x (from adlb) and TRT01P.y (from adsl) — downstream breaks
+
+# CORRECT:
+adlb_r() |>
+  select(-any_of("TRT01P")) |>        # remove existing copy first
+  left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID")
+  # → single TRT01P from adsl
+```
+
+### 3.3 Exercise — multi-dataset module
+
+Complete the server of a module that merges ADLB with ADSL and produces a boxplot of AVAL by treatment arm for a specified parameter.
+
+```{r multi-ds-ex, exercise=TRUE, exercise.lines=40}
+tm_lab_boxplot <- function(label = "Lab Boxplot",
+                           param = "ALT") {
+  teal_module(
+    label       = label,
+    datanames   = c(___, "ADLB"),
+    server_args = list(param = param),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      plotOutput(ns("box_plot"), height = "400px")
+    },
+
+    server = function(id, data, reporter, param, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[[___]])
+        adlb_r <- reactive(data()[[___]])
+
+        lab_merged <- reactive({
+          req(adsl_r(), adlb_r())
+          adlb_r() |>
+            filter(PARAMCD == ___) |>
+            select(-any_of(___)) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID")
+        })
+
+        output$box_plot <- renderPlot({
+          req(lab_merged())
+          lab_merged() |>
+            filter(!is.na(AVAL)) |>
+            ggplot(aes(x = TRT01P, y = AVAL, fill = TRT01P)) +
+            geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+            labs(title = paste(param, "Distribution by Treatment"),
+                 x = NULL, y = "Observed Value") +
+            theme_minimal(base_size = 14) +
+            theme(legend.position = "none",
+                  axis.text.x = element_text(angle = 30, hjust = 1))
+        })
+      })
+    }
+  )
+}
+
+mod <- tm_lab_boxplot(param = "ALT")
+print(mod)
+```
+
+```{r multi-ds-ex-solution}
+tm_lab_boxplot <- function(label = "Lab Boxplot",
+                           param = "ALT") {
+  teal_module(
+    label       = label,
+    datanames   = c("ADSL", "ADLB"),
+    server_args = list(param = param),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      plotOutput(ns("box_plot"), height = "400px")
+    },
+
+    server = function(id, data, reporter, param, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[["ADSL"]])
+        adlb_r <- reactive(data()[["ADLB"]])
+
+        lab_merged <- reactive({
+          req(adsl_r(), adlb_r())
+          adlb_r() |>
+            filter(PARAMCD == param) |>
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID")
+        })
+
+        output$box_plot <- renderPlot({
+          req(lab_merged())
+          lab_merged() |>
+            filter(!is.na(AVAL)) |>
+            ggplot(aes(x = TRT01P, y = AVAL, fill = TRT01P)) +
+            geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+            labs(title = paste(param, "Distribution by Treatment"),
+                 x = NULL, y = "Observed Value") +
+            theme_minimal(base_size = 14) +
+            theme(legend.position = "none",
+                  axis.text.x = element_text(angle = 30, hjust = 1))
+        })
+      })
+    }
+  )
+}
+
+mod <- tm_lab_boxplot(param = "ALT")
+print(mod)
+```
+
+---
+
+## 4 — teal.code: Reproducible Code Logging
+
+### 4.1 What is teal.code?
+
+`teal.code` provides the `qenv` (quoted environment) class. Every data manipulation and analysis step that a module performs can be logged to a `qenv`, so the app can present users with a downloadable R script that exactly reproduces what they see.
+
+In regulated environments this is critical: a clinical data reviewer can see the output **and** download the code that produced it.
+
+### 4.2 Basic `qenv` usage
+
+```{r qenv-demo, eval=FALSE}
+library(teal.code)
+
+# Create a fresh quoted environment
+q <- qenv()
+
+# Execute code inside the qenv — it runs AND is recorded
+q <- q |>
+  eval_code("adsl_sub <- dplyr::filter(adsl, SAFFL == 'Y')") |>
+  eval_code("n_subjects <- nrow(adsl_sub)") |>
+  eval_code("cat('N =', n_subjects, '\\n')")
+
+# Retrieve the logged code
+get_code(q)
+# [1]
+# adsl_sub <- dplyr::filter(adsl, SAFFL == 'Y')
+# n_subjects <- nrow(adsl_sub)
+# cat('N =', n_subjects, '\n')
+```
+
+### 4.3 `qenv` inside a module server
+
+In real teal, the `data` reactive returns a `teal_data` object that includes a `qenv`. Modules append their analysis code to it:
+
+```{r qenv-module-pattern, eval=FALSE}
+server = function(id, data, reporter, param, ...) {
+  moduleServer(id, function(input, output, session) {
+
+    # data() is a reactive teal_data object
+    # data()$env is its qenv
+
+    result <- reactive({
+      req(data())
+      # Get the pre-filtered data + its code history
+      tdata <- data()
+
+      # Extend the qenv with module-specific code
+      q <- tdata$env |>
+        eval_code(
+          sprintf(
+            'adlb_param <- dplyr::filter(ADLB, PARAMCD == "%s")',
+            param
+          )
+        ) |>
+        eval_code(
+          'p <- ggplot2::ggplot(adlb_param, ggplot2::aes(x=AVISIT, y=AVAL)) +
+             ggplot2::geom_boxplot()'
+        )
+
+      list(
+        data  = q$adlb_param,
+        plot  = q$p,
+        code  = get_code(q)
+      )
+    })
+
+    output$lab_plot <- renderPlot(result()$plot)
+
+    # Register with teal's reporter so "Show R Code" works
+    reporter$add_card({
+      teal.reporter::rcode_card(
+        code = result()$code,
+        title = paste("Lab Module —", param)
+      )
+    })
+  })
+}
+```
+
+### 4.4 Simplified `qenv` exercise
+
+Use the mock `qenv` defined in the setup chunk to build a reproducible analysis pipeline.
+
+```{r qenv-exercise, exercise=TRUE, exercise.lines=25}
+# Build a qenv that:
+# 1. Filters adsl to SAFFL == "Y"
+# 2. Computes mean age by TRT01P
+# 3. Prints the result
+
+q <- qenv()
+
+q$eval('adsl_saf <- dplyr::filter(adsl, ___ == "Y")')
+q$eval('age_summary <- adsl_saf |>
+          dplyr::group_by(___) |>
+          dplyr::summarise(mean_age = round(mean(AGE, na.rm=TRUE), 1),
+                           n = dplyr::n())')
+q$eval('print(___)')
+
+# Show the code log
+cat("\n── Recorded code ────────────────────────────────\n")
+cat(q$get_code(), "\n")
+```
+
+```{r qenv-exercise-solution}
+q <- qenv()
+
+q$eval('adsl_saf <- dplyr::filter(adsl, SAFFL == "Y")')
+q$eval('age_summary <- adsl_saf |>
+          dplyr::group_by(TRT01P) |>
+          dplyr::summarise(mean_age = round(mean(AGE, na.rm=TRUE), 1),
+                           n = dplyr::n())')
+q$eval('print(age_summary)')
+
+cat("\n── Recorded code ────────────────────────────────\n")
+cat(q$get_code(), "\n")
+```
+
+---
+
+## 5 — Dynamic UI Inside Modules
+
+### 5.1 Variable selectors driven by data
+
+A common pattern: populate a `selectInput` with the actual column names of the filtered dataset.
+
+```{r dynamic-ui-module, eval=FALSE}
+tm_dynamic_scatter <- function(label    = "Dynamic Scatter",
+                               dataname = "ADSL") {
+  teal_module(
+    label       = label,
+    datanames   = dataname,
+    server_args = list(dataname = dataname),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        fluidRow(
+          column(3, selectInput(ns("x_var"), "X Variable", choices = NULL)),
+          column(3, selectInput(ns("y_var"), "Y Variable", choices = NULL)),
+          column(3, selectInput(ns("col_var"), "Colour by",
+                                choices = c("(none)" = ""), selected = ""))
+        ),
+        plotOutput(ns("scatter"), height = "450px")
+      )
+    },
+
+    server = function(id, data, reporter, dataname, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        dataset_r <- reactive(data()[[dataname]])
+
+        # Populate variable selectors from actual data columns
+        observe({
+          req(dataset_r())
+          num_vars <- names(select(dataset_r(), where(is.numeric)))
+          cat_vars <- c("(none)" = "",
+                        names(select(dataset_r(), where(is.character))))
+
+          updateSelectInput(session, "x_var",
+                            choices = num_vars, selected = num_vars[1])
+          updateSelectInput(session, "y_var",
+                            choices = num_vars,
+                            selected = num_vars[min(2, length(num_vars))])
+          updateSelectInput(session, "col_var", choices = cat_vars)
+        })
+
+        output$scatter <- renderPlot({
+          req(dataset_r(), input$x_var, input$y_var)
+          p <- dataset_r() |>
+            ggplot(aes(x = .data[[input$x_var]],
+                       y = .data[[input$y_var]]))
+          if (nchar(input$col_var) > 0)
+            p <- p + aes(colour = .data[[input$col_var]])
+          p + geom_point(alpha = 0.6, size = 2) +
+            theme_minimal(base_size = 14)
+        })
+      })
+    }
+  )
+}
+```
+
+### 5.2 Exercise — add a visit selector
+
+Complete the server of a module that shows ADLB data for a user-selected PARAMCD and AVISIT.
+
+```{r dynamic-visit-ex, exercise=TRUE, exercise.lines=40}
+tm_lab_visit <- function(label = "Lab by Visit") {
+  teal_module(
+    label      = label,
+    datanames  = c("ADSL", "ADLB"),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        fluidRow(
+          column(3, selectInput(ns("param"),  "Parameter", choices = NULL)),
+          column(3, selectInput(ns("visit"),  "Visit",     choices = NULL))
+        ),
+        plotOutput(ns("lab_plot"), height = "400px")
+      )
+    },
+
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[["ADSL"]])
+        adlb_r <- reactive(data()[["ADLB"]])
+
+        # Populate param choices
+        observe({
+          req(adlb_r())
+          params <- sort(unique(adlb_r()$___))
+          updateSelectInput(session, "param", choices = params,
+                            selected = params[1])
+        })
+
+        # Populate visit choices based on selected param
+        observe({
+          req(adlb_r(), input$param)
+          visits <- adlb_r() |>
+            filter(PARAMCD == ___) |>
+            pull(AVISIT) |>
+            unique() |> sort()
+          updateSelectInput(session, "visit", choices = visits,
+                            selected = visits[1])
+        })
+
+        # Merged reactive
+        plot_data <- reactive({
+          req(adlb_r(), adsl_r(), input$param, input$visit)
+          adlb_r() |>
+            filter(PARAMCD == ___, AVISIT == ___) |>
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID")
+        })
+
+        output$lab_plot <- renderPlot({
+          req(plot_data())
+          plot_data() |>
+            filter(!is.na(AVAL)) |>
+            ggplot(aes(x = TRT01P, y = AVAL, fill = TRT01P)) +
+            geom_boxplot() +
+            labs(title = paste(input$param, "at", input$visit),
+                 x = NULL, y = "Value") +
+            theme_minimal(base_size = 14) +
+            theme(legend.position = "none",
+                  axis.text.x = element_text(angle = 30, hjust = 1))
+        })
+      })
+    }
+  )
+}
+
+mod <- tm_lab_visit()
+print(mod)
+```
+
+```{r dynamic-visit-ex-solution}
+tm_lab_visit <- function(label = "Lab by Visit") {
+  teal_module(
+    label      = label,
+    datanames  = c("ADSL", "ADLB"),
+
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        fluidRow(
+          column(3, selectInput(ns("param"),  "Parameter", choices = NULL)),
+          column(3, selectInput(ns("visit"),  "Visit",     choices = NULL))
+        ),
+        plotOutput(ns("lab_plot"), height = "400px")
+      )
+    },
+
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+
+        adsl_r <- reactive(data()[["ADSL"]])
+        adlb_r <- reactive(data()[["ADLB"]])
+
+        observe({
+          req(adlb_r())
+          params <- sort(unique(adlb_r()$PARAMCD))
+          updateSelectInput(session, "param", choices = params,
+                            selected = params[1])
+        })
+
+        observe({
+          req(adlb_r(), input$param)
+          visits <- adlb_r() |>
+            filter(PARAMCD == input$param) |>
+            pull(AVISIT) |>
+            unique() |> sort()
+          updateSelectInput(session, "visit", choices = visits,
+                            selected = visits[1])
+        })
+
+        plot_data <- reactive({
+          req(adlb_r(), adsl_r(), input$param, input$visit)
+          adlb_r() |>
+            filter(PARAMCD == input$param, AVISIT == input$visit) |>
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID")
+        })
+
+        output$lab_plot <- renderPlot({
+          req(plot_data())
+          plot_data() |>
+            filter(!is.na(AVAL)) |>
+            ggplot(aes(x = TRT01P, y = AVAL, fill = TRT01P)) +
+            geom_boxplot() +
+            labs(title = paste(input$param, "at", input$visit),
+                 x = NULL, y = "Value") +
+            theme_minimal(base_size = 14) +
+            theme(legend.position = "none",
+                  axis.text.x = element_text(angle = 30, hjust = 1))
+        })
+      })
+    }
+  )
+}
+
+mod <- tm_lab_visit()
+print(mod)
+```
+
+---
+
+## 6 — Testing Custom Modules
+
+### 6.1 Testing with `testServer()`
+
+teal modules are Shiny modules at heart, so Shiny's `testServer()` works directly:
+
+```{r test-server-pattern, eval=FALSE}
+library(shiny)
+library(testthat)
+
+test_that("tm_ae_severity_bar server runs without error", {
+
+  # Simulate filtered data
+  mock_data <- list(
+    ADAE = adae |> filter(TRT01A %in% c("Placebo", "Xanomeline High Dose"))
+  )
+  mock_reactive <- function() mock_data
+
+  mod_def <- tm_ae_severity_bar(arm_var = "TRT01A")
+
+  testServer(
+    mod_def$server,
+    args = list(
+      data     = mock_reactive,
+      reporter = list(),   # mock reporter
+      dataname = "ADAE",
+      arm_var  = "TRT01A"
+    ),
+    {
+      # Check output renders
+      expect_s3_class(output$sev_plot, "recordedplot")
+    }
+  )
+})
+```
+
+### 6.2 Unit-testing reactive data flow
+
+```{r reactive-test, eval=FALSE}
+test_that("lab_merged filters and joins correctly", {
+  mock_data <- list(
+    ADSL = adsl,
+    ADLB = adlb
+  )
+  mock_reactive <- function() mock_data
+
+  mod_def <- tm_lab_boxplot(param = "ALT")
+
+  testServer(
+    mod_def$server,
+    args = list(data = mock_reactive, reporter = list(), param = "ALT"),
+    {
+      # Access internal reactive
+      session$setInputs()   # no inputs to set
+      result <- lab_merged()
+
+      expect_true(all(result$PARAMCD == "ALT"))
+      expect_true("TRT01P" %in% names(result))
+      expect_false(any(duplicated(names(result))))   # no .x/.y suffixes
+    }
+  )
+})
+```
+
+### 6.3 Quiz
+
+```{r quiz-testing, echo=FALSE}
+quiz(
+  question(
+    "Which Shiny testing function lets you test the server logic of a teal module?",
+    answer("`runTests()`"),
+    answer("`testServer()`", correct = TRUE),
+    answer("`shinytest2::AppDriver()`"),
+    answer("`evaluate_promise()`"),
+    allow_retry = TRUE
+  ),
+  question(
+    "When testing a module that joins ADLB with ADSL, what should you check to catch the .x/.y column suffix bug?",
+    answer("`expect_equal(ncol(result), 10)`"),
+    answer("`expect_false(any(duplicated(names(result))))`", correct = TRUE),
+    answer("`expect_true(\"PARAMCD\" %in% names(result))`"),
+    answer("`expect_s3_class(result, \"data.frame\")`"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 7 — Module Best Practices
+
+### 7.1 Design checklist
+
+Before shipping a custom teal module:
+
+**Data safety**
+- [ ] Declare all needed datasets in `datanames`
+- [ ] Use `select(-any_of(...))` before any join that adds a column that may already exist
+- [ ] Wrap all reactives with `req()` to prevent errors on empty filter results
+- [ ] Use `.data[[var]]` (tidy eval) instead of `df$var` for programmatic column access
+
+**Reproducibility**
+- [ ] Log all data manipulation steps to `qenv` / `eval_code`
+- [ ] Register output with `teal.reporter` if the module produces analysable results
+
+**UX**
+- [ ] Populate variable selectors from the actual filtered data (not hardcoded values)
+- [ ] Show an informative message when `nrow(data()) == 0` after filtering
+- [ ] Use `withProgress()` for computations > ~1 second
+
+**Testing**
+- [ ] Write at least one `testServer()` test per module
+- [ ] Test with an empty dataset (0 rows after filter) — should not crash
+
+### 7.2 Exercise — add an empty-data guard
+
+Add a guard to this module's `renderPlot` that shows a message when the filtered data has 0 rows.
+
+```{r empty-guard-ex, exercise=TRUE, exercise.lines=30}
+# Module server with empty-data guard
+safe_plot_server <- function(input, output, session, data_r) {
+  output$plot <- renderPlot({
+    req(data_r())
+
+    d <- data_r()
+
+    # Add guard here: if d has 0 rows, show a message instead of plotting
+    if (___ == 0) {
+      plot.new()
+      text(0.5, 0.5,
+           "No data after applying filters.\nAdjust the filter panel.",
+           cex = 1.4, col = "grey50")
+      return(invisible(NULL))
+    }
+
+    d |>
+      count(TRT01P, SEX) |>
+      ggplot(aes(x = TRT01P, y = n, fill = SEX)) +
+      geom_col(position = "dodge") +
+      theme_minimal(base_size = 14)
+  })
+}
+
+# Test it with real data
+safe_data <- reactive(adsl)
+
+testServer(
+  function(input, output, session) {
+    safe_plot_server(input, output, session, safe_data)
+  },
+  {
+    expect_silent(output$plot)
+  }
+)
+
+cat("Module with guard compiled successfully\n")
+```
+
+```{r empty-guard-ex-solution}
+safe_plot_server <- function(input, output, session, data_r) {
+  output$plot <- renderPlot({
+    req(data_r())
+
+    d <- data_r()
+
+    if (nrow(d) == 0) {
+      plot.new()
+      text(0.5, 0.5,
+           "No data after applying filters.\nAdjust the filter panel.",
+           cex = 1.4, col = "grey50")
+      return(invisible(NULL))
+    }
+
+    d |>
+      count(TRT01P, SEX) |>
+      ggplot(aes(x = TRT01P, y = n, fill = SEX)) +
+      geom_col(position = "dodge") +
+      theme_minimal(base_size = 14)
+  })
+}
+
+safe_data <- reactive(adsl)
+
+testServer(
+  function(input, output, session) {
+    safe_plot_server(input, output, session, safe_data)
+  },
+  {
+    expect_silent(output$plot)
+  }
+)
+
+cat("Module with guard compiled successfully\n")
+```
+
+---
+
+## 8 — Capstone: Build a Complete Custom Module Suite
+
+Build a three-module custom suite and wire it into a teal app.
+
+### Requirements:
+
+1. **`tm_subj_count`** — shows N by treatment arm as a simple table (ADSL)
+2. **`tm_ae_rate`** — shows % subjects with ≥1 AE by treatment arm (ADSL + ADAE)
+3. **`tm_lab_shift`** — shows a simple shift table (BTOXGR → ATOXGR) for a chosen parameter (ADSL + ADLB)
+
+```{r capstone-modules, exercise=TRUE, exercise.eval=FALSE, exercise.lines=100}
+# ── Module 1: Subject Counts ──────────────────────────────────────────────
+tm_subj_count <- function(label = "Subject Counts") {
+  teal_module(
+    label      = label,
+    datanames  = "ADSL",
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        h4("Subject Counts by Treatment Arm"),
+        tableOutput(ns("count_table"))
+      )
+    },
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+        adsl_r <- reactive(data()[[___]])
+        output$count_table <- renderTable({
+          req(adsl_r())
+          adsl_r() |>
+            count(___, name = "N") |>
+            rename(`Treatment Arm` = TRT01P)
+        })
+      })
+    }
+  )
+}
+
+# ── Module 2: AE Rate ──────────────────────────────────────────────────────
+tm_ae_rate <- function(label = "AE Rate") {
+  teal_module(
+    label      = label,
+    datanames  = c("ADSL", "ADAE"),
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        h4("% Subjects with ≥1 AE"),
+        tableOutput(ns("ae_table"))
+      )
+    },
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+        adsl_r <- reactive(data()[[___]])
+        adae_r <- reactive(data()[[___]])
+
+        output$ae_table <- renderTable({
+          req(adsl_r(), adae_r())
+          denom <- adsl_r() |>
+            count(TRT01P, name = "N_total")
+
+          subj_with_ae <- adae_r() |>
+            distinct(USUBJID) |>
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, ___), by = "USUBJID") |>
+            count(___, name = "N_ae")
+
+          denom |>
+            left_join(___, by = "TRT01P") |>
+            mutate(N_ae = coalesce(N_ae, 0L),
+                   Pct  = round(100 * N_ae / N_total, 1)) |>
+            rename(`Treatment Arm` = TRT01P,
+                   `N (total)`     = N_total,
+                   `N (≥1 AE)`     = N_ae,
+                   `%`             = Pct)
+        })
+      })
+    }
+  )
+}
+
+# ── Module 3: Lab Shift ────────────────────────────────────────────────────
+tm_lab_shift <- function(label = "Lab Shift", default_param = "ALT") {
+  teal_module(
+    label       = label,
+    datanames   = c("ADSL", "ADLB"),
+    server_args = list(default_param = default_param),
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        selectInput(ns("param"), "Parameter", choices = NULL),
+        tableOutput(ns("shift_table"))
+      )
+    },
+    server = function(id, data, reporter, default_param, ...) {
+      moduleServer(id, function(input, output, session) {
+        adsl_r <- reactive(data()[["ADSL"]])
+        adlb_r <- reactive(data()[["ADLB"]])
+
+        observe({
+          req(adlb_r())
+          params <- sort(unique(adlb_r()$PARAMCD))
+          updateSelectInput(session, "param", choices = params,
+                            selected = default_param)
+        })
+
+        output$shift_table <- renderTable({
+          req(adlb_r(), input$param)
+          adlb_r() |>
+            filter(PARAMCD == input$param,
+                   !is.na(BTOXGR), !is.na(ATOXGR)) |>
+            count(BTOXGR, ATOXGR) |>
+            tidyr::pivot_wider(names_from  = ATOXGR,
+                               values_from = n,
+                               values_fill = 0L,
+                               names_prefix = "Post: Grade ") |>
+            rename(`Baseline Grade` = BTOXGR)
+        }, striped = TRUE, hover = TRUE, bordered = TRUE)
+      })
+    }
+  )
+}
+
+# ── Assemble the app ──────────────────────────────────────────────────────
+suite_data <- cdisc_data(
+  cdisc_dataset("ADSL", adsl, keys = c("STUDYID", "USUBJID")),
+  cdisc_dataset("ADAE", adae, keys = c("STUDYID", "USUBJID", "AESEQ")),
+  cdisc_dataset("ADLB", adlb, keys = c("STUDYID", "USUBJID", "PARAMCD", "ADT"))
+)
+
+suite_app <- teal(
+  data    = suite_data,
+  modules = modules(
+    tm_subj_count("Subject Counts"),
+    tm_ae_rate("AE Rate"),
+    tm_lab_shift("Lab Shift", default_param = "ALT")
+  ),
+  filter  = teal_slices(
+    teal_slice("ADSL", "SAFFL", selected = "Y")
+  ),
+  title   = "Custom Module Suite — CDISCPILOT01"
+)
+
+print(suite_app)
+```
+
+```{r capstone-modules-solution}
+tm_subj_count <- function(label = "Subject Counts") {
+  teal_module(
+    label      = label,
+    datanames  = "ADSL",
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        h4("Subject Counts by Treatment Arm"),
+        tableOutput(ns("count_table"))
+      )
+    },
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+        adsl_r <- reactive(data()[["ADSL"]])
+        output$count_table <- renderTable({
+          req(adsl_r())
+          adsl_r() |>
+            count(TRT01P, name = "N") |>
+            rename(`Treatment Arm` = TRT01P)
+        })
+      })
+    }
+  )
+}
+
+tm_ae_rate <- function(label = "AE Rate") {
+  teal_module(
+    label      = label,
+    datanames  = c("ADSL", "ADAE"),
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        h4("% Subjects with ≥1 AE"),
+        tableOutput(ns("ae_table"))
+      )
+    },
+    server = function(id, data, reporter, ...) {
+      moduleServer(id, function(input, output, session) {
+        adsl_r <- reactive(data()[["ADSL"]])
+        adae_r <- reactive(data()[["ADAE"]])
+
+        output$ae_table <- renderTable({
+          req(adsl_r(), adae_r())
+          denom <- adsl_r() |>
+            count(TRT01P, name = "N_total")
+
+          subj_with_ae <- adae_r() |>
+            distinct(USUBJID) |>
+            select(-any_of("TRT01P")) |>
+            left_join(select(adsl_r(), USUBJID, TRT01P), by = "USUBJID") |>
+            count(TRT01P, name = "N_ae")
+
+          denom |>
+            left_join(subj_with_ae, by = "TRT01P") |>
+            mutate(N_ae = coalesce(N_ae, 0L),
+                   Pct  = round(100 * N_ae / N_total, 1)) |>
+            rename(`Treatment Arm` = TRT01P,
+                   `N (total)`     = N_total,
+                   `N (≥1 AE)`     = N_ae,
+                   `%`             = Pct)
+        })
+      })
+    }
+  )
+}
+
+tm_lab_shift <- function(label = "Lab Shift", default_param = "ALT") {
+  teal_module(
+    label       = label,
+    datanames   = c("ADSL", "ADLB"),
+    server_args = list(default_param = default_param),
+    ui = function(id, ...) {
+      ns <- NS(id)
+      tagList(
+        selectInput(ns("param"), "Parameter", choices = NULL),
+        tableOutput(ns("shift_table"))
+      )
+    },
+    server = function(id, data, reporter, default_param, ...) {
+      moduleServer(id, function(input, output, session) {
+        adsl_r <- reactive(data()[["ADSL"]])
+        adlb_r <- reactive(data()[["ADLB"]])
+
+        observe({
+          req(adlb_r())
+          params <- sort(unique(adlb_r()$PARAMCD))
+          updateSelectInput(session, "param", choices = params,
+                            selected = default_param)
+        })
+
+        output$shift_table <- renderTable({
+          req(adlb_r(), input$param)
+          adlb_r() |>
+            filter(PARAMCD == input$param,
+                   !is.na(BTOXGR), !is.na(ATOXGR)) |>
+            count(BTOXGR, ATOXGR) |>
+            tidyr::pivot_wider(names_from  = ATOXGR,
+                               values_from = n,
+                               values_fill = 0L,
+                               names_prefix = "Post: Grade ") |>
+            rename(`Baseline Grade` = BTOXGR)
+        }, striped = TRUE, hover = TRUE, bordered = TRUE)
+      })
+    }
+  )
+}
+
+suite_data <- cdisc_data(
+  cdisc_dataset("ADSL", adsl, keys = c("STUDYID", "USUBJID")),
+  cdisc_dataset("ADAE", adae, keys = c("STUDYID", "USUBJID", "AESEQ")),
+  cdisc_dataset("ADLB", adlb, keys = c("STUDYID", "USUBJID", "PARAMCD", "ADT"))
+)
+
+suite_app <- teal(
+  data    = suite_data,
+  modules = modules(
+    tm_subj_count("Subject Counts"),
+    tm_ae_rate("AE Rate"),
+    tm_lab_shift("Lab Shift", default_param = "ALT")
+  ),
+  filter  = teal_slices(
+    teal_slice("ADSL", "SAFFL", selected = "Y")
+  ),
+  title   = "Custom Module Suite — CDISCPILOT01"
+)
+
+print(suite_app)
+```
+
+---
+
+## Summary
+
+You can now author production-quality custom teal modules:
+
+- **`teal_module()`** takes a `label`, `ui`, `server`, `datanames`, `ui_args`, and `server_args`
+- Configuration flows from the constructor to `ui` and `server` through `ui_args` / `server_args`
+- Inside the server, `data()[[\"DATANAME\"]]` retrieves the current filtered dataset as a reactive
+- **Always** use `select(-any_of(...))` before joining a column that may already exist
+- `teal.code`'s `qenv` / `eval_code` logs every analysis step for reproducible R code download
+- Dynamic UI (variable selectors driven by real data) uses `observe` + `updateSelectInput`
+- Empty-data guards (`if (nrow(d) == 0)`) prevent cryptic errors after aggressive filtering
+- `testServer()` validates reactive data flow without launching the app
+
+Next: **Lesson 41** covers `teal.data` in depth — `relational_data`, pull-from-server data connectors, lazy data loading, and deploying teal apps to Posit Connect with renv and environment variables.

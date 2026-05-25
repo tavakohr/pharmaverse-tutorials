@@ -1,0 +1,1426 @@
+---
+title: "Lesson 44 — datasetjson: CDISC Dataset-JSON"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Master the CDISC Dataset-JSON format and the datasetjson R package.
+  Covers the Dataset-JSON v1.1 specification, writing and reading JSON
+  datasets, metadata attachment, round-trip fidelity, comparison with XPT,
+  and integration with xportr for dual-format submission pipelines.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 44_datasetjson.Rmd
+# PURPOSE       : CDISC Dataset-JSON v1.1 — constructing, writing, and reading
+#                 JSON submission datasets: dataset_json(), write/read,
+#                 NA handling, round-trip fidelity, define.xml linkage.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+library(learnr)
+library(dplyr)
+library(tibble)
+library(jsonlite)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.eval = FALSE)
+
+# ── Pharmaverseadam datasets ────────────────────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+adsl <- adsl_raw |>
+  mutate(ITTFL  = SAFFL,
+         DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N")) |>
+  select(STUDYID, USUBJID, SUBJID, SITEID, ARM, TRT01P, TRT01A,
+         AGE, AGEGR1, SEX, RACE, ETHNIC,
+         SAFFL, ITTFL, DIABFL, HEIGHTBL, WEIGHTBL, BMIBL,
+         TRTSDT, TRTEDT, TRTDURD, RFSTDTC, RFENDTC,
+         DTHFL, COUNTRY)
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  select(STUDYID, USUBJID, AESEQ, AEDECOD, AESOC, AESEV,
+         AESTDTC, AEENDTC, AESER, AEREL, AEOUT,
+         ASTDT, AENDT, ASTDY, AENDY, TRT01A)
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ── Metadata spec (reused from lesson 43) ────────────────────────────────────
+adsl_spec <- tribble(
+  ~dataset,  ~variable,  ~label,                              ~type,       ~length, ~format,       ~data_type,
+  "ADSL","STUDYID",  "Study Identifier",                  "character",  12, NA_character_, "string",
+  "ADSL","USUBJID",  "Unique Subject Identifier",         "character",  50, NA_character_, "string",
+  "ADSL","SUBJID",   "Subject Identifier for the Study",  "character",  10, NA_character_, "string",
+  "ADSL","SITEID",   "Study Site Identifier",             "character",   3, NA_character_, "string",
+  "ADSL","ARM",      "Description of Planned Arm",        "character", 200, NA_character_, "string",
+  "ADSL","TRT01P",   "Planned Treatment for Period 01",   "character", 200, NA_character_, "string",
+  "ADSL","TRT01A",   "Actual Treatment for Period 01",    "character", 200, NA_character_, "string",
+  "ADSL","AGE",      "Age",                               "numeric",     8, NA_character_, "integer",
+  "ADSL","AGEGR1",   "Pooled Age Group 1",                "character",  10, NA_character_, "string",
+  "ADSL","SEX",      "Sex",                               "character",   2, NA_character_, "string",
+  "ADSL","RACE",     "Race",                              "character",  64, NA_character_, "string",
+  "ADSL","ETHNIC",   "Ethnicity",                         "character",  64, NA_character_, "string",
+  "ADSL","SAFFL",    "Safety Population Flag",            "character",   2, NA_character_, "string",
+  "ADSL","ITTFL",    "Intent-To-Treat Population Flag",   "character",   2, NA_character_, "string",
+  "ADSL","DIABFL",   "Diabetic Flag",                     "character",   2, NA_character_, "string",
+  "ADSL","HEIGHTBL", "Baseline Height (cm)",              "numeric",     8, NA_character_, "decimal",
+  "ADSL","WEIGHTBL", "Baseline Weight (kg)",              "numeric",     8, NA_character_, "decimal",
+  "ADSL","BMIBL",    "Baseline BMI (kg/m^2)",             "numeric",     8, NA_character_, "decimal",
+  "ADSL","TRTSDT",   "Date of First Exposure to Treatment","numeric",   8, "DATE9.",       "date",
+  "ADSL","TRTEDT",   "Date of Last Exposure to Treatment","numeric",    8, "DATE9.",       "date",
+  "ADSL","TRTDURD",  "Total Treatment Duration (Days)",   "numeric",     8, NA_character_, "integer",
+  "ADSL","RFSTDTC",  "Subject Reference Start Date/Time","character",  20, NA_character_, "string",
+  "ADSL","RFENDTC",  "Subject Reference End Date/Time",  "character",  20, NA_character_, "string",
+  "ADSL","DTHFL",    "Death Flag",                       "character",   2, NA_character_, "string",
+  "ADSL","COUNTRY",  "Country",                          "character",   3, NA_character_, "string"
+)
+
+# ── Mock datasetjson infrastructure ──────────────────────────────────────────
+# datasetjson writes/reads the CDISC Dataset-JSON v1.1 format.
+# We mock the core API so exercises run in learnr without the package.
+
+# CDISC Dataset-JSON v1.1 structure:
+#
+# {
+#   "datasetJSONVersion": "1.1.0",
+#   "fileOID": "...",
+#   "creationDateTime": "...",
+#   "originator": "...",
+#   "sourceSystem": {"name": "R", "version": "..."},
+#   "studyOID": "...",
+#   "metaDataRef": "define.xml",
+#   "clinicalData": {
+#     "studyOID": "...",
+#     "metaDataVersionOID": "...",
+#     "itemGroupData": {
+#       "IG.ADSL": {
+#         "records": 254,
+#         "label": "Subject-Level Analysis Dataset",
+#         "items": [
+#           {"OID": "IT.ADSL.STUDYID", "name": "STUDYID", "label": "Study Identifier",
+#            "type": "string", "length": 12},
+#           ...
+#         ],
+#         "itemData": [
+#           ["CDISCPILOT01", "CDISCPILOT01-01-701", "701", ...],
+#           ...
+#         ]
+#       }
+#     }
+#   }
+# }
+
+# dataset_json() — build a Dataset-JSON list object
+dataset_json <- function(data,
+                         file_oid         = NULL,
+                         label            = NULL,
+                         domain           = NULL,
+                         originator       = "Clinical Programmer",
+                         source_system    = "R",
+                         source_system_version = R.version.string,
+                         study_oid        = NULL,
+                         metadata_version = "MDV.1",
+                         metadata_ref     = "define.xml",
+                         item_metadata    = NULL) {
+  domain <- domain %||% deparse(substitute(data))
+  domain <- toupper(domain)
+
+  # Build item metadata from data types if not supplied
+  if (is.null(item_metadata)) {
+    item_metadata <- tibble(
+      name  = names(data),
+      label = vapply(data, function(v) attr(v,"label") %||% "", character(1)),
+      type  = vapply(data, function(v) {
+        if (inherits(v, c("Date","POSIXct","POSIXlt"))) "date"
+        else if (is.numeric(v)) "decimal"
+        else "string"
+      }, character(1)),
+      length = vapply(data, function(v) {
+        w <- attr(v,"width")
+        if (!is.null(w)) as.integer(w)
+        else if (is.character(v)) max(nchar(v), na.rm=TRUE)
+        else 8L
+      }, integer(1))
+    )
+  }
+
+  structure(
+    list(
+      data             = data,
+      file_oid         = file_oid %||% paste0("OID.", domain, ".", format(Sys.time(),"%Y%m%d%H%M%S")),
+      label            = label %||% domain,
+      domain           = domain,
+      originator       = originator,
+      source_system    = source_system,
+      source_system_version = source_system_version,
+      study_oid        = study_oid %||% paste0("STUDY.", unique(data$STUDYID)[1]),
+      metadata_version = metadata_version,
+      metadata_ref     = metadata_ref,
+      item_metadata    = item_metadata,
+      created          = format(Sys.time(), "%Y-%m-%dT%H:%M:%S")
+    ),
+    class = "dataset_json"
+  )
+}
+
+# print method
+print.dataset_json <- function(x, ...) {
+  cat("── Dataset-JSON Object ────────────────────────────────\n")
+  cat("  Domain         :", x$domain, "\n")
+  cat("  Label          :", x$label, "\n")
+  cat("  Records        :", nrow(x$data), "\n")
+  cat("  Variables      :", ncol(x$data), "\n")
+  cat("  fileOID        :", x$file_oid, "\n")
+  cat("  studyOID       :", x$study_oid, "\n")
+  cat("  metaDataRef    :", x$metadata_ref, "\n")
+  cat("  Created        :", x$created, "\n")
+  cat("  Source system  :", x$source_system, "\n")
+  cat("  Item types     :",
+      paste(sort(unique(x$item_metadata$type)), collapse=", "), "\n")
+  invisible(x)
+}
+
+# write_dataset_json() — serialize to JSON file (mocked)
+write_dataset_json <- function(x, path, pretty = FALSE, na = "null") {
+  if (!inherits(x, "dataset_json"))
+    stop("x must be a dataset_json object; use dataset_json() first")
+
+  # Build the JSON structure
+  items <- lapply(seq_len(nrow(x$item_metadata)), function(i) {
+    row <- x$item_metadata[i, ]
+    item <- list(
+      OID    = paste0("IT.", x$domain, ".", row$name),
+      name   = row$name,
+      label  = row$label,
+      type   = row$type,
+      length = row$length
+    )
+    if (row$type == "date") item$displayFormat <- "yyyy-mm-dd"
+    item
+  })
+
+  # Row data as list of lists
+  row_data <- apply(x$data, 1, function(r) as.list(r), simplify = FALSE)
+
+  json_obj <- list(
+    datasetJSONVersion = "1.1.0",
+    fileOID            = x$file_oid,
+    creationDateTime   = x$created,
+    originator         = x$originator,
+    sourceSystem       = list(
+      name    = x$source_system,
+      version = x$source_system_version
+    ),
+    studyOID      = x$study_oid,
+    metaDataRef   = x$metadata_ref,
+    clinicalData  = list(
+      studyOID           = x$study_oid,
+      metaDataVersionOID = x$metadata_version,
+      itemGroupData      = setNames(
+        list(list(
+          records  = nrow(x$data),
+          label    = x$label,
+          items    = items,
+          itemData = row_data
+        )),
+        paste0("IG.", x$domain)
+      )
+    )
+  )
+
+  cat(sprintf("── write_dataset_json ──────────────────────────────────\n"))
+  cat(sprintf("  Path       : %s\n", path))
+  cat(sprintf("  Domain     : %s\n", x$domain))
+  cat(sprintf("  Records    : %d\n", nrow(x$data)))
+  cat(sprintf("  Variables  : %d\n", ncol(x$data)))
+  cat(sprintf("  JSON ver.  : 1.1.0\n"))
+  cat(sprintf("  pretty     : %s\n", pretty))
+  cat(sprintf("  File size  : ~%.0f KB (estimated)\n",
+              object.size(json_obj) / 1024))
+
+  # Actually serialize (writes to the mock object, not disk in learnr)
+  json_str <- if (pretty)
+    jsonlite::toJSON(json_obj, auto_unbox=TRUE, pretty=TRUE, na=na)
+  else
+    jsonlite::toJSON(json_obj, auto_unbox=TRUE, pretty=FALSE, na=na)
+
+  attr(x, "json_string") <- json_str
+  cat(sprintf("  [mock] JSON serialized (%d chars)\n", nchar(json_str)))
+  cat("──────────────────────────────────────────────────────\n")
+  invisible(x)
+}
+
+# read_dataset_json() — deserialize JSON file back to data frame (mocked)
+read_dataset_json <- function(path) {
+  # In real use: reads JSON from disk. Here we simulate with a small inline example.
+  cat(sprintf("[mock] Reading Dataset-JSON from: %s\n", path))
+  cat("  Returns: dataset_json object with $data data frame\n")
+  invisible(NULL)
+}
+
+# as_tibble.dataset_json — extract data frame
+as_tibble.dataset_json <- function(x, ...) x$data
+
+# dataset_json_metadata() — extract item metadata
+dataset_json_metadata <- function(x) x$item_metadata
+
+# set_dataset_metadata() — attach metadata from spec data frame
+set_dataset_metadata <- function(dj_obj, metadata, domain = NULL) {
+  dom <- domain %||% dj_obj$domain
+  spec_dom <- metadata[toupper(metadata$dataset) == toupper(dom), ]
+
+  item_meta <- tibble(
+    name   = spec_dom$variable,
+    label  = spec_dom$label,
+    type   = spec_dom$data_type %||% if_else(spec_dom$type=="numeric","decimal","string"),
+    length = as.integer(spec_dom$length)
+  )
+
+  dj_obj$item_metadata <- item_meta
+  dj_obj
+}
+
+# dataset_json_from_spec() — convenience constructor with metadata
+dataset_json_from_spec <- function(data, metadata, domain, label = NULL,
+                                   study_oid = NULL, ...) {
+  dom      <- toupper(domain)
+  spec_dom <- metadata[toupper(metadata$dataset) == dom, ]
+
+  # infer data_type if column absent
+  if (!"data_type" %in% names(spec_dom)) {
+    spec_dom <- spec_dom |>
+      mutate(data_type = if_else(type == "numeric", "decimal", "string"))
+  }
+
+  item_meta <- tibble(
+    name   = spec_dom$variable,
+    label  = spec_dom$label,
+    type   = spec_dom$data_type,
+    length = as.integer(spec_dom$length)
+  )
+
+  # Reorder data to spec variable order
+  ordered_vars <- intersect(spec_dom$variable, names(data))
+  data_ordered <- data[, ordered_vars, drop = FALSE]
+
+  dataset_json(
+    data          = data_ordered,
+    label         = label %||% dom,
+    domain        = dom,
+    study_oid     = study_oid,
+    item_metadata = item_meta,
+    ...
+  )
+}
+
+# Summarise JSON object — pretty diagnostics
+summarise_dataset_json <- function(dj_obj) {
+  cat(sprintf("Dataset-JSON Summary — %s\n", dj_obj$domain))
+  cat(strrep("─", 60), "\n")
+  cat(sprintf("  Records    : %d\n", nrow(dj_obj$data)))
+  cat(sprintf("  Variables  : %d\n", nrow(dj_obj$item_metadata)))
+  type_tbl <- table(dj_obj$item_metadata$type)
+  cat("  Data types :\n")
+  for (nm in names(type_tbl))
+    cat(sprintf("    %-12s %d variable(s)\n", nm, type_tbl[[nm]]))
+  unlabelled <- sum(is.na(dj_obj$item_metadata$label) |
+                    dj_obj$item_metadata$label == "")
+  cat(sprintf("  Unlabelled : %d variable(s)\n", unlabelled))
+  cat(strrep("─", 60), "\n")
+  invisible(dj_obj)
+}
+
+# compare_xpt_json() — compare two exports for round-trip fidelity
+compare_formats <- function(df_original, df_restored, domain = "DATASET") {
+  cat(sprintf("── Round-trip comparison: %s ──────────────────────────\n", domain))
+
+  # Row count
+  if (nrow(df_original) == nrow(df_restored)) {
+    cat(sprintf("  ✓ Row count: %d\n", nrow(df_original)))
+  } else {
+    cat(sprintf("  ✗ Row count mismatch: original=%d, restored=%d\n",
+                nrow(df_original), nrow(df_restored)))
+  }
+
+  # Column count
+  common_cols <- intersect(names(df_original), names(df_restored))
+  if (length(common_cols) == ncol(df_original)) {
+    cat(sprintf("  ✓ All %d columns present\n", ncol(df_original)))
+  } else {
+    missing <- setdiff(names(df_original), names(df_restored))
+    cat(sprintf("  ✗ Missing columns: %s\n", paste(missing, collapse=", ")))
+  }
+
+  # Value fidelity for character columns
+  char_cols  <- common_cols[sapply(df_original[common_cols], is.character)]
+  char_match <- 0L
+  for (v in char_cols) {
+    if (isTRUE(all.equal(df_original[[v]], df_restored[[v]]))) char_match <- char_match + 1L
+  }
+  cat(sprintf("  ✓ Character columns matching: %d / %d\n",
+              char_match, length(char_cols)))
+  cat("──────────────────────────────────────────────────────\n")
+  invisible(NULL)
+}
+
+# peek_json() — show first N characters of a serialised JSON string
+peek_json <- function(dj_obj, n = 800) {
+  js <- attr(dj_obj, "json_string")
+  if (is.null(js)) {
+    cat("No JSON string attached — run write_dataset_json() first\n")
+    return(invisible(NULL))
+  }
+  cat(substr(js, 1, n))
+  if (nchar(js) > n) cat(sprintf("\n... [%d more chars]\n", nchar(js)-n))
+  invisible(js)
+}
+```
+
+## Overview
+
+**CDISC Dataset-JSON** is a modern, open-standard format for submitting clinical trial data to regulatory authorities. It is designed to complement — and eventually succeed — the SAS XPT transport format. The **datasetjson** R package provides the tools to read and write Dataset-JSON files within the pharmaverse workflow.
+
+> **Why a new format?**
+>
+> The SAS Version 5 XPT format was designed in the 1980s. Its limitations — 8-character variable names, 200-character labels, no native support for Unicode, maximum file size restrictions — have become pain points as datasets grow and submission standards evolve. Dataset-JSON is JSON-based, human-readable, natively Unicode, and supports modern data types.
+
+### The two formats side by side
+
+| Feature | XPT (SAS V5) | Dataset-JSON v1.1 |
+|---------|-------------|------------------|
+| Encoding | Binary (SAS transport) | UTF-8 JSON text |
+| Variable name max | 8 characters | 32 characters |
+| Label max | 200 characters | Unlimited |
+| Date type | Numeric (days since 1960-01-01) | ISO 8601 string |
+| Human-readable | No | Yes |
+| Software dependency | SAS / haven | Any JSON parser |
+| FDA acceptance | Required (current) | Pilot submissions accepted |
+| CDISC standard | CDISC Submission Data Standards | CDISC Dataset-JSON v1.1 |
+
+---
+
+## 1 — The Dataset-JSON v1.1 Specification
+
+### 1.1 Document structure
+
+A Dataset-JSON file is a single JSON document with this top-level structure:
+
+```{r json-structure-demo, eval=FALSE}
+# Conceptual structure of a Dataset-JSON v1.1 file:
+{
+  "datasetJSONVersion": "1.1.0",
+  "fileOID":            "OID.ADSL.20260524",
+  "creationDateTime":   "2026-05-24T09:00:00",
+  "originator":         "Clinical Programming Team",
+  "sourceSystem":       {"name": "R", "version": "4.4.0"},
+  "studyOID":           "CDISCPILOT01",
+  "metaDataRef":        "define.xml",
+  "clinicalData": {
+    "studyOID":           "CDISCPILOT01",
+    "metaDataVersionOID": "MDV.1",
+    "itemGroupData": {
+      "IG.ADSL": {
+        "records":  254,
+        "label":    "Subject-Level Analysis Dataset",
+        "items": [
+          {
+            "OID":    "IT.ADSL.STUDYID",
+            "name":   "STUDYID",
+            "label":  "Study Identifier",
+            "type":   "string",
+            "length": 12
+          },
+          {
+            "OID":    "IT.ADSL.AGE",
+            "name":   "AGE",
+            "label":  "Age",
+            "type":   "integer"
+          },
+          {
+            "OID":             "IT.ADSL.TRTSDT",
+            "name":            "TRTSDT",
+            "label":           "Date of First Exposure to Treatment",
+            "type":            "date",
+            "displayFormat":   "yyyy-mm-dd"
+          }
+        ],
+        "itemData": [
+          ["CDISCPILOT01", "CDISCPILOT01-01-701", 67, "2014-01-02"],
+          ["CDISCPILOT01", "CDISCPILOT01-01-702", 72, "2014-01-15"],
+          ...
+        ]
+      }
+    }
+  }
+}
+```
+
+### 1.2 Key structural elements
+
+| Element | Purpose |
+|---------|---------|
+| `datasetJSONVersion` | Spec version — must be `"1.1.0"` for current standard |
+| `fileOID` | Unique identifier for this file |
+| `studyOID` | Links to the study's define.xml |
+| `metaDataRef` | Path/name of the accompanying define.xml |
+| `clinicalData.itemGroupData` | Map of dataset OIDs to dataset contents |
+| `items` | Variable-level metadata (name, label, type, length) |
+| `itemData` | Row data — each row is a JSON array of values |
+
+### 1.3 Dataset-JSON data types
+
+| JSON type | Maps to | SAS equivalent |
+|-----------|---------|---------------|
+| `"string"` | character | $CHAR |
+| `"integer"` | integer numeric | numeric (format `8.`) |
+| `"decimal"` | double numeric | numeric (format `8.2`) |
+| `"date"` | Date (ISO 8601 `"yyyy-mm-dd"`) | numeric + `DATE9.` format |
+| `"datetime"` | POSIXct (ISO 8601) | numeric + `DATETIME20.` |
+| `"time"` | character HH:MM:SS | $TIME |
+
+### 1.4 Quiz
+
+```{r quiz-structure, echo=FALSE}
+quiz(
+  question(
+    "In Dataset-JSON v1.1, how are date values represented in the `itemData` arrays?",
+    answer("As SAS date integers (days since 1960-01-01)"),
+    answer("As ISO 8601 date strings (e.g., '2024-03-15')", correct = TRUE),
+    answer("As Unix timestamps (seconds since 1970-01-01)"),
+    answer("As character strings in the format 'DDMMMYYYY'"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What is the key structural difference between Dataset-JSON and XPT regarding variable names?",
+    answer("XPT allows 32-character names; Dataset-JSON allows only 8"),
+    answer("Both allow only 8-character names"),
+    answer("Dataset-JSON allows 32-character names while XPT is limited to 8", correct = TRUE),
+    answer("Dataset-JSON has no limit on variable name length"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which field in a Dataset-JSON file links the data to its corresponding define.xml?",
+    answer("`datasetJSONVersion`"),
+    answer("`studyOID`"),
+    answer("`metaDataRef`", correct = TRUE),
+    answer("`fileOID`"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 2 — Creating a `dataset_json` Object
+
+### 2.1 `dataset_json()` — the basic constructor
+
+```{r basic-constructor-demo, eval=FALSE}
+# Simplest form: data frame + domain
+adsl_dj <- dataset_json(
+  data      = adsl,
+  domain    = "ADSL",
+  label     = "Subject-Level Analysis Dataset",
+  study_oid = "CDISCPILOT01",
+  originator = "Clinical Programming — Pharmasave"
+)
+
+print(adsl_dj)
+```
+
+### 2.2 Exercise — create a dataset_json object
+
+Create a `dataset_json` object for ADSL with appropriate metadata fields.
+
+```{r basic-constructor-ex, exercise=TRUE, exercise.lines=16}
+adsl_dj <- dataset_json(
+  data       = ___,
+  domain     = "ADSL",
+  label      = ___,
+  study_oid  = "CDISCPILOT01",
+  originator = "Clinical Programming"
+)
+
+print(___)
+```
+
+```{r basic-constructor-ex-solution}
+adsl_dj <- dataset_json(
+  data       = adsl,
+  domain     = "ADSL",
+  label      = "Subject-Level Analysis Dataset",
+  study_oid  = "CDISCPILOT01",
+  originator = "Clinical Programming"
+)
+
+print(adsl_dj)
+```
+
+### 2.3 `dataset_json_from_spec()` — metadata-driven constructor
+
+The spec-driven constructor is preferred in production because it attaches variable labels and types in one call:
+
+```{r spec-constructor-demo, eval=FALSE}
+adsl_dj <- dataset_json_from_spec(
+  data      = adsl,
+  metadata  = adsl_spec,
+  domain    = "ADSL",
+  label     = "Subject-Level Analysis Dataset",
+  study_oid = "CDISCPILOT01"
+)
+
+# Inspect item metadata
+dataset_json_metadata(adsl_dj)
+```
+
+### 2.4 Exercise — spec-driven constructor
+
+```{r spec-constructor-ex, exercise=TRUE, exercise.lines=14}
+adsl_dj_spec <- dataset_json_from_spec(
+  data      = ___,
+  metadata  = adsl_spec,
+  domain    = ___,
+  label     = "Subject-Level Analysis Dataset",
+  study_oid = "CDISCPILOT01"
+)
+
+cat("── Item metadata (first 8 rows) ──\n")
+print(head(dataset_json_metadata(___), 8))
+```
+
+```{r spec-constructor-ex-solution}
+adsl_dj_spec <- dataset_json_from_spec(
+  data      = adsl,
+  metadata  = adsl_spec,
+  domain    = "ADSL",
+  label     = "Subject-Level Analysis Dataset",
+  study_oid = "CDISCPILOT01"
+)
+
+cat("── Item metadata (first 8 rows) ──\n")
+print(head(dataset_json_metadata(adsl_dj_spec), 8))
+```
+
+---
+
+## 3 — Writing Dataset-JSON Files
+
+### 3.1 `write_dataset_json()`
+
+```{r write-demo, eval=FALSE}
+adsl_dj <- dataset_json_from_spec(
+  data      = adsl,
+  metadata  = adsl_spec,
+  domain    = "ADSL",
+  label     = "Subject-Level Analysis Dataset",
+  study_oid = "CDISCPILOT01"
+)
+
+write_dataset_json(
+  x      = adsl_dj,
+  path   = "submission/adam/adsl.json",
+  pretty = FALSE    # compact for submission; TRUE for debugging
+)
+```
+
+### 3.2 Exercise — write ADSL to JSON
+
+```{r write-ex, exercise=TRUE, exercise.lines=20}
+adsl_dj <- dataset_json_from_spec(
+  data     = adsl,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  label    = "Subject-Level Analysis Dataset"
+)
+
+result <- write_dataset_json(
+  x      = ___,
+  path   = "adam/adsl.json",
+  pretty = ___     # use FALSE for compact output
+)
+
+cat("\nObject class:", class(result), "\n")
+```
+
+```{r write-ex-solution}
+adsl_dj <- dataset_json_from_spec(
+  data     = adsl,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  label    = "Subject-Level Analysis Dataset"
+)
+
+result <- write_dataset_json(
+  x      = adsl_dj,
+  path   = "adam/adsl.json",
+  pretty = FALSE
+)
+
+cat("\nObject class:", class(result), "\n")
+```
+
+### 3.3 Inspect the JSON output with `peek_json()`
+
+```{r peek-demo, exercise=TRUE, exercise.lines=14}
+adsl_dj <- dataset_json_from_spec(
+  data     = adsl,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  label    = "Subject-Level Analysis Dataset"
+)
+
+adsl_written <- write_dataset_json(adsl_dj, path="adam/adsl.json", pretty=TRUE)
+
+cat("\n── First 1000 chars of JSON ──\n")
+peek_json(adsl_written, n = 1000)
+```
+
+### 3.4 Pretty vs compact output
+
+```{r pretty-vs-compact, eval=FALSE}
+# For submission: compact (smaller file, faster to parse by agency systems)
+write_dataset_json(adsl_dj, path="submission/adsl.json", pretty=FALSE)
+# ~50% smaller file size than pretty-printed
+
+# For review / debugging: pretty-printed (human-readable)
+write_dataset_json(adsl_dj, path="review/adsl_debug.json", pretty=TRUE)
+
+# File size comparison:
+# adsl.json (compact): ~145 KB for 254 subjects × 25 vars
+# adsl_debug.json (pretty): ~290 KB
+```
+
+---
+
+## 4 — Reading Dataset-JSON Files
+
+### 4.1 `read_dataset_json()`
+
+```{r read-demo, eval=FALSE}
+# Read a Dataset-JSON file back into R
+adsl_restored <- read_dataset_json("submission/adam/adsl.json")
+
+# Inspect the restored object
+print(adsl_restored)
+
+# Extract the data frame
+adsl_df <- as_tibble(adsl_restored)
+head(adsl_df)
+```
+
+### 4.2 Round-trip fidelity
+
+A critical property: data must survive a write → read cycle intact. Use `compare_formats()` to verify:
+
+```{r round-trip-ex, exercise=TRUE, exercise.lines=22}
+# Simulate a round-trip: build → write → restore
+adsl_dj <- dataset_json_from_spec(
+  data     = adsl,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  label    = "Subject-Level Analysis Dataset"
+)
+
+# Write (mock — stores JSON string in attribute)
+adsl_written <- write_dataset_json(adsl_dj, path="adam/adsl.json")
+
+# In real usage, read_dataset_json() restores from disk.
+# Here we simulate by extracting data directly from the object:
+adsl_restored_df <- as_tibble(adsl_dj)   # same data (round-trip fidelity check)
+
+# Compare original to restored
+compare_formats(
+  df_original = ___,
+  df_restored = ___,
+  domain      = "ADSL"
+)
+```
+
+```{r round-trip-ex-solution}
+adsl_dj <- dataset_json_from_spec(
+  data     = adsl,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  label    = "Subject-Level Analysis Dataset"
+)
+
+adsl_written <- write_dataset_json(adsl_dj, path="adam/adsl.json")
+adsl_restored_df <- as_tibble(adsl_dj)
+
+compare_formats(
+  df_original = adsl,
+  df_restored = adsl_restored_df,
+  domain      = "ADSL"
+)
+```
+
+---
+
+## 5 — NA Handling in Dataset-JSON
+
+### 5.1 The `na` argument
+
+JSON has no native concept of a missing value for all types. Dataset-JSON handles NAs via the `na` argument to `write_dataset_json()`:
+
+| `na` value | JSON output for NA | When to use |
+|-----------|-------------------|-------------|
+| `"null"` (default) | `null` | FDA/EMA submission — most common |
+| `""` | `""` | Legacy compatibility |
+| `"NA"` | `"NA"` | Debugging only — creates string values |
+
+```{r na-handling-demo, eval=FALSE}
+# Submission-ready: NA → null
+write_dataset_json(adsl_dj, path="adsl.json", na="null")
+
+# Results in JSON like:
+# {"DTHFL": null, "TRTDURD": null}
+
+# NOT this (never use na="NA" for submissions):
+# {"DTHFL": "NA", "TRTDURD": "NA"}  ← creates string "NA", wrong type
+```
+
+### 5.2 Quiz
+
+```{r quiz-na, echo=FALSE}
+quiz(
+  question(
+    "When writing a Dataset-JSON file for FDA submission, which `na` argument value should you use?",
+    answer("`na = \"NA\"` — explicit string"),
+    answer("`na = \"\"` — empty string"),
+    answer("`na = \"null\"` — JSON null", correct = TRUE),
+    answer("`na = 0` — zero for numeric NAs"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A Dataset-JSON file has `\"type\": \"date\"` for variable TRTSDT. How should date values appear in `itemData`?",
+    answer("As SAS date integers: `20454`"),
+    answer("As ISO 8601 strings: `\"2026-01-15\"`", correct = TRUE),
+    answer("As R Date objects: `Date(20454)`"),
+    answer("As character strings with SAS format: `\"15JAN2026\"`"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 6 — Dataset-JSON vs XPT: When to Use Each
+
+### 6.1 Decision guide
+
+```
+Is this a current FDA eCTD submission?
+├── Yes → XPT is REQUIRED (FDA Study Data Technical Conformance Guide)
+│          Dataset-JSON may ALSO be included as supplementary
+└── No  → use Dataset-JSON for:
+           • EMA submissions (increasingly accepting JSON)
+           • Internal data warehouses and review platforms
+           • Data exchange with clinical data management systems
+           • Datasets > 5 GB (XPT has de facto file size limits)
+           • Non-ASCII characters in labels / values
+```
+
+### 6.2 Dual-format export pipeline
+
+Many sponsors produce **both** XPT and Dataset-JSON from the same source:
+
+```{r dual-format-demo, eval=FALSE}
+library(xportr)
+library(datasetjson)
+library(purrr)
+
+export_dual_format <- function(data, domain, spec, output_dir,
+                               label, study_oid) {
+
+  # ── XPT (required for FDA eCTD) ───────────────────────────────────────
+  xpt_path <- file.path(output_dir, "xpt", paste0(tolower(domain), ".xpt"))
+
+  data |>
+    xportr_metadata(spec, domain = domain) |>
+    xportr_type()   |>
+    xportr_label()  |>
+    xportr_length() |>
+    xportr_format() |>
+    xportr_order()  |>
+    xportr_df_label(label) |>
+    xportr_write(xpt_path, label = label)
+
+  # ── Dataset-JSON (supplementary / modern pipeline) ────────────────────
+  json_path <- file.path(output_dir, "json", paste0(tolower(domain), ".json"))
+
+  dataset_json_from_spec(
+    data      = data,
+    metadata  = spec,
+    domain    = domain,
+    label     = label,
+    study_oid = study_oid
+  ) |>
+    write_dataset_json(path = json_path, na = "null")
+
+  message(sprintf("[%s] XPT: %s | JSON: %s", domain, xpt_path, json_path))
+}
+```
+
+### 6.3 Exercise — dual format export
+
+Build a dual-format export for ADSL using the mock functions.
+
+```{r dual-format-ex, exercise=TRUE, exercise.lines=40}
+# Helper: run xportr pipeline (from lesson 43 mocks in setup)
+# We re-define a minimal version here for clarity
+mock_xportr_pipeline <- function(data, spec, domain, label) {
+  cat(sprintf("[xportr] %s: %d rows × %d cols → adam/%s.xpt\n",
+              domain, nrow(data), ncol(data), tolower(domain)))
+  invisible(data)
+}
+
+# Step 1: XPT export
+cat("=== XPT Export ===\n")
+mock_xportr_pipeline(
+  data   = ___,
+  spec   = adsl_spec,
+  domain = "ADSL",
+  label  = "Subject-Level Analysis Dataset"
+)
+
+# Step 2: Dataset-JSON export
+cat("\n=== Dataset-JSON Export ===\n")
+adsl_dj <- dataset_json_from_spec(
+  data      = ___,
+  metadata  = ___,
+  domain    = "ADSL",
+  label     = "Subject-Level Analysis Dataset",
+  study_oid = "CDISCPILOT01"
+)
+
+write_dataset_json(adsl_dj, path = "adam/adsl.json", na = ___)
+
+# Step 3: Summarise both outputs
+cat("\n=== Summary ===\n")
+summarise_dataset_json(___)
+```
+
+```{r dual-format-ex-solution}
+mock_xportr_pipeline <- function(data, spec, domain, label) {
+  cat(sprintf("[xportr] %s: %d rows × %d cols → adam/%s.xpt\n",
+              domain, nrow(data), ncol(data), tolower(domain)))
+  invisible(data)
+}
+
+cat("=== XPT Export ===\n")
+mock_xportr_pipeline(
+  data   = adsl,
+  spec   = adsl_spec,
+  domain = "ADSL",
+  label  = "Subject-Level Analysis Dataset"
+)
+
+cat("\n=== Dataset-JSON Export ===\n")
+adsl_dj <- dataset_json_from_spec(
+  data      = adsl,
+  metadata  = adsl_spec,
+  domain    = "ADSL",
+  label     = "Subject-Level Analysis Dataset",
+  study_oid = "CDISCPILOT01"
+)
+
+write_dataset_json(adsl_dj, path = "adam/adsl.json", na = "null")
+
+cat("\n=== Summary ===\n")
+summarise_dataset_json(adsl_dj)
+```
+
+---
+
+## 7 — Working with Multiple Datasets
+
+### 7.1 The `purrr::walk()` pattern for JSON export
+
+```{r multi-json-demo, eval=FALSE}
+library(purrr)
+library(datasetjson)
+
+datasets <- list(ADSL=adsl, ADAE=adae, ADLB=adlb)
+
+full_spec <- bind_rows(adsl_spec, adae_spec, adlb_spec)
+
+ds_labels <- c(
+  ADSL = "Subject-Level Analysis Dataset",
+  ADAE = "Adverse Events Analysis Dataset",
+  ADLB = "Laboratory Test Results"
+)
+
+output_dir <- "submission/json"
+dir.create(output_dir, recursive=TRUE, showWarnings=FALSE)
+
+walk(names(datasets), function(nm) {
+  dataset_json_from_spec(
+    data      = datasets[[nm]],
+    metadata  = full_spec,
+    domain    = nm,
+    label     = ds_labels[[nm]],
+    study_oid = "CDISCPILOT01"
+  ) |>
+    write_dataset_json(
+      path = file.path(output_dir, paste0(tolower(nm), ".json")),
+      na   = "null"
+    )
+
+  message(sprintf("✓ %s exported", nm))
+})
+```
+
+### 7.2 Exercise — export ADSL and ADAE
+
+```{r multi-json-ex, exercise=TRUE, exercise.lines=30}
+library(purrr)
+
+datasets <- list(
+  ADSL = adsl,
+  ADAE = ___
+)
+
+# Build a combined spec (ADSL only for this exercise — ADAE spec not loaded)
+# Use adsl_spec for ADSL and a minimal inline spec for ADAE
+adae_mini_spec <- adae |>
+  names() |>
+  tibble::tibble(variable=___, dataset="ADAE") |>
+  mutate(
+    label     = variable,
+    type      = if_else(sapply(adae[variable], is.numeric), "numeric", "character"),
+    data_type = if_else(type=="numeric", "decimal", "string"),
+    length    = 200L,
+    format    = NA_character_
+  )
+
+combined_spec <- bind_rows(adsl_spec, adae_mini_spec)
+
+walk(names(datasets), function(nm) {
+  dj <- dataset_json_from_spec(
+    data      = datasets[[nm]],
+    metadata  = ___,
+    domain    = ___,
+    study_oid = "CDISCPILOT01"
+  )
+  write_dataset_json(dj, path=paste0("adam/",tolower(nm),".json"), na="null")
+})
+
+cat("Export complete\n")
+```
+
+```{r multi-json-ex-solution}
+library(purrr)
+
+datasets <- list(
+  ADSL = adsl,
+  ADAE = adae
+)
+
+adae_mini_spec <- adae |>
+  names() |>
+  (\(nms) tibble::tibble(variable=nms, dataset="ADAE"))() |>
+  mutate(
+    label     = variable,
+    type      = if_else(sapply(adae[variable], is.numeric), "numeric", "character"),
+    data_type = if_else(type=="numeric", "decimal", "string"),
+    length    = 200L,
+    format    = NA_character_
+  )
+
+combined_spec <- bind_rows(adsl_spec, adae_mini_spec)
+
+walk(names(datasets), function(nm) {
+  dj <- dataset_json_from_spec(
+    data      = datasets[[nm]],
+    metadata  = combined_spec,
+    domain    = nm,
+    study_oid = "CDISCPILOT01"
+  )
+  write_dataset_json(dj, path=paste0("adam/",tolower(nm),".json"), na="null")
+})
+
+cat("Export complete\n")
+```
+
+---
+
+## 8 — Dataset-JSON and define.xml
+
+### 8.1 The relationship
+
+Every Dataset-JSON submission package must include a `define.xml` that:
+
+1. Declares all datasets and their variables
+2. Provides the `OID` values referenced in each JSON file's `metaDataRef` field
+3. Includes codelist, value level metadata, and computational algorithms
+
+```{r define-relationship, eval=FALSE}
+# The flow:
+#
+#   define.xml ←──────────────────────── metaDataRef
+#       │                                     │
+#       │  declares                           │  references
+#       ▼                                     │
+#   IG.ADSL (ItemGroupDef OID)          adsl.json
+#   IT.ADSL.USUBJID (ItemDef OID)     "IT.ADSL.USUBJID" in items[]
+#   IT.ADSL.AGE (ItemDef OID)         "IT.ADSL.AGE" in items[]
+#
+# The OIDs in the JSON items[] MUST match OIDs in define.xml
+
+# Correct OID pattern:
+# fileOID:     "OID.STUDY001.ADSL.20260524"
+# itemGroup:   "IG.ADSL"
+# item OIDs:   "IT.ADSL.STUDYID", "IT.ADSL.USUBJID", ...
+```
+
+### 8.2 Generating define.xml with `metacore` + `definexml`
+
+In a full pharmaverse submission pipeline:
+
+```{r define-gen, eval=FALSE}
+library(metacore)
+library(definexml)   # pharmaverse package for define.xml generation
+
+# Load specs from Excel workbook
+mc <- spec_to_metacore("specs/adam_specs.xlsx")
+
+# Generate define.xml
+define <- mc |>
+  metacore_to_define(
+    study_oid     = "CDISCPILOT01",
+    metadata_version_oid = "MDV.1",
+    std_oid       = "CDISC/ADAM/3.2"
+  )
+
+write_define(define, path = "submission/define.xml")
+
+# The Dataset-JSON files then reference this define.xml:
+adsl_dj <- dataset_json_from_spec(
+  data         = adsl,
+  metadata     = mc,
+  domain       = "ADSL",
+  metadata_ref = "define.xml"   # must match the written file name
+)
+```
+
+---
+
+## 9 — Validation and Quality Checks
+
+### 9.1 What to validate before submission
+
+```{r validation-checklist, eval=FALSE}
+# 1. All OIDs match define.xml
+#    → Check item OIDs in JSON match ItemDef OIDs in define.xml
+
+# 2. Variable count matches define.xml
+#    → itemGroupData.IG.ADSL records count == nrow(adsl)
+
+# 3. No unlabelled variables
+adsl_dj$item_metadata |>
+  filter(is.na(label) | label == "")
+# Should be empty
+
+# 4. All date variables have type="date" (not "decimal")
+adsl_dj$item_metadata |>
+  filter(name %in% c("TRTSDT","TRTEDT","ASTDT","AENDT")) |>
+  select(name, type)
+# type should be "date" not "decimal"
+
+# 5. NA encoding is "null" (not "NA" or "")
+write_dataset_json(adsl_dj, path="check.json", na="null")
+
+# 6. fileOID is unique across all files in the package
+# (enforce in your export pipeline by including a timestamp)
+```
+
+### 9.2 Exercise — validate item metadata completeness
+
+Check whether all variables in `adsl_dj` have labels and correct types.
+
+```{r validate-meta-ex, exercise=TRUE, exercise.lines=20}
+adsl_dj <- dataset_json_from_spec(
+  data     = adsl,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  label    = "Subject-Level Analysis Dataset"
+)
+
+meta <- dataset_json_metadata(adsl_dj)
+
+# Check 1: any unlabelled variables?
+unlabelled <- meta |> filter(is.na(label) | label == "")
+cat("Unlabelled variables:", nrow(___), "\n")
+
+# Check 2: date variables with wrong type
+date_vars  <- c("TRTSDT", "TRTEDT")
+date_types <- meta |>
+  filter(name %in% ___) |>
+  select(name, ___)
+
+cat("\nDate variable types:\n")
+print(date_types)
+
+# Check 3: string variables with length > 200
+long_strings <- meta |>
+  filter(type == "string", ___ > 200) |>
+  arrange(desc(length))
+
+cat("\nString variables > 200 chars:", nrow(long_strings), "\n")
+```
+
+```{r validate-meta-ex-solution}
+adsl_dj <- dataset_json_from_spec(
+  data     = adsl,
+  metadata = adsl_spec,
+  domain   = "ADSL",
+  label    = "Subject-Level Analysis Dataset"
+)
+
+meta <- dataset_json_metadata(adsl_dj)
+
+unlabelled <- meta |> filter(is.na(label) | label == "")
+cat("Unlabelled variables:", nrow(unlabelled), "\n")
+
+date_vars  <- c("TRTSDT", "TRTEDT")
+date_types <- meta |>
+  filter(name %in% date_vars) |>
+  select(name, type)
+
+cat("\nDate variable types:\n")
+print(date_types)
+
+long_strings <- meta |>
+  filter(type == "string", length > 200) |>
+  arrange(desc(length))
+
+cat("\nString variables > 200 chars:", nrow(long_strings), "\n")
+```
+
+---
+
+## 10 — Capstone: Full Submission JSON Package
+
+Build a complete, validated Dataset-JSON submission package for ADSL and ADAE.
+
+```{r capstone-json, exercise=TRUE, exercise.eval=FALSE, exercise.lines=70}
+library(purrr)
+
+# ── Step 1: Prepare datasets ──────────────────────────────────────────────
+cat("=== Step 1: Prepare datasets ===\n")
+
+adsl_clean <- adsl |>
+  select(any_of(adsl_spec$variable)) |>
+  mutate(COUNTRY = substr(COUNTRY, 1, 3))
+
+adae_clean <- adae |>
+  select(STUDYID, USUBJID, AESEQ, AEDECOD, AESOC, AESEV,
+         AESTDTC, AEENDTC, AESER, AEREL, AEOUT,
+         ASTDT, AENDT, ASTDY, AENDY, TRT01A)
+
+cat(sprintf("  ADSL: %d rows × %d cols\n", nrow(adsl_clean), ncol(adsl_clean)))
+cat(sprintf("  ADAE: %d rows × %d cols\n", nrow(adae_clean), ncol(adae_clean)))
+
+# ── Step 2: Build minimal ADAE spec ──────────────────────────────────────
+adae_mini <- tibble(
+  dataset   = "ADAE",
+  variable  = names(adae_clean),
+  label     = c("Study Identifier", "Unique Subject Identifier",
+                "Sequence Number", "Dictionary-Derived Term",
+                "Primary System Organ Class", "Severity/Intensity",
+                "Start Date/Time of AE", "End Date/Time of AE",
+                "Serious AE", "Causality", "Outcome of AE",
+                "Analysis Start Date", "Analysis End Date",
+                "Analysis Start Relative Day", "Analysis End Relative Day",
+                "Actual Treatment for Period 01"),
+  type      = c(rep("character",2), "numeric", rep("character",3),
+                rep("character",4), rep("character",2),
+                rep("numeric",4), "character"),
+  data_type = c(rep("string",2), "integer", rep("string",3),
+                rep("string",4), rep("string",2),
+                rep("date",2), rep("integer",2), "string"),
+  length    = c(12L,50L,8L,200L,200L,10L,20L,20L,2L,16L,60L,8L,8L,8L,8L,200L),
+  format    = c(rep(NA_character_,11), "DATE9.","DATE9.",
+                rep(NA_character_,3))
+)
+
+combined_spec <- bind_rows(adsl_spec, adae_mini)
+
+# ── Step 3: Build dataset_json objects ────────────────────────────────────
+cat("\n=== Step 3: Build JSON objects ===\n")
+
+datasets <- list(
+  ADSL = list(data=___, label="Subject-Level Analysis Dataset"),
+  ADAE = list(data=___, label="Adverse Events Analysis Dataset")
+)
+
+dj_objects <- imap(datasets, function(ds, nm) {
+  cat(sprintf("  Building %s...\n", nm))
+  dataset_json_from_spec(
+    data      = ds$data,
+    metadata  = ___,
+    domain    = nm,
+    label     = ds$label,
+    study_oid = "CDISCPILOT01"
+  )
+})
+
+# ── Step 4: Validate ──────────────────────────────────────────────────────
+cat("\n=== Step 4: Validate ===\n")
+walk(names(dj_objects), function(nm) {
+  meta <- dataset_json_metadata(dj_objects[[nm]])
+  unlabelled <- sum(is.na(meta$label) | meta$label == "")
+  cat(sprintf("  %s: %d variables, %d unlabelled\n",
+              nm, nrow(meta), unlabelled))
+})
+
+# ── Step 5: Write ─────────────────────────────────────────────────────────
+cat("\n=== Step 5: Write JSON files ===\n")
+walk(names(dj_objects), function(nm) {
+  write_dataset_json(
+    dj_objects[[nm]],
+    path = paste0("submission/", tolower(nm), ".json"),
+    na   = ___
+  )
+})
+
+# ── Step 6: Summary ──────────────────────────────────────────────────────
+cat("\n=== Final Summary ===\n")
+walk(names(dj_objects), function(nm) summarise_dataset_json(dj_objects[[nm]]))
+```
+
+```{r capstone-json-solution}
+library(purrr)
+
+cat("=== Step 1: Prepare datasets ===\n")
+adsl_clean <- adsl |>
+  select(any_of(adsl_spec$variable)) |>
+  mutate(COUNTRY = substr(COUNTRY, 1, 3))
+
+adae_clean <- adae |>
+  select(STUDYID, USUBJID, AESEQ, AEDECOD, AESOC, AESEV,
+         AESTDTC, AEENDTC, AESER, AEREL, AEOUT,
+         ASTDT, AENDT, ASTDY, AENDY, TRT01A)
+
+cat(sprintf("  ADSL: %d rows × %d cols\n", nrow(adsl_clean), ncol(adsl_clean)))
+cat(sprintf("  ADAE: %d rows × %d cols\n", nrow(adae_clean), ncol(adae_clean)))
+
+adae_mini <- tibble(
+  dataset   = "ADAE",
+  variable  = names(adae_clean),
+  label     = c("Study Identifier", "Unique Subject Identifier",
+                "Sequence Number", "Dictionary-Derived Term",
+                "Primary System Organ Class", "Severity/Intensity",
+                "Start Date/Time of AE", "End Date/Time of AE",
+                "Serious AE", "Causality", "Outcome of AE",
+                "Analysis Start Date", "Analysis End Date",
+                "Analysis Start Relative Day", "Analysis End Relative Day",
+                "Actual Treatment for Period 01"),
+  type      = c(rep("character",2), "numeric", rep("character",3),
+                rep("character",4), rep("character",2),
+                rep("numeric",4), "character"),
+  data_type = c(rep("string",2), "integer", rep("string",3),
+                rep("string",4), rep("string",2),
+                rep("date",2), rep("integer",2), "string"),
+  length    = c(12L,50L,8L,200L,200L,10L,20L,20L,2L,16L,60L,8L,8L,8L,8L,200L),
+  format    = c(rep(NA_character_,11), "DATE9.","DATE9.",
+                rep(NA_character_,3))
+)
+
+combined_spec <- bind_rows(adsl_spec, adae_mini)
+
+cat("\n=== Step 3: Build JSON objects ===\n")
+datasets <- list(
+  ADSL = list(data=adsl_clean, label="Subject-Level Analysis Dataset"),
+  ADAE = list(data=adae_clean, label="Adverse Events Analysis Dataset")
+)
+
+dj_objects <- imap(datasets, function(ds, nm) {
+  cat(sprintf("  Building %s...\n", nm))
+  dataset_json_from_spec(
+    data      = ds$data,
+    metadata  = combined_spec,
+    domain    = nm,
+    label     = ds$label,
+    study_oid = "CDISCPILOT01"
+  )
+})
+
+cat("\n=== Step 4: Validate ===\n")
+walk(names(dj_objects), function(nm) {
+  meta <- dataset_json_metadata(dj_objects[[nm]])
+  unlabelled <- sum(is.na(meta$label) | meta$label == "")
+  cat(sprintf("  %s: %d variables, %d unlabelled\n",
+              nm, nrow(meta), unlabelled))
+})
+
+cat("\n=== Step 5: Write JSON files ===\n")
+walk(names(dj_objects), function(nm) {
+  write_dataset_json(
+    dj_objects[[nm]],
+    path = paste0("submission/", tolower(nm), ".json"),
+    na   = "null"
+  )
+})
+
+cat("\n=== Final Summary ===\n")
+walk(names(dj_objects), function(nm) summarise_dataset_json(dj_objects[[nm]]))
+```
+
+---
+
+## Summary
+
+You can now produce CDISC Dataset-JSON v1.1 files from R for modern electronic submissions:
+
+**Format fundamentals:**
+- Dataset-JSON stores data as UTF-8 JSON with `items[]` (variable metadata) and `itemData[]` (row arrays)
+- Dates are ISO 8601 strings (`"yyyy-mm-dd"`), not SAS numeric integers
+- JSON data types: `"string"`, `"integer"`, `"decimal"`, `"date"`, `"datetime"`
+- `na = "null"` is the correct NA encoding for submission files
+
+**Key functions:**
+- `dataset_json(data, domain, label, ...)` — basic constructor
+- `dataset_json_from_spec(data, metadata, domain, ...)` — metadata-driven constructor (preferred)
+- `write_dataset_json(x, path, pretty, na)` — serialize to JSON file
+- `read_dataset_json(path)` — deserialize from JSON file
+- `dataset_json_metadata(dj)` — extract item metadata table
+- `summarise_dataset_json(dj)` — diagnostics summary
+
+**Submission strategy:**
+- **XPT is still required** for FDA eCTD submissions — Dataset-JSON is supplementary or for EMA/pilot
+- Dual-format pipelines produce both XPT and JSON from the same source data
+- Every Dataset-JSON package must include a matching `define.xml` with consistent OIDs
+- `metaDataRef = "define.xml"` in the JSON links it to the define file
+
+Next: **Lesson 45** covers `logrx` — automated R session logging for 21 CFR Part 11 compliance, capturing package versions, environment details, and execution metadata alongside every analysis run.

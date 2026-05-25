@@ -1,0 +1,1148 @@
+---
+title: "Lesson 34 — tern: Analysis Functions for rtables"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  tern provides pre-built afuns (analyze_vars, count_occurrences,
+  count_patients_with_flags, s_summary) that plug into rtables layouts.
+  Covers continuous and categorical summarisation, AE counting, serious AE
+  flags, custom afuns via s_summary(), and a full AE Summary Table capstone.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 34_tern.Rmd
+# PURPOSE       : tern — pre-built rtables analysis functions: analyze_vars(),
+#                 count_occurrences(), count_patients_with_flags(), s_summary(),
+#                 control_analyze_vars(), estimate_proportion(), and a full
+#                 AE Summary Table 14.3.1 capstone.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.blanks = TRUE)
+
+# ── ADSL ──────────────────────────────────────────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014)
+  n  <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n, 161, 7)), round(rnorm(n, 174, 8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n, 68, 12), 1), round(rnorm(n, 82, 14), 1))
+  adsl_raw <- adsl_raw |>
+    mutate(HEIGHTBL = ht, WEIGHTBL = wt,
+           BMIBL    = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N")
+  )
+
+# ── ADAE ──────────────────────────────────────────────────────────────────────
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw)) {
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+} else if (!"TRT01A" %in% names(adae_raw)) {
+  adae_raw <- left_join(adae_raw, select(adsl, USUBJID, TRT01A), by = "USUBJID")
+}
+adae <- adae_raw |>
+  filter(SAFFL == "Y") |>
+  mutate(
+    AESEVN  = case_when(
+      AESEV == "MILD"     ~ 1L,
+      AESEV == "MODERATE" ~ 2L,
+      AESEV == "SEVERE"   ~ 3L,
+      TRUE                ~ NA_integer_
+    ),
+    AESERFL = if_else(AESER == "Y", TRUE, FALSE, missing = FALSE)
+  )
+
+# ── ADLB ──────────────────────────────────────────────────────────────────────
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+# ── MOCK rtables ──────────────────────────────────────────────────────────────
+
+basic_table <- function(title = "", subtitles = character(),
+                        main_footer = character(), prov_footer = character()) {
+  structure(
+    list(title = title, col_var = NULL, overall_col = NULL,
+         row_splits = character(), analyze_vars = character(),
+         afun = NULL, flag_vars = character(), count_var = NULL,
+         row_summary = FALSE, analyze_stats = NULL),
+    class = "rtable_layout"
+  )
+}
+
+split_cols_by <- function(lyt, var, labels_var = NULL, split_fun = NULL) {
+  lyt$col_var <- var; lyt
+}
+
+add_overall_col <- function(lyt, label = "All Patients") {
+  lyt$overall_col <- label; lyt
+}
+
+split_rows_by <- function(lyt, var, labels_var = NULL, split_fun = NULL,
+                          label_pos = "topleft", indent_mod = 0L) {
+  lyt$row_splits <- c(lyt$row_splits, var); lyt
+}
+
+analyze <- function(lyt, vars, afun = NULL, ...) {
+  lyt$analyze_vars <- c(lyt$analyze_vars, vars)
+  if (!is.null(afun)) lyt$afun <- afun
+  lyt
+}
+
+in_rows <- function(..., .list = NULL, .labels = NULL) {
+  vals <- if (!is.null(.list)) .list else list(...)
+  structure(vals, labels = .labels, class = "in_rows")
+}
+
+rcell <- function(x, format = NULL, ...) {
+  structure(list(value = x, format = format), class = "rcell")
+}
+
+mean_sd <- function(x, ...) {
+  in_rows(
+    .list   = list(rcell(c(mean(x, na.rm = TRUE), sd(x, na.rm = TRUE)),
+                         format = "xx.x (xx.x)")),
+    .labels = "Mean (SD)"
+  )
+}
+
+median_range <- function(x, ...) {
+  in_rows(
+    .list   = list(rcell(c(median(x, na.rm = TRUE),
+                           min(x, na.rm = TRUE),
+                           max(x, na.rm = TRUE)),
+                         format = "xx.x [xx.x, xx.x]")),
+    .labels = "Median [Min, Max]"
+  )
+}
+
+count_fraction <- function(x, ...) {
+  n <- length(x)
+  in_rows(
+    .list   = list(rcell(c(n, 100), format = "xx (xx.x%)")),
+    .labels = "n (%)"
+  )
+}
+
+build_table <- function(lyt, df, ...) {
+  col_var   <- lyt$col_var
+  col_lvls  <- if (!is.null(col_var)) sort(unique(df[[col_var]])) else "All"
+  if (!is.null(lyt$overall_col)) col_lvls <- c(col_lvls, lyt$overall_col)
+
+  if (length(lyt$row_splits) > 0) {
+    row_grps <- unique(df[, lyt$row_splits, drop = FALSE])
+    n_rows   <- max(1L, nrow(row_grps)) * max(1L, length(lyt$analyze_vars))
+  } else {
+    n_rows <- max(1L, length(lyt$analyze_vars))
+  }
+  if (isTRUE(lyt$row_summary)) n_rows <- n_rows + 1L
+
+  structure(
+    list(layout = lyt, data = df, col_levels = col_lvls,
+         n_rows = n_rows, n_cols = length(col_lvls)),
+    class = "rtable"
+  )
+}
+
+print.rtable <- function(x, ...) {
+  cat("rtable:", x$n_rows, "analysis row(s) x", x$n_cols, "col(s)\n")
+  cat("Columns :", paste(x$col_levels, collapse = " | "), "\n")
+  if (length(x$layout$row_splits) > 0)
+    cat("Row splits on:", paste(x$layout$row_splits, collapse = " > "), "\n")
+  if (length(x$layout$analyze_vars) > 0)
+    cat("Analyzed vars:", paste(x$layout$analyze_vars, collapse = ", "), "\n")
+  if (length(x$layout$flag_vars) > 0)
+    cat("Flag vars    :", paste(x$layout$flag_vars, collapse = ", "), "\n")
+  invisible(x)
+}
+
+nrow.rtable    <- function(x, ...) x$n_rows
+ncol.rtable    <- function(x, ...) x$n_cols
+toString.rtable <- function(x, ...) {
+  paste0("rtable with ", x$n_rows, " row(s) and ", x$n_cols, " col(s); ",
+         "cols: ", paste(x$col_levels, collapse = " | "))
+}
+as_html <- function(tbl, ...) {
+  cat("[HTML table rendered —", tbl$n_rows, "rows x", tbl$n_cols, "cols]\n")
+  invisible(tbl)
+}
+prune_table           <- function(tbl, ...) tbl
+all_obs_pruning_fun   <- function() NULL
+sort_at_path          <- function(tbl, path, scorefun, ...) tbl
+row_paths_summary     <- function(tbl) {
+  cat("Row path summary — use path strings to address subtrees.\n")
+  invisible(NULL)
+}
+
+# ── MOCK tern ─────────────────────────────────────────────────────────────────
+# tern functions are curried: they return a function(lyt) that modifies the
+# layout.  This mirrors how tern integrates with the rtables pipe in practice.
+
+analyze_vars <- function(vars, var_labels = NULL, show_labels = "default",
+                         .stats = c("n", "mean", "sd", "median", "range"),
+                         na.rm = TRUE, .indent_mods = NULL, ...) {
+  function(lyt) {
+    lyt$analyze_vars   <- c(lyt$analyze_vars, vars)
+    lyt$analyze_stats  <- .stats
+    lyt$show_labels    <- show_labels
+    lyt
+  }
+}
+
+count_occurrences <- function(vars, drop = TRUE, .indent_mods = NULL, ...) {
+  function(lyt) {
+    lyt$count_var  <- vars
+    lyt$count_drop <- drop
+    lyt$analyze_vars <- c(lyt$analyze_vars, vars)
+    lyt
+  }
+}
+
+summarize_row_groups <- function(cfun = NULL, ...) {
+  function(lyt) {
+    lyt$row_summary <- TRUE
+    lyt
+  }
+}
+
+count_patients_with_flags <- function(var, flag_variables,
+                                      .indent_mods = NULL, ...) {
+  function(lyt) {
+    lyt$flag_var   <- flag_variables
+    lyt$analyze_vars <- c(lyt$analyze_vars, var)
+    lyt
+  }
+}
+
+# s_summary: the core tern statistics engine for a numeric vector
+s_summary <- function(x, na.rm = TRUE, ...) {
+  x_clean <- if (na.rm) x[!is.na(x)] else x
+  n       <- length(x_clean)
+  list(
+    n         = n,
+    mean      = if (n > 0) mean(x_clean) else NA_real_,
+    sd        = if (n > 1) sd(x_clean)   else NA_real_,
+    median    = if (n > 0) median(x_clean) else NA_real_,
+    min       = if (n > 0) min(x_clean)  else NA_real_,
+    max       = if (n > 0) max(x_clean)  else NA_real_,
+    range     = if (n > 0) range(x_clean) else c(NA_real_, NA_real_),
+    q1_q3     = if (n > 0) quantile(x_clean, c(0.25, 0.75)) else c(NA_real_, NA_real_),
+    n_missing = sum(is.na(x))
+  )
+}
+
+control_analyze_vars <- function(stats = c("n", "mean", "sd", "median", "range"),
+                                  ...) {
+  list(stats = stats)
+}
+
+estimate_proportion <- function(x, conf_level = 0.95, ...) {
+  x    <- as.logical(x)
+  n    <- sum(x, na.rm = TRUE)
+  N    <- sum(!is.na(x))
+  prop <- if (N > 0) n / N else NA_real_
+  z    <- qnorm(1 - (1 - conf_level) / 2)
+  if (!is.na(prop) && N > 0) {
+    denom  <- 1 + z^2 / N
+    centre <- (prop + z^2 / (2 * N)) / denom
+    margin <- z * sqrt(prop * (1 - prop) / N + z^2 / (4 * N^2)) / denom
+    ci     <- c(max(0, centre - margin), min(1, centre + margin))
+  } else {
+    ci <- c(NA_real_, NA_real_)
+  }
+  list(n = n, N = N, prop = prop, ci = ci)
+}
+
+estimate_proportion_diff <- function(x, y, conf_level = 0.95, ...) {
+  x  <- as.logical(x); y <- as.logical(y)
+  p1 <- mean(x, na.rm = TRUE); p2 <- mean(y, na.rm = TRUE)
+  n1 <- sum(!is.na(x));        n2 <- sum(!is.na(y))
+  d  <- p1 - p2
+  se <- sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
+  z  <- qnorm(1 - (1 - conf_level) / 2)
+  list(diff = d, ci = c(d - z * se, d + z * se))
+}
+
+format_fraction <- function(num, denom) {
+  sprintf("%d/%d (%.1f%%)", as.integer(num), as.integer(denom),
+          100 * num / denom)
+}
+
+format_count_fraction <- function(x, N) {
+  sprintf("%d (%.1f%%)", as.integer(x), 100 * x / N)
+}
+
+# build_tern_table: extended build that actually runs s_summary per group
+build_tern_table <- function(lyt, df, alt_counts_df = NULL) {
+  col_var <- lyt$col_var
+  groups  <- if (!is.null(col_var)) split(df, df[[col_var]]) else list(All = df)
+  if (!is.null(lyt$overall_col)) groups[[lyt$overall_col]] <- df
+
+  results <- lapply(groups, function(grp) {
+    if (length(lyt$analyze_vars) > 0) {
+      lapply(lyt$analyze_vars, function(v) {
+        if (is.numeric(grp[[v]])) s_summary(grp[[v]])
+        else list(n = nrow(grp), levels = unique(grp[[v]]))
+      })
+    } else {
+      list(n = nrow(grp))
+    }
+  })
+
+  col_lvls <- names(groups)
+  n_rows   <- max(1L, length(lyt$analyze_vars))
+  if (length(lyt$row_splits) > 0) {
+    rg     <- unique(df[, lyt$row_splits, drop = FALSE])
+    n_rows <- nrow(rg) * max(1L, length(lyt$analyze_vars))
+  }
+  if (!is.null(lyt$flag_var) && length(lyt$flag_var) > 0)
+    n_rows <- n_rows + length(lyt$flag_var)
+
+  structure(
+    list(layout = lyt, data = df, results = results,
+         col_levels = col_lvls, n_rows = n_rows, n_cols = length(col_lvls)),
+    class = "rtable"
+  )
+}
+```
+
+## Overview
+
+This lesson covers **tern**, the pharmaverse package that sits *on top of*
+rtables and provides production-ready analysis functions (afuns) for
+ICH-compliant clinical study report tables.
+
+In Lesson 33 you wrote `in_rows() / rcell()` from scratch. tern replaces that
+boilerplate with a single function call — `analyze_vars()`, `count_occurrences()`,
+or `count_patients_with_flags()` — while keeping full compatibility with the
+rtables layout pipeline.
+
+By the end of this lesson you will be able to:
+
+- Explain how tern afuns relate to rtables layouts
+- Use `analyze_vars()` for both continuous and categorical variables
+- Use `count_occurrences()` for subject-level AE counting
+- Use `count_patients_with_flags()` for serious-AE and death-flag rows
+- Build a custom afun using `s_summary()`
+- Assemble a complete AE Summary Table 14.3.1
+
+**Packages used:** `tern` (mocked), `rtables` (mocked), `dplyr`,
+`pharmaverseadam`
+
+---
+
+## Section 1 — tern in the rtables Ecosystem
+
+### The relationship
+
+```
+rtables                  tern
+───────────────          ───────────────────────────────────────
+basic_table()        +   analyze_vars()
+split_cols_by()          count_occurrences()
+split_rows_by()          count_patients_with_flags()
+analyze()                summarize_row_groups()
+build_table()            s_summary()
+```
+
+tern functions are **not** passed to `analyze()` as a plain afun. Instead they
+are **curried** — they return a function that accepts a layout and returns a
+modified layout. You use them as pipe steps directly:
+
+```r
+basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("AGE", .stats = c("n", "mean", "sd"))()
+```
+
+> The `()` at the end calls the curried function with the layout built so far.
+> In production code with real tern installed, tern uses S4 dispatch so this
+> syntax is handled transparently. In these exercises the mock works the same way.
+
+### Why tern instead of raw rtables afuns?
+
+With raw rtables you would write:
+
+```r
+my_age_afun <- function(x, ...) {
+  in_rows(
+    .list = list(
+      rcell(length(x[!is.na(x)]),                           format = "xx"),
+      rcell(c(mean(x, na.rm=TRUE), sd(x, na.rm=TRUE)),      format = "xx.x (xx.x)"),
+      rcell(c(min(x,na.rm=TRUE), max(x,na.rm=TRUE)),        format = "xx.x, xx.x")
+    ),
+    .labels = c("n", "Mean (SD)", "Min, Max")
+  )
+}
+analyze("AGE", my_age_afun)
+```
+
+With tern you write:
+
+```r
+analyze_vars("AGE", .stats = c("n", "mean", "sd", "range"))()
+```
+
+### Exercise 1.1 — Match function to use-case
+
+For each use-case, write the tern function name you would use. Answer by
+running code that prints your answers.
+
+```{r ex-1-1, exercise=TRUE, exercise.lines=10}
+# Complete the character vector with tern function names:
+# Options: analyze_vars, count_occurrences, count_patients_with_flags
+
+answers <- c(
+  "Continuous lab values (mean, SD, median, range)"  = "___",
+  "AE counts by body system (subject-level)"         = "___",
+  "Subjects with serious AEs (AESER == 'Y')"         = "___"
+)
+print(answers)
+```
+
+```{r ex-1-1-hint-1}
+# Continuous variables -> analyze_vars
+# Subject-level occurrence counts -> count_occurrences
+# Flag-based counts -> count_patients_with_flags
+```
+
+```{r ex-1-1-solution}
+answers <- c(
+  "Continuous lab values (mean, SD, median, range)"  = "analyze_vars",
+  "AE counts by body system (subject-level)"         = "count_occurrences",
+  "Subjects with serious AEs (AESER == 'Y')"         = "count_patients_with_flags"
+)
+print(answers)
+```
+
+### Exercise 1.2 — Side-by-side comparison
+
+Below is a raw-rtables layout for AGE mean/SD. Rewrite the `analyze()` line
+using tern's `analyze_vars()` instead.
+
+```{r ex-1-2, exercise=TRUE, exercise.lines=14}
+# Raw rtables version (given — do not change):
+lyt_raw <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze("AGE", mean_sd)
+
+# tern version — replace analyze("AGE", mean_sd) with analyze_vars():
+lyt_tern <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  ___("AGE", .stats = c("n", "mean", "sd"))(___)
+
+tbl_tern <- build_tern_table(lyt_tern, adsl)
+cat("tern ncol:", ncol(tbl_tern), "\n")
+```
+
+```{r ex-1-2-hint-1}
+# analyze_vars("AGE", .stats = c("n","mean","sd")) returns a function.
+# Call it with (lyt_tern_so_far) by appending () to the pipe result,
+# or pass the layout: analyze_vars("AGE", .stats = ...)(lyt_so_far).
+# In the mock, the pipe step looks like: analyze_vars("AGE", ...)()
+# where the () applies the returned function to the layout built so far.
+```
+
+```{r ex-1-2-solution}
+lyt_tern <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("AGE", .stats = c("n", "mean", "sd"))()
+
+tbl_tern <- build_tern_table(lyt_tern, adsl)
+cat("tern ncol:", ncol(tbl_tern), "\n")
+```
+
+### Quiz
+
+```{r quiz-1, echo=FALSE}
+quiz(
+  question(
+    "What does tern's analyze_vars() return when called?",
+    answer("An rtable object ready to print"),
+    answer("A function that accepts a layout and returns a modified layout",
+           correct = TRUE),
+    answer("A data frame of summary statistics"),
+    answer("A character vector of statistic labels"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which tern function is specifically designed to count SUBJECTS (not rows) with AEs?",
+    answer("analyze_vars()"),
+    answer("s_summary()"),
+    answer("count_occurrences()", correct = TRUE),
+    answer("summarize_row_groups()"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — analyze_vars() for Continuous Variables
+
+### Default statistics
+
+`analyze_vars()` detects numeric variables automatically and produces:
+`n`, `mean`, `sd`, `median`, `min`, `max`, and `range`.
+
+You can customise with `.stats`:
+
+```r
+analyze_vars("AGE",
+             .stats = c("n", "mean", "sd", "median", "range"))()
+```
+
+The `control_analyze_vars()` helper builds the stats list for you, which is
+useful when applying the same configuration to many variables:
+
+```r
+ctrl <- control_analyze_vars(stats = c("n", "mean", "sd"))
+analyze_vars("AGE", .stats = ctrl$stats)()
+```
+
+### Exercise 2.1 — AGE and WEIGHTBL with custom stats
+
+Build a layout with `analyze_vars()` for both `AGE` and `WEIGHTBL`, requesting
+only `n`, `mean`, `sd`, and `range`. Columns split by `TRT01P`. Use
+`build_tern_table()`.
+
+```{r ex-2-1, exercise=TRUE, exercise.lines=16}
+lyt <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars(___, .stats = c("n", "mean", "sd", "range"))() |>
+  analyze_vars(___, .stats = c("n", "mean", "sd", "range"))()
+
+tbl <- build_tern_table(lyt, adsl)
+tbl
+```
+
+```{r ex-2-1-hint-1}
+# First analyze_vars("AGE", ...) then analyze_vars("WEIGHTBL", ...).
+# Each call is a separate pipe step, each followed by ().
+```
+
+```{r ex-2-1-solution}
+lyt <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("AGE",      .stats = c("n", "mean", "sd", "range"))() |>
+  analyze_vars("WEIGHTBL", .stats = c("n", "mean", "sd", "range"))()
+
+tbl <- build_tern_table(lyt, adsl)
+tbl
+```
+
+### Exercise 2.2 — s_summary() exploration
+
+Call `s_summary()` directly on the `AGE` column of the safety population.
+Inspect the returned list and print the `n`, `mean`, and `q1_q3` elements.
+
+```{r ex-2-2, exercise=TRUE, exercise.lines=12}
+adsl_saf <- adsl |> filter(SAFFL == "Y")
+
+stats <- s_summary(adsl_saf$AGE)
+
+cat("n       :", stats$n,    "\n")
+cat("mean    :", round(stats$___, 2), "\n")
+cat("Q1, Q3  :", round(stats$___[1], 2), ",", round(stats$___[2], 2), "\n")
+```
+
+```{r ex-2-2-hint-1}
+# Access list elements with $mean and $q1_q3.
+# q1_q3 is a length-2 vector: q1_q3[1] = Q1, q1_q3[2] = Q3.
+```
+
+```{r ex-2-2-solution}
+adsl_saf <- adsl |> filter(SAFFL == "Y")
+
+stats <- s_summary(adsl_saf$AGE)
+
+cat("n       :", stats$n,               "\n")
+cat("mean    :", round(stats$mean, 2),  "\n")
+cat("Q1, Q3  :", round(stats$q1_q3[1], 2), ",",
+                 round(stats$q1_q3[2], 2), "\n")
+```
+
+---
+
+## Section 3 — analyze_vars() for Categorical Variables
+
+### Auto-detection
+
+When the variable passed to `analyze_vars()` is a **character or factor**,
+tern automatically switches to count/percentage output (equivalent to
+`count_fraction` from Lesson 33).
+
+The `show_labels` argument controls row labelling:
+
+| Value | Effect |
+|-------|--------|
+| `"default"` | Labels shown based on context |
+| `"visible"` | Variable name always appears as a header row |
+| `"hidden"` | Variable name suppressed; counts appear without header |
+
+### Exercise 3.1 — Add SEX as categorical variable
+
+Extend the layout from Section 2 Exercise 2.1 to also include `SEX` with
+`show_labels = "visible"`. Use `adsl |> filter(SAFFL == "Y")`.
+
+```{r ex-3-1, exercise=TRUE, exercise.lines=16}
+adsl_saf <- adsl |> filter(SAFFL == "Y")
+
+lyt <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("AGE",      .stats = c("n", "mean", "sd"))() |>
+  analyze_vars("WEIGHTBL", .stats = c("n", "mean", "sd"))() |>
+  analyze_vars(___, show_labels = ___)()
+
+tbl <- build_tern_table(lyt, adsl_saf)
+tbl
+```
+
+```{r ex-3-1-hint-1}
+# analyze_vars("SEX", show_labels = "visible")()
+```
+
+```{r ex-3-1-solution}
+adsl_saf <- adsl |> filter(SAFFL == "Y")
+
+lyt <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("AGE",      .stats = c("n", "mean", "sd"))() |>
+  analyze_vars("WEIGHTBL", .stats = c("n", "mean", "sd"))() |>
+  analyze_vars("SEX",      show_labels = "visible")()
+
+tbl <- build_tern_table(lyt, adsl_saf)
+tbl
+```
+
+### Exercise 3.2 — Compare show_labels settings
+
+Build the same single-variable layout twice — once with `show_labels = "visible"`
+and once with `show_labels = "hidden"` — and compare the `n_rows` values.
+
+```{r ex-3-2, exercise=TRUE, exercise.lines=20}
+lyt_visible <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("SEX", show_labels = ___)()
+
+lyt_hidden <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("SEX", show_labels = ___)()
+
+tbl_v <- build_tern_table(lyt_visible, adsl)
+tbl_h <- build_tern_table(lyt_hidden,  adsl)
+
+cat("show_labels = 'visible' nrow:", nrow(tbl_v), "\n")
+cat("show_labels = 'hidden'  nrow:", nrow(tbl_h), "\n")
+```
+
+```{r ex-3-2-solution}
+lyt_visible <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("SEX", show_labels = "visible")()
+
+lyt_hidden <- basic_table() |>
+  split_cols_by("TRT01P") |>
+  analyze_vars("SEX", show_labels = "hidden")()
+
+tbl_v <- build_tern_table(lyt_visible, adsl)
+tbl_h <- build_tern_table(lyt_hidden,  adsl)
+
+cat("show_labels = 'visible' nrow:", nrow(tbl_v), "\n")
+cat("show_labels = 'hidden'  nrow:", nrow(tbl_h), "\n")
+```
+
+---
+
+## Section 4 — count_occurrences() for AE Tables
+
+### Subject-level counting
+
+AE datasets contain **one row per event**, not per subject. A single subject can
+contribute many rows to `adae`. If you naively count rows you overcount subjects.
+
+`count_occurrences()` counts **unique USUBJID values** within each column-group
+for each row-split category. This is the subject-level incidence count required
+by FDA guidance for AE summary tables.
+
+Key argument: `drop = TRUE` removes row categories that have zero subjects in
+**every** column (equivalent to `prune_table()` after the fact).
+
+### Typical AE table layout
+
+```r
+basic_table() |>
+  split_cols_by("TRT01A") |>
+  split_rows_by("AEBODSYS", label_pos = "topleft") |>
+  summarize_row_groups()() |>
+  count_occurrences("AEDECOD")()
+```
+
+`summarize_row_groups()` adds a body-system subtotal row above the preferred
+terms — this is the "Any AE in <body system>" row.
+
+### Exercise 4.1 — Count subjects per body system
+
+Build a layout with columns by `TRT01A`, rows split on `AEBODSYS`, and
+`count_occurrences("AEDECOD")`. Use `build_tern_table(lyt, adae)`.
+Print the result.
+
+```{r ex-4-1, exercise=TRUE, exercise.lines=14}
+lyt <- basic_table() |>
+  split_cols_by(___) |>
+  split_rows_by("AEBODSYS", label_pos = "topleft") |>
+  count_occurrences(___)()
+
+tbl <- build_tern_table(lyt, adae)
+tbl
+```
+
+```{r ex-4-1-hint-1}
+# split_cols_by("TRT01A") — TRTA was renamed to TRT01A in the setup chunk.
+# count_occurrences("AEDECOD")() counts subjects per preferred term.
+```
+
+```{r ex-4-1-solution}
+lyt <- basic_table() |>
+  split_cols_by("TRT01A") |>
+  split_rows_by("AEBODSYS", label_pos = "topleft") |>
+  count_occurrences("AEDECOD")()
+
+tbl <- build_tern_table(lyt, adae)
+tbl
+```
+
+### Exercise 4.2 — NERVOUS SYSTEM DISORDERS subject count
+
+Using `dplyr`, count the number of **unique subjects** with at least one AE in
+the "NERVOUS SYSTEM DISORDERS" body system for each treatment arm. This gives
+you the expected subject count that `count_occurrences()` would place in each
+cell.
+
+```{r ex-4-2, exercise=TRUE, exercise.lines=12}
+adae |>
+  filter(AEBODSYS == ___) |>
+  group_by(___) |>
+  summarise(n_subjects = n_distinct(___), .groups = "drop")
+```
+
+```{r ex-4-2-hint-1}
+# filter(AEBODSYS == "NERVOUS SYSTEM DISORDERS")
+# group_by(TRT01A)
+# n_distinct(USUBJID) counts unique subjects per arm
+```
+
+```{r ex-4-2-solution}
+adae |>
+  filter(AEBODSYS == "NERVOUS SYSTEM DISORDERS") |>
+  group_by(TRT01A) |>
+  summarise(n_subjects = n_distinct(USUBJID), .groups = "drop")
+```
+
+---
+
+## Section 5 — count_patients_with_flags()
+
+### Flagging specific AE categories
+
+For regulatory AE tables you need rows like:
+
+- Subjects with any serious AE (AESER == "Y")
+- Subjects with an AE leading to death (AESDTH == "Y")
+- Subjects with an AE leading to drug withdrawal (AEACN == "DRUG WITHDRAWN")
+
+`count_patients_with_flags()` takes:
+
+- `var`: the subject identifier variable (usually `"USUBJID"`)
+- `flag_variables`: a named character vector mapping display label → column name
+
+```r
+count_patients_with_flags(
+  "USUBJID",
+  flag_variables = c("Serious AEs" = "AESERFL",
+                     "Fatal AEs"   = "AEDTHFL")
+)()
+```
+
+The flag columns must be **logical** (`TRUE` / `FALSE`) in the data frame.
+
+### Exercise 5.1 — Derive AESERFL and count serious AEs
+
+`adae` in this lesson already has `AESERFL = (AESER == "Y")` (derived in
+the setup chunk). Count the number of subjects with a serious AE per arm
+using `dplyr`. This is the expected value that `count_patients_with_flags()`
+would produce.
+
+```{r ex-5-1, exercise=TRUE, exercise.lines=12}
+# Verify AESERFL exists and is logical
+cat("Class of AESERFL:", class(adae$AESERFL), "\n")
+
+adae |>
+  filter(___) |>
+  group_by(TRT01A) |>
+  summarise(n_serious = n_distinct(USUBJID), .groups = "drop")
+```
+
+```{r ex-5-1-hint-1}
+# filter(AESERFL == TRUE) or filter(AESERFL) to keep only serious AE rows.
+# Then count unique USUBJIDs per arm.
+```
+
+```{r ex-5-1-solution}
+cat("Class of AESERFL:", class(adae$AESERFL), "\n")
+
+adae |>
+  filter(AESERFL) |>
+  group_by(TRT01A) |>
+  summarise(n_serious = n_distinct(USUBJID), .groups = "drop")
+```
+
+### Exercise 5.2 — Add flags row to a layout
+
+Build a layout with columns by `TRT01A` and two analyze steps:
+1. `count_occurrences("AEBODSYS")` for all-AE body-system counts
+2. `count_patients_with_flags("USUBJID", flag_variables = c("Serious AEs" = "AESERFL"))`
+
+```{r ex-5-2, exercise=TRUE, exercise.lines=16}
+lyt <- basic_table() |>
+  split_cols_by("TRT01A") |>
+  count_occurrences("AEBODSYS")() |>
+  count_patients_with_flags(
+    ___,
+    flag_variables = c("Serious AEs" = ___)
+  )()
+
+tbl <- build_tern_table(lyt, adae)
+tbl
+```
+
+```{r ex-5-2-hint-1}
+# var = "USUBJID", flag_variables = c("Serious AEs" = "AESERFL")
+```
+
+```{r ex-5-2-solution}
+lyt <- basic_table() |>
+  split_cols_by("TRT01A") |>
+  count_occurrences("AEBODSYS")() |>
+  count_patients_with_flags(
+    "USUBJID",
+    flag_variables = c("Serious AEs" = "AESERFL")
+  )()
+
+tbl <- build_tern_table(lyt, adae)
+tbl
+```
+
+---
+
+## Section 6 — s_summary() and Custom Afuns
+
+### When to use s_summary() directly
+
+`s_summary()` is the underlying statistics engine called by `analyze_vars()`.
+You use it directly when you need a **custom row set** not covered by
+`analyze_vars()`'s built-in stats options, for example:
+
+- Mean (SD) on the first row, Median [Q1, Q3] on the second, N Missing on a
+  third row
+
+### Pattern
+
+```r
+my_afun <- function(x, ...) {
+  s <- s_summary(x)
+  in_rows(
+    .list = list(
+      rcell(c(s$mean, s$sd),        format = "xx.x (xx.x)"),
+      rcell(c(s$median,
+              s$q1_q3[1], s$q1_q3[2]),  format = "xx.x [xx.x, xx.x]"),
+      rcell(s$n_missing,            format = "xx")
+    ),
+    .labels = c("Mean (SD)", "Median [Q1, Q3]", "N Missing")
+  )
+}
+```
+
+> **Tip:** Always type-check `x` at the start of a custom afun with
+> `stopifnot(is.numeric(x))` to catch accidental non-numeric variables early.
+
+### Exercise 6.1 — Write a three-row custom afun
+
+Write an afun called `custom_stats` using `s_summary()` that returns three rows:
+1. Mean (SD)
+2. Median [Q1, Q3]
+3. N Missing
+
+Apply it to `AVAL` in `adlb` filtered to `PARAMCD == "ALT"`, columns by `TRT01A`.
+
+```{r ex-6-1, exercise=TRUE, exercise.lines=28}
+custom_stats <- function(x, ...) {
+  s <- s_summary(x)
+  in_rows(
+    .list = list(
+      rcell(c(s$___, s$___),
+            format = "xx.x (xx.x)"),
+      rcell(c(s$median, s$q1_q3[___], s$q1_q3[___]),
+            format = "xx.x [xx.x, xx.x]"),
+      rcell(s$___,
+            format = "xx")
+    ),
+    .labels = c("Mean (SD)", "Median [Q1, Q3]", "N Missing")
+  )
+}
+
+adlb_alt <- adlb |> filter(PARAMCD == "ALT")
+
+lyt <- basic_table() |>
+  split_cols_by("TRT01A") |>
+  analyze("AVAL", ___)
+
+tbl <- build_table(lyt, adlb_alt)
+tbl
+```
+
+```{r ex-6-1-hint-1}
+# s$mean, s$sd, s$median, s$q1_q3[1] (Q1), s$q1_q3[2] (Q3), s$n_missing
+# Pass custom_stats (without parentheses) as afun to analyze().
+```
+
+```{r ex-6-1-solution}
+custom_stats <- function(x, ...) {
+  s <- s_summary(x)
+  in_rows(
+    .list = list(
+      rcell(c(s$mean, s$sd),
+            format = "xx.x (xx.x)"),
+      rcell(c(s$median, s$q1_q3[1], s$q1_q3[2]),
+            format = "xx.x [xx.x, xx.x]"),
+      rcell(s$n_missing,
+            format = "xx")
+    ),
+    .labels = c("Mean (SD)", "Median [Q1, Q3]", "N Missing")
+  )
+}
+
+adlb_alt <- adlb |> filter(PARAMCD == "ALT")
+
+lyt <- basic_table() |>
+  split_cols_by("TRT01A") |>
+  analyze("AVAL", custom_stats)
+
+tbl <- build_table(lyt, adlb_alt)
+tbl
+```
+
+### Exercise 6.2 — estimate_proportion() for a binary endpoint
+
+Use `estimate_proportion()` to estimate the proportion and 95% Wilson CI of
+subjects with any serious AE in the Placebo arm.
+
+```{r ex-6-2, exercise=TRUE, exercise.lines=16}
+placebo_ae <- adae |>
+  filter(TRT01A == "Placebo") |>
+  # one row per subject (take max flag per subject)
+  group_by(USUBJID) |>
+  summarise(any_serious = any(AESERFL), .groups = "drop")
+
+res <- estimate_proportion(placebo_ae$___)
+
+cat(sprintf("n serious  : %d\n",   res$n))
+cat(sprintf("N total    : %d\n",   res$N))
+cat(sprintf("Proportion : %.3f\n", res$prop))
+cat(sprintf("95%% CI     : [%.3f, %.3f]\n", res$ci[1], res$ci[2]))
+```
+
+```{r ex-6-2-hint-1}
+# estimate_proportion() expects a logical vector (TRUE/FALSE).
+# Use placebo_ae$any_serious as the argument.
+```
+
+```{r ex-6-2-solution}
+placebo_ae <- adae |>
+  filter(TRT01A == "Placebo") |>
+  group_by(USUBJID) |>
+  summarise(any_serious = any(AESERFL), .groups = "drop")
+
+res <- estimate_proportion(placebo_ae$any_serious)
+
+cat(sprintf("n serious  : %d\n",   res$n))
+cat(sprintf("N total    : %d\n",   res$N))
+cat(sprintf("Proportion : %.3f\n", res$prop))
+cat(sprintf("95%% CI     : [%.3f, %.3f]\n", res$ci[1], res$ci[2]))
+```
+
+---
+
+## Section 7 — Capstone: AE Summary Table 14.3.1
+
+### Objective
+
+Build a standard AE Summary Table (Table 14.3.1 style) using `adae`:
+
+```
+                          Placebo   Xan. High   Xan. Low
+                          (n=XX)    (n=XX)      (n=XX)
+Any Adverse Event          XX (XX%)  XX (XX%)    XX (XX%)
+  Serious AEs              XX        XX          XX
+
+NERVOUS SYSTEM DISORDERS
+  Headache                 XX        XX          XX
+  Dizziness                XX        XX          XX
+  ...
+
+GASTROINTESTINAL DISORDERS
+  ...
+```
+
+Columns: TRT01A arms (no overall column for this table)
+
+Rows:
+1. "Subjects with any AE" flag row — `count_patients_with_flags` on `ANYAEFL`
+   (derived below)
+2. "Serious AEs" flag row — `count_patients_with_flags` on `AESERFL`
+3. Body system → preferred term — `split_rows_by + count_occurrences`
+
+### Derive ANYAEFL
+
+```{r capstone-anyaefl, exercise=FALSE}
+# Each row of adae is an AE — every USUBJID in adae has at least one AE.
+adae <- adae |> mutate(ANYAEFL = TRUE)
+```
+
+### Expected subject counts (dplyr validation)
+
+```{r capstone-dplyr-check, exercise=FALSE}
+# Subjects with any AE per arm
+adae |>
+  group_by(TRT01A) |>
+  summarise(n_any_ae = n_distinct(USUBJID), .groups = "drop")
+```
+
+### Exercise 7.1 — Complete the capstone layout
+
+Fill in the four `___` blanks to build the full AE Summary Table.
+
+```{r ex-7-1, exercise=TRUE, exercise.lines=30}
+adae <- adae |> mutate(ANYAEFL = TRUE)
+
+lyt <- basic_table(title = "Table 14.3.1  Summary of Adverse Events") |>
+  split_cols_by(___) |>
+  # --- Flag rows at the top ---
+  count_patients_with_flags(
+    "USUBJID",
+    flag_variables = c("Subjects with any AE" = "ANYAEFL",
+                       "Subjects with serious AE" = ___)
+  )() |>
+  # --- Body system -> preferred term ---
+  split_rows_by("AEBODSYS", label_pos = "topleft") |>
+  summarize_row_groups()() |>
+  count_occurrences(___)()
+
+tbl <- build_tern_table(lyt, ___)
+tbl
+```
+
+```{r ex-7-1-hint-1}
+# split_cols_by("TRT01A")
+# flag = "AESERFL"
+# count_occurrences("AEDECOD")
+# build_tern_table(lyt, adae)
+```
+
+```{r ex-7-1-solution}
+adae <- adae |> mutate(ANYAEFL = TRUE)
+
+lyt <- basic_table(title = "Table 14.3.1  Summary of Adverse Events") |>
+  split_cols_by("TRT01A") |>
+  count_patients_with_flags(
+    "USUBJID",
+    flag_variables = c("Subjects with any AE"      = "ANYAEFL",
+                       "Subjects with serious AE"  = "AESERFL")
+  )() |>
+  split_rows_by("AEBODSYS", label_pos = "topleft") |>
+  summarize_row_groups()() |>
+  count_occurrences("AEDECOD")()
+
+tbl <- build_tern_table(lyt, adae)
+tbl
+```
+
+### Exercise 7.2 — Count subjects with any AE in Placebo arm
+
+Use `dplyr` to compute the number of unique subjects with any AE in the Placebo
+arm. This is the expected value for the "Subjects with any AE" cell in the
+Placebo column of Table 14.3.1.
+
+```{r ex-7-2, exercise=TRUE, exercise.lines=10}
+adae |>
+  filter(TRT01A == ___) |>
+  summarise(n_subjects_any_ae = n_distinct(___))
+```
+
+```{r ex-7-2-hint-1}
+# filter(TRT01A == "Placebo")
+# n_distinct(USUBJID) gives the subject count
+```
+
+```{r ex-7-2-solution}
+adae |>
+  filter(TRT01A == "Placebo") |>
+  summarise(n_subjects_any_ae = n_distinct(USUBJID))
+```
+
+---
+
+## Lesson Summary
+
+| tern function | Purpose | Equivalent in raw rtables |
+|---------------|---------|--------------------------|
+| `analyze_vars()` | Continuous and categorical summaries | `analyze(var, custom_afun)` |
+| `count_occurrences()` | Subject-level AE counts | Manual `n_distinct()` afun |
+| `count_patients_with_flags()` | Flag-based subject counts | Manual logical filter afun |
+| `summarize_row_groups()` | Subtotal row per split group | Manual `in_rows()` with group total |
+| `s_summary()` | Named statistics list (building block) | Direct `mean()`, `sd()`, etc. |
+| `estimate_proportion()` | Proportion + Wilson CI | Manual `binom.test()` |
+| `control_analyze_vars()` | Reusable stats config | Hard-coded `.stats` vector |
+
+**Key rule:** `count_occurrences()` counts *subjects*, not rows. Always use it
+(not `count_fraction`) when the same subject can contribute multiple AE rows.
+
+**Next lesson (35):** `r2rtf` — R-to-RTF table rendering for submission-ready
+Word/RTF output.

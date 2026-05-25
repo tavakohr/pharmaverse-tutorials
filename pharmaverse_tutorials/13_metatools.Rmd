@@ -11,6 +11,32 @@ description: >
 ---
 
 ```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 13_metatools.Rmd
+# PURPOSE       : metatools package for metadata-driven dataset derivation: check_ct(),
+#                 create_iso8601(), drop_unspec_vars(), metatools-guided
+#                 ADaM variable creation, and spec-conformance
+#                 validation.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
 library(learnr)
 library(dplyr)
 library(tidyr)
@@ -140,12 +166,14 @@ create_var_from_codelist <- function(dataset, metacore_obj, input_var, out_var,
       mutate(numeric_code = suppressWarnings(as.numeric(code))) |>
       select(decode, numeric_code)
     dataset <- dataset |>
+      select(-any_of(out_nm)) |>          # drop NA placeholder if build_from_derived() added it
       left_join(lookup, by = setNames("decode", input_nm)) |>
       rename(!!out_nm := numeric_code)
   } else {
     # code → decode (expand to long label)
     lookup <- cl |> select(code, decode)
     dataset <- dataset |>
+      select(-any_of(out_nm)) |>          # drop NA placeholder if build_from_derived() added it
       left_join(lookup, by = setNames("code", input_nm)) |>
       rename(!!out_nm := decode)
   }
@@ -295,7 +323,7 @@ dm <- tibble(
   TRT01A  = c("XANOMELINE HIGH DOSE", "XANOMELINE LOW DOSE", "PLACEBO", "XANOMELINE HIGH DOSE")
 )
 
-# SUPPDM (subject-level supplemental qualifiers)
+# SUPPDM (subject-level supplemental qualifiers — single QNAM)
 suppdm <- tibble(
   STUDYID  = "CDISCPILOT01",
   RDOMAIN  = "DM",
@@ -308,6 +336,26 @@ suppdm <- tibble(
   QORIG    = "CRF",
   QEVAL    = "INVESTIGATOR"
 )
+
+# SUPPDM with two supplemental variables (STRATGRP + ETHNIC2)
+suppdm_multi <- tibble(
+  STUDYID  = "CDISCPILOT01",
+  RDOMAIN  = "DM",
+  USUBJID  = rep(c("01-701-1015", "01-701-1023", "01-702-1042", "01-702-1101"), 2),
+  IDVAR    = "",
+  IDVARVAL = "",
+  QNAM     = c(rep("STRATGRP", 4), rep("ETHNIC2", 4)),
+  QLABEL   = c(rep("Stratification Group", 4), rep("Ethnicity Detail", 4)),
+  QVAL     = c("A", "B", "A", "B",
+               "NOT HISPANIC OR LATINO", "NOT HISPANIC OR LATINO",
+               "NOT HISPANIC OR LATINO", "HISPANIC OR LATINO"),
+  QORIG    = "CRF",
+  QEVAL    = "INVESTIGATOR"
+)
+
+# ── Real pharmaverseadam data ─────────────────────────────────────────────────
+library(pharmaverseadam)
+adsl_real <- pharmaverseadam::adsl
 ```
 
 ## Welcome
@@ -383,6 +431,37 @@ cat("STRATGRP values:", paste(dm_combined2$STRATGRP, collapse = ", "), "\n")
 cat("NAs in STRATGRP:", sum(is.na(dm_combined2$STRATGRP)), "\n")
 ```
 
+### Exercise: Combine a SUPPDM with two supplemental variables
+
+`suppdm_multi` contains two QNAMs: `STRATGRP` and `ETHNIC2`. `combine_supp()` pivots all QNAMs wide in one call — no loop needed.
+
+```{r combine-supp-multi, exercise=TRUE, exercise.lines=14}
+# Combine both SUPPDM variables into DM in one call
+dm_multi <- combine_supp(dm, ___)
+
+# Confirm both new columns exist
+cat("Columns added to DM:\n")
+cat(paste(setdiff(names(dm_multi), names(dm)), collapse = ", "), "\n\n")
+
+# Show the result
+dm_multi |> select(USUBJID, STRATGRP, ETHNIC2)
+```
+
+```{r combine-supp-multi-hint-1}
+# combine_supp(dm, suppdm_multi)
+```
+
+```{r combine-supp-multi-solution}
+dm_multi <- combine_supp(dm, suppdm_multi)
+
+cat("Columns added to DM:\n")
+cat(paste(setdiff(names(dm_multi), names(dm)), collapse = ", "), "\n\n")
+
+dm_multi |> select(USUBJID, STRATGRP, ETHNIC2)
+```
+
+> **Real-world note**: A DM domain can have many SUPP-- variables collected across dozens of CRF pages. `combine_supp()` handles all QNAMs in one call regardless of how many there are, making it far more maintainable than individual `pivot_wider()` + `left_join()` chains.
+
 ---
 
 ## 3 — `build_from_derived()`: spec-driven base dataset
@@ -422,6 +501,45 @@ spec_order <- md_adsl$ds_vars |>
 cat("Spec order (first 6):", paste(head(spec_order, 6), collapse = " → "), "\n")
 cat("Data order (first 6):", paste(head(names(adsl_base), 6), collapse = " → "), "\n")
 cat("Match:", identical(head(spec_order, 6), head(names(adsl_base), 6)), "\n")
+```
+
+### Exercise: Compare `adsl_base` output to the real pharmaverseadam ADSL
+
+`adsl_real` is the fully derived `pharmaverseadam::adsl`. The `adsl_base` we just built is the spec-ordered skeleton before admiral derivations. Use `setdiff()` to see which variables the real ADSL has that our base is still missing, and which spec variables the real dataset doesn't carry.
+
+```{r build-real-gap, exercise=TRUE, exercise.lines=16}
+# Variables in real adsl not in our spec-skeleton (fully derived but not in our mini spec)
+in_real_not_base <- setdiff(names(adsl_real), names(adsl_base))
+cat("In real ADSL, not in our base (", length(in_real_not_base), "vars ):\n", sep = "")
+cat(paste(head(in_real_not_base, 12), collapse = ", "), "...\n\n")
+
+# Variables spec planned that real ADSL already has
+shared <- intersect(names(adsl_base), names(adsl_real))
+cat("Variables present in both base and real ADSL:", length(shared), "\n")
+cat(paste(shared, collapse = ", "), "\n\n")
+
+# Variables in our spec still NA in adsl_base (not yet derived)
+na_cols <- names(adsl_base)[sapply(adsl_base, function(x) all(is.na(x)))]
+cat("Spec columns still all-NA (need admiral derivation):", paste(na_cols, collapse = ", "), "\n")
+```
+
+```{r build-real-gap-hint-1}
+# setdiff(names(adsl_real), names(adsl_base))  — in real, not in base
+# intersect(names(adsl_base), names(adsl_real)) — in both
+# sapply(adsl_base, function(x) all(is.na(x)))  — all-NA columns
+```
+
+```{r build-real-gap-solution}
+in_real_not_base <- setdiff(names(adsl_real), names(adsl_base))
+cat("In real ADSL, not in our base (", length(in_real_not_base), "vars):\n", sep = "")
+cat(paste(head(in_real_not_base, 12), collapse = ", "), "...\n\n")
+
+shared <- intersect(names(adsl_base), names(adsl_real))
+cat("Variables present in both base and real ADSL:", length(shared), "\n")
+cat(paste(shared, collapse = ", "), "\n\n")
+
+na_cols <- names(adsl_base)[sapply(adsl_base, function(x) all(is.na(x)))]
+cat("Spec columns still all-NA (need admiral derivation):", paste(na_cols, collapse = ", "), "\n")
 ```
 
 ---
@@ -502,6 +620,41 @@ cat("Manual RACEN:    ", adsl_manual_racen$RACEN, "\n")
 cat("Spec-driven RACEN:", adsl_spec_racen$RACEN, "\n")
 cat("Identical:", identical(adsl_manual_racen$RACEN, adsl_spec_racen$RACEN), "\n")
 ```
+
+### Exercise: Apply `create_var_from_codelist` to real pharmaverseadam data
+
+`adsl_real` has 254 subjects and a real `RACE` column. Derive `RACEN` from it using the spec codelist, then summarise the race distribution.
+
+```{r create-var-real, exercise=TRUE, exercise.lines=20}
+# Take just the columns we need from the real adsl
+adsl_real_mini <- adsl_real |>
+  select(USUBJID, RACE)
+
+# Derive RACEN using the codelist in md_adsl
+adsl_real_with_racen <- adsl_real_mini |>
+  create_var_from_codelist(md_adsl, input_var = ___, out_var = ___)
+
+# Summarise RACE distribution with derived numeric code
+adsl_real_with_racen |>
+  count(RACE, RACEN, sort = TRUE)
+```
+
+```{r create-var-real-hint-1}
+# create_var_from_codelist(md_adsl, input_var = RACE, out_var = RACEN)
+```
+
+```{r create-var-real-solution}
+adsl_real_mini <- adsl_real |>
+  select(USUBJID, RACE)
+
+adsl_real_with_racen <- adsl_real_mini |>
+  create_var_from_codelist(md_adsl, input_var = RACE, out_var = RACEN)
+
+adsl_real_with_racen |>
+  count(RACE, RACEN, sort = TRUE)
+```
+
+> **What to observe**: Any RACE values in the real data that don't match a codelist decode will produce `NA` for RACEN. A `NA` count here would indicate either a data entry variant or a gap in the codelist — exactly the kind of issue `check_ct_data()` is designed to surface.
 
 ---
 
@@ -743,6 +896,55 @@ quiz(
     answer("check_variables()"),
     answer("check_ct_data()", correct = TRUE),
     answer("check_unique_keys()"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`combine_supp()` with a SUPPDM that has three different QNAMs will produce:",
+    answer("Only the first QNAM as a new column — you need one call per QNAM"),
+    answer("Three new columns joined to the parent domain — one per QNAM", correct = TRUE),
+    answer("A warning that only a single QNAM is supported"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A subject present in DM but missing from SUPPDM will have what value in the SUPPDM-derived column after `combine_supp()`?",
+    answer("The subject's row is dropped from the result"),
+    answer("An error is thrown"),
+    answer("NA — because combine_supp uses a left join, keeping all parent domain rows", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`build_from_derived()` produces `NA` for a spec variable when:",
+    answer("The variable is mandatory"),
+    answer("The variable is not present in any of the source datasets passed in `ds_list`", correct = TRUE),
+    answer("The variable type is 'numeric'"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`apply_variable_labels()` stores labels as:",
+    answer("A separate tibble column called 'label'"),
+    answer("Attribute metadata on each column vector — readable by export tools like xportr", correct = TRUE),
+    answer("A PROC CONTENTS-style report"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`check_variables()` returns a warning when a variable is in the dataset but NOT in the spec. This usually means:",
+    answer("The variable is a required variable that was accidentally deleted"),
+    answer("A temporary intermediate variable was not dropped, or a variable was added that isn't documented in the spec", correct = TRUE),
+    answer("The dataset has too many rows"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You run `create_var_from_codelist()` and some output values are `NA`. The most likely cause is:",
+    answer("The function has a bug — it always produces some NAs"),
+    answer("The input variable has values that don't match any decode in the codelist — a data quality issue to investigate", correct = TRUE),
+    answer("NA output means the codelist derivation succeeded"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "metatools functions take a `DatasetMeta` rather than a full `metacore` object because:",
+    answer("DatasetMeta objects load faster from disk"),
+    answer("Scoping to one dataset avoids accidental use of another dataset's metadata (e.g., ADAE codelists when building ADSL)", correct = TRUE),
+    answer("Full metacore objects don't have a value_spec table"),
     random_answer_order = TRUE
   )
 )

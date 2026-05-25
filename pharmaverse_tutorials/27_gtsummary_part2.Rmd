@@ -1,0 +1,1094 @@
+---
+title: "Lesson 27 — gtsummary Part 2: Regression Tables, Merging, and ARD Integration"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Extend gtsummary beyond demographics: build regression tables with
+  tbl_regression() and exponentiate odds ratios, screen predictors with
+  tbl_uvregression(), combine tables side-by-side with tbl_merge() and
+  stacked with tbl_stack(), drive gtsummary directly from a cards ARD via
+  tbl_ard_summary(), and report statistics inline in R Markdown prose using
+  inline_text(). Capstone: a safety AE-rate table plus a logistic regression
+  of any-AE predictors.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 27_gtsummary_part2.Rmd
+# PURPOSE       : gtsummary Part 2 — tbl_regression(), tbl_uvregression(),
+#                 tbl_merge(), tbl_stack(), tbl_ard_summary(), inline_text(),
+#                 and a complete safety/regression capstone.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo","Xanomeline Low Dose","Xanomeline High Dose")),
+    DTHFL_N = as.integer(!is.na(DTHFL) & DTHFL == "Y")
+  ) |>
+  filter(SAFFL == "Y")
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GTSUMMARY MOCK FUNCTIONS (carried from lesson 26)
+# ══════════════════════════════════════════════════════════════════════════════
+
+.fmt_stat <- function(x, fmt) {
+  mean_v   <- round(mean(x, na.rm=TRUE), 1)
+  sd_v     <- round(sd(x, na.rm=TRUE), 1)
+  median_v <- round(median(x, na.rm=TRUE), 1)
+  p25_v    <- round(quantile(x, 0.25, na.rm=TRUE), 1)
+  p75_v    <- round(quantile(x, 0.75, na.rm=TRUE), 1)
+  fmt |>
+    gsub("\\{mean\\}",   mean_v,   x = _) |>
+    gsub("\\{sd\\}",     sd_v,     x = _) |>
+    gsub("\\{median\\}", median_v, x = _) |>
+    gsub("\\{p25\\}",    p25_v,    x = _) |>
+    gsub("\\{p75\\}",    p75_v,    x = _)
+}
+
+tbl_summary <- function(data, by = NULL, include = NULL,
+                        statistic = list(
+                          all_continuous  = "{mean} ({sd})",
+                          all_categorical = "{n} ({p}%)"
+                        ),
+                        digits = NULL, label = NULL, missing = "ifany") {
+  all_vars <- names(data)
+  if (!is.null(by)) all_vars <- all_vars[all_vars != by]
+  vars <- if (!is.null(include)) include else all_vars
+
+  cont_fmt <- if (!is.null(statistic$all_continuous))  statistic$all_continuous  else "{mean} ({sd})"
+  cat_fmt  <- if (!is.null(statistic$all_categorical)) statistic$all_categorical else "{n} ({p}%)"
+
+  arms <- if (!is.null(by)) as.character(sort(unique(na.omit(data[[by]])))) else "Overall"
+
+  rows <- lapply(vars, function(vv) {
+    x_all     <- data[[vv]]
+    is_cont   <- is.numeric(x_all)
+    var_label <- if (!is.null(label) && !is.null(label[[vv]])) label[[vv]] else vv
+
+    if (is_cont) {
+      r <- tibble(variable = vv, label = var_label, row_type = "label")
+      for (arm in arms) {
+        xi <- if (arm == "Overall") x_all else x_all[as.character(data[[by]]) == arm]
+        r[[paste0("stat_", arm)]] <- .fmt_stat(xi, cont_fmt)
+      }
+      if (missing != "no" && sum(is.na(x_all)) > 0) {
+        rm2 <- tibble(variable = vv, label = "  Unknown", row_type = "missing")
+        for (arm in arms) {
+          xi <- if (arm == "Overall") x_all else x_all[as.character(data[[by]]) == arm]
+          rm2[[paste0("stat_", arm)]] <- as.character(sum(is.na(xi)))
+        }
+        r <- bind_rows(r, rm2)
+      }
+      r
+    } else {
+      header <- tibble(variable = vv, label = var_label, row_type = "label")
+      for (arm in arms) header[[paste0("stat_", arm)]] <- NA_character_
+      levs <- sort(unique(na.omit(as.character(x_all))))
+      level_rows <- lapply(levs, function(lv) {
+        lr <- tibble(variable = vv, label = paste0("  ", lv), row_type = "level")
+        for (arm in arms) {
+          xi    <- if (arm == "Overall") x_all else x_all[as.character(data[[by]]) == arm]
+          total <- sum(!is.na(xi))
+          n_lv  <- sum(xi == lv, na.rm = TRUE)
+          p_lv  <- round(100 * n_lv / total, 1)
+          lr[[paste0("stat_", arm)]] <- cat_fmt |>
+            gsub("\\{n\\}", n_lv, x = _) |>
+            gsub("\\{p\\}", p_lv, x = _)
+        }
+        lr
+      })
+      bind_rows(header, level_rows)
+    }
+  }) |> bind_rows()
+
+  structure(
+    list(table_body = rows, by = by, arms = arms, data = data,
+         include = vars, label = label),
+    class = "gtsummary"
+  )
+}
+
+print.gtsummary <- function(x, ...) {
+  stat_cols <- grep("^stat_", names(x$table_body), value = TRUE)
+  display   <- x$table_body |> select(label, all_of(stat_cols))
+  names(display)[names(display) != "label"] <-
+    gsub("^stat_", "", names(display)[names(display) != "label"])
+  cat("\n[gtsummary table]\n\n")
+  print(display, n = Inf)
+  invisible(x)
+}
+
+as_tibble.gtsummary <- function(x, ...) {
+  stat_cols <- grep("^stat_", names(x$table_body), value = TRUE)
+  display   <- x$table_body |>
+    select(variable, label, row_type, all_of(stat_cols))
+  names(display)[names(display) %in% stat_cols] <-
+    gsub("^stat_", "", stat_cols)
+  display
+}
+
+add_p <- function(x, test = NULL, pvalue_fun = NULL, ...) UseMethod("add_p")
+add_p.gtsummary <- function(x, test = NULL, pvalue_fun = NULL, ...) {
+  if (is.null(x$by)) { message("add_p() requires a 'by' variable"); return(x) }
+  p_rows <- lapply(x$include, function(vv) {
+    xi  <- x$data[[vv]]
+    grp <- x$data[[x$by]]
+    pval <- tryCatch({
+      if (is.numeric(xi)) {
+        levs <- unique(na.omit(grp))
+        if (length(levs) == 2) {
+          t.test(xi[grp == levs[1]], xi[grp == levs[2]])$p.value
+        } else {
+          summary(aov(xi ~ as.factor(grp)))[[1]][["Pr(>F)"]][1]
+        }
+      } else {
+        chisq.test(table(xi, grp), simulate.p.value = TRUE)$p.value
+      }
+    }, error = function(e) NA_real_)
+    tibble(variable  = vv,
+           p.value   = round(pval, 3),
+           p_display = if (!is.na(pval)) formatC(pval, digits = 3, format = "f") else "NA")
+  }) |> bind_rows()
+  x$table_body <- left_join(x$table_body, p_rows, by = "variable")
+  x$p_added    <- TRUE
+  x
+}
+
+add_overall <- function(x, col_label = "**Overall**", last = FALSE, ...) UseMethod("add_overall")
+add_overall.gtsummary <- function(x, col_label = "**Overall**", last = FALSE, ...) {
+  if (is.null(x$by)) return(x)
+  tbl_overall  <- tbl_summary(x$data, by = NULL, include = x$include, label = x$label)
+  overall_col  <- tbl_overall$table_body |>
+    select(variable, label, row_type, stat_Overall)
+  x$table_body <- left_join(x$table_body, overall_col,
+                             by = c("variable", "label", "row_type"))
+  x$overall_added <- TRUE
+  x
+}
+
+add_n <- function(x, ...) UseMethod("add_n")
+add_n.gtsummary <- function(x, ...) {
+  n_row <- tibble(variable = "__n__", label = "N", row_type = "N")
+  for (arm in x$arms) {
+    n_arm <- if (arm == "Overall") nrow(x$data)
+             else sum(as.character(x$data[[x$by]]) == arm, na.rm = TRUE)
+    n_row[[paste0("stat_", arm)]] <- as.character(n_arm)
+  }
+  if (!is.null(x$table_body$stat_Overall))
+    n_row$stat_Overall <- as.character(nrow(x$data))
+  x$table_body <- bind_rows(n_row, x$table_body)
+  x
+}
+
+modify_header <- function(x, ...) UseMethod("modify_header")
+modify_header.gtsummary <- function(x, ...) {
+  dots <- list(...)
+  if (!is.null(dots)) x$custom_headers <- dots
+  x
+}
+
+bold_labels <- function(x)           { UseMethod("bold_labels") }
+bold_labels.gtsummary <- function(x) { x$bold_labels <- TRUE; x }
+
+italicize_levels <- function(x)           { UseMethod("italicize_levels") }
+italicize_levels.gtsummary <- function(x) { x$italicize_levels <- TRUE; x }
+
+as_gt <- function(x, ...) UseMethod("as_gt")
+as_gt.gtsummary <- function(x, ...) {
+  cat("[as_gt(): In a live session this renders a formatted HTML/RTF table via the gt package.]\n")
+  invisible(as_tibble(x))
+}
+
+inline_text <- function(x, variable, level = NULL, column = NULL, ...) UseMethod("inline_text")
+inline_text.gtsummary <- function(x, variable, level = NULL, column = NULL, ...) {
+  body <- x$table_body
+  row  <- if (!is.null(level)) {
+    body[body$variable == variable & grepl(level, body$label), ]
+  } else {
+    body[body$variable == variable & body$row_type %in% c("label", "N"), ]
+  }
+  if (nrow(row) == 0) return(NA_character_)
+  col_nm <- if (!is.null(column)) paste0("stat_", column) else
+    grep("^stat_", names(row), value = TRUE)[1]
+  as.character(row[[col_nm]][1])
+}
+
+theme_gtsummary_compact  <- function() invisible(NULL)
+set_gtsummary_theme      <- function(x) invisible(NULL)
+reset_gtsummary_theme    <- function() invisible(NULL)
+all_continuous  <- function() "all_continuous"
+all_categorical <- function() "all_categorical"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REGRESSION TABLE MOCKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+tbl_regression <- function(x_model, exponentiate = FALSE, label = NULL,
+                            include = NULL, conf.level = 0.95, ...) {
+  cf <- tryCatch(summary(x_model)$coefficients, error = function(e) NULL)
+  if (is.null(cf)) { warning("Model summary failed"); return(invisible(NULL)) }
+  ci <- tryCatch(confint(x_model, level = conf.level),
+                 error = function(e) matrix(NA, nrow = nrow(cf), ncol = 2))
+
+  rows <- tibble(
+    variable    = rownames(cf),
+    label       = rownames(cf),
+    estimate    = if (exponentiate) round(exp(cf[, 1]), 3) else round(cf[, 1], 3),
+    conf.low    = if (exponentiate) round(exp(ci[, 1]), 3) else round(ci[, 1], 3),
+    conf.high   = if (exponentiate) round(exp(ci[, 2]), 3) else round(ci[, 2], 3),
+    p.value     = round(cf[, 4], 4),
+    ci_display  = paste0(
+      round(if (exponentiate) exp(ci[, 1]) else ci[, 1], 2), ", ",
+      round(if (exponentiate) exp(ci[, 2]) else ci[, 2], 2))
+  ) |>
+    filter(variable != "(Intercept)")
+
+  rows$stat_display <- paste0(rows$estimate, " (", rows$ci_display, ")")
+
+  structure(
+    list(table_body = rows, model = x_model, exponentiate = exponentiate),
+    class = "gtsummary"
+  )
+}
+
+tbl_uvregression <- function(data, method, y, exponentiate = FALSE,
+                              include = NULL, conf.level = 0.95, ...) {
+  y_nm  <- as.character(substitute(y))
+  vars  <- if (!is.null(include)) include else names(data)[names(data) != y_nm]
+
+  rows <- lapply(vars, function(vv) {
+    if (vv == y_nm) return(NULL)
+    frm <- as.formula(paste(y_nm, "~", vv))
+    m   <- tryCatch(method(frm, data = data), error = function(e) NULL)
+    if (is.null(m)) return(NULL)
+    cf  <- tryCatch(summary(m)$coefficients, error = function(e) NULL)
+    if (is.null(cf) || nrow(cf) < 2) return(NULL)
+    ci  <- tryCatch(confint(m, level = conf.level)[2, ], error = function(e) c(NA, NA))
+    est <- if (exponentiate) exp(cf[2, 1]) else cf[2, 1]
+    tibble(
+      variable     = vv,
+      label        = vv,
+      estimate     = round(est, 3),
+      conf.low     = round(if (exponentiate) exp(ci[1]) else ci[1], 3),
+      conf.high    = round(if (exponentiate) exp(ci[2]) else ci[2], 3),
+      p.value      = round(cf[2, 4], 4),
+      stat_display = paste0(round(est, 2), " (",
+                            round(if (exponentiate) exp(ci[1]) else ci[1], 2), ", ",
+                            round(if (exponentiate) exp(ci[2]) else ci[2], 2), ")")
+    )
+  }) |> bind_rows()
+
+  structure(
+    list(table_body = rows, y = y_nm, exponentiate = exponentiate),
+    class = "gtsummary"
+  )
+}
+
+tbl_merge <- function(tbls, tab_spanner = NULL) {
+  combined <- lapply(seq_along(tbls), function(i) {
+    body      <- tbls[[i]]$table_body
+    stat_cols <- grep("^stat_", names(body), value = TRUE)
+    suffix    <- paste0("_tbl", i)
+    names(body)[names(body) %in% stat_cols] <- paste0(stat_cols, suffix)
+    body
+  })
+  merged_body <- Reduce(
+    function(a, b) full_join(a, b, by = intersect(names(a), names(b))),
+    combined
+  )
+  structure(list(table_body = merged_body, tab_spanner = tab_spanner),
+            class = "gtsummary")
+}
+
+tbl_stack <- function(tbls, group_header = NULL) {
+  rows <- lapply(seq_along(tbls), function(i) {
+    body <- tbls[[i]]$table_body
+    if (!is.null(group_header)) {
+      body <- bind_rows(
+        tibble(variable = "__header__", label = group_header[i], row_type = "group_header"),
+        body
+      )
+    }
+    body
+  }) |> bind_rows()
+  structure(list(table_body = rows), class = "gtsummary")
+}
+
+tbl_ard_summary <- function(cards, by = NULL, include = NULL, statistic = NULL, ...) {
+  stat_cols <- if (!is.null(by)) {
+    sort(unique(na.omit(cards$group1_level)))
+  } else "Overall"
+
+  vars <- if (!is.null(include)) include else unique(na.omit(cards$variable))
+
+  rows <- lapply(vars, function(vv) {
+    sub     <- cards[cards$variable == vv, ]
+    context <- unique(sub$context)[1]
+
+    if (context == "continuous") {
+      r <- tibble(variable = vv, label = vv, row_type = "label")
+      for (arm in stat_cols) {
+        sub_arm <- if (arm == "Overall")
+          sub[is.na(sub$group1_level) | sub$group1_level == "NA", ]
+        else
+          sub[!is.na(sub$group1_level) & sub$group1_level == arm, ]
+        mean_v <- tryCatch(round(unlist(sub_arm$stat[sub_arm$stat_name == "mean"]), 1),
+                           error = function(e) NA)
+        sd_v   <- tryCatch(round(unlist(sub_arm$stat[sub_arm$stat_name == "sd"]), 1),
+                           error = function(e) NA)
+        r[[paste0("stat_", arm)]] <- paste0(mean_v, " (", sd_v, ")")
+      }
+      r
+    } else {
+      levs   <- unique(na.omit(sub$variable_level))
+      header <- tibble(variable = vv, label = vv, row_type = "label")
+      for (arm in stat_cols) header[[paste0("stat_", arm)]] <- NA_character_
+      level_rows <- lapply(levs, function(lv) {
+        lr <- tibble(variable = vv, label = paste0("  ", lv), row_type = "level")
+        for (arm in stat_cols) {
+          sub_arm <- if (arm == "Overall")
+            sub[is.na(sub$group1_level) | sub$group1_level == "NA", ]
+          else
+            sub[!is.na(sub$group1_level) & sub$group1_level == arm, ]
+          sub_lv  <- sub_arm[!is.na(sub_arm$variable_level) & sub_arm$variable_level == lv, ]
+          n_v     <- tryCatch(unlist(sub_lv$stat[sub_lv$stat_name == "n"]), error = function(e) NA)
+          p_v     <- tryCatch(unlist(sub_lv$stat[sub_lv$stat_name == "p"]), error = function(e) NA)
+          lr[[paste0("stat_", arm)]] <- paste0(n_v, " (", p_v, "%)")
+        }
+        lr
+      }) |> bind_rows()
+      bind_rows(header, level_rows)
+    }
+  }) |> bind_rows()
+
+  structure(list(table_body = rows, by = by, arms = stat_cols), class = "gtsummary")
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARDS / CARDX ARD MOCKS (needed for tbl_ard_summary exercises)
+# ══════════════════════════════════════════════════════════════════════════════
+
+.ard_row <- function(group1 = NA_character_, group1_level = NA_character_,
+                     variable, variable_level = NA_character_,
+                     context, stat_name, stat, stat_label) {
+  tibble(group1 = group1, group1_level = group1_level,
+         variable = variable, variable_level = variable_level,
+         context = context, stat_name = stat_name,
+         stat = list(stat), stat_label = stat_label)
+}
+
+ard_continuous <- function(data, variables, by = NULL,
+                           statistics = list(
+                             N      = function(x) sum(!is.na(x)),
+                             mean   = function(x) mean(x, na.rm = TRUE),
+                             sd     = function(x) sd(x, na.rm = TRUE),
+                             median = function(x) median(x, na.rm = TRUE),
+                             p25    = function(x) quantile(x, 0.25, na.rm = TRUE),
+                             p75    = function(x) quantile(x, 0.75, na.rm = TRUE),
+                             min    = function(x) min(x, na.rm = TRUE),
+                             max    = function(x) max(x, na.rm = TRUE),
+                             n_miss = function(x) sum(is.na(x)),
+                             p_miss = function(x) round(100 * mean(is.na(x)), 1)
+                           )) {
+  stat_labels <- c(N="N (non-missing)", mean="Mean", sd="SD", median="Median",
+                   p25="Q1 (25th pctile)", p75="Q3 (75th pctile)",
+                   min="Min", max="Max", n_miss="N missing", p_miss="% missing")
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      x   <- sub[[vv]]
+      lapply(names(statistics), function(sn) {
+        val <- tryCatch(statistics[[sn]](x), error = function(e) NA_real_)
+        .ard_row(group1 = if (!is.null(by)) by else NA_character_,
+                 group1_level = as.character(gl),
+                 variable = vv, context = "continuous",
+                 stat_name = sn, stat = val,
+                 stat_label = stat_labels[sn])
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+ard_categorical <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    levs <- sort(unique(as.character(data[[vv]])))
+    levs <- levs[!is.na(levs)]
+    lapply(groups, function(gl) {
+      sub   <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      total <- sum(!is.na(sub[[vv]]))
+      lapply(levs, function(lv) {
+        cnt <- sum(sub[[vv]] == lv, na.rm = TRUE)
+        bind_rows(
+          .ard_row(group1 = if (!is.null(by)) by else NA_character_,
+                   group1_level = as.character(gl), variable = vv,
+                   variable_level = lv, context = "categorical",
+                   stat_name = "n", stat = cnt, stat_label = "n"),
+          .ard_row(group1 = if (!is.null(by)) by else NA_character_,
+                   group1_level = as.character(gl), variable = vv,
+                   variable_level = lv, context = "categorical",
+                   stat_name = "p", stat = round(100 * cnt / total, 1), stat_label = "%")
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+ard_stack <- function(...) {
+  out <- bind_rows(...)
+  structure(out, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+bind_ard <- function(...) ard_stack(...)
+
+ard_get_stat <- function(ard, stat_nm, var_nm = NULL) {
+  x <- if (!is.null(var_nm)) filter(ard, variable == var_nm) else ard
+  x |> filter(stat_name == stat_nm) |> pull(stat) |> unlist()
+}
+```
+
+## Overview
+
+Lesson 26 covered `tbl_summary()` for descriptive tables. This lesson extends gtsummary to **regression output**, **table composition**, and **ARD-driven tables** — the full production workflow for a clinical study report.
+
+**Topics covered:**
+
+| Function | What it does |
+|----------|-------------|
+| `tbl_regression()` | Format a fitted `lm`/`glm` model as a gtsummary table |
+| `tbl_uvregression()` | Fit and format one model per predictor (univariable screening) |
+| `tbl_merge()` | Combine two tables side-by-side (e.g., unadjusted vs adjusted) |
+| `tbl_stack()` | Stack tables vertically by subgroup |
+| `tbl_ard_summary()` | Build a gtsummary table from a pre-computed cards ARD |
+| `inline_text()` | Extract a formatted statistic as a character string for CSR prose |
+
+**Why this matters:**
+
+In a Clinical Study Report the same subject-level data feeds both Table 14.1.1 (demographics) and the logistic-regression safety table in Appendix 16. With gtsummary both tables share the same pipeline — including QC via `as_tibble()` — and any statistic can be referenced inline without re-typing it.
+
+---
+
+## Section 1 — tbl_regression(): Linear Regression
+
+`tbl_regression()` accepts any fitted model object and returns a `gtsummary` object. The `$table_body` contains:
+
+| Column | Meaning |
+|--------|---------|
+| `variable` | Predictor name (or level name for factors) |
+| `estimate` | Coefficient (or OR if `exponentiate=TRUE`) |
+| `conf.low` / `conf.high` | 95% CI bounds |
+| `p.value` | Two-sided p-value |
+| `stat_display` | Formatted string: `"estimate (CI low, CI high)"` |
+
+### Exercise 1 — Linear regression of AGE on treatment
+
+Fit `lm(AGE ~ TRT01P, data = adsl)`, pass the result to `tbl_regression()`, then inspect `table_body`.
+
+```{r tbl-reg-lm, exercise=TRUE, exercise.lines=12}
+mod_lm <- lm(___ ~ ___, data = ___)
+
+tbl_lm <- tbl_regression(___)
+
+# View the table_body
+tbl_lm$table_body
+```
+
+```{r tbl-reg-lm-hint-1}
+# lm(AGE ~ TRT01P, data = adsl)
+# tbl_regression(mod_lm)
+```
+
+```{r tbl-reg-lm-solution}
+mod_lm <- lm(AGE ~ TRT01P, data = adsl)
+
+tbl_lm <- tbl_regression(mod_lm)
+
+# View the table_body
+tbl_lm$table_body
+```
+
+```{r quiz-sec1, echo=FALSE}
+quiz(
+  question(
+    "What does `tbl_regression()` do with the model intercept by default?",
+    answer("Includes it as the first row"),
+    answer("Removes it from the table_body", correct = TRUE),
+    answer("Exponentiates it"),
+    answer("Reports it as a p-value"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — exponentiate=TRUE: Odds Ratios
+
+For logistic regression the coefficient scale is the log-odds. Setting `exponentiate=TRUE` exponentiates estimates and CI bounds to produce **odds ratios**.
+
+### Exercise 2 — Logistic regression with odds ratios
+
+Fit a logistic regression of death (`DTHFL_N`) on `AGE` and `TRT01P`, then pass it to `tbl_regression(exponentiate=TRUE)`. Extract the OR for `AGE` from `table_body`.
+
+```{r tbl-reg-logistic, exercise=TRUE, exercise.lines=14}
+mod_glm <- glm(
+  ___ ~ AGE + factor(TRT01P),
+  family  = ___,
+  data    = adsl
+)
+
+tbl_or <- tbl_regression(___, exponentiate = ___)
+
+# Extract OR for AGE
+or_age <- tbl_or$table_body |>
+  filter(variable == "AGE") |>
+  pull(___)
+
+cat("OR for AGE:", or_age, "\n")
+```
+
+```{r tbl-reg-logistic-hint-1}
+# glm(DTHFL_N ~ AGE + factor(TRT01P), family = binomial, data = adsl)
+# tbl_regression(mod_glm, exponentiate = TRUE)
+# pull(estimate)
+```
+
+```{r tbl-reg-logistic-solution}
+mod_glm <- glm(
+  DTHFL_N ~ AGE + factor(TRT01P),
+  family  = binomial,
+  data    = adsl
+)
+
+tbl_or <- tbl_regression(mod_glm, exponentiate = TRUE)
+
+# Extract OR for AGE
+or_age <- tbl_or$table_body |>
+  filter(variable == "AGE") |>
+  pull(estimate)
+
+cat("OR for AGE:", or_age, "\n")
+```
+
+```{r quiz-sec2, echo=FALSE}
+quiz(
+  question(
+    "An OR of 1.05 for AGE in a logistic regression of death means:",
+    answer("A 5% increase in the probability of death per year"),
+    answer("A 5% higher odds of death for each additional year of age", correct = TRUE),
+    answer("A 5% lower odds of death per year"),
+    answer("The effect is not statistically significant"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 3 — tbl_uvregression(): Univariable Screening
+
+`tbl_uvregression()` fits one model per predictor variable and assembles the results into a single table — equivalent to running `tbl_regression()` in a loop.
+
+**Arguments:**
+
+| Argument | Purpose |
+|----------|---------|
+| `data` | Source data frame |
+| `method` | Model function (`lm`, `glm`, ...) |
+| `y` | Outcome variable (unquoted) |
+| `exponentiate` | Exponentiate estimates? |
+| `include` | Predictors to screen |
+
+### Exercise 3 — Univariable screening
+
+Screen SEX, RACE, and DIABFL as univariable predictors of AGE using `lm`.
+
+```{r tbl-uv, exercise=TRUE, exercise.lines=10}
+tbl_uv <- tbl_uvregression(
+  data    = ___,
+  method  = ___,
+  y       = ___,
+  include = c("SEX", "RACE", "DIABFL")
+)
+
+tbl_uv$table_body
+```
+
+```{r tbl-uv-hint-1}
+# data = adsl, method = lm, y = AGE (unquoted)
+```
+
+```{r tbl-uv-solution}
+tbl_uv <- tbl_uvregression(
+  data    = adsl,
+  method  = lm,
+  y       = AGE,
+  include = c("SEX", "RACE", "DIABFL")
+)
+
+tbl_uv$table_body
+```
+
+---
+
+## Section 4 — tbl_merge(): Side-by-Side Tables
+
+`tbl_merge()` takes a **list** of gtsummary objects and places their `stat_*` columns side-by-side. It is commonly used to show unadjusted and adjusted models next to each other.
+
+`tab_spanner` provides column-group headers (like `SPANNING=` in PROC REPORT).
+
+### Exercise 4 — Merge two stat-format tables
+
+Build two `tbl_summary()` tables for adsl — one with mean/SD and one with median/IQR — then merge them.
+
+```{r tbl-merge-ex, exercise=TRUE, exercise.lines=18}
+tbl_mean <- tbl_summary(
+  adsl,
+  by        = "TRT01P",
+  include   = c("AGE", "WEIGHTBL"),
+  statistic = list(all_continuous = "{mean} ({sd})")
+)
+
+tbl_med <- tbl_summary(
+  adsl,
+  by        = "TRT01P",
+  include   = c("AGE", "WEIGHTBL"),
+  statistic = list(all_continuous = "{median} [{p25}, {p75}]")
+)
+
+tbl_m <- tbl_merge(
+  tbls        = ___(tbl_mean, tbl_med),
+  tab_spanner = c("Mean (SD)", "Median [IQR]")
+)
+
+tbl_m$table_body |> select(variable, label, contains("tbl"))
+```
+
+```{r tbl-merge-ex-hint-1}
+# tbl_merge(tbls = list(tbl_mean, tbl_med), tab_spanner = ...)
+```
+
+```{r tbl-merge-ex-solution}
+tbl_mean <- tbl_summary(
+  adsl,
+  by        = "TRT01P",
+  include   = c("AGE", "WEIGHTBL"),
+  statistic = list(all_continuous = "{mean} ({sd})")
+)
+
+tbl_med <- tbl_summary(
+  adsl,
+  by        = "TRT01P",
+  include   = c("AGE", "WEIGHTBL"),
+  statistic = list(all_continuous = "{median} [{p25}, {p75}]")
+)
+
+tbl_m <- tbl_merge(
+  tbls        = list(tbl_mean, tbl_med),
+  tab_spanner = c("Mean (SD)", "Median [IQR]")
+)
+
+tbl_m$table_body |> select(variable, label, contains("tbl"))
+```
+
+---
+
+## Section 5 — tbl_stack(): Vertical Stacking by Subgroup
+
+`tbl_stack()` binds tables vertically. Use `group_header` to add a labelling row before each sub-table — useful for subgroup analyses (e.g., diabetic vs non-diabetic subjects).
+
+### Exercise 5 — Stack diabetic and non-diabetic demographics
+
+Build separate `tbl_summary()` tables for `DIABFL == "Y"` and `DIABFL == "N"`, then stack them.
+
+```{r tbl-stack-ex, exercise=TRUE, exercise.lines=20}
+tbl_diab <- tbl_summary(
+  adsl |> filter(DIABFL == "Y"),
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "WEIGHTBL")
+)
+
+tbl_nondiab <- tbl_summary(
+  adsl |> filter(___ == ___),
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "WEIGHTBL")
+)
+
+tbl_s <- tbl_stack(
+  tbls         = ___(tbl_diab, tbl_nondiab),
+  group_header = c(___, ___)
+)
+
+tbl_s$table_body |> filter(row_type %in% c("group_header","label")) |>
+  select(variable, label, row_type)
+```
+
+```{r tbl-stack-ex-hint-1}
+# filter(DIABFL == "N")
+# tbl_stack(tbls = list(...), group_header = c("Obese (BMI >= 30)", "Non-obese"))
+```
+
+```{r tbl-stack-ex-solution}
+tbl_diab <- tbl_summary(
+  adsl |> filter(DIABFL == "Y"),
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "WEIGHTBL")
+)
+
+tbl_nondiab <- tbl_summary(
+  adsl |> filter(DIABFL == "N"),
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "WEIGHTBL")
+)
+
+tbl_s <- tbl_stack(
+  tbls         = list(tbl_diab, tbl_nondiab),
+  group_header = c("Obese (BMI >= 30)", "Non-obese")
+)
+
+tbl_s$table_body |> filter(row_type %in% c("group_header","label")) |>
+  select(variable, label, row_type)
+```
+
+---
+
+## Section 6 — tbl_ard_summary(): Table from a cards ARD
+
+`tbl_ard_summary()` accepts a cards ARD tibble (from `ard_continuous()` + `ard_categorical()`) and builds a `gtsummary`-style table from it. This is the intended production path when the ARD is the source of truth: compute once in cards, format in gtsummary.
+
+### Exercise 6 — Build an ARD then feed it to tbl_ard_summary()
+
+1. Build an ARD for AGE and SEX stratified by `TRT01P`.
+2. Pass it to `tbl_ard_summary()`.
+3. Compare with a direct `tbl_summary()` call.
+
+```{r tbl-ard-ex, exercise=TRUE, exercise.lines=22}
+# Step 1: build the ARD
+ard_age  <- ard_continuous(adsl,  variables = "AGE",  by = "TRT01P")
+ard_sex  <- ard_categorical(adsl, variables = "SEX",  by = "TRT01P")
+ard_full <- ard_stack(___, ___)
+
+# Step 2: feed to tbl_ard_summary
+tbl_from_ard <- tbl_ard_summary(
+  cards   = ___,
+  by      = "TRT01P",
+  include = c("AGE", "SEX")
+)
+
+tbl_from_ard$table_body
+
+# Step 3: compare to direct tbl_summary
+tbl_direct <- tbl_summary(adsl, by = "TRT01P", include = c("AGE", "SEX"))
+tbl_direct$table_body |> filter(row_type == "label")
+```
+
+```{r tbl-ard-ex-hint-1}
+# ard_stack(ard_age, ard_sex)
+# tbl_ard_summary(cards = ard_full, by = "TRT01P", include = c("AGE","SEX"))
+```
+
+```{r tbl-ard-ex-solution}
+# Step 1: build the ARD
+ard_age  <- ard_continuous(adsl,  variables = "AGE",  by = "TRT01P")
+ard_sex  <- ard_categorical(adsl, variables = "SEX",  by = "TRT01P")
+ard_full <- ard_stack(ard_age, ard_sex)
+
+# Step 2: feed to tbl_ard_summary
+tbl_from_ard <- tbl_ard_summary(
+  cards   = ard_full,
+  by      = "TRT01P",
+  include = c("AGE", "SEX")
+)
+
+tbl_from_ard$table_body
+
+# Step 3: compare to direct tbl_summary
+tbl_direct <- tbl_summary(adsl, by = "TRT01P", include = c("AGE", "SEX"))
+tbl_direct$table_body |> filter(row_type == "label")
+```
+
+---
+
+## Section 7 — inline_text(): Statistics in CSR Prose
+
+`inline_text()` extracts a formatted statistic from a gtsummary object as a plain character string. In an R Markdown CSR, you call it inside backtick-r inline code to avoid ever typing a number manually:
+
+```{r inline-prose-example, eval=FALSE}
+# Paste this into your CSR R Markdown document —
+# the backtick-r expression is evaluated at render time:
+#
+# The mean age in the Placebo arm was `r inline_text(tbl, variable="AGE", column="Placebo")`.
+#
+# Replace 'tbl' with the name of your tbl_summary object.
+```
+
+**Arguments:**
+
+| Argument | Purpose |
+|----------|---------|
+| `variable` | Variable name (matches `$table_body$variable`) |
+| `level` | For categorical: the level string to match |
+| `column` | Arm name (without the `stat_` prefix) |
+
+### Exercise 7 — Extract and report mean AGE for Placebo
+
+Use `inline_text()` to extract the Placebo mean AGE statistic and paste it into a sentence.
+
+```{r inline-text-ex, exercise=TRUE, exercise.lines=12}
+tbl7 <- tbl_summary(
+  adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX")
+)
+
+placebo_age <- inline_text(tbl7, variable = ___, column = ___)
+
+cat("The mean (SD) age in the Placebo arm was", placebo_age, "years.\n")
+```
+
+```{r inline-text-ex-hint-1}
+# variable = "AGE", column = "Placebo"
+# The column argument matches the arm name exactly (no "stat_" prefix)
+```
+
+```{r inline-text-ex-solution}
+tbl7 <- tbl_summary(
+  adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX")
+)
+
+placebo_age <- inline_text(tbl7, variable = "AGE", column = "Placebo")
+
+cat("The mean (SD) age in the Placebo arm was", placebo_age, "years.\n")
+```
+
+---
+
+## Section 8 — Capstone: Safety AE-Rate Table + Logistic Regression
+
+In a real CSR you need two complementary outputs for the safety section:
+
+1. An AE rate table showing `n (%)` of subjects with any AE by treatment arm.
+2. A logistic regression showing which baseline factors predict experiencing any AE.
+
+### Capstone Exercise A — AE rate summary table
+
+Derive a subject-level any-AE flag, join it to adsl, then build a `tbl_summary()`.
+
+```{r capstone-ae-table, exercise=TRUE, exercise.lines=20}
+# Step 1: derive ANYAE_FL = "Y" if subject has >= 1 AE record
+anyae <- adae |>
+  distinct(USUBJID) |>
+  mutate(ANYAE_FL = "Y")
+
+# Step 2: join to adsl (subjects with no AE get NA -> recode to "N")
+adsl_ae <- adsl |>
+  left_join(___, by = "USUBJID") |>
+  mutate(ANYAE_FL = if_else(is.na(ANYAE_FL), "N", ANYAE_FL))
+
+# Step 3: build summary table
+tbl_ae <- tbl_summary(
+  adsl_ae,
+  by      = ___,
+  include = "ANYAE_FL",
+  label   = list(ANYAE_FL = "Any Adverse Event")
+) |>
+  add_p() |>
+  add_overall() |>
+  add_n()
+
+tbl_ae
+```
+
+```{r capstone-ae-table-hint-1}
+# left_join(anyae, by = "USUBJID")
+# by = "TRT01P"
+```
+
+```{r capstone-ae-table-solution}
+# Step 1: derive ANYAE_FL = "Y" if subject has >= 1 AE record
+anyae <- adae |>
+  distinct(USUBJID) |>
+  mutate(ANYAE_FL = "Y")
+
+# Step 2: join to adsl (subjects with no AE get NA -> recode to "N")
+adsl_ae <- adsl |>
+  left_join(anyae, by = "USUBJID") |>
+  mutate(ANYAE_FL = if_else(is.na(ANYAE_FL), "N", ANYAE_FL))
+
+# Step 3: build summary table
+tbl_ae <- tbl_summary(
+  adsl_ae,
+  by      = "TRT01P",
+  include = "ANYAE_FL",
+  label   = list(ANYAE_FL = "Any Adverse Event")
+) |>
+  add_p() |>
+  add_overall() |>
+  add_n()
+
+tbl_ae
+```
+
+### Capstone Exercise B — Logistic regression of any-AE
+
+Fit a logistic regression of `ANYAE_N` (1/0) on `AGE`, `SEX`, and `TRT01P`. Use `tbl_regression(exponentiate=TRUE)`. Extract and report the OR with 95% CI for AGE.
+
+```{r capstone-logreg, exercise=TRUE, exercise.lines=24}
+# Derive binary outcome
+anyae <- adae |> distinct(USUBJID) |> mutate(ANYAE_FL = "Y")
+adsl_ae <- adsl |>
+  left_join(anyae, by = "USUBJID") |>
+  mutate(ANYAE_N = as.integer(!is.na(ANYAE_FL) & ANYAE_FL == "Y"))
+
+# Fit logistic regression
+mod_ae <- glm(
+  ANYAE_N ~ ___ + ___ + factor(TRT01P),
+  family = ___,
+  data   = adsl_ae
+)
+
+# Build gtsummary regression table with ORs
+tbl_ae_reg <- tbl_regression(___, exponentiate = ___)
+
+# Extract OR and CI for AGE
+age_row <- tbl_ae_reg$table_body |> filter(variable == ___)
+
+cat("OR for AGE:", age_row$estimate, "\n")
+cat("95% CI: (", age_row$conf.low, ",", age_row$conf.high, ")\n")
+cat("p-value:", age_row$p.value, "\n")
+
+tbl_ae_reg$table_body
+```
+
+```{r capstone-logreg-hint-1}
+# ANYAE_N ~ AGE + SEX + factor(TRT01P), family = binomial
+# tbl_regression(mod_ae, exponentiate = TRUE)
+# filter(variable == "AGE")
+```
+
+```{r capstone-logreg-solution}
+# Derive binary outcome
+anyae <- adae |> distinct(USUBJID) |> mutate(ANYAE_FL = "Y")
+adsl_ae <- adsl |>
+  left_join(anyae, by = "USUBJID") |>
+  mutate(ANYAE_N = as.integer(!is.na(ANYAE_FL) & ANYAE_FL == "Y"))
+
+# Fit logistic regression
+mod_ae <- glm(
+  ANYAE_N ~ AGE + SEX + factor(TRT01P),
+  family = binomial,
+  data   = adsl_ae
+)
+
+# Build gtsummary regression table with ORs
+tbl_ae_reg <- tbl_regression(mod_ae, exponentiate = TRUE)
+
+# Extract OR and CI for AGE
+age_row <- tbl_ae_reg$table_body |> filter(variable == "AGE")
+
+cat("OR for AGE:", age_row$estimate, "\n")
+cat("95% CI: (", age_row$conf.low, ",", age_row$conf.high, ")\n")
+cat("p-value:", age_row$p.value, "\n")
+
+tbl_ae_reg$table_body
+```
+
+---
+
+## Lesson Summary
+
+In this lesson you extended gtsummary from descriptive tables to a full clinical report toolkit:
+
+| Concept | Key function |
+|---------|-------------|
+| Regression table | `tbl_regression(model, exponentiate=FALSE)` |
+| Odds ratios | `tbl_regression(model, exponentiate=TRUE)` |
+| Univariable screening | `tbl_uvregression(data, method=glm, y=outcome, ...)` |
+| Side-by-side tables | `tbl_merge(list(tbl1, tbl2), tab_spanner=...)` |
+| Subgroup stacking | `tbl_stack(list(tbl1, tbl2), group_header=...)` |
+| ARD-driven table | `tbl_ard_summary(cards_ard, by=..., include=...)` |
+| Inline CSR text | `inline_text(tbl, variable=..., column=...)` |
+
+**Key gotchas to remember:**
+
+> `tbl_regression()` drops the intercept automatically. If you need it, filter `table_body` manually before downstream use.
+
+> `exponentiate=TRUE` applies `exp()` to both the estimate **and** the CI bounds. The p-value is unchanged (it is computed on the log-odds scale).
+
+> `tbl_uvregression()` uses `substitute()` to capture the `y=` argument — always pass it **unquoted** (e.g., `y = AGE`, not `y = "AGE"`).
+
+> `tbl_stack()` simply `bind_rows()` the table bodies. Make sure all tables include the same `include=` variables or the stat columns will not align.
+
+**Next lesson:** Lesson 28 — cardinal — clinical trial analysis results with pre-built ARD functions for standard regulatory tables.

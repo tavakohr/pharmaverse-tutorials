@@ -1,0 +1,2143 @@
+---
+title: "Lesson 20 — admiral Oncology Extension (admiralonco): ADRS, ADTR & Oncology TTE"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Oncology ADaM derivations using the admiralonco package: RECIST 1.1 response
+  assessments (ADRS), tumour measurement datasets (ADTR), confirmed response,
+  Best Overall Response, and oncology-specific time-to-event parameters (PFS, DOR).
+  Includes real-world capstone problems.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 20_admiralonco.Rmd
+# PURPOSE       : admiralonco extension — RECIST 1.1 oncology endpoints: ADRS overall
+#                 response, best overall response (BOR), confirmed
+#                 response, confirmed BOR, response duration, and tumour
+#                 burden (ADTR/SLD) derivations.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNTHETIC ONCOLOGY DATA
+# Simulates a Phase II solid-tumour trial (NSCLC / colorectal mix).
+# 80 subjects, 2 arms: Investigational Drug A (IDA) vs Placebo.
+# ══════════════════════════════════════════════════════════════════════════════
+set.seed(2024)
+n_sub <- 80
+
+adsl_onco <- tibble(
+  STUDYID  = "ONCO2024",
+  USUBJID  = sprintf("ONCO2024-%03d", seq_len(n_sub)),
+  SUBJID   = sprintf("%03d", seq_len(n_sub)),
+  AGE      = sample(42:78, n_sub, replace = TRUE),
+  SEX      = sample(c("M","F"), n_sub, replace = TRUE, prob = c(.55,.45)),
+  RACE     = sample(c("WHITE","ASIAN","BLACK OR AFRICAN AMERICAN"),
+                    n_sub, replace = TRUE, prob = c(.65,.25,.10)),
+  ARM      = rep(c("Investigational Drug A","Placebo"), each = n_sub/2),
+  ARMCD    = rep(c("IDA","PBO"), each = n_sub/2),
+  TRTSDT   = as.Date("2023-01-15") + sample(0:120, n_sub, replace = TRUE),
+  TRTEDT   = as.Date("2023-01-15") + sample(180:540, n_sub, replace = TRUE),
+  EOSSTT   = sample(c("COMPLETED","DISCONTINUED","ONGOING"),
+                    n_sub, replace = TRUE, prob = c(.30,.45,.25)),
+  DTHFL    = sample(c("Y","N"), n_sub, replace = TRUE, prob = c(.38,.62)),
+  SAFFL    = "Y",
+  ITTFL    = "Y"
+) |>
+  mutate(
+    LSTALVDT = if_else(DTHFL == "Y",
+                       TRTSDT + sample(90:500, n_sub, replace = TRUE),
+                       TRTEDT + sample(0:60, n_sub, replace = TRUE)),
+    DTHDT    = if_else(DTHFL == "Y", LSTALVDT, as.Date(NA))
+  )
+
+# ── RS domain (Tumour Response assessments) ───────────────────────────────────
+# RECIST 1.1 overall response at each scheduled visit
+recist_vals <- c("CR","PR","SD","PD","NE")
+visits      <- c("SCREENING","CYCLE 2 DAY 1","CYCLE 4 DAY 1",
+                 "CYCLE 6 DAY 1","CYCLE 8 DAY 1","END OF TREATMENT")
+visit_days  <- c(-14, 42, 84, 126, 168, 210)
+
+# Each subject has a "true best" drawn from a realistic distribution;
+# responses then evolve plausibly over visits.
+true_best <- sample(recist_vals, n_sub, replace = TRUE,
+                    prob = c(.08,.22,.35,.28,.07))
+
+rs_rows <- lapply(seq_len(n_sub), function(i) {
+  subj   <- adsl_onco$USUBJID[i]
+  trtsdt <- adsl_onco$TRTSDT[i]
+  arm    <- adsl_onco$ARMCD[i]
+  best   <- true_best[i]
+
+  # Subjects in PBO arm have worse outcomes
+  if (arm == "PBO" && best %in% c("CR","PR"))
+    best <- sample(c("SD","PD"), 1, prob = c(.6,.4))
+
+  lapply(seq_along(visits), function(j) {
+    v <- visits[j]; d <- visit_days[j]
+    # progression: once PD, stay PD; NE allowed at any point
+    resp <- if (j == 1) {
+      "NE"   # screening is always NE for overall response
+    } else if (best == "PD" && j >= 3) {
+      "PD"
+    } else if (best == "CR" && j >= 4) {
+      sample(c("CR","CR","PR"), 1)
+    } else if (best == "PR" && j >= 3) {
+      sample(c("PR","PR","SD","PD"), 1, prob = c(.5,.2,.2,.1))
+    } else if (best == "SD" && j >= 3) {
+      sample(c("SD","SD","PD","NE"), 1, prob = c(.5,.2,.2,.1))
+    } else {
+      sample(recist_vals, 1, prob = c(.03,.12,.30,.35,.20))
+    }
+    tibble(
+      STUDYID  = "ONCO2024",
+      USUBJID  = subj,
+      RSSEQ    = as.integer((i - 1) * length(visits) + j),
+      VISIT    = v,
+      VISITNUM = as.numeric(j),
+      VISITDY  = as.integer(d),
+      RSTESTCD = "OVRLRESP",
+      RSTEST   = "Overall Response",
+      RSCAT    = "RECIST 1.1",
+      RSSTRESC = resp,
+      RSDTC    = format(trtsdt + d, "%Y-%m-%d"),
+      ADT      = trtsdt + d,
+      AVALC    = resp,
+      AVAL     = case_when(resp == "CR" ~ 1L, resp == "PR" ~ 2L,
+                           resp == "SD" ~ 3L, resp == "NE" ~ 4L,
+                           resp == "PD" ~ 5L, TRUE ~ NA_integer_)
+    )
+  }) |> bind_rows()
+}) |> bind_rows()
+
+# Filter out screening (not used in BOR derivation)
+rs_visits <- rs_rows |> filter(VISIT != "SCREENING")
+
+# ── TU domain (Tumour Measurements — target lesions) ─────────────────────────
+# Each subject has 1-3 target lesions measured at each visit
+tu_visits <- c("SCREENING","CYCLE 2 DAY 1","CYCLE 4 DAY 1",
+               "CYCLE 6 DAY 1","CYCLE 8 DAY 1")
+tu_days   <- c(-14, 42, 84, 126, 168)
+
+tu_rows <- lapply(seq_len(n_sub), function(i) {
+  subj      <- adsl_onco$USUBJID[i]
+  trtsdt    <- adsl_onco$TRTSDT[i]
+  n_lesions <- sample(1:3, 1)
+  best      <- true_best[i]
+
+  lapply(seq_along(tu_visits), function(j) {
+    v <- tu_visits[j]; d <- tu_days[j]
+    lapply(seq_len(n_lesions), function(k) {
+      base_size <- runif(1, 10, 50)
+      # Size trajectory based on true best response
+      factor <- if (best == "CR") max(0, 1 - (j - 1) * 0.35)
+                else if (best == "PR") max(0, 1 - (j - 1) * 0.18)
+                else if (best == "SD") 1 + (j - 1) * 0.03 + rnorm(1, 0, 0.05)
+                else 1 + (j - 1) * 0.20 + rnorm(1, 0, 0.08)   # PD/NE
+      size_mm <- round(max(0, base_size * factor + rnorm(1, 0, 2)), 1)
+      tibble(
+        STUDYID  = "ONCO2024",
+        USUBJID  = subj,
+        TUSEQ    = as.integer((i - 1) * length(tu_visits) * 3 + (j - 1) * 3 + k),
+        TULNKID  = sprintf("TL%d", k),
+        VISIT    = v,
+        VISITNUM = as.numeric(j),
+        TUTESTCD = "DIAMETER",
+        TUTEST   = "Longest Diameter",
+        TUORRES  = size_mm,
+        TUSTRESC = as.character(size_mm),
+        TUSTRESU = "mm",
+        ADT      = trtsdt + d,
+        AVAL     = size_mm
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+}) |> bind_rows()
+
+# ── Pre-built ADRS skeleton (used in later exercises) ─────────────────────────
+adrs_base <- rs_visits |>
+  left_join(select(adsl_onco, USUBJID, TRTSDT, ARMCD), by = "USUBJID") |>
+  mutate(
+    ADY       = as.integer(ADT - TRTSDT + 1L),
+    PARAMCD   = "OVR",
+    PARAM     = "Overall Response by Investigator",
+    DTYPE     = NA_character_
+  )
+
+# ── ADTR skeleton — Sum of Longest Diameters (SLD) ───────────────────────────
+adtr_sld <- tu_rows |>
+  group_by(STUDYID, USUBJID, VISIT, VISITNUM, ADT) |>
+  summarise(AVAL = round(sum(AVAL, na.rm = TRUE), 1), .groups = "drop") |>
+  left_join(select(adsl_onco, USUBJID, TRTSDT, ARMCD), by = "USUBJID") |>
+  mutate(
+    ADY     = as.integer(ADT - TRTSDT + 1L),
+    PARAMCD = "SLD",
+    PARAM   = "Sum of Longest Diameters (mm)",
+    DTYPE   = NA_character_
+  ) |>
+  arrange(USUBJID, ADT)
+
+# Add baseline SLD
+adtr_sld <- adtr_sld |>
+  group_by(USUBJID) |>
+  mutate(
+    BASE   = first(AVAL[VISIT == "SCREENING"], default = NA_real_),
+    ABLFL  = if_else(VISIT == "SCREENING", "Y", NA_character_)
+  ) |>
+  ungroup()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIRALONCO FUNCTION MOCKS
+# These replicate the interface and logic of the real admiralonco package
+# so exercises run inside learnr without the package installed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Helper: RECIST 1.1 numeric hierarchy (lower = better)
+.recist_rank <- c(CR = 1L, PR = 2L, SD = 3L, NE = 4L, PD = 5L)
+
+#' Derive Overall Response parameter in ADRS
+#' Maps RSSTRESC → AVALC/AVAL using RECIST 1.1 hierarchy
+derive_param_clinicalresp <- function(dataset,
+                                      dataset_adsl,
+                                      filter_source   = NULL,
+                                      source_var      = AVALC,
+                                      set_values_to   = list(),
+                                      reference_date  = NULL,
+                                      ref_start_var   = NULL,
+                                      ...) {
+  src_nm <- deparse(substitute(source_var))
+  filt   <- substitute(filter_source)
+
+  rs <- if (!is.null(filt)) {
+    tryCatch(filter(dataset, !!filt), error = function(e) dataset)
+  } else dataset
+
+  if (src_nm %in% names(rs)) {
+    rs <- rs |>
+      mutate(
+        AVALC = as.character(.data[[src_nm]]),
+        AVAL  = .recist_rank[AVALC]
+      )
+  }
+
+  for (nm in names(set_values_to)) {
+    val <- set_values_to[[nm]]
+    rs[[nm]] <- if (is.language(val)) tryCatch(eval(val, rs), error = function(e) NA)
+                else val
+  }
+
+  # Merge with ADSL to get one row per subject per visit
+  by_cols <- intersect(c("STUDYID","USUBJID"), names(dataset_adsl))
+  adsl_mini <- dataset_adsl |> select(all_of(by_cols))
+  rs <- left_join(rs, adsl_mini, by = by_cols)
+  bind_rows(dataset, rs) |> distinct()
+}
+
+#' Derive Best Overall Response (BOR) in ADRS
+#' BOR = best (lowest-ranked) confirmed or unconfirmed response
+derive_param_bor <- function(dataset,
+                              dataset_adsl,
+                              filter_source   = NULL,
+                              source_var      = AVALC,
+                              reference_date  = NULL,
+                              missing_as_ne   = FALSE,
+                              set_values_to   = list(),
+                              ...) {
+  src_nm <- deparse(substitute(source_var))
+  filt   <- substitute(filter_source)
+
+  rs <- if (!is.null(filt)) {
+    tryCatch(filter(dataset, !!filt), error = function(e) dataset)
+  } else dataset
+
+  bor_rows <- rs |>
+    group_by(USUBJID) |>
+    summarise(
+      AVALC = {
+        vals <- .data[[src_nm]]
+        if (missing_as_ne) vals[is.na(vals)] <- "NE"
+        ranks <- .recist_rank[vals]
+        best_val <- vals[which.min(ranks)]
+        if (length(best_val) == 0) "NE" else best_val
+      },
+      .groups = "drop"
+    ) |>
+    mutate(
+      AVAL  = .recist_rank[AVALC],
+      DTYPE = "BOR"
+    )
+
+  for (nm in names(set_values_to)) {
+    val <- set_values_to[[nm]]
+    bor_rows[[nm]] <- if (is.language(val)) tryCatch(eval(val, bor_rows), error = function(e) NA)
+                      else val
+  }
+
+  bind_rows(dataset, bor_rows)
+}
+
+#' Derive Confirmed Overall Response
+#' A response is "confirmed" when the same or better response is seen
+#' at a subsequent visit >= confirmed_period days later.
+derive_param_confirmed_resp <- function(dataset,
+                                         filter_source  = NULL,
+                                         source_var     = AVALC,
+                                         ref_start_var  = TRTSDT,
+                                         confirmed_period = 28L,
+                                         set_values_to  = list(),
+                                         ...) {
+  src_nm  <- deparse(substitute(source_var))
+  ref_nm  <- deparse(substitute(ref_start_var))
+  filt    <- substitute(filter_source)
+
+  rs <- if (!is.null(filt)) {
+    tryCatch(filter(dataset, !!filt), error = function(e) dataset)
+  } else dataset
+
+  rs <- rs |> arrange(USUBJID, ADT)
+
+  confirmed <- rs |>
+    group_by(USUBJID) |>
+    mutate(
+      .rank    = .recist_rank[.data[[src_nm]]],
+      .confirm = map2_lgl(row_number(), .rank, function(r, rk) {
+        future <- .rank[(r + 1):length(.rank)]
+        future_dates <- ADT[(r + 1):length(ADT)]
+        if (length(future) == 0) return(FALSE)
+        gap <- as.numeric(future_dates - ADT[r])
+        any(!is.na(future) & future <= rk & gap >= confirmed_period, na.rm = TRUE)
+      }),
+      AVALC_CONF = if_else(.confirm, .data[[src_nm]], "NE"),
+      AVAL_CONF  = .recist_rank[AVALC_CONF]
+    ) |>
+    ungroup() |>
+    select(-starts_with("."))
+
+  for (nm in names(set_values_to)) {
+    val <- set_values_to[[nm]]
+    confirmed[[nm]] <- if (is.language(val)) tryCatch(eval(val, confirmed), error = function(e) NA)
+                       else val
+  }
+  confirmed
+}
+
+#' Derive Confirmed Best Overall Response
+derive_param_confirmed_bor <- function(dataset,
+                                        filter_source  = NULL,
+                                        source_var     = AVALC,
+                                        confirmed_period = 28L,
+                                        missing_as_ne  = FALSE,
+                                        set_values_to  = list(),
+                                        ...) {
+  conf <- derive_param_confirmed_resp(
+    dataset          = dataset,
+    filter_source    = NULL,
+    source_var       = !!substitute(source_var),
+    confirmed_period = confirmed_period,
+    set_values_to    = list()
+  )
+
+  cbor_rows <- conf |>
+    group_by(USUBJID) |>
+    summarise(
+      AVALC = {
+        vals  <- AVALC_CONF
+        if (missing_as_ne) vals[is.na(vals)] <- "NE"
+        ranks <- .recist_rank[vals]
+        best  <- vals[which.min(ranks)]
+        if (length(best) == 0) "NE" else best
+      },
+      .groups = "drop"
+    ) |>
+    mutate(AVAL = .recist_rank[AVALC], DTYPE = "CBOR")
+
+  for (nm in names(set_values_to)) {
+    val <- set_values_to[[nm]]
+    cbor_rows[[nm]] <- if (is.language(val)) tryCatch(eval(val, cbor_rows), error = function(e) NA)
+                       else val
+  }
+  bind_rows(dataset, cbor_rows)
+}
+
+#' Derive Duration of Response (DOR) — time from first CR/PR to PD/death
+derive_param_response_duration <- function(dataset,
+                                            dataset_adsl,
+                                            filter_source     = NULL,
+                                            source_var        = AVALC,
+                                            start_date        = TRTSDT,
+                                            event_conditions  = list(),
+                                            censor_conditions = list(),
+                                            set_values_to     = list(),
+                                            ...) {
+  src_nm  <- deparse(substitute(source_var))
+  start_nm <- deparse(substitute(start_date))
+
+  rs <- if (!is.null(substitute(filter_source))) {
+    tryCatch(filter(dataset, !!substitute(filter_source)), error = function(e) dataset)
+  } else dataset
+
+  # First response date (CR or PR)
+  first_resp <- rs |>
+    filter(.data[[src_nm]] %in% c("CR","PR")) |>
+    group_by(USUBJID) |>
+    summarise(RESP_DT = min(ADT, na.rm = TRUE), .groups = "drop")
+
+  # First PD after response
+  first_pd <- rs |>
+    filter(.data[[src_nm]] == "PD") |>
+    group_by(USUBJID) |>
+    summarise(PD_DT = min(ADT, na.rm = TRUE), .groups = "drop")
+
+  dor_rows <- dataset_adsl |>
+    select(USUBJID, all_of(intersect(c(start_nm, "DTHDT", "LSTALVDT"), names(dataset_adsl)))) |>
+    left_join(first_resp, by = "USUBJID") |>
+    left_join(first_pd,   by = "USUBJID") |>
+    filter(!is.na(RESP_DT)) |>
+    mutate(
+      # Event: PD or death after response; Censor: alive without PD
+      EVNTDESC = case_when(
+        !is.na(PD_DT) & PD_DT > RESP_DT ~ "PROGRESSIVE DISEASE",
+        "DTHDT" %in% names(.) & !is.na(DTHDT) & DTHDT > RESP_DT ~ "DEATH",
+        TRUE                             ~ "CENSORED"
+      ),
+      CNSR  = if_else(EVNTDESC == "CENSORED", 1L, 0L),
+      ENDDT = case_when(
+        EVNTDESC == "PROGRESSIVE DISEASE" ~ PD_DT,
+        EVNTDESC == "DEATH"               ~ DTHDT,
+        "LSTALVDT" %in% names(.) ~ LSTALVDT,
+        TRUE                              ~ as.Date(NA)
+      ),
+      AVAL  = as.numeric(ENDDT - RESP_DT),
+      DTYPE = "DOR"
+    )
+
+  for (nm in names(set_values_to)) {
+    val <- set_values_to[[nm]]
+    dor_rows[[nm]] <- if (is.language(val)) tryCatch(eval(val, dor_rows), error = function(e) NA)
+                      else val
+  }
+  dor_rows
+}
+
+# ── Shared admiral helpers (also used in onco context) ───────────────────────
+exprs <- function(...) as.list(substitute(list(...)))[-1]
+
+derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL, ...) {
+  by_nm <- sapply(by_vars, deparse)
+  jdf   <- dataset_add
+  if (!is.null(new_vars)) {
+    old <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d,"=")[[1]][2]) else d
+    })
+    new <- sapply(new_vars, function(x) {
+      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d,"=")[[1]][1]) else d
+    })
+    keep <- intersect(c(by_nm, old), names(jdf))
+    jdf  <- jdf |> select(all_of(keep))
+    for (i in seq_along(old))
+      if (old[i] != new[i] && old[i] %in% names(jdf))
+        jdf <- rename(jdf, !!new[i] := !!old[i])
+  }
+  left_join(dataset, jdf, by = intersect(by_nm, names(jdf)))
+}
+
+derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "first") {
+  new_nm  <- deparse(substitute(new_var))
+  by_nm   <- sapply(by_vars, deparse)
+  ord_nms <- sapply(order, function(x) gsub("desc\\(|\\)", "", deparse(x)))
+  desc_fl <- sapply(order, function(x) grepl("^desc\\(", deparse(x)))
+  odf <- dataset
+  for (i in rev(seq_along(ord_nms)))
+    if (ord_nms[i] %in% names(odf))
+      odf <- if (desc_fl[i]) arrange(odf, desc(.data[[ord_nms[i]]]))
+             else arrange(odf, .data[[ord_nms[i]]])
+  byp <- intersect(by_nm, names(odf))
+  fl  <- if (mode == "first")
+    odf |> group_by(across(all_of(byp))) |> slice(1) |> ungroup() |>
+           mutate(!!new_nm := "Y") |> select(all_of(c(byp, new_nm)))
+  else
+    odf |> group_by(across(all_of(byp))) |> slice(n()) |> ungroup() |>
+           mutate(!!new_nm := "Y") |> select(all_of(c(byp, new_nm)))
+  left_join(dataset, fl, by = byp)
+}
+```
+
+## Overview
+
+### The oncology ADaM landscape
+
+**`{admiralonco}`** is the official pharmaverse extension of `{admiral}` for solid-tumour oncology trials. It implements derivations mandated by RECIST 1.1, RANO, and iRECIST — the three dominant imaging-based response criteria frameworks.
+
+The three oncology-specific ADaM datasets you will build in this lesson are:
+
+| Dataset | Full Name | Key Variables |
+|---------|-----------|---------------|
+| **ADRS** | Analysis Dataset — Response | PARAMCD, AVALC, AVAL, BOR, DOR |
+| **ADTR** | Analysis Dataset — Tumour Results | SLD (Sum of Longest Diameters), % change |
+| **ADTTE** (onco) | Analysis Dataset — Time-to-Event | PFS, DOR, OS with oncology-specific censoring |
+
+> **SAS parallel:** In SAS you would typically derive BOR with a custom `PROC SORT` + `DATA` step using `BY` processing. admiral.onco replaces this with purpose-built functions that enforce RECIST hierarchy and confirmation logic consistently.
+
+### Source domains
+
+ADRS and ADTR are derived from **SDTM RS** (Tumour Response) and **SDTM TU** (Tumour Measurements) domains respectively.
+
+```{r overview-data, exercise=FALSE}
+# Inspect the RS-domain data (pre-loaded as rs_visits)
+rs_visits |>
+  count(RSTESTCD, AVALC) |>
+  pivot_wider(names_from = AVALC, values_from = n, values_fill = 0L)
+```
+
+```{r overview-data2, exercise=FALSE}
+# Inspect the TU-domain data (SLD calculations come from here)
+tu_rows |>
+  filter(USUBJID == "ONCO2024-001") |>
+  select(USUBJID, VISIT, TULNKID, AVAL, ADT)
+```
+
+---
+
+## Section 1 — RECIST 1.1 Foundations
+
+### RECIST 1.1 response hierarchy
+
+**RECIST 1.1** (Response Evaluation Criteria in Solid Tumours) defines five possible overall responses. They are stored in AVALC (character) and numerically ranked in AVAL:
+
+| AVALC | Meaning | AVAL (rank) |
+|-------|---------|-------------|
+| `CR`  | Complete Response — all target lesions disappear | 1 |
+| `PR`  | Partial Response — ≥30 % decrease in SLD | 2 |
+| `SD`  | Stable Disease — neither PR nor PD criteria met | 3 |
+| `NE`  | Not Evaluable — assessment missing or unevaluable | 4 |
+| `PD`  | Progressive Disease — ≥20 % increase in SLD, or new lesion | 5 |
+
+**Best Overall Response (BOR)** = the best (lowest-ranked) AVALC achieved across all post-baseline visits.
+
+```{r quiz-recist1, echo=FALSE}
+quiz(
+  caption = "Quiz — RECIST 1.1 Hierarchy",
+
+  question("A subject's AVALC values across visits are: SD, PR, SD, PD. What is their BOR?",
+    answer("SD"),
+    answer("PR", correct = TRUE,
+           message = "PR (rank 2) is the best response — lower rank = better."),
+    answer("PD"),
+    answer("NE"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("In the RECIST 1.1 AVAL scheme taught here, which numeric value represents Complete Response?",
+    answer("0"),
+    answer("1", correct = TRUE),
+    answer("5"),
+    answer("-1"),
+    allow_retry = TRUE
+  ),
+
+  question("A subject has only NE assessments because all scans were unevaluable. Their BOR should be recorded as:",
+    answer("SD — assume stability when data are missing"),
+    answer("NE", correct = TRUE,
+           message = "NE is the correct BOR when no evaluable assessment exists."),
+    answer("PD — missing scans imply progression"),
+    answer("Missing/blank"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 1.0 — Explore the RECIST hierarchy in data
+
+```{r ex-recist-rank, exercise=TRUE, exercise.lines=10}
+# rs_visits contains post-baseline RECIST assessments.
+# For subject "ONCO2024-001", show all AVALC and AVAL values
+# arranged from best to worst response (ascending AVAL).
+rs_visits |>
+  filter(___ == "ONCO2024-001") |>
+  arrange(___) |>
+  select(USUBJID, VISIT, AVALC, AVAL)
+```
+
+```{r ex-recist-rank-hint-1}
+# filter by USUBJID, arrange by AVAL ascending
+```
+
+```{r ex-recist-rank-solution}
+rs_visits |>
+  filter(USUBJID == "ONCO2024-001") |>
+  arrange(AVAL) |>
+  select(USUBJID, VISIT, AVALC, AVAL)
+```
+
+### Exercise 1.1 — Tabulate response distribution
+
+Use `rs_visits` (pre-loaded). Count how many **unique subjects** achieved each AVALC response at **any post-baseline visit** for arm `IDA`, then arrange from best to worst using `AVAL`.
+
+```{r ex-recist-count, exercise=TRUE, exercise.lines=12}
+# rs_visits has USUBJID, AVALC, AVAL, ARMCD, VISIT
+# Count unique subjects per AVALC, arm IDA only, arrange by AVAL
+
+rs_visits |>
+  filter(ARMCD == ___) |>
+  group_by(___, ___) |>
+  summarise(n_subjects = n_distinct(___), .groups = "drop") |>
+  arrange(___)
+```
+
+```{r ex-recist-count-hint-1}
+# Filter to IDA arm, group by AVALC and AVAL, count distinct USUBJIDs
+rs_visits |>
+  filter(ARMCD == "IDA") |>
+  group_by(AVALC, AVAL) |>
+  summarise(n_subjects = n_distinct(USUBJID), .groups = "drop") |>
+  arrange(AVAL)
+```
+
+```{r ex-recist-count-solution}
+rs_visits |>
+  filter(ARMCD == "IDA") |>
+  group_by(AVALC, AVAL) |>
+  summarise(n_subjects = n_distinct(USUBJID), .groups = "drop") |>
+  arrange(AVAL)
+```
+
+---
+
+## Section 2 — ADRS: Deriving Response Parameters
+
+### How admiralonco builds ADRS
+
+`derive_param_clinicalresp()` maps each post-baseline assessment into a standardised ADRS row. It adds AVALC (CR/PR/SD/NE/PD) and AVAL (1–5) derived from the source RS variable, and applies any `set_values_to` metadata (PARAMCD, PARAM, etc.).
+
+The `set_values_to` argument accepts a **named list** of column-name → value pairs that are stamped onto every row added by the derivation function. It is how you assign PARAMCD, PARAM, and any other dataset-level metadata without a separate `mutate()` call:
+
+```r
+set_values_to = list(
+  PARAMCD = "OVR",
+  PARAM   = "Overall Response by Investigator"
+)
+```
+
+Every row the function creates will have `PARAMCD = "OVR"` and `PARAM = "Overall Response by Investigator"`. This pattern is consistent across all admiralonco derivation functions.
+
+```{r adrs-demo, exercise=FALSE}
+# Minimal example: derive the OVR (Overall Response) parameter
+adrs_ovr <- derive_param_clinicalresp(
+  dataset      = adrs_base,
+  dataset_adsl = adsl_onco,
+  source_var   = AVALC,
+  set_values_to = list(
+    PARAMCD = "OVR",
+    PARAM   = "Overall Response by Investigator"
+  )
+)
+
+adrs_ovr |>
+  filter(USUBJID == "ONCO2024-001") |>
+  select(USUBJID, VISIT, AVALC, AVAL, PARAMCD)
+```
+
+```{r quiz-adrs1, echo=FALSE}
+quiz(
+  caption = "Quiz — ADRS Derivation Logic",
+
+  question("Why is the SCREENING visit excluded when deriving BOR?",
+    answer("Because RECIST does not allow a baseline assessment to contribute to BOR",
+           correct = TRUE,
+           message = "The screening scan establishes *baseline* SLD — it is not a post-baseline response assessment."),
+    answer("Because the SCREENING visit always has AVALC = NE"),
+    answer("admiral.onco requires VISITNUM > 1 to derive BOR"),
+    answer("Screening data comes from a different SDTM domain"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise — Use set_values_to to assign a custom PARAMCD
+
+```{r ex-set-values-to, exercise=TRUE, exercise.lines=14}
+# derive_param_clinicalresp() is already available.
+# Call it on adrs_base to produce a new ADRS parameter with:
+#   PARAMCD = "INVRSP"
+#   PARAM   = "Investigator Overall Response"
+# Then show the first 5 rows, keeping only USUBJID, VISIT, AVALC, AVAL, PARAMCD.
+
+adrs_invrsp <- derive_param_clinicalresp(
+  dataset       = ___,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  set_values_to = list(
+    PARAMCD = ___,
+    PARAM   = ___
+  )
+)
+
+adrs_invrsp |> select(USUBJID, VISIT, AVALC, AVAL, PARAMCD) |> head(5)
+```
+
+```{r ex-set-values-to-hint-1}
+# dataset = adrs_base
+# PARAMCD = "INVRSP"
+# PARAM   = "Investigator Overall Response"
+```
+
+```{r ex-set-values-to-solution}
+adrs_invrsp <- derive_param_clinicalresp(
+  dataset       = adrs_base,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  set_values_to = list(
+    PARAMCD = "INVRSP",
+    PARAM   = "Investigator Overall Response"
+  )
+)
+
+adrs_invrsp |> select(USUBJID, VISIT, AVALC, AVAL, PARAMCD) |> head(5)
+```
+
+### Exercise 2.1 — Derive OVR with PARAMCD
+
+Using `adrs_base` and `adsl_onco`, call `derive_param_clinicalresp()` to produce an ADRS with PARAMCD = `"OVR"` and PARAM = `"Overall Response by Investigator"`. Then count rows per AVALC.
+
+```{r ex-derive-ovr, exercise=TRUE, exercise.lines=18}
+adrs_ovr <- derive_param_clinicalresp(
+  dataset       = ___,
+  dataset_adsl  = ___,
+  source_var    = AVALC,
+  set_values_to = list(
+    PARAMCD = ___,
+    PARAM   = ___
+  )
+)
+
+# Count rows per AVALC
+adrs_ovr |>
+  count(___, sort = TRUE)
+```
+
+```{r ex-derive-ovr-hint-1}
+# dataset = adrs_base, dataset_adsl = adsl_onco
+# set_values_to takes a named list of PARAMCD and PARAM strings
+adrs_ovr <- derive_param_clinicalresp(
+  dataset       = adrs_base,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  set_values_to = list(
+    PARAMCD = "OVR",
+    PARAM   = "Overall Response by Investigator"
+  )
+)
+adrs_ovr |> count(AVALC, sort = TRUE)
+```
+
+```{r ex-derive-ovr-solution}
+adrs_ovr <- derive_param_clinicalresp(
+  dataset       = adrs_base,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  set_values_to = list(
+    PARAMCD = "OVR",
+    PARAM   = "Overall Response by Investigator"
+  )
+)
+adrs_ovr |> count(AVALC, sort = TRUE)
+```
+
+### Exercise 2.2 — Flag the analysis baseline record
+
+ADRS must include an `ABLFL = "Y"` flag on the **first post-baseline overall response** for each subject. Use `derive_var_extreme_flag()` on `adrs_ovr`.
+
+```{r ex-ablfl, exercise=TRUE, exercise.lines=16, exercise.setup="ex-derive-ovr-solution"}
+# Flag the earliest post-baseline assessment (ADY > 0) per subject as ABLFL
+adrs_ovr_flag <- derive_var_extreme_flag(
+  dataset  = adrs_ovr,
+  by_vars  = exprs(___),
+  order    = exprs(___),
+  new_var  = ABLFL,
+  mode     = "first"
+)
+
+adrs_ovr_flag |>
+  filter(!is.na(ABLFL)) |>
+  select(USUBJID, VISIT, ADY, AVALC, ABLFL) |>
+  head(6)
+```
+
+```{r ex-ablfl-hint-1}
+# by_vars = each subject separately → exprs(USUBJID)
+# order   = sort by study day ascending → exprs(ADY)
+# mode    = "first" picks the earliest record
+derive_var_extreme_flag(
+  dataset = adrs_ovr,
+  by_vars = exprs(USUBJID),
+  order   = exprs(ADY),
+  new_var = ABLFL,
+  mode    = "first"
+)
+```
+
+```{r ex-ablfl-solution}
+adrs_ovr_flag <- derive_var_extreme_flag(
+  dataset  = adrs_ovr,
+  by_vars  = exprs(USUBJID),
+  order    = exprs(ADY),
+  new_var  = ABLFL,
+  mode     = "first"
+)
+adrs_ovr_flag |>
+  filter(!is.na(ABLFL)) |>
+  select(USUBJID, VISIT, ADY, AVALC, ABLFL) |>
+  head(6)
+```
+
+---
+
+## Section 3 — Best Overall Response (BOR)
+
+### What is BOR?
+
+**Best Overall Response** is a single-record summary per subject representing the most favourable response achieved. In ADRS it is stored as a separate parameter (PARAMCD = `"BOR"`) with `DTYPE = "BOR"`.
+
+> **Important gotcha:** PD cannot improve to CR/PR. The BOR derivation looks at the *minimum AVAL* — but a confirmation requirement (Section 4) may alter which responses qualify.
+
+```{r quiz-bor1, echo=FALSE}
+quiz(
+  caption = "Quiz — Best Overall Response",
+
+  question("A subject achieves SD → CR → PD across three visits. Their BOR is:",
+    answer("SD — first post-baseline assessment"),
+    answer("CR", correct = TRUE,
+           message = "BOR = lowest-ranked AVALC. CR (rank 1) beats SD (rank 3)."),
+    answer("PD — last assessment wins"),
+    answer("NE — conflicting responses"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("In admiralonco's `derive_param_bor()`, the argument `missing_as_ne = TRUE` means:",
+    answer("Subjects with no post-baseline assessment are excluded from BOR"),
+    answer("NA responses in AVALC are treated as NE before finding the best rank",
+           correct = TRUE,
+           message = "This prevents NA values from being silently ignored."),
+    answer("NE responses are recoded to NA"),
+    answer("Missing scan dates are imputed using the visit window"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 3.0 — Derive BOR and count subjects per response
+
+```{r ex-bor-count, exercise=TRUE, exercise.lines=16}
+# Derive BOR from adrs_base (which already has OVR rows).
+# Use missing_as_ne = TRUE.
+# Then count how many subjects have each BOR response.
+
+adrs_bor <- derive_param_bor(
+  dataset       = adrs_base,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  missing_as_ne = ___,
+  set_values_to = list(PARAMCD = "BOR", PARAM = "Best Overall Response")
+)
+
+adrs_bor |>
+  filter(PARAMCD == "BOR") |>
+  count(___, sort = TRUE)
+```
+
+```{r ex-bor-count-hint-1}
+# missing_as_ne = TRUE
+# count(AVALC)
+```
+
+```{r ex-bor-count-solution}
+adrs_bor <- derive_param_bor(
+  dataset       = adrs_base,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  missing_as_ne = TRUE,
+  set_values_to = list(PARAMCD = "BOR", PARAM = "Best Overall Response")
+)
+
+adrs_bor |>
+  filter(PARAMCD == "BOR") |>
+  count(AVALC, sort = TRUE)
+```
+
+### Exercise 3.1 — Derive BOR
+
+Using `adrs_ovr` from Exercise 2.1, derive BOR with PARAMCD = `"BOR"` and treat missing AVALC as `NE`.
+
+```{r ex-bor, exercise=TRUE, exercise.lines=18, exercise.setup="ex-derive-ovr-solution"}
+adrs_with_bor <- derive_param_bor(
+  dataset       = ___,
+  dataset_adsl  = adsl_onco,
+  source_var    = ___,
+  missing_as_ne = ___,
+  set_values_to = list(
+    PARAMCD = ___,
+    PARAM   = "Best Overall Response"
+  )
+)
+
+# How many subjects achieved each BOR?
+adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  count(AVALC, AVAL, sort = FALSE) |>
+  arrange(AVAL)
+```
+
+```{r ex-bor-hint-1}
+# source_var = AVALC; missing_as_ne = TRUE; PARAMCD = "BOR"
+adrs_with_bor <- derive_param_bor(
+  dataset       = adrs_ovr,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  missing_as_ne = TRUE,
+  set_values_to = list(
+    PARAMCD = "BOR",
+    PARAM   = "Best Overall Response"
+  )
+)
+adrs_with_bor |> filter(DTYPE == "BOR") |> count(AVALC, AVAL) |> arrange(AVAL)
+```
+
+```{r ex-bor-solution}
+adrs_with_bor <- derive_param_bor(
+  dataset       = adrs_ovr,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  missing_as_ne = TRUE,
+  set_values_to = list(
+    PARAMCD = "BOR",
+    PARAM   = "Best Overall Response"
+  )
+)
+adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  count(AVALC, AVAL, sort = FALSE) |>
+  arrange(AVAL)
+```
+
+### Exercise 3.2 — Responder flag (binary endpoint)
+
+A **responder** is a subject whose BOR is CR or PR. Derive a column `RESPFL = "Y"/"N"` on the BOR rows only, then calculate the overall response rate (ORR) separately by arm.
+
+```{r ex-orr, exercise=TRUE, exercise.lines=20, exercise.setup="ex-bor-solution"}
+orr_summary <- adrs_with_bor |>
+  filter(DTYPE == ___) |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  mutate(
+    RESPFL = if_else(AVALC %in% c(___, ___), "Y", "N")
+  ) |>
+  group_by(___) |>
+  summarise(
+    n_subjects  = n(),
+    n_responders = sum(RESPFL == "Y"),
+    ORR_pct     = round(100 * n_responders / n_subjects, 1),
+    .groups     = "drop"
+  )
+
+orr_summary
+```
+
+```{r ex-orr-hint-1}
+# filter DTYPE == "BOR", join ARMCD, mutate RESPFL for CR or PR
+# group by ARMCD, summarise ORR
+adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  mutate(RESPFL = if_else(AVALC %in% c("CR", "PR"), "Y", "N")) |>
+  group_by(ARMCD) |>
+  summarise(
+    n_subjects   = n(),
+    n_responders = sum(RESPFL == "Y"),
+    ORR_pct      = round(100 * n_responders / n_subjects, 1),
+    .groups      = "drop"
+  )
+```
+
+```{r ex-orr-solution}
+orr_summary <- adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  mutate(
+    RESPFL = if_else(AVALC %in% c("CR", "PR"), "Y", "N")
+  ) |>
+  group_by(ARMCD) |>
+  summarise(
+    n_subjects   = n(),
+    n_responders = sum(RESPFL == "Y"),
+    ORR_pct      = round(100 * n_responders / n_subjects, 1),
+    .groups      = "drop"
+  )
+orr_summary
+```
+
+---
+
+## Section 4 — Confirmed Response
+
+### Why confirmation matters
+
+Many oncology trials require a **confirmed response**: the same or better RECIST category must be seen at a subsequent assessment ≥ 28 days later. This prevents spurious CR/PR due to scan artefacts or measurement error.
+
+```{r quiz-confirm1, echo=FALSE}
+quiz(
+  caption = "Quiz — Confirmed Response",
+
+  question("Subject visits: Day 42 PR, Day 70 SD, Day 112 PR. Is the Day 42 PR *confirmed* (28-day window)?",
+    answer("Yes — Day 70 SD comes within 28 days and SD is close enough",
+           message = "SD is a *worse* response than PR (higher rank); it does not confirm PR."),
+    answer("No — Day 70 SD is a worse response than PR, so PR is not confirmed",
+           correct = TRUE,
+           message = "Confirmation requires the same or *better* (lower-ranked) response at a subsequent visit ≥28 days later. SD (rank 3) does not confirm PR (rank 2). Day 112 PR is 70 days after Day 42, so it would confirm — but only if there is no PD in between."),
+    answer("Yes — Day 112 PR automatically confirms Day 42 PR regardless of intervening SD"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("When no CR/PR response can be confirmed, the confirmed BOR (CBOR) is:",
+    answer("The unconfirmed BOR"),
+    answer("NE", correct = TRUE,
+           message = "If no confirmation is possible the subject is considered non-responder; CBOR = NE or the best confirmed response they did achieve."),
+    answer("PD"),
+    answer("SD if any SD was observed"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 4.1 — Derive confirmed response
+
+Apply `derive_param_confirmed_resp()` to `adrs_ovr` with a 28-day confirmation window.
+
+```{r ex-confirmed, exercise=TRUE, exercise.lines=16, exercise.setup="ex-derive-ovr-solution"}
+adrs_conf <- derive_param_confirmed_resp(
+  dataset          = ___,
+  source_var       = AVALC,
+  ref_start_var    = TRTSDT,
+  confirmed_period = ___
+)
+
+# Compare unconfirmed AVALC vs confirmed AVALC_CONF for one subject
+adrs_conf |>
+  filter(USUBJID == "ONCO2024-002") |>
+  select(USUBJID, VISIT, ADY, AVALC, AVALC_CONF)
+```
+
+```{r ex-confirmed-hint-1}
+# dataset = adrs_ovr; confirmed_period = 28L
+derive_param_confirmed_resp(
+  dataset          = adrs_ovr,
+  source_var       = AVALC,
+  ref_start_var    = TRTSDT,
+  confirmed_period = 28L
+)
+```
+
+```{r ex-confirmed-solution}
+adrs_conf <- derive_param_confirmed_resp(
+  dataset          = adrs_ovr,
+  source_var       = AVALC,
+  ref_start_var    = TRTSDT,
+  confirmed_period = 28L
+)
+adrs_conf |>
+  filter(USUBJID == "ONCO2024-002") |>
+  select(USUBJID, VISIT, ADY, AVALC, AVALC_CONF)
+```
+
+### Exercise 4.2 — Confirmed BOR and compare with unconfirmed
+
+Derive confirmed BOR (CBOR) using `derive_param_confirmed_bor()`, then join with BOR to see how many subjects *lost* a CR/PR due to the confirmation requirement.
+
+```{r ex-cbor, exercise=TRUE, exercise.lines=24, exercise.setup="ex-bor-solution"}
+adrs_cbor <- derive_param_confirmed_bor(
+  dataset          = ___,
+  source_var       = AVALC,
+  confirmed_period = 28L,
+  missing_as_ne    = TRUE,
+  set_values_to    = list(PARAMCD = "CBOR", PARAM = "Confirmed Best Overall Response")
+)
+
+# Compare BOR vs CBOR per subject
+comparison <- adrs_cbor |>
+  filter(DTYPE %in% c("BOR","CBOR")) |>
+  select(USUBJID, DTYPE, AVALC) |>
+  pivot_wider(names_from = DTYPE, values_from = AVALC) |>
+  mutate(changed = (BOR != CBOR))
+
+comparison |> count(BOR, CBOR) |> arrange(BOR, CBOR)
+```
+
+```{r ex-cbor-hint-1}
+# dataset = adrs_with_bor (contains OVR and BOR rows)
+derive_param_confirmed_bor(
+  dataset          = adrs_with_bor,
+  source_var       = AVALC,
+  confirmed_period = 28L,
+  missing_as_ne    = TRUE,
+  set_values_to    = list(PARAMCD = "CBOR", PARAM = "Confirmed Best Overall Response")
+)
+```
+
+```{r ex-cbor-solution}
+adrs_cbor <- derive_param_confirmed_bor(
+  dataset          = adrs_with_bor,
+  source_var       = AVALC,
+  confirmed_period = 28L,
+  missing_as_ne    = TRUE,
+  set_values_to    = list(PARAMCD = "CBOR", PARAM = "Confirmed Best Overall Response")
+)
+comparison <- adrs_cbor |>
+  filter(DTYPE %in% c("BOR","CBOR")) |>
+  select(USUBJID, DTYPE, AVALC) |>
+  pivot_wider(names_from = DTYPE, values_from = AVALC) |>
+  mutate(changed = (BOR != CBOR))
+comparison |> count(BOR, CBOR) |> arrange(BOR, CBOR)
+```
+
+---
+
+## Section 5 — ADTR: Tumour Results and SLD
+
+### Sum of Longest Diameters
+
+**ADTR** (Tumour Results) is a BDS dataset where each record is a tumour measurement parameter. The most important derived parameter is **SLD** — the sum of the longest diameters of all target lesions at each visit.
+
+| ADTR Variable | Meaning |
+|---------------|---------|
+| `AVAL`   | Observed SLD in mm |
+| `BASE`   | Baseline (screening) SLD |
+| `CHG`    | Change from baseline = AVAL − BASE |
+| `PCHG`   | % change = 100 × CHG / BASE |
+| `ABLFL`  | "Y" on the baseline (screening) record |
+
+```{r quiz-adtr1, echo=FALSE}
+quiz(
+  caption = "Quiz — ADTR / SLD",
+
+  question("A subject has 2 target lesions. At Cycle 4, lesion 1 = 18 mm and lesion 2 = 12 mm. Their SLD is:",
+    answer("18 mm — only the longest lesion counts"),
+    answer("30 mm", correct = TRUE,
+           message = "SLD = sum of all target lesion diameters at that visit."),
+    answer("15 mm — average"),
+    answer("12 mm — smallest diameter"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("PCHG (percent change from baseline) is calculated as:",
+    answer("100 × (AVAL / BASE)"),
+    answer("100 × (AVAL − BASE) / BASE", correct = TRUE),
+    answer("(AVAL − BASE) / BASE"),
+    answer("100 × BASE / AVAL"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("The ABLFL = 'Y' flag in ADTR should be placed on:",
+    answer("The first post-baseline visit"),
+    answer("The screening visit measurement", correct = TRUE,
+           message = "The screening SLD establishes BASE for all post-baseline % change calculations."),
+    answer("The visit with the minimum SLD"),
+    answer("Cycle 1 Day 1 regardless of actual timing"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 5.0 — SLD percent change and nadir subject
+
+```{r ex-sld-pchg, exercise=TRUE, exercise.lines=14}
+# adtr_sld has SLD measurements with BASE already derived.
+# Compute PCHG = round(100 * (AVAL - BASE) / BASE, 2).
+# Then find the subject with the greatest SLD reduction at their nadir visit.
+
+adtr_sld |>
+  mutate(PCHG = ___) |>
+  filter(!is.na(PCHG)) |>
+  slice_min(PCHG, n = 1) |>
+  select(USUBJID, VISIT, AVAL, BASE, PCHG, ARMCD)
+```
+
+```{r ex-sld-pchg-hint-1}
+# PCHG = round(100 * (AVAL - BASE) / BASE, 2)
+# slice_min(PCHG, n=1) finds the row with the smallest (most negative) PCHG
+```
+
+```{r ex-sld-pchg-solution}
+adtr_sld |>
+  mutate(PCHG = round(100 * (AVAL - BASE) / BASE, 2)) |>
+  filter(!is.na(PCHG)) |>
+  slice_min(PCHG, n = 1) |>
+  select(USUBJID, VISIT, AVAL, BASE, PCHG, ARMCD)
+```
+
+### Exercise 5.1 — Derive CHG and PCHG
+
+`adtr_sld` is pre-loaded with AVAL (observed SLD) and BASE (screening SLD). Derive CHG and PCHG, then show the nadir (minimum SLD visit) per subject.
+
+```{r ex-pchg, exercise=TRUE, exercise.lines=22}
+# adtr_sld has: USUBJID, VISIT, VISITNUM, ADT, ADY, AVAL, BASE, ABLFL, ARMCD
+
+adtr_derived <- adtr_sld |>
+  filter(VISIT != "SCREENING") |>          # post-baseline only for CHG/PCHG
+  mutate(
+    CHG  = ___ - ___,
+    PCHG = round(100 * ___ / ___, 1)
+  )
+
+# Nadir = visit with minimum SLD per subject
+nadir <- adtr_derived |>
+  group_by(___) |>
+  slice_min(order_by = ___, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(USUBJID, VISIT, AVAL, PCHG) |>
+  rename(NADIR_SLD = AVAL, NADIR_PCHG = PCHG)
+
+nadir |> arrange(NADIR_PCHG) |> head(10)
+```
+
+```{r ex-pchg-hint-1}
+# CHG = AVAL - BASE; PCHG = 100 * CHG / BASE
+# nadir: group_by(USUBJID), slice_min(AVAL)
+adtr_derived <- adtr_sld |>
+  filter(VISIT != "SCREENING") |>
+  mutate(CHG  = AVAL - BASE,
+         PCHG = round(100 * CHG / BASE, 1))
+
+nadir <- adtr_derived |>
+  group_by(USUBJID) |>
+  slice_min(order_by = AVAL, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(USUBJID, VISIT, AVAL, PCHG) |>
+  rename(NADIR_SLD = AVAL, NADIR_PCHG = PCHG)
+
+nadir |> arrange(NADIR_PCHG) |> head(10)
+```
+
+```{r ex-pchg-solution}
+adtr_derived <- adtr_sld |>
+  filter(VISIT != "SCREENING") |>
+  mutate(
+    CHG  = AVAL - BASE,
+    PCHG = round(100 * CHG / BASE, 1)
+  )
+
+nadir <- adtr_derived |>
+  group_by(USUBJID) |>
+  slice_min(order_by = AVAL, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(USUBJID, VISIT, AVAL, PCHG) |>
+  rename(NADIR_SLD = AVAL, NADIR_PCHG = PCHG)
+
+nadir |> arrange(NADIR_PCHG) |> head(10)
+```
+
+### Exercise 5.2 — RECIST 30% PR threshold flag
+
+Derive a logical column `PR_THRESH` = TRUE when `PCHG <= -30` (the RECIST 1.1 criterion for partial response eligibility), and count how many subjects crossed this threshold at any visit, by arm.
+
+```{r ex-pr-thresh, exercise=TRUE, exercise.lines=18, exercise.setup="ex-pchg-solution"}
+pr_subjects <- adtr_derived |>
+  mutate(PR_THRESH = ___ <= ___) |>
+  group_by(USUBJID, ___) |>
+  summarise(ever_pr_thresh = any(PR_THRESH, na.rm = TRUE), .groups = "drop") |>
+  group_by(___) |>
+  summarise(
+    n_total        = n(),
+    n_pr_threshold = sum(___),
+    pct            = round(100 * n_pr_threshold / n_total, 1),
+    .groups        = "drop"
+  )
+
+pr_subjects
+```
+
+```{r ex-pr-thresh-hint-1}
+# PR_THRESH = PCHG <= -30
+# group by USUBJID and ARMCD; any() over PR_THRESH
+adtr_derived |>
+  mutate(PR_THRESH = PCHG <= -30) |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(ever_pr_thresh = any(PR_THRESH, na.rm = TRUE), .groups = "drop") |>
+  group_by(ARMCD) |>
+  summarise(n_total = n(), n_pr_threshold = sum(ever_pr_thresh),
+            pct = round(100 * n_pr_threshold / n_total, 1), .groups = "drop")
+```
+
+```{r ex-pr-thresh-solution}
+pr_subjects <- adtr_derived |>
+  mutate(PR_THRESH = PCHG <= -30) |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(ever_pr_thresh = any(PR_THRESH, na.rm = TRUE), .groups = "drop") |>
+  group_by(ARMCD) |>
+  summarise(
+    n_total        = n(),
+    n_pr_threshold = sum(ever_pr_thresh),
+    pct            = round(100 * n_pr_threshold / n_total, 1),
+    .groups        = "drop"
+  )
+pr_subjects
+```
+
+### Exercise 5.3 — Waterfall plot data
+
+A **waterfall plot** displays each subject's maximum PCHG (or nadir PCHG) sorted from best to worst. Build the data frame for such a plot: one row per subject with their nadir PCHG and BOR colour category.
+
+```{r ex-waterfall, exercise=TRUE, exercise.lines=24, exercise.setup="ex-pchg-solution"}
+# Build waterfall data: join nadir PCHG with BOR from adrs_with_bor
+# (adrs_with_bor and nadir are both available in this exercise)
+
+waterfall_data <- adtr_derived |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(NADIR_PCHG = min(___, na.rm = TRUE), .groups = "drop") |>
+  left_join(
+    adrs_with_bor |>
+      filter(DTYPE == "BOR") |>
+      select(USUBJID, BOR = ___),
+    by = "USUBJID"
+  ) |>
+  mutate(
+    BOR_COLOR = case_when(
+      BOR == "CR" ~ "Complete Response",
+      BOR == "PR" ~ "Partial Response",
+      BOR == "SD" ~ "Stable Disease",
+      BOR == "PD" ~ "Progressive Disease",
+      TRUE        ~ "Not Evaluable"
+    )
+  ) |>
+  arrange(___)   # sort so waterfall descends from best to worst
+
+# Preview
+waterfall_data |> select(USUBJID, ARMCD, NADIR_PCHG, BOR, BOR_COLOR) |> head(10)
+```
+
+```{r ex-waterfall-hint-1}
+# min(PCHG) for nadir; join BOR (AVALC) from adrs_with_bor; arrange(NADIR_PCHG)
+adtr_derived |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(NADIR_PCHG = min(PCHG, na.rm = TRUE), .groups = "drop") |>
+  left_join(
+    adrs_with_bor |> filter(DTYPE == "BOR") |> select(USUBJID, BOR = AVALC),
+    by = "USUBJID"
+  ) |>
+  mutate(BOR_COLOR = case_when(
+    BOR == "CR" ~ "Complete Response",
+    BOR == "PR" ~ "Partial Response",
+    BOR == "SD" ~ "Stable Disease",
+    BOR == "PD" ~ "Progressive Disease",
+    TRUE        ~ "Not Evaluable"
+  )) |>
+  arrange(NADIR_PCHG)
+```
+
+```{r ex-waterfall-solution}
+waterfall_data <- adtr_derived |>
+  group_by(USUBJID, ARMCD) |>
+  summarise(NADIR_PCHG = min(PCHG, na.rm = TRUE), .groups = "drop") |>
+  left_join(
+    adrs_with_bor |>
+      filter(DTYPE == "BOR") |>
+      select(USUBJID, BOR = AVALC),
+    by = "USUBJID"
+  ) |>
+  mutate(
+    BOR_COLOR = case_when(
+      BOR == "CR" ~ "Complete Response",
+      BOR == "PR" ~ "Partial Response",
+      BOR == "SD" ~ "Stable Disease",
+      BOR == "PD" ~ "Progressive Disease",
+      TRUE        ~ "Not Evaluable"
+    )
+  ) |>
+  arrange(NADIR_PCHG)
+
+waterfall_data |> select(USUBJID, ARMCD, NADIR_PCHG, BOR, BOR_COLOR) |> head(10)
+```
+
+---
+
+## Section 6 — Oncology TTE: PFS and Duration of Response
+
+### Oncology-specific time-to-event parameters
+
+Oncology trials typically include multiple TTE endpoints:
+
+| Parameter | PARAMCD | Event | Censor |
+|-----------|---------|-------|--------|
+| Progression-Free Survival | `PFS` | PD or death | Last progression-free assessment |
+| Overall Survival | `OS` | Death | Last known alive date |
+| Duration of Response | `DOR` | PD or death (among responders) | Last progression-free assessment |
+
+> **Key difference from non-oncology TTE:** PFS uses the *imaging assessment date* as the event date (the scan date on which PD was first declared), not the date of clinical deterioration.
+
+```{r quiz-tte1, echo=FALSE}
+quiz(
+  caption = "Quiz — Oncology TTE",
+
+  question("A subject's last tumour scan showing SD was on Day 168. At Day 196 (next scheduled scan) PD was declared. The PFS event date is:",
+    answer("Day 168 — date of last non-PD assessment"),
+    answer("Day 196 — date PD was first declared", correct = TRUE,
+           message = "The event date is the date of the assessment that first documents PD, not the preceding scan."),
+    answer("Midpoint of Day 168 and Day 196"),
+    answer("TRTEDT — date of last dose"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("Duration of Response (DOR) is calculated only for subjects who:",
+    answer("Are in the investigational arm"),
+    answer("Had BOR = CR or PR (i.e., responders)", correct = TRUE,
+           message = "DOR is defined only from the date of first CR/PR to PD or death. Non-responders have no DOR."),
+    answer("Had at least 3 post-baseline scans"),
+    answer("Completed treatment"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("Which CNSR value indicates the subject was censored (did not have the event)?",
+    answer("CNSR = 0 — event occurred"),
+    answer("CNSR = 1 — censored", correct = TRUE,
+           message = "Convention in CDISC ADaM: CNSR = 0 means event occurred; CNSR = 1 means censored."),
+    answer("CNSR = 2"),
+    answer("CNSR = NA"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Exercise 6.1 — Build PFS from RS and ADSL
+
+PFS = time from treatment start to first PD **or** death (whichever comes first). Using `adrs_ovr` and `adsl_onco`, construct PFS ADTTE rows.
+
+```{r ex-pfs, exercise=TRUE, exercise.lines=34, exercise.setup="ex-derive-ovr-solution"}
+# Step 1: Get first PD date per subject (from ADRS)
+first_pd <- adrs_ovr |>
+  filter(AVALC == ___) |>
+  group_by(___) |>
+  summarise(PD_DT = min(___, na.rm = TRUE), .groups = "drop")
+
+# Step 2: Build PFS with event/censor logic
+pfs <- adsl_onco |>
+  select(USUBJID, TRTSDT, DTHDT, DTHFL, LSTALVDT, ARMCD) |>
+  left_join(___, by = "USUBJID") |>
+  mutate(
+    # Event date: earliest of PD or death
+    EVT_DT   = pmin(PD_DT, DTHDT, na.rm = TRUE),
+    CNSR     = if_else(is.na(EVT_DT), ___, ___),   # 0 = event, 1 = censored
+    ENDDT    = if_else(!is.na(EVT_DT), EVT_DT, LSTALVDT),
+    AVAL     = as.numeric(___ - TRTSDT),            # days from trt start
+    PARAMCD  = "PFS",
+    PARAM    = "Progression-Free Survival",
+    EVNTDESC = case_when(
+      !is.na(PD_DT) & (is.na(DTHDT) | PD_DT <= DTHDT) ~ "PROGRESSIVE DISEASE",
+      !is.na(DTHDT)                                     ~ "DEATH",
+      TRUE                                              ~ "CENSORED"
+    )
+  )
+
+pfs |>
+  count(EVNTDESC, CNSR) |>
+  arrange(CNSR)
+```
+
+```{r ex-pfs-hint-1}
+# first_pd: filter AVALC == "PD", group_by USUBJID, min(ADT)
+# CNSR: 0 if event, 1 if censored (no event)
+# AVAL = ENDDT - TRTSDT
+
+first_pd <- adrs_ovr |>
+  filter(AVALC == "PD") |>
+  group_by(USUBJID) |>
+  summarise(PD_DT = min(ADT, na.rm = TRUE), .groups = "drop")
+
+pfs <- adsl_onco |>
+  select(USUBJID, TRTSDT, DTHDT, DTHFL, LSTALVDT, ARMCD) |>
+  left_join(first_pd, by = "USUBJID") |>
+  mutate(
+    EVT_DT   = pmin(PD_DT, DTHDT, na.rm = TRUE),
+    CNSR     = if_else(is.na(EVT_DT), 1L, 0L),
+    ENDDT    = if_else(!is.na(EVT_DT), EVT_DT, LSTALVDT),
+    AVAL     = as.numeric(ENDDT - TRTSDT),
+    PARAMCD  = "PFS",
+    PARAM    = "Progression-Free Survival",
+    EVNTDESC = case_when(
+      !is.na(PD_DT) & (is.na(DTHDT) | PD_DT <= DTHDT) ~ "PROGRESSIVE DISEASE",
+      !is.na(DTHDT)                                     ~ "DEATH",
+      TRUE                                              ~ "CENSORED"
+    )
+  )
+pfs |> count(EVNTDESC, CNSR) |> arrange(CNSR)
+```
+
+```{r ex-pfs-solution}
+first_pd <- adrs_ovr |>
+  filter(AVALC == "PD") |>
+  group_by(USUBJID) |>
+  summarise(PD_DT = min(ADT, na.rm = TRUE), .groups = "drop")
+
+pfs <- adsl_onco |>
+  select(USUBJID, TRTSDT, DTHDT, DTHFL, LSTALVDT, ARMCD) |>
+  left_join(first_pd, by = "USUBJID") |>
+  mutate(
+    EVT_DT   = pmin(PD_DT, DTHDT, na.rm = TRUE),
+    CNSR     = if_else(is.na(EVT_DT), 1L, 0L),
+    ENDDT    = if_else(!is.na(EVT_DT), EVT_DT, LSTALVDT),
+    AVAL     = as.numeric(ENDDT - TRTSDT),
+    PARAMCD  = "PFS",
+    PARAM    = "Progression-Free Survival",
+    EVNTDESC = case_when(
+      !is.na(PD_DT) & (is.na(DTHDT) | PD_DT <= DTHDT) ~ "PROGRESSIVE DISEASE",
+      !is.na(DTHDT)                                     ~ "DEATH",
+      TRUE                                              ~ "CENSORED"
+    )
+  )
+pfs |>
+  count(EVNTDESC, CNSR) |>
+  arrange(CNSR)
+```
+
+### Exercise 6.2 — Duration of Response
+
+Use `derive_param_response_duration()` to build DOR rows. Then compute the median DOR by arm (using `median(AVAL)`).
+
+```{r ex-dor, exercise=TRUE, exercise.lines=22, exercise.setup="ex-derive-ovr-solution"}
+dor_rows <- derive_param_response_duration(
+  dataset      = ___,
+  dataset_adsl = adsl_onco,
+  source_var   = AVALC,
+  start_date   = TRTSDT,
+  set_values_to = list(
+    PARAMCD = "DOR",
+    PARAM   = "Duration of Response"
+  )
+)
+
+# Median DOR by arm (responders only)
+dor_rows |>
+  filter(CNSR == 0 | !is.na(AVAL)) |>   # keep all DOR rows
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(___) |>
+  summarise(
+    n_responders = n(),
+    median_DOR   = round(median(___, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+```{r ex-dor-hint-1}
+# dataset = adrs_ovr; group by ARMCD; median of AVAL
+dor_rows <- derive_param_response_duration(
+  dataset       = adrs_ovr,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  start_date    = TRTSDT,
+  set_values_to = list(PARAMCD = "DOR", PARAM = "Duration of Response")
+)
+dor_rows |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD) |>
+  summarise(n_responders = n(), median_DOR = round(median(AVAL, na.rm = TRUE)), .groups = "drop")
+```
+
+```{r ex-dor-solution}
+dor_rows <- derive_param_response_duration(
+  dataset       = adrs_ovr,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  start_date    = TRTSDT,
+  set_values_to = list(PARAMCD = "DOR", PARAM = "Duration of Response")
+)
+dor_rows |>
+  filter(CNSR == 0 | !is.na(AVAL)) |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD) |>
+  summarise(
+    n_responders = n(),
+    median_DOR   = round(median(AVAL, na.rm = TRUE)),
+    .groups      = "drop"
+  )
+```
+
+---
+
+## Section 7 — Real-World Capstone Problems
+
+These capstones mirror the complexity of production oncology programming tasks. Read each problem brief carefully before writing code.
+
+### Capstone 1 — ADRS Assembly Pipeline
+
+**Scenario:** You are the lead statistical programmer on a NSCLC trial. The medical statistician requests a complete ADRS containing four parameters in a single dataset:
+
+| PARAMCD | PARAM | Notes |
+|---------|-------|-------|
+| `OVR`   | Overall Response by Investigator | one row per subject per visit |
+| `BOR`   | Best Overall Response | one row per subject, DTYPE = "BOR" |
+| `CBOR`  | Confirmed BOR (28-day window) | one row per subject, DTYPE = "CBOR" |
+| `RESP`  | Responder flag (Y/N) | derived from BOR, one row per subject |
+
+Additionally, the dataset must have:
+- `TRTSDT` merged from `adsl_onco`
+- `ADY` = study day relative to TRTSDT
+- `ARMCD` merged from `adsl_onco`
+- Records sorted by `USUBJID`, `PARAMCD`, `ADY`
+
+```{r capstone1, exercise=TRUE, exercise.lines=60}
+# ── Step 1: OVR parameter ─────────────────────────────────────────────────────
+adrs_ovr_c1 <- derive_param_clinicalresp(
+  dataset       = adrs_base,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  set_values_to = list(PARAMCD = "OVR",
+                        PARAM   = "Overall Response by Investigator")
+)
+
+# ── Step 2: BOR ───────────────────────────────────────────────────────────────
+adrs_bor_c1 <- derive_param_bor(
+  dataset       = ___,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  missing_as_ne = TRUE,
+  set_values_to = list(PARAMCD = "BOR",
+                        PARAM   = "Best Overall Response")
+)
+
+# ── Step 3: CBOR ──────────────────────────────────────────────────────────────
+adrs_cbor_c1 <- derive_param_confirmed_bor(
+  dataset          = ___,
+  source_var       = AVALC,
+  confirmed_period = 28L,
+  missing_as_ne    = TRUE,
+  set_values_to    = list(PARAMCD = "CBOR",
+                           PARAM   = "Confirmed Best Overall Response")
+)
+
+# ── Step 4: RESP — responder flag (derive from BOR rows) ─────────────────────
+resp_rows <- adrs_cbor_c1 |>
+  filter(DTYPE == "BOR") |>
+  mutate(
+    AVALC   = if_else(AVALC %in% c("CR","PR"), "Y", "N"),
+    AVAL    = if_else(AVALC == "Y", 1L, 0L),
+    PARAMCD = "RESP",
+    PARAM   = "Responder (CR or PR)",
+    DTYPE   = NA_character_
+  )
+
+# ── Step 5: Assemble and sort ─────────────────────────────────────────────────
+adrs_final <- bind_rows(adrs_cbor_c1, resp_rows) |>
+  left_join(select(adsl_onco, USUBJID, TRTSDT, ARMCD), by = "USUBJID") |>
+  mutate(
+    ADY = if_else(!is.na(ADT) & !is.na(TRTSDT),
+                  as.integer(ADT - TRTSDT + 1L), NA_integer_)
+  ) |>
+  arrange(___, ___, ___)
+
+# ── Validation checks ─────────────────────────────────────────────────────────
+cat("Parameters:", paste(sort(unique(adrs_final$PARAMCD)), collapse=", "), "\n")
+cat("Total rows:", nrow(adrs_final), "\n")
+adrs_final |>
+  count(PARAMCD, DTYPE) |>
+  print()
+```
+
+```{r capstone1-hint-1}
+# Step 2 uses adrs_ovr_c1 as the input dataset
+# Step 3 uses adrs_bor_c1 (contains OVR + BOR rows)
+# arrange by USUBJID, PARAMCD, ADY (use NA last via coalesce or arrange with na.last)
+```
+
+```{r capstone1-hint-2}
+# Step 2:
+adrs_bor_c1 <- derive_param_bor(
+  dataset = adrs_ovr_c1, dataset_adsl = adsl_onco,
+  source_var = AVALC, missing_as_ne = TRUE,
+  set_values_to = list(PARAMCD = "BOR", PARAM = "Best Overall Response")
+)
+# Step 3:
+adrs_cbor_c1 <- derive_param_confirmed_bor(
+  dataset = adrs_bor_c1, source_var = AVALC,
+  confirmed_period = 28L, missing_as_ne = TRUE,
+  set_values_to = list(PARAMCD = "CBOR", PARAM = "Confirmed Best Overall Response")
+)
+# arrange:  arrange(USUBJID, PARAMCD, ADY)
+```
+
+```{r capstone1-solution}
+adrs_ovr_c1 <- derive_param_clinicalresp(
+  dataset       = adrs_base,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  set_values_to = list(PARAMCD = "OVR", PARAM = "Overall Response by Investigator")
+)
+
+adrs_bor_c1 <- derive_param_bor(
+  dataset       = adrs_ovr_c1,
+  dataset_adsl  = adsl_onco,
+  source_var    = AVALC,
+  missing_as_ne = TRUE,
+  set_values_to = list(PARAMCD = "BOR", PARAM = "Best Overall Response")
+)
+
+adrs_cbor_c1 <- derive_param_confirmed_bor(
+  dataset          = adrs_bor_c1,
+  source_var       = AVALC,
+  confirmed_period = 28L,
+  missing_as_ne    = TRUE,
+  set_values_to    = list(PARAMCD = "CBOR", PARAM = "Confirmed Best Overall Response")
+)
+
+resp_rows <- adrs_cbor_c1 |>
+  filter(DTYPE == "BOR") |>
+  mutate(
+    AVALC   = if_else(AVALC %in% c("CR","PR"), "Y", "N"),
+    AVAL    = if_else(AVALC == "Y", 1L, 0L),
+    PARAMCD = "RESP",
+    PARAM   = "Responder (CR or PR)",
+    DTYPE   = NA_character_
+  )
+
+adrs_final <- bind_rows(adrs_cbor_c1, resp_rows) |>
+  left_join(select(adsl_onco, USUBJID, TRTSDT, ARMCD), by = "USUBJID") |>
+  mutate(
+    ADY = if_else(!is.na(ADT) & !is.na(TRTSDT),
+                  as.integer(ADT - TRTSDT + 1L), NA_integer_)
+  ) |>
+  arrange(USUBJID, PARAMCD, ADY)
+
+cat("Parameters:", paste(sort(unique(adrs_final$PARAMCD)), collapse=", "), "\n")
+cat("Total rows:", nrow(adrs_final), "\n")
+adrs_final |> count(PARAMCD, DTYPE) |> print()
+```
+
+### Capstone 2 — Oncology Efficacy Summary Table
+
+**Scenario:** The Data Safety Monitoring Board (DSMB) is meeting in two weeks. You need to produce an interim **efficacy summary table** that includes:
+
+1. ORR (% CR + PR) with 95% exact binomial CI (use the Wilson formula: `p ± 1.96 * sqrt(p*(1-p)/n)`) — by arm
+2. Median PFS in days — by arm
+3. Confirmed ORR (from CBOR) — by arm
+4. Disease control rate (DCR = CR + PR + SD) — by arm
+
+All results must be in one tidy `summary_tbl` data frame with columns: `ARMCD`, `Endpoint`, `n`, `n_events`, `Value`.
+
+```{r capstone2, exercise=TRUE, exercise.lines=80}
+# Pre-requisite objects available from earlier exercises:
+#   adrs_with_bor — contains OVR + BOR rows (unconfirmed)
+#   adrs_cbor     — contains OVR + BOR + CBOR rows
+#   pfs           — ADTTE PFS rows
+
+# ── Helper: Wilson 95% CI ─────────────────────────────────────────────────────
+wilson_ci <- function(x, n) {
+  p   <- x / n
+  z   <- 1.96
+  lo  <- round(100 * max(0, p - z * sqrt(p * (1 - p) / n)), 1)
+  hi  <- round(100 * min(1, p + z * sqrt(p * (1 - p) / n)), 1)
+  paste0(round(100 * p, 1), "% (", lo, "–", hi, "%)")
+}
+
+# ── 1. ORR ────────────────────────────────────────────────────────────────────
+orr_tbl <- adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(___) |>
+  summarise(
+    n        = n(),
+    n_events = sum(AVALC %in% c("CR","PR")),
+    Value    = wilson_ci(n_events, n),
+    Endpoint = "ORR (CR+PR)",
+    .groups  = "drop"
+  )
+
+# ── 2. Confirmed ORR (from CBOR) ──────────────────────────────────────────────
+corr_tbl <- ___ |>
+  filter(DTYPE == "CBOR") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(___) |>
+  summarise(
+    n        = n(),
+    n_events = sum(AVALC %in% c("CR","PR")),
+    Value    = wilson_ci(n_events, n),
+    Endpoint = "Confirmed ORR",
+    .groups  = "drop"
+  )
+
+# ── 3. Disease Control Rate ────────────────────────────────────────────────────
+dcr_tbl <- adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(___) |>
+  summarise(
+    n        = n(),
+    n_events = sum(AVALC %in% ___),       # CR, PR, or SD
+    Value    = wilson_ci(n_events, n),
+    Endpoint = "DCR (CR+PR+SD)",
+    .groups  = "drop"
+  )
+
+# ── 4. Median PFS ─────────────────────────────────────────────────────────────
+pfs_tbl <- pfs |>
+  group_by(___) |>
+  summarise(
+    n        = n(),
+    n_events = sum(___ == 0),             # events = CNSR == 0
+    Value    = paste0(round(median(___, na.rm = TRUE)), " days"),
+    Endpoint = "Median PFS",
+    .groups  = "drop"
+  )
+
+# ── 5. Stack into one table ───────────────────────────────────────────────────
+summary_tbl <- bind_rows(orr_tbl, corr_tbl, dcr_tbl, pfs_tbl) |>
+  select(Endpoint, ARMCD, n, n_events, Value) |>
+  arrange(Endpoint, ARMCD)
+
+print(summary_tbl, n = Inf)
+```
+
+```{r capstone2-hint-1}
+# ORR / confirmed ORR / DCR all follow the same pattern:
+#   group_by(ARMCD) → summarise with wilson_ci()
+# corr_tbl uses adrs_cbor (not adrs_with_bor)
+# dcr_tbl uses AVALC %in% c("CR","PR","SD")
+# pfs_tbl: group_by(ARMCD), n_events = sum(CNSR == 0), median(AVAL)
+```
+
+```{r capstone2-hint-2}
+# PFS: pfs has ARMCD already from the earlier solution
+# If not present, join from adsl_onco: left_join(select(adsl_onco, USUBJID, ARMCD))
+pfs_tbl <- pfs |>
+  group_by(ARMCD) |>
+  summarise(
+    n = n(), n_events = sum(CNSR == 0),
+    Value = paste0(round(median(AVAL, na.rm = TRUE)), " days"),
+    Endpoint = "Median PFS", .groups = "drop"
+  )
+```
+
+```{r capstone2-solution}
+wilson_ci <- function(x, n) {
+  p  <- x / n; z <- 1.96
+  lo <- round(100 * max(0, p - z * sqrt(p * (1 - p) / n)), 1)
+  hi <- round(100 * min(1, p + z * sqrt(p * (1 - p) / n)), 1)
+  paste0(round(100 * p, 1), "% (", lo, "–", hi, "%)")
+}
+
+orr_tbl <- adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_events = sum(AVALC %in% c("CR","PR")),
+            Value = wilson_ci(n_events, n), Endpoint = "ORR (CR+PR)", .groups = "drop")
+
+corr_tbl <- adrs_cbor |>
+  filter(DTYPE == "CBOR") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_events = sum(AVALC %in% c("CR","PR")),
+            Value = wilson_ci(n_events, n), Endpoint = "Confirmed ORR", .groups = "drop")
+
+dcr_tbl <- adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_events = sum(AVALC %in% c("CR","PR","SD")),
+            Value = wilson_ci(n_events, n), Endpoint = "DCR (CR+PR+SD)", .groups = "drop")
+
+pfs_tbl <- pfs |>
+  group_by(ARMCD) |>
+  summarise(n = n(), n_events = sum(CNSR == 0),
+            Value = paste0(round(median(AVAL, na.rm = TRUE)), " days"),
+            Endpoint = "Median PFS", .groups = "drop")
+
+summary_tbl <- bind_rows(orr_tbl, corr_tbl, dcr_tbl, pfs_tbl) |>
+  select(Endpoint, ARMCD, n, n_events, Value) |>
+  arrange(Endpoint, ARMCD)
+
+print(summary_tbl, n = Inf)
+```
+
+---
+
+## Section 8 — Hard Challenges: Real-World Edge Cases
+
+These advanced problems test your ability to handle edge cases that frequently arise in production oncology programming.
+
+### Challenge 1 — Pseudo-progression handling
+
+**Context:** Some immunotherapy trials use iRECIST, which allows an initial "pseudo-progression" (tumour grows then shrinks). A subject may have a RECIST PD at one visit followed by a PR. Under iRECIST, the initial PD does not count if the next scan shows ≥ SD.
+
+Identify all subjects in `adrs_ovr` where **PD is followed by PR or CR at the next scheduled visit** (potential pseudo-progressors). Flag these subjects with `PSEUDO_PROG = TRUE`.
+
+```{r challenge-pseudo, exercise=TRUE, exercise.lines=28}
+# adrs_ovr is available; sorted by USUBJID, ADT within each subject
+pseudo_prog_subjects <- adrs_ovr |>
+  arrange(USUBJID, ADT) |>
+  group_by(USUBJID) |>
+  mutate(
+    NEXT_AVALC = lead(AVALC),               # next visit response
+    PSEUDO_PROG = (AVALC == "PD") & (NEXT_AVALC %in% c("CR","PR"))
+  ) |>
+  ungroup() |>
+  filter(___) |>                            # keep rows where PSEUDO_PROG is TRUE
+  select(USUBJID, VISIT, ADY, AVALC, NEXT_AVALC, PSEUDO_PROG)
+
+pseudo_prog_subjects
+
+# How many unique subjects are potential pseudo-progressors?
+cat("Pseudo-progressors:", n_distinct(pseudo_prog_subjects$USUBJID), "\n")
+```
+
+```{r challenge-pseudo-hint-1}
+# lead(AVALC) gives the *next* row's AVALC within each subject group
+# filter(PSEUDO_PROG) keeps only the PD rows followed by CR/PR
+pseudo_prog_subjects <- adrs_ovr |>
+  arrange(USUBJID, ADT) |>
+  group_by(USUBJID) |>
+  mutate(NEXT_AVALC  = lead(AVALC),
+         PSEUDO_PROG = (AVALC == "PD") & (NEXT_AVALC %in% c("CR","PR"))) |>
+  ungroup() |>
+  filter(PSEUDO_PROG) |>
+  select(USUBJID, VISIT, ADY, AVALC, NEXT_AVALC, PSEUDO_PROG)
+```
+
+```{r challenge-pseudo-solution}
+pseudo_prog_subjects <- adrs_ovr |>
+  arrange(USUBJID, ADT) |>
+  group_by(USUBJID) |>
+  mutate(
+    NEXT_AVALC  = lead(AVALC),
+    PSEUDO_PROG = (AVALC == "PD") & (NEXT_AVALC %in% c("CR","PR"))
+  ) |>
+  ungroup() |>
+  filter(PSEUDO_PROG) |>
+  select(USUBJID, VISIT, ADY, AVALC, NEXT_AVALC, PSEUDO_PROG)
+
+pseudo_prog_subjects
+cat("Pseudo-progressors:", n_distinct(pseudo_prog_subjects$USUBJID), "\n")
+```
+
+### Challenge 2 — Missing scan imputation for PFS
+
+**Scenario:** A subject's last tumour scan was at Day 168 (SD). Their next scheduled scan at Day 210 is missing (subject refused). They are alive at Day 220 (last contact). Per protocol, PFS is censored at Day 168 (date of last non-PD scan), **not** Day 220.
+
+From `adtr_sld`, identify subjects who:
+1. Have a missing Cycle 8 scan (no row for `VISIT == "CYCLE 8 DAY 1"`)
+2. Have a preceding SD or better SLD value (PCHG > -30 and no prior PD in `adrs_ovr`)
+3. Were alive at LSTALVDT
+
+For these subjects, adjust the PFS censor date from `LSTALVDT` to the last observed non-PD scan date.
+
+```{r challenge-censoring, exercise=TRUE, exercise.lines=40}
+# Step 1: find subjects missing Cycle 8 scan
+all_subj <- unique(adtr_sld$USUBJID)
+cycle8_subj <- adtr_sld |>
+  filter(VISIT == "CYCLE 8 DAY 1") |>
+  pull(USUBJID) |>
+  unique()
+
+missing_cycle8 <- setdiff(___, ___)
+cat("Subjects missing Cycle 8:", length(missing_cycle8), "\n")
+
+# Step 2: for those subjects, find last non-PD imaging date
+last_nonpd_scan <- adrs_ovr |>
+  filter(USUBJID %in% ___, AVALC != "PD") |>
+  group_by(USUBJID) |>
+  summarise(LAST_NONPD_DT = max(ADT, na.rm = TRUE), .groups = "drop")
+
+# Step 3: apply corrected censor date in PFS
+pfs_corrected <- pfs |>
+  left_join(___, by = "USUBJID") |>
+  mutate(
+    # Only adjust censored subjects missing Cycle 8 who have a last non-PD date
+    ENDDT_CORR = case_when(
+      CNSR == 1 & USUBJID %in% missing_cycle8 & !is.na(LAST_NONPD_DT) ~ LAST_NONPD_DT,
+      TRUE ~ ENDDT
+    ),
+    AVAL_CORR  = as.numeric(ENDDT_CORR - TRTSDT)
+  )
+
+# Compare original vs corrected AVAL for affected subjects
+pfs_corrected |>
+  filter(USUBJID %in% missing_cycle8, CNSR == 1) |>
+  select(USUBJID, ARMCD, AVAL, AVAL_CORR, ENDDT, ENDDT_CORR) |>
+  head(10)
+```
+
+```{r challenge-censoring-hint-1}
+# missing_cycle8 = setdiff(all_subj, cycle8_subj)
+# last_nonpd_scan: filter adrs_ovr for missing_cycle8 subjects; max(ADT) where AVALC != "PD"
+# left_join last_nonpd_scan into pfs by USUBJID
+```
+
+```{r challenge-censoring-solution}
+all_subj      <- unique(adtr_sld$USUBJID)
+cycle8_subj   <- adtr_sld |> filter(VISIT == "CYCLE 8 DAY 1") |> pull(USUBJID) |> unique()
+missing_cycle8 <- setdiff(all_subj, cycle8_subj)
+cat("Subjects missing Cycle 8:", length(missing_cycle8), "\n")
+
+last_nonpd_scan <- adrs_ovr |>
+  filter(USUBJID %in% missing_cycle8, AVALC != "PD") |>
+  group_by(USUBJID) |>
+  summarise(LAST_NONPD_DT = max(ADT, na.rm = TRUE), .groups = "drop")
+
+pfs_corrected <- pfs |>
+  left_join(last_nonpd_scan, by = "USUBJID") |>
+  mutate(
+    ENDDT_CORR = case_when(
+      CNSR == 1 & USUBJID %in% missing_cycle8 & !is.na(LAST_NONPD_DT) ~ LAST_NONPD_DT,
+      TRUE ~ ENDDT
+    ),
+    AVAL_CORR = as.numeric(ENDDT_CORR - TRTSDT)
+  )
+
+pfs_corrected |>
+  filter(USUBJID %in% missing_cycle8, CNSR == 1) |>
+  select(USUBJID, ARMCD, AVAL, AVAL_CORR, ENDDT, ENDDT_CORR) |>
+  head(10)
+```
+
+### Challenge 3 — Multi-parameter ADRS shift table
+
+**Final boss problem.** The statistical analysis plan calls for a **response shift table** showing, for each arm, how many subjects transitioned from each BOR category to each CBOR category (i.e., how confirmation changes the response assignment). The result must be a wide table where rows = BOR, columns = CBOR, cells = counts.
+
+```{r challenge-shift, exercise=TRUE, exercise.lines=30}
+# adrs_with_bor and adrs_cbor are available
+
+bor_data  <- adrs_with_bor |>
+  filter(DTYPE == "BOR") |>
+  select(USUBJID, BOR = AVALC)
+
+cbor_data <- adrs_cbor |>
+  filter(DTYPE == "CBOR") |>
+  select(USUBJID, CBOR = AVALC)
+
+shift_table <- bor_data |>
+  left_join(___, by = "USUBJID") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD, BOR, CBOR) |>
+  summarise(n = n(), .groups = "drop") |>
+  # Wide: rows = BOR, columns = CBOR
+  pivot_wider(
+    names_from  = ___,
+    values_from = ___,
+    values_fill = 0L
+  ) |>
+  arrange(ARMCD, BOR)
+
+print(shift_table, n = Inf)
+```
+
+```{r challenge-shift-hint-1}
+# left_join cbor_data by USUBJID
+# pivot_wider: names_from = CBOR, values_from = n
+```
+
+```{r challenge-shift-solution}
+bor_data  <- adrs_with_bor |> filter(DTYPE == "BOR") |> select(USUBJID, BOR = AVALC)
+cbor_data <- adrs_cbor     |> filter(DTYPE == "CBOR") |> select(USUBJID, CBOR = AVALC)
+
+shift_table <- bor_data |>
+  left_join(cbor_data, by = "USUBJID") |>
+  left_join(select(adsl_onco, USUBJID, ARMCD), by = "USUBJID") |>
+  group_by(ARMCD, BOR, CBOR) |>
+  summarise(n = n(), .groups = "drop") |>
+  pivot_wider(names_from = CBOR, values_from = n, values_fill = 0L) |>
+  arrange(ARMCD, BOR)
+
+print(shift_table, n = Inf)
+```
+
+---
+
+## Lesson Summary
+
+```{r quiz-final, echo=FALSE}
+quiz(
+  caption = "Final Knowledge Check",
+
+  question("In admiralonco, which function derives the single-record Best Overall Response per subject?",
+    answer("derive_param_clinicalresp()"),
+    answer("derive_param_bor()", correct = TRUE),
+    answer("derive_param_confirmed_bor()"),
+    answer("derive_var_extreme_flag()"),
+    allow_retry = TRUE
+  ),
+
+  question("ADTR stores which variable as the sum of target lesion longest diameters?",
+    answer("DIAMETER"),
+    answer("SLD — but it is stored in the PARAM column, not a fixed variable name"),
+    answer("AVAL, with PARAMCD = 'SLD'", correct = TRUE,
+           message = "AVAL holds the numeric measurement; PARAMCD/PARAM identifies what is measured."),
+    answer("TUORRES"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("Which statement about Duration of Response (DOR) is TRUE?",
+    answer("DOR is calculated for all subjects, starting from TRTSDT"),
+    answer("DOR starts from the first response (CR/PR) date and ends at PD or death, only for responders",
+           correct = TRUE),
+    answer("DOR starts from randomisation"),
+    answer("DOR is a censored variable only — there are no events"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("A subject's RECIST responses across 4 visits are: NE, PR, SD, PD. Under a 28-day confirmation requirement, is the PR confirmed if the next visit (SD) is 35 days later?",
+    answer("Yes — 35 days ≥ 28 days, so the next visit qualifies as the confirmation visit",
+           message = "The timing is sufficient, but SD (rank 3) is WORSE than PR (rank 2). Confirmation requires the same or BETTER response."),
+    answer("No — SD is a worse response than PR so it cannot confirm PR", correct = TRUE),
+    answer("Yes — any post-PR assessment within the window confirms the response"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+
+  question("In the CDISC ADaM convention, CNSR = 0 means:",
+    answer("The subject was censored"),
+    answer("The event occurred", correct = TRUE,
+           message = "CNSR = 0 → event; CNSR = 1 → censored. This is the inverse of what many analysts expect!"),
+    answer("The subject was excluded from TTE analysis"),
+    answer("No event and no censoring information available"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Key takeaways
+
+You have learned to:
+
+- Apply the RECIST 1.1 five-category hierarchy (CR/PR/SD/NE/PD) and AVAL rank coding
+- Use `derive_param_clinicalresp()` to populate ADRS with OVR assessments
+- Derive unconfirmed BOR with `derive_param_bor()` and confirmed BOR with `derive_param_confirmed_bor()`
+- Build ADTR with SLD, CHG, PCHG, waterfall-plot data and threshold flags
+- Construct oncology TTE parameters (PFS, DOR) with correct event/censor logic
+- Handle real-world edge cases: pseudo-progression, missing scan imputation, and response shift tables
+
+**Next lesson:** Lesson 21 — `admiralvaccine` — ADaM derivations for vaccine immunogenicity trials (antibody titre endpoints, seroconversion, AISM).

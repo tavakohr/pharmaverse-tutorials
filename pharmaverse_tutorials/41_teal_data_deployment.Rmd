@@ -1,0 +1,1133 @@
+---
+title: "Lesson 41 — teal: Data Connectors & Deployment"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Deep dive into teal.data — cdisc_data, relational_data, pull-from-server
+  data connectors, lazy loading, dataset relationships, and full deployment
+  workflows for Posit Connect, Docker, and internal clinical environments.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem.
+#
+# SCRIPT NAME   : 41_teal_data_deployment.Rmd
+# PURPOSE       : teal data layer and deployment — teal_data() + join_keys() API,
+#                 dataset_connector() lazy loading, code reproducibility,
+#                 and production deployment on Posit Connect / Docker.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER: Independent work. No proprietary IP. Public docs only.
+# LICENSE       : MIT License
+# ==============================================================================
+library(learnr)
+library(dplyr)
+library(tibble)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+tutorial_options(exercise.timelimit = 90, exercise.eval = FALSE)
+
+# ── Pharmaverseadam datasets ────────────────────────────────────────────────
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+adsl <- adsl_raw |> mutate(
+  ITTFL  = SAFFL,
+  DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"))
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw)) {
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+}
+adae <- adae_raw |> mutate(AESEVN = case_when(
+  AESEV == "MILD"     ~ 1L, AESEV == "MODERATE" ~ 2L,
+  AESEV == "SEVERE"   ~ 3L, TRUE ~ NA_integer_))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+advs <- pharmaverseadam::advs
+
+# ── Mock teal.data infrastructure ────────────────────────────────────────────
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ── cdisc_dataset / cdisc_data (review from lesson 39) ──────────────────────
+cdisc_dataset <- function(dataname, x, keys=character(0), label=NULL,
+                          code=NULL, parent=NULL) {
+  structure(
+    list(dataname=dataname, data=x, keys=keys,
+         label=label %||% dataname, code=code, parent=parent),
+    class=c("cdisc_dataset","teal_dataset"))
+}
+
+cdisc_data <- function(..., check=FALSE, code=NULL) {
+  datasets <- list(...)
+  names(datasets) <- vapply(datasets, function(d) d$dataname, character(1))
+  structure(list(datasets=datasets, check=check, code=code),
+            class=c("cdisc_data","teal_data"))
+}
+
+# ── relational_data ─────────────────────────────────────────────────────────
+dataset <- function(dataname, x, keys=character(0), label=NULL, code=NULL) {
+  structure(
+    list(dataname=dataname, data=x, keys=keys,
+         label=label %||% dataname, code=code),
+    class=c("dataset","teal_dataset"))
+}
+
+relational_data <- function(..., check=FALSE) {
+  datasets <- list(...)
+  names(datasets) <- vapply(datasets, function(d) d$dataname, character(1))
+  structure(list(datasets=datasets, check=check),
+            class=c("relational_data","teal_data"))
+}
+
+# ── dataset_connector (simulates deferred/lazy loading) ─────────────────────
+dataset_connector <- function(dataname, pull_callable, keys=character(0), label=NULL) {
+  structure(
+    list(dataname=dataname,
+         pull_callable=pull_callable,
+         keys=keys,
+         label=label %||% dataname,
+         .pulled=FALSE,
+         .data=NULL),
+    class=c("dataset_connector","teal_dataset"))
+}
+
+# Simulate pulling data from a connector
+pull_dataset_connector <- function(connector, ...) {
+  connector$.data   <- connector$pull_callable(...)
+  connector$.pulled <- TRUE
+  connector
+}
+
+cdisc_dataset_connector <- function(dataname, pull_callable, keys=character(0),
+                                    label=NULL) {
+  structure(
+    list(dataname=dataname,
+         pull_callable=pull_callable,
+         keys=keys,
+         label=label %||% dataname,
+         .pulled=FALSE,
+         .data=NULL),
+    class=c("cdisc_dataset_connector","dataset_connector","teal_dataset"))
+}
+
+# ── join_keys ────────────────────────────────────────────────────────────────
+join_key <- function(dataset_1, dataset_2, keys) {
+  structure(list(dataset_1=dataset_1, dataset_2=dataset_2, keys=keys),
+            class="join_key")
+}
+
+join_keys <- function(...) {
+  jk_list <- list(...)
+  structure(list(keys=jk_list), class="join_keys")
+}
+
+print.join_keys <- function(x, ...) {
+  cat("── join_keys ─────────────────────────────────────────\n")
+  for (jk in x$keys) {
+    cat(sprintf("  %s ↔ %s  [%s]\n",
+                jk$dataset_1, jk$dataset_2,
+                paste(names(jk$keys), collapse=", ")))
+  }
+  invisible(x)
+}
+
+# ── teal_data() — new-style API (teal >= 0.15) ───────────────────────────────
+# In teal >= 0.15, teal_data() replaces cdisc_data() + relational_data()
+teal_data <- function(..., code=NULL, join_keys=NULL) {
+  datasets <- list(...)
+  nms <- sapply(datasets, function(d) {
+    if (inherits(d, "teal_dataset")) d$dataname
+    else deparse(substitute(d))
+  })
+  # For datasets passed as named arguments, use the argument names
+  call_names <- names(match.call(expand.dots=FALSE)$`...`)
+  if (!is.null(call_names) && length(call_names) == length(datasets))
+    nms <- call_names
+  names(datasets) <- nms
+  structure(list(datasets=datasets, code=code, join_keys=join_keys),
+            class=c("teal_data","list"))
+}
+
+# Convenience: wrap a data frame without explicit cdisc_dataset()
+# (new teal_data() API accepts data frames directly)
+verify <- function(tdata) {
+  cat("── teal_data verification ──────────────────────────\n")
+  cat("  Datasets:", paste(names(tdata$datasets), collapse=", "), "\n")
+  if (!is.null(tdata$join_keys)) {
+    cat("  Join keys defined:", length(tdata$join_keys$keys), "\n")
+  }
+  cat("  Status: OK\n")
+  invisible(tdata)
+}
+
+# ── teal mock ────────────────────────────────────────────────────────────────
+modules <- function(..., label="root") {
+  mods <- list(...)
+  structure(list(modules=mods, label=label), class="teal_modules")
+}
+tab_group <- function(label, ...) {
+  structure(list(label=label, children=list(...)),
+            class=c("tab_group","teal_module"))
+}
+tm_data_table        <- function(label="Data Table", ...)    structure(list(label=label,type="data_table"),   class=c("tm_data_table","teal_module"))
+tm_variable_browser  <- function(label="Variable Browser",...) structure(list(label=label,type="var_browser"), class=c("tm_variable_browser","teal_module"))
+tm_t_summary         <- function(label="Summary",...) structure(list(label=label,type="t_summary"),  class=c("tm_t_summary","teal_module"))
+tm_g_scatterplot     <- function(label="Scatter",...)  structure(list(label=label,type="scatter"),    class=c("tm_g_scatterplot","teal_module"))
+teal_slice  <- function(dataname,varname,selected=NULL,...) structure(list(dataname=dataname,varname=varname,selected=selected),class="teal_slice")
+teal_slices <- function(...,exclude_varnames=NULL) structure(list(slices=list(...),exclude_varnames=exclude_varnames),class="teal_slices")
+
+teal <- function(data, modules, title="teal app", filter=NULL, ...) {
+  structure(list(data=data,modules=modules,title=title,filter=filter),
+            class=c("teal_app","shiny.appobj"))
+}
+print.teal_app <- function(x,...) {
+  cat("── teal Application ──────────────────────────────────\n")
+  cat("  Title:", x$title,"\n")
+  ds_names <- if (inherits(x$data,"teal_data")) names(x$data$datasets)
+              else if (!is.null(x$data$datasets)) names(x$data$datasets)
+              else "?"
+  cat("  Datasets:", paste(ds_names, collapse=", "),"\n")
+  invisible(x)
+}
+```
+
+## Overview
+
+This lesson covers the `teal.data` layer in depth — the connectors that load and relate datasets — and the complete deployment workflow for clinical applications. You will learn the difference between static and dynamic data connectors, how to declare join relationships, and how to ship a teal app securely to Posit Connect.
+
+---
+
+## 1 — `teal.data` in Depth
+
+### 1.1 Evolution of the API
+
+teal.data has gone through two API generations:
+
+| Version | Style | Key functions |
+|---------|-------|---------------|
+| teal < 0.15 | "Old API" | `cdisc_data()`, `cdisc_dataset()`, `relational_data()`, `dataset()` |
+| teal ≥ 0.15 | "New API" | `teal_data()` (unified), `join_keys()`, `join_key()` |
+
+Both APIs are in active use in the field. This lesson covers both.
+
+### 1.2 `cdisc_data()` — old API (still common)
+
+```{r old-api-demo, eval=FALSE}
+# Old API — explicit cdisc_dataset() wrappers
+app_data <- cdisc_data(
+  cdisc_dataset("ADSL", adsl,
+                keys  = c("STUDYID", "USUBJID"),
+                label = "Subject-Level Analysis Dataset"),
+  cdisc_dataset("ADAE", adae,
+                keys  = c("STUDYID", "USUBJID", "AESEQ"),
+                label = "Adverse Events"),
+  check = TRUE
+)
+```
+
+### 1.3 `teal_data()` — new API (teal ≥ 0.15)
+
+```{r new-api-demo, eval=FALSE}
+# New API — pass data frames directly, declare keys separately
+app_data <- teal_data(
+  ADSL = adsl,
+  ADAE = adae,
+  ADLB = adlb,
+  join_keys = join_keys(
+    join_key("ADSL", "ADAE", c("STUDYID" = "STUDYID",
+                                "USUBJID" = "USUBJID")),
+    join_key("ADSL", "ADLB", c("STUDYID" = "STUDYID",
+                                "USUBJID" = "USUBJID")),
+    join_key("ADAE", "ADLB", c("STUDYID" = "STUDYID",
+                                "USUBJID" = "USUBJID"))
+  )
+)
+
+# Verify integrity
+verify(app_data)
+```
+
+> **Which API to use?** Use the new `teal_data()` API for new projects — it is cleaner and actively maintained. The old `cdisc_data()` API will remain supported but receives fewer enhancements.
+
+### 1.4 Exercise — new API
+
+Build a `teal_data` object for ADSL, ADAE, and ADVS with the new API.
+
+```{r new-api-ex, exercise=TRUE, exercise.lines=18}
+pilot_data <- teal_data(
+  ADSL = ___,
+  ADAE = ___,
+  ADVS = advs,
+  join_keys = join_keys(
+    join_key("ADSL", "ADAE",
+             c("STUDYID" = "STUDYID", ___ = "USUBJID")),
+    join_key("ADSL", "ADVS",
+             c("STUDYID" = "STUDYID", "USUBJID" = ___))
+  )
+)
+
+verify(pilot_data)
+```
+
+```{r new-api-ex-solution}
+pilot_data <- teal_data(
+  ADSL = adsl,
+  ADAE = adae,
+  ADVS = advs,
+  join_keys = join_keys(
+    join_key("ADSL", "ADAE",
+             c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID")),
+    join_key("ADSL", "ADVS",
+             c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID"))
+  )
+)
+
+verify(pilot_data)
+```
+
+---
+
+## 2 — `relational_data()` — Non-CDISC Datasets
+
+### 2.1 When to use `relational_data()`
+
+`cdisc_data()` is designed for ADaM datasets with CDISC-standard join paths. For other data (site metadata, patient registries, operational data), use `relational_data()`:
+
+```{r relational-demo, eval=FALSE}
+# Non-CDISC supplemental datasets
+site_info <- tibble::tribble(
+  ~SITEID, ~COUNTRY,  ~PI_NAME,
+  "001",   "USA",     "Dr. Smith",
+  "002",   "Germany", "Dr. Müller",
+  "003",   "Japan",   "Dr. Tanaka"
+)
+
+protocol_defs <- tibble::tribble(
+  ~PARAMCD, ~PARAM_LONG,            ~UNIT,  ~LLOQ, ~ULOQ,
+  "ALT",    "Alanine Aminotransferase", "U/L", 7,    56,
+  "CREAT",  "Creatinine",            "mg/dL", 0.6,  1.2,
+  "WBC",    "White Blood Cells",      "10^9/L", 3.5, 10.5
+)
+
+# relational_data for non-ADAM supplemental data
+supp_data <- relational_data(
+  dataset("SITE",  site_info,      keys = "SITEID"),
+  dataset("PARAM", protocol_defs,  keys = "PARAMCD")
+)
+```
+
+### 2.2 Mixing CDISC and relational data
+
+In practice, a clinical app often needs both types. The new `teal_data()` API handles them uniformly:
+
+```{r mixed-data-demo, eval=FALSE}
+mixed_data <- teal_data(
+  ADSL  = adsl,
+  ADLB  = adlb,
+  SITE  = site_info,
+  PARAM = protocol_defs,
+  join_keys = join_keys(
+    join_key("ADSL", "ADLB", c("STUDYID","USUBJID")),
+    join_key("ADSL", "SITE", c("SITEID" = "SITEID")),
+    join_key("ADLB", "PARAM", c("PARAMCD" = "PARAMCD"))
+  )
+)
+```
+
+### 2.3 Exercise — build a relational dataset
+
+Create a `relational_data` object with two supplemental tables.
+
+```{r relational-ex, exercise=TRUE, exercise.lines=20}
+# Supplemental datasets
+arm_labels <- tibble(
+  ARMCD = c("Pbo", "Xan_Lo", "Xan_Hi"),
+  ARM   = c("Placebo", "Xanomeline Low Dose", "Xanomeline High Dose"),
+  DOSE_MG = c(0, 54, 81)
+)
+
+visit_schedule <- tibble(
+  AVISIT = c("Baseline", "Week 2", "Week 4", "Week 8",
+             "Week 16", "Week 24", "End of Treatment"),
+  AVISITN = c(0, 2, 4, 8, 16, 24, 99)
+)
+
+supp <- relational_data(
+  dataset("ARM_LABELS",     ___, keys = "ARMCD"),
+  dataset("VISIT_SCHEDULE", ___, keys = c("AVISIT", ___))
+)
+
+cat("Supplemental data created\n")
+cat("Datasets:", paste(names(supp$datasets), collapse=", "), "\n")
+```
+
+```{r relational-ex-solution}
+arm_labels <- tibble(
+  ARMCD = c("Pbo", "Xan_Lo", "Xan_Hi"),
+  ARM   = c("Placebo", "Xanomeline Low Dose", "Xanomeline High Dose"),
+  DOSE_MG = c(0, 54, 81)
+)
+
+visit_schedule <- tibble(
+  AVISIT = c("Baseline", "Week 2", "Week 4", "Week 8",
+             "Week 16", "Week 24", "End of Treatment"),
+  AVISITN = c(0, 2, 4, 8, 16, 24, 99)
+)
+
+supp <- relational_data(
+  dataset("ARM_LABELS",     arm_labels,     keys = "ARMCD"),
+  dataset("VISIT_SCHEDULE", visit_schedule, keys = c("AVISIT", "AVISITN"))
+)
+
+cat("Supplemental data created\n")
+cat("Datasets:", paste(names(supp$datasets), collapse=", "), "\n")
+```
+
+---
+
+## 3 — Data Connectors: Deferred & Dynamic Loading
+
+### 3.1 The problem with static data
+
+Loading all datasets at app startup creates problems in production:
+
+- Large datasets (ADLB can be millions of rows) slow the startup
+- Datasets may need to be refreshed from an external source during the session
+- Credentials for databases should not be embedded in the app code
+
+**Data connectors** solve this by deferring the data pull until it is actually needed.
+
+### 3.2 `dataset_connector()` / `cdisc_dataset_connector()`
+
+```{r connector-demo, eval=FALSE}
+# Define a connector — data is NOT loaded yet
+adlb_connector <- cdisc_dataset_connector(
+  dataname = "ADLB",
+  keys     = c("STUDYID", "USUBJID", "PARAMCD", "ADT"),
+
+  # pull_callable: a function or JoinKeys-aware callable that loads data
+  pull_callable = function(...) {
+    # Could be a DBI query, haven::read_xpt, or anything
+    message("Pulling ADLB from server...")
+    pharmaverseadam::adlb |>
+      dplyr::filter(is.na(DTYPE))
+  }
+)
+
+# The data is pulled when teal first needs it:
+adlb_connector <- pull_dataset_connector(adlb_connector)
+cat("Pulled:", nrow(adlb_connector$.data), "rows\n")
+```
+
+### 3.3 Real-world connector patterns
+
+**SAS XPT files from a study folder:**
+
+```{r xpt-connector, eval=FALSE}
+adam_path <- Sys.getenv("ADAM_PATH", "/mnt/clinical/study001/adam")
+
+adlb_from_xpt <- cdisc_dataset_connector(
+  dataname = "ADLB",
+  keys     = c("STUDYID","USUBJID","PARAMCD","ADT"),
+  pull_callable = function(...) {
+    haven::read_xpt(file.path(adam_path, "adlb.xpt")) |>
+      dplyr::filter(is.na(DTYPE))
+  }
+)
+```
+
+**Database via DBI:**
+
+```{r db-connector, eval=FALSE}
+adlb_from_db <- cdisc_dataset_connector(
+  dataname = "ADLB",
+  keys     = c("STUDYID","USUBJID","PARAMCD","ADT"),
+  pull_callable = function(...) {
+    con <- DBI::dbConnect(
+      odbc::odbc(),
+      dsn      = Sys.getenv("DB_DSN"),
+      uid      = Sys.getenv("DB_USER"),
+      pwd      = Sys.getenv("DB_PASS")
+    )
+    on.exit(DBI::dbDisconnect(con))
+    DBI::dbReadTable(con, "ADLB_FILTERED")
+  }
+)
+```
+
+> **Security rule:** Never hard-code credentials in app code. Always use `Sys.getenv()` with environment variables set in the deployment environment.
+
+### 3.4 Exercise — build a file-based connector
+
+Build a connector that simulates loading ADSL from a file path stored in an environment variable. Use `Sys.getenv()` and fall back to `pharmaverseadam::adsl` if the variable is not set.
+
+```{r connector-ex, exercise=TRUE, exercise.lines=20}
+adsl_connector <- cdisc_dataset_connector(
+  dataname = "ADSL",
+  keys     = c("STUDYID", "USUBJID"),
+  label    = "Subject-Level Analysis Dataset (from file)",
+
+  pull_callable = function(...) {
+    path <- Sys.getenv("ADSL_XPT_PATH", unset = "")
+
+    if (nchar(path) > 0 && file.exists(path)) {
+      message("Loading ADSL from: ", path)
+      haven::read_xpt(___)
+    } else {
+      message("ADSL_XPT_PATH not set — using pharmaverseadam fallback")
+      ___
+    }
+  }
+)
+
+# Simulate pulling (no env var set → fallback)
+adsl_connector <- pull_dataset_connector(adsl_connector)
+
+cat("Pulled ADSL:", nrow(adsl_connector$.data), "rows\n")
+cat("Columns:", ncol(adsl_connector$.data), "\n")
+```
+
+```{r connector-ex-solution}
+adsl_connector <- cdisc_dataset_connector(
+  dataname = "ADSL",
+  keys     = c("STUDYID", "USUBJID"),
+  label    = "Subject-Level Analysis Dataset (from file)",
+
+  pull_callable = function(...) {
+    path <- Sys.getenv("ADSL_XPT_PATH", unset = "")
+
+    if (nchar(path) > 0 && file.exists(path)) {
+      message("Loading ADSL from: ", path)
+      haven::read_xpt(path)
+    } else {
+      message("ADSL_XPT_PATH not set — using pharmaverseadam fallback")
+      pharmaverseadam::adsl
+    }
+  }
+)
+
+adsl_connector <- pull_dataset_connector(adsl_connector)
+
+cat("Pulled ADSL:", nrow(adsl_connector$.data), "rows\n")
+cat("Columns:", ncol(adsl_connector$.data), "\n")
+```
+
+---
+
+## 4 — `join_keys()` and Dataset Relationships
+
+### 4.1 Why explicit join keys matter
+
+Without declared join keys:
+- teal cannot infer how to propagate filters across datasets
+- Cross-dataset modules must do their own joins manually
+- Subject count in the filter panel is wrong or missing
+
+### 4.2 Declaring CDISC join paths
+
+Standard CDISC join topology for a typical clinical study:
+
+```{r join-keys-demo, eval=FALSE}
+adam_join_keys <- join_keys(
+  # ADSL is the subject backbone — joins to everything via USUBJID
+  join_key("ADSL", "ADAE",  c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID")),
+  join_key("ADSL", "ADLB",  c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID")),
+  join_key("ADSL", "ADVS",  c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID")),
+  join_key("ADSL", "ADTTE", c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID")),
+
+  # ADAE self-key (for within-ADAE filtering)
+  join_key("ADAE", "ADAE",  c("STUDYID","USUBJID","AESEQ")),
+
+  # Lab and VS share time-point structure but are not directly joined
+  join_key("ADLB", "ADVS",  c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID"))
+)
+
+print(adam_join_keys)
+```
+
+### 4.3 Self-keys (within-dataset key declarations)
+
+teal uses self-keys (where both `dataset_1` and `dataset_2` are the same name) to understand the primary key of a dataset:
+
+```{r self-keys, eval=FALSE}
+# Tell teal that ADLB rows are uniquely identified by these 4 columns
+join_key("ADLB", "ADLB",  c("STUDYID", "USUBJID", "PARAMCD", "ADT"))
+```
+
+Always declare a self-key for every dataset so the filter panel shows correct subject counts.
+
+### 4.4 Exercise — declare a full join_keys object
+
+Declare join keys for ADSL, ADAE, ADLB, and ADVS including self-keys for each.
+
+```{r join-keys-ex, exercise=TRUE, exercise.lines=22}
+study_keys <- join_keys(
+  # Self-keys (primary keys)
+  join_key("ADSL", "ADSL", c("STUDYID", "USUBJID")),
+  join_key("ADAE", "ADAE", c("STUDYID", "USUBJID", ___)),
+  join_key("ADLB", "ADLB", c("STUDYID", "USUBJID", "PARAMCD", ___)),
+  join_key("ADVS", "ADVS", c("STUDYID", "USUBJID", ___, "ADT")),
+
+  # Cross-dataset links
+  join_key("ADSL", "ADAE", c("STUDYID" = "STUDYID", ___ = "USUBJID")),
+  join_key("ADSL", "ADLB", c("STUDYID" = "STUDYID", "USUBJID" = ___)),
+  join_key("ADSL", "ADVS", c(___ = "STUDYID", "USUBJID" = "USUBJID"))
+)
+
+print(study_keys)
+```
+
+```{r join-keys-ex-solution}
+study_keys <- join_keys(
+  join_key("ADSL", "ADSL", c("STUDYID", "USUBJID")),
+  join_key("ADAE", "ADAE", c("STUDYID", "USUBJID", "AESEQ")),
+  join_key("ADLB", "ADLB", c("STUDYID", "USUBJID", "PARAMCD", "ADT")),
+  join_key("ADVS", "ADVS", c("STUDYID", "USUBJID", "PARAMCD", "ADT")),
+
+  join_key("ADSL", "ADAE", c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID")),
+  join_key("ADSL", "ADLB", c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID")),
+  join_key("ADSL", "ADVS", c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID"))
+)
+
+print(study_keys)
+```
+
+---
+
+## 5 — Reproducible `code` Argument
+
+### 5.1 Embedded code in `teal_data()`
+
+The new API accepts a `code` argument — R code (as a string or expression) that reproduces the data preparation steps. This is logged by teal.code and available in the downloaded reproducible script.
+
+```{r code-arg-demo, eval=FALSE}
+app_data <- teal_data(
+  ADSL = adsl,
+  ADAE = adae,
+  ADLB = adlb,
+
+  # Reproducible code string: what a user would need to run to recreate ADSL
+  code = "
+    library(pharmaverseadam)
+    library(dplyr)
+
+    adsl <- pharmaverseadam::adsl |>
+      mutate(
+        ITTFL  = SAFFL,
+        DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, 'Y', 'N', missing = 'N')
+      )
+
+    adae <- pharmaverseadam::adae |>
+      rename(TRT01A = TRTA) |>
+      mutate(AESEVN = case_when(
+        AESEV == 'MILD'     ~ 1L,
+        AESEV == 'MODERATE' ~ 2L,
+        AESEV == 'SEVERE'   ~ 3L,
+        TRUE ~ NA_integer_))
+
+    adlb <- pharmaverseadam::adlb |>
+      filter(is.na(DTYPE)) |>
+      mutate(ATOXGR = as.integer(ATOXGR),
+             BTOXGR = as.integer(BTOXGR))
+  "
+)
+```
+
+> When users click "Show R Code" in the teal app, this preparation code appears at the top of the downloaded script, followed by all filter and analysis steps recorded during the session.
+
+### 5.2 Per-dataset code with `cdisc_dataset()`
+
+In the old API, reproducible code is attached per-dataset:
+
+```{r per-dataset-code, eval=FALSE}
+adlb_ds <- cdisc_dataset(
+  dataname = "ADLB",
+  x        = adlb,
+  keys     = c("STUDYID", "USUBJID", "PARAMCD", "ADT"),
+  code     = "
+    adlb <- pharmaverseadam::adlb |>
+      dplyr::filter(is.na(DTYPE)) |>
+      dplyr::mutate(ATOXGR = as.integer(ATOXGR),
+                    BTOXGR = as.integer(BTOXGR))
+  "
+)
+```
+
+---
+
+## 6 — Deploying to Posit Connect
+
+### 6.1 Deployment checklist
+
+Before deploying a teal app to Posit Connect:
+
+**Code preparation**
+- [ ] All data loading uses `Sys.getenv()` for paths and credentials
+- [ ] `renv::snapshot()` run to capture all dependencies in `renv.lock`
+- [ ] `app.R` as the single entry point in a clean directory
+- [ ] No absolute local paths in the code
+
+**Posit Connect configuration**
+- [ ] Environment variables set in the Connect Content Settings
+- [ ] Correct R version specified in `renv.lock`
+- [ ] `rsconnect::deployApp()` or Git-backed deployment configured
+
+**Access control**
+- [ ] Viewer permissions set (individuals, groups, or public)
+- [ ] Data access audited — does the Posit Connect server have access to the ADaM file path?
+
+### 6.2 A production `app.R`
+
+```{r production-app-r, eval=FALSE}
+# ── app.R ── deploy this directory to Posit Connect ────────────────────────
+library(shiny)
+library(teal)
+library(teal.data)
+library(teal.modules.general)
+library(teal.modules.clinical)
+library(dplyr)
+library(haven)
+
+# ── Data loading: use env vars for paths ───────────────────────────────────
+adam_dir <- Sys.getenv("ADAM_DIR", unset = "")
+
+load_adam <- function(dataset_name) {
+  if (nchar(adam_dir) > 0) {
+    path <- file.path(adam_dir, paste0(tolower(dataset_name), ".xpt"))
+    if (file.exists(path)) return(read_xpt(path))
+  }
+  # Fallback for development: pharmaverseadam
+  message(sprintf("%s: using pharmaverseadam fallback", dataset_name))
+  get(tolower(dataset_name), envir = asNamespace("pharmaverseadam"))
+}
+
+adsl <- load_adam("ADSL") |>
+  mutate(ITTFL  = SAFFL,
+         DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"))
+
+adae <- load_adam("ADAE") |>
+  { d <- .; if ("TRTA" %in% names(d) && !"TRT01A" %in% names(d)) rename(d, TRT01A=TRTA) else d }() |>
+  mutate(AESEVN = case_when(AESEV=="MILD"~1L, AESEV=="MODERATE"~2L,
+                             AESEV=="SEVERE"~3L, TRUE~NA_integer_))
+
+adlb <- load_adam("ADLB") |>
+  { d <- .; if ("DTYPE" %in% names(d)) filter(d, is.na(DTYPE)) else d }() |>
+  mutate(ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+
+# ── teal.data ──────────────────────────────────────────────────────────────
+app_data <- teal_data(
+  ADSL = adsl,
+  ADAE = adae,
+  ADLB = adlb,
+  join_keys = join_keys(
+    join_key("ADSL","ADSL", c("STUDYID","USUBJID")),
+    join_key("ADAE","ADAE", c("STUDYID","USUBJID","AESEQ")),
+    join_key("ADLB","ADLB", c("STUDYID","USUBJID","PARAMCD","ADT")),
+    join_key("ADSL","ADAE", c("STUDYID"="STUDYID","USUBJID"="USUBJID")),
+    join_key("ADSL","ADLB", c("STUDYID"="STUDYID","USUBJID"="USUBJID"))
+  )
+)
+
+# ── Modules ────────────────────────────────────────────────────────────────
+app_modules <- modules(
+  tab_group("Data Explorer",
+    tm_data_table("Raw Data"),
+    tm_variable_browser("Variables")
+  ),
+  tab_group("Safety",
+    tm_t_summary("Demographics", dataname="ADSL"),
+    tm_t_summary("AE Summary",   dataname="ADAE")
+  ),
+  tab_group("Labs",
+    tm_g_scatterplot("Lab Scatter", dataname="ADLB", x="ADY", y="AVAL")
+  )
+)
+
+# ── App ────────────────────────────────────────────────────────────────────
+app <- teal(
+  data    = app_data,
+  modules = app_modules,
+  filter  = teal_slices(
+    teal_slice("ADSL", "SAFFL", selected = "Y"),
+    exclude_varnames = list(ADSL = c("STUDYID","USUBJID","SUBJID"))
+  ),
+  title   = "CDISCPILOT01 Clinical Review",
+  header  = tags$h4(
+    "Xanomeline Study — Internal Review Platform",
+    style = "color:#2c3e50; margin:10px 0;"
+  ),
+  footer  = tags$p(
+    sprintf("Data cut: %s | For Internal Use Only",
+            Sys.getenv("DATA_CUT_DATE", "2026-01-01")),
+    style = "font-size:11px; color:#7f8c8d;"
+  )
+)
+
+shinyApp(ui = app$ui, server = app$server)
+```
+
+### 6.3 `rsconnect` deployment commands
+
+```{r deploy-commands, eval=FALSE}
+# Step 1: Snapshot dependencies
+renv::snapshot()
+
+# Step 2: Add Posit Connect server (one-time)
+rsconnect::addServer(
+  url  = "https://connect.company.com",
+  name = "company-connect"
+)
+
+# Step 3: Deploy
+rsconnect::deployApp(
+  appDir      = "path/to/app/",
+  appName     = "cdiscpilot01-clinical-review",
+  server      = "company-connect",
+  account     = "htavakoli",
+  appFiles    = c("app.R", "renv.lock", "renv/activate.R"),
+  forceUpdate = TRUE
+)
+```
+
+### 6.4 Setting environment variables on Posit Connect
+
+After deployment, go to the content item's settings on Posit Connect:
+
+```
+Content Settings → Environment Variables → Add Variable
+
+ADAM_DIR        /mnt/study001/adam
+DATA_CUT_DATE   2026-03-15
+DB_DSN          clinical_db
+DB_USER         rstudio_ro
+DB_PASS         <from secrets manager>
+```
+
+> **GxP note:** Storing credentials as environment variables (not in code) is required under 21 CFR Part 11 and ICH E6 good programming practice.
+
+### 6.5 Exercise — write a deployment-ready data loader
+
+Write a `load_adam_dataset()` function that:
+- Reads an XPT from `Sys.getenv("ADAM_DIR")/{dataset}.xpt` if available
+- Falls back to `pharmaverseadam::{dataset}` otherwise
+- Converts the dataset name to lowercase for the file path
+
+```{r deploy-loader-ex, exercise=TRUE, exercise.lines=25}
+load_adam_dataset <- function(dataname) {
+  # dataname: e.g. "ADSL", "ADLB"
+  adam_dir <- Sys.getenv(___, unset = "")
+  fname    <- paste0(tolower(___), ".xpt")
+
+  if (nchar(adam_dir) > 0) {
+    full_path <- file.path(___, fname)
+    if (file.exists(full_path)) {
+      message(sprintf("Loading %s from %s", dataname, full_path))
+      return(haven::read_xpt(full_path))
+    }
+  }
+
+  # Fallback
+  message(sprintf("%s: ADAM_DIR not set or file not found — using pharmaverseadam",
+                  dataname))
+  ns <- asNamespace("pharmaverseadam")
+  if (exists(tolower(dataname), envir = ns, inherits = FALSE)) {
+    get(tolower(___), envir = ns)
+  } else {
+    stop(sprintf("Dataset '%s' not found in pharmaverseadam", dataname))
+  }
+}
+
+# Test the fallback
+adsl_loaded <- load_adam_dataset("adsl")
+cat("Rows:", nrow(adsl_loaded), "| Cols:", ncol(adsl_loaded), "\n")
+```
+
+```{r deploy-loader-ex-solution}
+load_adam_dataset <- function(dataname) {
+  adam_dir <- Sys.getenv("ADAM_DIR", unset = "")
+  fname    <- paste0(tolower(dataname), ".xpt")
+
+  if (nchar(adam_dir) > 0) {
+    full_path <- file.path(adam_dir, fname)
+    if (file.exists(full_path)) {
+      message(sprintf("Loading %s from %s", dataname, full_path))
+      return(haven::read_xpt(full_path))
+    }
+  }
+
+  message(sprintf("%s: ADAM_DIR not set or file not found — using pharmaverseadam",
+                  dataname))
+  ns <- asNamespace("pharmaverseadam")
+  if (exists(tolower(dataname), envir = ns, inherits = FALSE)) {
+    get(tolower(dataname), envir = ns)
+  } else {
+    stop(sprintf("Dataset '%s' not found in pharmaverseadam", dataname))
+  }
+}
+
+adsl_loaded <- load_adam_dataset("adsl")
+cat("Rows:", nrow(adsl_loaded), "| Cols:", ncol(adsl_loaded), "\n")
+```
+
+---
+
+## 7 — renv for teal Applications
+
+### 7.1 Why renv is mandatory for regulated apps
+
+In clinical development, every software component must be version-controlled and reproducible. `renv` does this for R packages:
+
+```{r renv-workflow, eval=FALSE}
+# ── One-time project setup ──────────────────────────────────────────────────
+renv::init()        # creates renv.lock, renv/ folder, .Rprofile
+
+# Install all teal packages
+install.packages(c(
+  "teal",
+  "teal.data",
+  "teal.code",
+  "teal.widgets",
+  "teal.modules.general",
+  "teal.modules.clinical",
+  "teal.reporter",
+  "pharmaverseadam"
+))
+
+# Snapshot after any install
+renv::snapshot()
+
+# ── Reproducible restore on new machine / CI ────────────────────────────────
+renv::restore()     # installs exact versions from renv.lock
+```
+
+### 7.2 `renv.lock` for a teal app — what to include
+
+```{r renv-check, eval=FALSE}
+# Check which packages are recorded
+renv::status()
+
+# Key teal-family packages that MUST be in renv.lock:
+required_pkgs <- c(
+  "teal", "teal.data", "teal.code", "teal.widgets", "teal.slice",
+  "teal.modules.general", "teal.modules.clinical",
+  "shiny", "bslib", "ggplot2", "dplyr",
+  "pharmaverseadam", "admiral", "haven"
+)
+
+# Verify all are snapshotted
+renv_lock <- renv::lockfile_read()
+missing <- setdiff(required_pkgs, names(renv_lock$Packages))
+if (length(missing) > 0) {
+  warning("Not in renv.lock: ", paste(missing, collapse=", "))
+} else {
+  message("All required packages in renv.lock")
+}
+```
+
+### 7.3 Docker deployment pattern
+
+```{r docker-pattern, eval=FALSE}
+# Dockerfile for a teal app
+# FROM rocker/r-ver:4.4.0
+#
+# RUN apt-get update && apt-get install -y \
+#     libssl-dev libcurl4-openssl-dev libxml2-dev
+#
+# WORKDIR /app
+# COPY renv.lock renv.lock
+# COPY renv/activate.R renv/activate.R
+# RUN Rscript -e "renv::restore()"
+#
+# COPY . .
+# EXPOSE 3838
+# CMD ["Rscript", "-e", "shiny::runApp('.', host='0.0.0.0', port=3838)"]
+```
+
+### 7.4 Quiz
+
+```{r quiz-deploy, echo=FALSE}
+quiz(
+  question(
+    "Under 21 CFR Part 11 and GxP good practice, where should database credentials be stored?",
+    answer("Directly in app.R as R character strings"),
+    answer("In a config.R file committed to git"),
+    answer("As environment variables set in the deployment environment, never in code", correct = TRUE),
+    answer("In a hardcoded list inside the server function"),
+    allow_retry = TRUE
+  ),
+  question(
+    "What does `renv::restore()` do when run on a new server?",
+    answer("Upgrades all packages to the latest version"),
+    answer("Installs the exact package versions recorded in renv.lock, ensuring reproducibility", correct = TRUE),
+    answer("Removes all packages and re-installs from CRAN"),
+    answer("Validates the R code syntax"),
+    allow_retry = TRUE
+  ),
+  question(
+    "In the new teal_data() API, what does the `join_keys()` argument tell teal?",
+    answer("The column order for display in data tables"),
+    answer("How to join datasets for cross-dataset filter propagation and subject counting", correct = TRUE),
+    answer("Which datasets to load first for performance"),
+    answer("The dataset labels shown in the filter panel"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## 8 — Capstone: Production-Ready Data Layer
+
+Build a complete, deployment-ready data layer for a three-dataset clinical app using the new API, with proper join keys, a fallback data loader, and reproducible code.
+
+```{r capstone-data, exercise=TRUE, exercise.eval=FALSE, exercise.lines=60}
+# ── 1. Flexible data loader ───────────────────────────────────────────────
+load_study_data <- function(dataname) {
+  adam_dir <- Sys.getenv("ADAM_DIR", unset = "")
+  fname    <- paste0(tolower(___), ".xpt")
+
+  if (nchar(adam_dir) > 0 && file.exists(file.path(adam_dir, fname))) {
+    haven::read_xpt(file.path(adam_dir, fname))
+  } else {
+    get(tolower(dataname), envir = asNamespace("pharmaverseadam"))
+  }
+}
+
+# ── 2. Load and prepare datasets ─────────────────────────────────────────
+adsl_prod <- load_study_data(___) |>
+  mutate(ITTFL  = SAFFL,
+         DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"))
+
+adae_prod <- load_study_data("adae") |>
+  { d <- .; if ("TRTA" %in% names(d) && !"TRT01A" %in% names(d))
+      rename(d, TRT01A = TRTA) else d }() |>
+  mutate(AESEVN = case_when(AESEV=="MILD"~1L, AESEV=="MODERATE"~2L,
+                             AESEV=="SEVERE"~3L, TRUE~NA_integer_))
+
+adlb_prod <- load_study_data(___) |>
+  { d <- .; if ("DTYPE" %in% names(d)) filter(d, is.na(DTYPE)) else d }() |>
+  mutate(ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+
+# ── 3. Build teal_data with full join_keys ────────────────────────────────
+study_keys <- join_keys(
+  join_key("ADSL", "ADSL", c("STUDYID", "USUBJID")),
+  join_key("ADAE", "ADAE", c("STUDYID", "USUBJID", ___)),
+  join_key("ADLB", "ADLB", c("STUDYID", "USUBJID", "PARAMCD", ___)),
+  join_key("ADSL", "ADAE", c("STUDYID" = "STUDYID", ___ = "USUBJID")),
+  join_key("ADSL", "ADLB", c("STUDYID" = "STUDYID", "USUBJID" = ___))
+)
+
+prod_data <- teal_data(
+  ADSL = ___,
+  ADAE = ___,
+  ADLB = ___,
+  join_keys = ___,
+  code = '
+    adsl <- pharmaverseadam::adsl |>
+      dplyr::mutate(ITTFL=SAFFL,
+                    DIABFL=dplyr::if_else(!is.na(BMIBL)&BMIBL>=30,"Y","N",missing="N"))
+    adae <- pharmaverseadam::adae |>
+      dplyr::rename(TRT01A=TRTA)
+    adlb <- pharmaverseadam::adlb |>
+      dplyr::filter(is.na(DTYPE)) |>
+      dplyr::mutate(ATOXGR=as.integer(ATOXGR), BTOXGR=as.integer(BTOXGR))
+  '
+)
+
+verify(prod_data)
+```
+
+```{r capstone-data-solution}
+load_study_data <- function(dataname) {
+  adam_dir <- Sys.getenv("ADAM_DIR", unset = "")
+  fname    <- paste0(tolower(dataname), ".xpt")
+
+  if (nchar(adam_dir) > 0 && file.exists(file.path(adam_dir, fname))) {
+    haven::read_xpt(file.path(adam_dir, fname))
+  } else {
+    get(tolower(dataname), envir = asNamespace("pharmaverseadam"))
+  }
+}
+
+adsl_prod <- load_study_data("adsl") |>
+  mutate(ITTFL  = SAFFL,
+         DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"))
+
+adae_prod <- load_study_data("adae") |>
+  { d <- .; if ("TRTA" %in% names(d) && !"TRT01A" %in% names(d))
+      rename(d, TRT01A = TRTA) else d }() |>
+  mutate(AESEVN = case_when(AESEV=="MILD"~1L, AESEV=="MODERATE"~2L,
+                             AESEV=="SEVERE"~3L, TRUE~NA_integer_))
+
+adlb_prod <- load_study_data("adlb") |>
+  { d <- .; if ("DTYPE" %in% names(d)) filter(d, is.na(DTYPE)) else d }() |>
+  mutate(ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+
+study_keys <- join_keys(
+  join_key("ADSL", "ADSL", c("STUDYID", "USUBJID")),
+  join_key("ADAE", "ADAE", c("STUDYID", "USUBJID", "AESEQ")),
+  join_key("ADLB", "ADLB", c("STUDYID", "USUBJID", "PARAMCD", "ADT")),
+  join_key("ADSL", "ADAE", c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID")),
+  join_key("ADSL", "ADLB", c("STUDYID" = "STUDYID", "USUBJID" = "USUBJID"))
+)
+
+prod_data <- teal_data(
+  ADSL = adsl_prod,
+  ADAE = adae_prod,
+  ADLB = adlb_prod,
+  join_keys = study_keys,
+  code = '
+    adsl <- pharmaverseadam::adsl |>
+      dplyr::mutate(ITTFL=SAFFL,
+                    DIABFL=dplyr::if_else(!is.na(BMIBL)&BMIBL>=30,"Y","N",missing="N"))
+    adae <- pharmaverseadam::adae |>
+      dplyr::rename(TRT01A=TRTA)
+    adlb <- pharmaverseadam::adlb |>
+      dplyr::filter(is.na(DTYPE)) |>
+      dplyr::mutate(ATOXGR=as.integer(ATOXGR), BTOXGR=as.integer(BTOXGR))
+  '
+)
+
+verify(prod_data)
+```
+
+---
+
+## Summary
+
+You now have a complete picture of `teal.data` and deployment:
+
+- **Old API** (`cdisc_data()` / `cdisc_dataset()`) and **new API** (`teal_data()` / `join_keys()`) both work; prefer the new API for new projects
+- **`relational_data()`** handles non-CDISC supplemental datasets
+- **Data connectors** (`cdisc_dataset_connector()`) defer loading to runtime and support any pull source — files, databases, APIs
+- **`join_keys()`** declares the full join topology so teal can propagate filters correctly
+- The `code` argument embeds reproducible preparation steps into the downloaded R script
+- **Deployment** requires `Sys.getenv()` for all credentials, `renv::snapshot()` for dependency locking, and environment variables set on Posit Connect
+- **Docker** provides fully reproducible, OS-level isolation for regulated deployment
+
+Next: **Lesson 42** is the teal capstone — building a complete, multi-module CDISCPILOT01 clinical data review application with custom modules, full deployment configuration, and end-to-end testing.

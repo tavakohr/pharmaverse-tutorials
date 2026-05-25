@@ -1,0 +1,864 @@
+---
+title: "Lesson 26 — gtsummary Part 1: tbl_summary() and Clinical Demographic Tables"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    theme: flatly
+runtime: shiny_prerendered
+description: >
+  Build clinical demographic and baseline characteristic tables using
+  gtsummary's tbl_summary(): stratify by treatment arm, customise
+  statistic formats (mean/SD vs median [IQR]), add p-values with
+  add_p(), add overall column with add_overall(), annotate with
+  bold_labels() and italicize_levels(), extract results programmatically
+  with as_tibble() and inline_text(), and assemble a complete Table
+  14.1.1-style demographics table.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 26_gtsummary_part1.Rmd
+# PURPOSE       : gtsummary Part 1 — tbl_summary(), add_p(), add_overall(),
+#                 add_n(), modify_header(), bold_labels(), italicize_levels(),
+#                 as_tibble(), inline_text(), and a full Table 14.1.1-style
+#                 demographics table capstone.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-05-24
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo","Xanomeline Low Dose","Xanomeline High Dose"))
+  ) |>
+  filter(SAFFL == "Y")
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GTSUMMARY MOCK FUNCTIONS
+# Replicate the real gtsummary API so exercises run inside learnr without the
+# package installed. The mock computes real statistics from base R and returns
+# an S3 "gtsummary" object whose table_body is a tibble following the same
+# column layout as the real package.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Helper: format a continuous statistic string
+.fmt_stat <- function(x, fmt) {
+  mean_v   <- round(mean(x, na.rm=TRUE), 1)
+  sd_v     <- round(sd(x, na.rm=TRUE), 1)
+  median_v <- round(median(x, na.rm=TRUE), 1)
+  p25_v    <- round(quantile(x, 0.25, na.rm=TRUE), 1)
+  p75_v    <- round(quantile(x, 0.75, na.rm=TRUE), 1)
+  fmt |>
+    gsub("\\{mean\\}",   mean_v,   x = _) |>
+    gsub("\\{sd\\}",     sd_v,     x = _) |>
+    gsub("\\{median\\}", median_v, x = _) |>
+    gsub("\\{p25\\}",    p25_v,    x = _) |>
+    gsub("\\{p75\\}",    p75_v,    x = _)
+}
+
+tbl_summary <- function(data, by = NULL, include = NULL,
+                        statistic = list(
+                          all_continuous  = "{mean} ({sd})",
+                          all_categorical = "{n} ({p}%)"
+                        ),
+                        digits = NULL, label = NULL, missing = "ifany") {
+  all_vars <- names(data)
+  if (!is.null(by)) all_vars <- all_vars[all_vars != by]
+  vars <- if (!is.null(include)) include else all_vars
+
+  cont_fmt <- if (!is.null(statistic$all_continuous))  statistic$all_continuous  else "{mean} ({sd})"
+  cat_fmt  <- if (!is.null(statistic$all_categorical)) statistic$all_categorical else "{n} ({p}%)"
+
+  arms <- if (!is.null(by)) as.character(sort(unique(na.omit(data[[by]])))) else "Overall"
+
+  rows <- lapply(vars, function(vv) {
+    x_all     <- data[[vv]]
+    is_cont   <- is.numeric(x_all)
+    var_label <- if (!is.null(label) && !is.null(label[[vv]])) label[[vv]] else vv
+
+    if (is_cont) {
+      r <- tibble(variable = vv, label = var_label, row_type = "label")
+      for (arm in arms) {
+        xi <- if (arm == "Overall") x_all else x_all[as.character(data[[by]]) == arm]
+        r[[paste0("stat_", arm)]] <- .fmt_stat(xi, cont_fmt)
+      }
+      if (missing != "no" && sum(is.na(x_all)) > 0) {
+        rm2 <- tibble(variable = vv, label = "  Unknown", row_type = "missing")
+        for (arm in arms) {
+          xi <- if (arm == "Overall") x_all else x_all[as.character(data[[by]]) == arm]
+          rm2[[paste0("stat_", arm)]] <- as.character(sum(is.na(xi)))
+        }
+        r <- bind_rows(r, rm2)
+      }
+      r
+    } else {
+      header <- tibble(variable = vv, label = var_label, row_type = "label")
+      for (arm in arms) header[[paste0("stat_", arm)]] <- NA_character_
+      levs <- sort(unique(na.omit(as.character(x_all))))
+      level_rows <- lapply(levs, function(lv) {
+        lr <- tibble(variable = vv, label = paste0("  ", lv), row_type = "level")
+        for (arm in arms) {
+          xi    <- if (arm == "Overall") x_all else x_all[as.character(data[[by]]) == arm]
+          total <- sum(!is.na(xi))
+          n_lv  <- sum(xi == lv, na.rm = TRUE)
+          p_lv  <- round(100 * n_lv / total, 1)
+          lr[[paste0("stat_", arm)]] <- cat_fmt |>
+            gsub("\\{n\\}", n_lv, x = _) |>
+            gsub("\\{p\\}", p_lv, x = _)
+        }
+        lr
+      })
+      bind_rows(header, level_rows)
+    }
+  }) |> bind_rows()
+
+  structure(
+    list(table_body = rows, by = by, arms = arms, data = data,
+         include = vars, label = label),
+    class = "gtsummary"
+  )
+}
+
+print.gtsummary <- function(x, ...) {
+  stat_cols <- grep("^stat_", names(x$table_body), value = TRUE)
+  display   <- x$table_body |> select(label, all_of(stat_cols))
+  names(display)[names(display) != "label"] <-
+    gsub("^stat_", "", names(display)[names(display) != "label"])
+  cat("\n[gtsummary table]\n\n")
+  print(display, n = Inf)
+  invisible(x)
+}
+
+as_tibble.gtsummary <- function(x, ...) {
+  stat_cols <- grep("^stat_", names(x$table_body), value = TRUE)
+  display   <- x$table_body |>
+    select(variable, label, row_type, all_of(stat_cols))
+  names(display)[names(display) %in% stat_cols] <-
+    gsub("^stat_", "", stat_cols)
+  display
+}
+
+add_p <- function(x, test = NULL, pvalue_fun = NULL, ...) UseMethod("add_p")
+add_p.gtsummary <- function(x, test = NULL, pvalue_fun = NULL, ...) {
+  if (is.null(x$by)) { message("add_p() requires a 'by' variable"); return(x) }
+  p_rows <- lapply(x$include, function(vv) {
+    xi  <- x$data[[vv]]
+    grp <- x$data[[x$by]]
+    pval <- tryCatch({
+      if (is.numeric(xi)) {
+        levs <- unique(na.omit(grp))
+        if (length(levs) == 2) {
+          t.test(xi[grp == levs[1]], xi[grp == levs[2]])$p.value
+        } else {
+          summary(aov(xi ~ as.factor(grp)))[[1]][["Pr(>F)"]][1]
+        }
+      } else {
+        chisq.test(table(xi, grp), simulate.p.value = TRUE)$p.value
+      }
+    }, error = function(e) NA_real_)
+    tibble(variable  = vv,
+           p.value   = round(pval, 3),
+           p_display = if (!is.na(pval)) formatC(pval, digits = 3, format = "f") else "NA")
+  }) |> bind_rows()
+  x$table_body <- left_join(x$table_body, p_rows, by = "variable")
+  x$p_added    <- TRUE
+  x
+}
+
+add_overall <- function(x, col_label = "**Overall**", last = FALSE, ...) UseMethod("add_overall")
+add_overall.gtsummary <- function(x, col_label = "**Overall**", last = FALSE, ...) {
+  if (is.null(x$by)) return(x)
+  tbl_overall  <- tbl_summary(x$data, by = NULL, include = x$include, label = x$label)
+  overall_col  <- tbl_overall$table_body |>
+    select(variable, label, row_type, stat_Overall)
+  x$table_body <- left_join(x$table_body, overall_col,
+                             by = c("variable", "label", "row_type"))
+  x$overall_added <- TRUE
+  x
+}
+
+add_n <- function(x, ...) UseMethod("add_n")
+add_n.gtsummary <- function(x, ...) {
+  n_row <- tibble(variable = "__n__", label = "N", row_type = "N")
+  for (arm in x$arms) {
+    n_arm <- if (arm == "Overall") nrow(x$data)
+             else sum(as.character(x$data[[x$by]]) == arm, na.rm = TRUE)
+    n_row[[paste0("stat_", arm)]] <- as.character(n_arm)
+  }
+  if (!is.null(x$table_body$stat_Overall))
+    n_row$stat_Overall <- as.character(nrow(x$data))
+  x$table_body <- bind_rows(n_row, x$table_body)
+  x
+}
+
+modify_header <- function(x, ...) UseMethod("modify_header")
+modify_header.gtsummary <- function(x, ...) {
+  dots <- list(...)
+  if (!is.null(dots)) x$custom_headers <- dots
+  x
+}
+
+bold_labels <- function(x)           { UseMethod("bold_labels") }
+bold_labels.gtsummary <- function(x) { x$bold_labels <- TRUE; x }
+
+italicize_levels <- function(x)           { UseMethod("italicize_levels") }
+italicize_levels.gtsummary <- function(x) { x$italicize_levels <- TRUE; x }
+
+as_gt <- function(x, ...) UseMethod("as_gt")
+as_gt.gtsummary <- function(x, ...) {
+  cat("[as_gt(): In a live session this renders a formatted HTML/RTF table via the gt package.]\n")
+  invisible(as_tibble(x))
+}
+
+inline_text <- function(x, variable, level = NULL, column = NULL, ...) UseMethod("inline_text")
+inline_text.gtsummary <- function(x, variable, level = NULL, column = NULL, ...) {
+  body <- x$table_body
+  row  <- if (!is.null(level)) {
+    body[body$variable == variable & grepl(level, body$label), ]
+  } else {
+    body[body$variable == variable & body$row_type %in% c("label", "N"), ]
+  }
+  if (nrow(row) == 0) return(NA_character_)
+  col_nm <- if (!is.null(column)) paste0("stat_", column) else
+    grep("^stat_", names(row), value = TRUE)[1]
+  as.character(row[[col_nm]][1])
+}
+
+theme_gtsummary_compact  <- function() invisible(NULL)
+set_gtsummary_theme      <- function(x) invisible(NULL)
+reset_gtsummary_theme    <- function() invisible(NULL)
+
+# Simplified selector helpers
+all_continuous  <- function() "all_continuous"
+all_categorical <- function() "all_categorical"
+```
+
+## Overview
+
+**gtsummary** is the most widely used R package for producing publication-ready summary tables in clinical research. Its role in the pharmaverse pipeline sits just above the ARD layer:
+
+```
+Data / ARD  →  gtsummary (compute + format)  →  gt / flextable / Word / RTF
+```
+
+Where **cards** (Lesson 25) separates *computing* statistics from *displaying* them, gtsummary combines both steps in a concise, pipe-chainable API that can also accept a pre-built ARD via `tbl_ard_summary()`.
+
+**Why gtsummary matters for clinical programming:**
+
+- `tbl_summary()` produces Table 14.1.1-style demographics tables in a single call.
+- Every result is extractable as a tibble (`as_tibble()`) or as inline R text (`inline_text()`), making it suitable for programmatic QC and CSR prose generation.
+- The chain model (`|> add_p() |> add_overall() |> bold_labels()`) mirrors the SAS PROC REPORT + ODS pipeline but is fully reproducible and version-controllable.
+
+**The gtsummary S3 object:**
+
+Every gtsummary function returns a list of class `"gtsummary"`. The most important component is `$table_body` — a tibble with one row per variable (or per level for categorical variables) and one `stat_*` column per stratum.
+
+| `$table_body` column | Contents |
+|---------------------|---------|
+| `variable` | Source column name |
+| `label` | Display label (header for group; indented for level) |
+| `row_type` | `"label"`, `"level"`, `"missing"`, or `"N"` |
+| `stat_<arm>` | Formatted statistic string for that stratum |
+
+### Trial Dataset
+
+All exercises use the **CDISCPILOT01** Alzheimer's study from `pharmaverseadam` — 254 subjects in the safety population across three arms: `Placebo`, `Xanomeline Low Dose`, `Xanomeline High Dose`.
+
+---
+
+## Section 1 — tbl_summary() Basics
+
+`tbl_summary()` is the workhorse. Its core arguments are:
+
+| Argument | Purpose |
+|----------|---------|
+| `data` | A data frame (filtered safety population recommended) |
+| `by` | Column name to stratify by (quoted string) |
+| `include` | Character vector of variables to include |
+| `statistic` | Named list of format strings |
+| `label` | Named list of display labels |
+| `missing` | `"ifany"` (default), `"always"`, or `"no"` |
+
+### Exercise 1a — First demographics table
+
+Build a table showing AGE, SEX, and RACE stratified by `TRT01P`, then print it.
+
+```{r tbl-basic, exercise=TRUE, exercise.lines=10}
+tbl1 <- tbl_summary(
+  data    = ___,
+  by      = ___,
+  include = ___
+)
+
+tbl1
+```
+
+```{r tbl-basic-hint-1}
+# Pass the adsl safety population.
+# by = "TRT01P"  (quoted string, not the bare column name)
+# include = c("AGE", "SEX", "RACE")
+```
+
+```{r tbl-basic-solution}
+tbl1 <- tbl_summary(
+  data    = adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "RACE")
+)
+
+tbl1
+```
+
+### Exercise 1b — View table_body as a tibble
+
+`as_tibble()` converts the gtsummary object to a plain tibble for programmatic use. Filter it to rows where `variable == "SEX"`.
+
+```{r tbl-tibble, exercise=TRUE, exercise.lines=8}
+tbl1 <- tbl_summary(adsl, by = "TRT01P", include = c("AGE", "SEX", "RACE"))
+
+as_tibble(tbl1) |>
+  filter(___ == ___)
+```
+
+```{r tbl-tibble-hint-1}
+# filter(variable == "SEX")
+```
+
+```{r tbl-tibble-solution}
+tbl1 <- tbl_summary(adsl, by = "TRT01P", include = c("AGE", "SEX", "RACE"))
+
+as_tibble(tbl1) |>
+  filter(variable == "SEX")
+```
+
+```{r quiz-sec1, echo=FALSE}
+quiz(
+  question(
+    "What does `row_type = 'level'` mean in the table_body tibble?",
+    answer("The row is a group header for a categorical variable"),
+    answer("The row holds a formatted statistic for one level of a categorical variable",
+           correct = TRUE),
+    answer("The row is a missing-value count"),
+    answer("The row is a continuous summary"),
+    allow_retry = TRUE
+  ),
+  question(
+    "When `by = NULL` in tbl_summary(), what column name does the mock use for the statistic?",
+    answer("stat_All"),
+    answer("stat_Total"),
+    answer("stat_Overall", correct = TRUE),
+    answer("stat_NA"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — The statistic= Argument
+
+By default, continuous variables show `mean (SD)` and categoricals show `n (%)`. Override this with the `statistic` argument, which accepts a named list with entries `all_continuous` and `all_categorical`.
+
+**Common format tokens:**
+
+| Token | Meaning |
+|-------|---------|
+| `{mean}` | Arithmetic mean |
+| `{sd}` | Standard deviation |
+| `{median}` | Median |
+| `{p25}` | 25th percentile |
+| `{p75}` | 75th percentile |
+| `{n}` | Count in level |
+| `{p}` | Percentage |
+
+### Exercise 2a — Median [IQR] format
+
+Change the continuous statistic to `"{median} [{p25}, {p75}]"` and keep the categorical default.
+
+```{r stat-median, exercise=TRUE, exercise.lines=10}
+tbl2 <- tbl_summary(
+  data      = adsl,
+  by        = "TRT01P",
+  include   = c("AGE", "SEX", "WEIGHTBL"),
+  statistic = list(
+    all_continuous  = ___,
+    all_categorical = "{n} ({p}%)"
+  )
+)
+
+tbl2
+```
+
+```{r stat-median-hint-1}
+# all_continuous = "{median} [{p25}, {p75}]"
+```
+
+```{r stat-median-solution}
+tbl2 <- tbl_summary(
+  data      = adsl,
+  by        = "TRT01P",
+  include   = c("AGE", "SEX", "WEIGHTBL"),
+  statistic = list(
+    all_continuous  = "{median} [{p25}, {p75}]",
+    all_categorical = "{n} ({p}%)"
+  )
+)
+
+tbl2
+```
+
+### Exercise 2b — Per-variable label override
+
+Use the `label` argument to display `AGE` as `"Age (years)"` and `WEIGHTBL` as `"Baseline Weight (kg)"`.
+
+```{r stat-label, exercise=TRUE, exercise.lines=12}
+tbl2b <- tbl_summary(
+  data    = adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "WEIGHTBL"),
+  label   = list(
+    AGE      = ___,
+    WEIGHTBL = ___
+  )
+)
+
+tbl2b
+```
+
+```{r stat-label-hint-1}
+# label = list(AGE = "Age (years)", WEIGHTBL = "Baseline Weight (kg)")
+```
+
+```{r stat-label-solution}
+tbl2b <- tbl_summary(
+  data    = adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "WEIGHTBL"),
+  label   = list(
+    AGE      = "Age (years)",
+    WEIGHTBL = "Baseline Weight (kg)"
+  )
+)
+
+tbl2b
+```
+
+---
+
+## Section 3 — add_p(): P-values
+
+`add_p()` appends a p-value column by performing an appropriate test for each variable:
+
+- **Continuous** with 2 arms → Welch t-test; 3+ arms → one-way ANOVA.
+- **Categorical** → chi-squared test (with Monte Carlo simulation for small cells).
+
+### Exercise 3a — Add p-values
+
+Chain `add_p()` onto a tbl_summary of AGE, SEX, and RACE.
+
+```{r addp-basic, exercise=TRUE, exercise.lines=10}
+tbl3 <- tbl_summary(
+  adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "RACE")
+) |>
+  ___()
+
+tbl3
+```
+
+```{r addp-basic-hint-1}
+# |> add_p()
+```
+
+```{r addp-basic-solution}
+tbl3 <- tbl_summary(
+  adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "RACE")
+) |>
+  add_p()
+
+tbl3
+```
+
+### Exercise 3b — Extract the AGE p-value programmatically
+
+After calling `add_p()`, the `table_body` gains a `p.value` column. Pull the p-value for AGE.
+
+```{r addp-extract, exercise=TRUE, exercise.lines=10}
+tbl3 <- tbl_summary(adsl, by = "TRT01P", include = c("AGE", "SEX", "RACE")) |>
+  add_p()
+
+age_p <- tbl3$table_body |>
+  filter(variable == ___, row_type == "label") |>
+  pull(___)
+
+age_p
+```
+
+```{r addp-extract-hint-1}
+# filter(variable == "AGE", row_type == "label") |> pull(p.value)
+```
+
+```{r addp-extract-solution}
+tbl3 <- tbl_summary(adsl, by = "TRT01P", include = c("AGE", "SEX", "RACE")) |>
+  add_p()
+
+age_p <- tbl3$table_body |>
+  filter(variable == "AGE", row_type == "label") |>
+  pull(p.value)
+
+age_p
+```
+
+```{r quiz-sec3, echo=FALSE}
+quiz(
+  question(
+    "Which statistical test does gtsummary use by default for a continuous variable with three treatment arms?",
+    answer("Kruskal-Wallis test"),
+    answer("One-way ANOVA", correct = TRUE),
+    answer("Welch two-sample t-test"),
+    answer("Wilcoxon rank-sum test"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 4 — add_overall() and add_n()
+
+`add_overall()` appends a column containing statistics computed across all strata combined.
+`add_n()` prepends a row showing the subject count per stratum.
+
+Both functions return the same `gtsummary` class, so they chain naturally.
+
+### Exercise 4 — Overall column and N row
+
+Chain `add_overall()` then `add_n()` onto a baseline demographics table.
+
+```{r overall-n, exercise=TRUE, exercise.lines=12}
+tbl4 <- tbl_summary(
+  adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "RACE", "WEIGHTBL")
+) |>
+  ___() |>
+  ___()
+
+tbl4
+```
+
+```{r overall-n-hint-1}
+# |> add_overall() |> add_n()
+```
+
+```{r overall-n-solution}
+tbl4 <- tbl_summary(
+  adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "RACE", "WEIGHTBL")
+) |>
+  add_overall() |>
+  add_n()
+
+tbl4
+```
+
+---
+
+## Section 5 — modify_header(), bold_labels(), italicize_levels()
+
+Three annotation functions polish the final table:
+
+| Function | Effect |
+|----------|--------|
+| `modify_header()` | Override column header text |
+| `bold_labels()` | Mark variable-level header rows as bold (rendered in gt/flextable) |
+| `italicize_levels()` | Mark category levels as italic |
+
+### Exercise 5 — Full annotation pipeline
+
+Build a complete chain: `tbl_summary |> add_p() |> add_overall() |> add_n() |> bold_labels() |> italicize_levels()`.
+
+```{r annotate, exercise=TRUE, exercise.lines=14}
+tbl5 <- tbl_summary(
+  adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "RACE")
+) |>
+  ___() |>
+  ___() |>
+  ___() |>
+  ___() |>
+  ___()
+
+# Check that the flags are set
+cat("bold_labels flag:", isTRUE(tbl5$bold_labels), "\n")
+cat("italicize_levels flag:", isTRUE(tbl5$italicize_levels), "\n")
+```
+
+```{r annotate-hint-1}
+# Chain in order: add_p(), add_overall(), add_n(), bold_labels(), italicize_levels()
+```
+
+```{r annotate-solution}
+tbl5 <- tbl_summary(
+  adsl,
+  by      = "TRT01P",
+  include = c("AGE", "SEX", "RACE")
+) |>
+  add_p() |>
+  add_overall() |>
+  add_n() |>
+  bold_labels() |>
+  italicize_levels()
+
+# Check that the flags are set
+cat("bold_labels flag:", isTRUE(tbl5$bold_labels), "\n")
+cat("italicize_levels flag:", isTRUE(tbl5$italicize_levels), "\n")
+```
+
+---
+
+## Section 6 — as_tibble() and Programmatic Extraction
+
+`as_tibble()` converts a gtsummary object to a plain tibble, enabling downstream filtering, joins, and QC comparisons. This is the bridge between gtsummary and the broader tidyverse.
+
+**Use cases:**
+- Export to CSV for independent verification.
+- Join with ARD output from cards to cross-check values.
+- Filter to specific rows for inline reporting in CSR prose.
+
+### Exercise 6a — Extract AGE rows only
+
+Use `as_tibble()` and then filter to keep only rows where `variable == "AGE"`.
+
+```{r extract-age, exercise=TRUE, exercise.lines=10}
+tbl6 <- tbl_summary(adsl, by = "TRT01P", include = c("AGE", "SEX", "RACE"))
+
+age_rows <- as_tibble(___) |>
+  filter(___ == "AGE")
+
+age_rows
+```
+
+```{r extract-age-hint-1}
+# as_tibble(tbl6) |> filter(variable == "AGE")
+```
+
+```{r extract-age-solution}
+tbl6 <- tbl_summary(adsl, by = "TRT01P", include = c("AGE", "SEX", "RACE"))
+
+age_rows <- as_tibble(tbl6) |>
+  filter(variable == "AGE")
+
+age_rows
+```
+
+### Exercise 6b — Coefficient of variation as a custom statistic
+
+Compute the coefficient of variation (CV = SD / mean x 100) for AGE by treatment arm.
+`tbl_summary()` format strings do not include CV directly; compute it with `summarise()` instead.
+
+```{r cv-age, exercise=TRUE, exercise.lines=12}
+adsl |>
+  group_by(TRT01P) |>
+  summarise(
+    mean_age = mean(AGE, na.rm = TRUE),
+    sd_age   = sd(AGE, na.rm = TRUE),
+    cv_age   = round(___ / ___ * 100, 1)
+  )
+```
+
+```{r cv-age-hint-1}
+# cv_age = round(sd_age / mean_age * 100, 1)
+```
+
+```{r cv-age-solution}
+adsl |>
+  group_by(TRT01P) |>
+  summarise(
+    mean_age = mean(AGE, na.rm = TRUE),
+    sd_age   = sd(AGE, na.rm = TRUE),
+    cv_age   = round(sd_age / mean_age * 100, 1)
+  )
+```
+
+---
+
+## Section 7 — Capstone: Complete Table 14.1.1-Style Demographics Table
+
+In a clinical study report, Table 14.1.1 is the baseline demographics and characteristics table. It typically includes age, sex, race, age group, BMI category, and weight, stratified by treatment arm with p-values and an overall column.
+
+### Capstone Exercise — Full demographics table
+
+Build a complete Table 14.1.1 for the CDISCPILOT01 safety population:
+
+- Variables: `AGE`, `SEX`, `RACE`, `AGEGR1`, `DIABFL`, `WEIGHTBL`
+- Labels: `AGE` → `"Age (years)"`, `WEIGHTBL` → `"Baseline Weight (kg)"`, `DIABFL` → `"Obese at Baseline (BMI >= 30)"`, `AGEGR1` → `"Age Group"`
+- Statistic: continuous → `"{mean} ({sd})"`, categorical → `"{n} ({p}%)"`
+- Chain: `add_p() |> add_overall() |> add_n() |> bold_labels() |> italicize_levels()`
+- After building the table, extract the p-value for AGE and store it in `age_p_val`
+
+```{r capstone, exercise=TRUE, exercise.lines=32}
+tbl_1411 <- tbl_summary(
+  data      = ___,
+  by        = "TRT01P",
+  include   = c("AGE", "SEX", "RACE", "AGEGR1", "DIABFL", "WEIGHTBL"),
+  statistic = list(
+    all_continuous  = ___,
+    all_categorical = ___
+  ),
+  label = list(
+    AGE      = ___,
+    WEIGHTBL = ___,
+    DIABFL   = ___,
+    AGEGR1   = ___
+  )
+) |>
+  ___() |>
+  ___() |>
+  ___() |>
+  ___() |>
+  ___()
+
+# Extract AGE p-value
+age_p_val <- tbl_1411$table_body |>
+  filter(variable == "AGE", row_type == "label") |>
+  pull(___)
+
+cat("AGE p-value:", age_p_val, "\n")
+tbl_1411
+```
+
+```{r capstone-hint-1}
+# data = adsl
+# statistic: "{mean} ({sd})" and "{n} ({p}%)"
+# Chain: add_p(), add_overall(), add_n(), bold_labels(), italicize_levels()
+# pull(p.value) to extract the AGE p-value
+```
+
+```{r capstone-solution}
+tbl_1411 <- tbl_summary(
+  data      = adsl,
+  by        = "TRT01P",
+  include   = c("AGE", "SEX", "RACE", "AGEGR1", "DIABFL", "WEIGHTBL"),
+  statistic = list(
+    all_continuous  = "{mean} ({sd})",
+    all_categorical = "{n} ({p}%)"
+  ),
+  label = list(
+    AGE      = "Age (years)",
+    WEIGHTBL = "Baseline Weight (kg)",
+    DIABFL   = "Obese at Baseline (BMI >= 30)",
+    AGEGR1   = "Age Group"
+  )
+) |>
+  add_p() |>
+  add_overall() |>
+  add_n() |>
+  bold_labels() |>
+  italicize_levels()
+
+# Extract AGE p-value
+age_p_val <- tbl_1411$table_body |>
+  filter(variable == "AGE", row_type == "label") |>
+  pull(p.value)
+
+cat("AGE p-value:", age_p_val, "\n")
+tbl_1411
+```
+
+---
+
+## Lesson Summary
+
+In this lesson you built clinical demographic tables using gtsummary's `tbl_summary()`:
+
+| Concept | Key function / argument |
+|---------|------------------------|
+| Stratified summary | `tbl_summary(data, by="TRT01P")` |
+| Variable subset | `include = c("AGE","SEX","RACE")` |
+| Custom stat format | `statistic = list(all_continuous="{median} [{p25}, {p75}]")` |
+| Display labels | `label = list(AGE = "Age (years)")` |
+| P-values | `add_p()` |
+| Overall column | `add_overall()` |
+| N per arm header | `add_n()` |
+| Bold / italic | `bold_labels()`, `italicize_levels()` |
+| Programmatic access | `as_tibble()`, `$table_body` |
+| Inline reporting | `inline_text()` |
+| Export to gt | `as_gt()` |
+
+**Key gotchas to remember:**
+
+> `by=` takes a **quoted string** (`"TRT01P"`), not a bare column name.
+
+> `as_tibble()` is the escape hatch for any downstream computation — always use it before trying to do arithmetic on table contents.
+
+> `add_p()` silently returns the object unchanged (with a message) if `by=` was not set. Always stratify first.
+
+**Next lesson:** Lesson 27 — gtsummary Part 2 — Regression tables with `tbl_regression()`, univariable screening with `tbl_uvregression()`, table merging and stacking, and building gtsummary tables directly from a cards ARD with `tbl_ard_summary()`.
