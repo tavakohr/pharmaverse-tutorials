@@ -23,13 +23,40 @@ code in the browser via Posit Connect, or locally in RStudio by clicking
 
 ## How to Run
 
+### First-time setup (after cloning)
+
+The repo is locked with **renv**. Run the bootstrap script **once** to install
+every required package (pharmaverse, admiral, learnr, teal, etc.). Windows /
+macOS users get pre-built binaries from the Posit Public Package Manager — no
+Rtools / Xcode required.
+
+```sh
+# from a terminal, in the project root
+Rscript setup.R
+```
+
+Or from an R session opened in the project folder:
+
 ```r
-# 1 — install learnr once
-install.packages("learnr")
+source("setup.R")
+```
 
-# 2a — open any .Rmd in RStudio and click "Run Document"
+The script:
 
-# 2b — or run from the console
+1. Checks you are on **R >= 4.4**.
+2. Points the session at P3M binaries.
+3. Installs/upgrades **renv**.
+4. Runs `renv::restore(prompt = FALSE)`.
+5. Falls back to direct `install.packages()` for the pharmaverse core if
+   `renv::restore()` cannot resolve a package.
+
+If `setup.R` reports missing packages, re-run it (transient network errors are
+common on first install) or install them manually with `install.packages()`.
+
+### Running a tutorial
+
+```r
+# open any .Rmd in RStudio and click "Run Document", or:
 rmarkdown::run("pharmaverse_tutorials/04_datastep_to_dplyr.Rmd")
 ```
 
