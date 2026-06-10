@@ -576,38 +576,123 @@ quiz(
 
 ### Concept
 
-**Split** a single column on a delimiter:
+Four small tools that each replace a different SAS pattern in ADaM / BDS work:
+
+| tidyr function | What it does | SAS analog |
+|---|---|---|
+| `separate_wider_delim()` | Split **one** column into **many** on a delimiter | `SCAN()` + multiple assignments in DATA step |
+| `unite()` | Glue **many** columns into **one** with a separator | `CATX()` / `CAT('-', y, m, d)` |
+| `complete()` | Insert **missing rows** for combinations that should exist | `PROC FREQ … /SPARSE` or merging against a `_NULL_` skeleton dataset |
+| `fill()` | Propagate the **last non-missing value** into NA rows | `RETAIN var;` + `IF NOT MISSING(var) THEN _var = var;` (LOCF) |
+
+`separate_wider_delim()` and `unite()` are mechanical and easy. The two that
+trip SAS users up are `complete()` and `fill()` — covered in detail below.
+
+---
+
+#### 4.1  `complete()` — the BDS "structural zero" problem
+
+In ADaM BDS (`adlb`, `advs`, `adeg`), a row exists only when a measurement was
+**actually recorded**. If subject `01-701-1015` skipped Week 8 for HGB, there
+is **no Week 8 row at all** for that subject and parameter.
+
+For TLG layouts, this is a bug: the table needs a cell for every
+**(subject × visit)** combination, even an empty one. SAS solves this with
+`PROC FREQ … /SPARSE` or by merging against a Cartesian skeleton. tidyr solves
+it with one call:
 
 ```r
-df |>
-  separate_wider_delim(TESTCD_CAT, delim = "_",
-                       names = c("LBTESTCD", "LBCAT"))
+adlb_hgb |>
+  filter(PARAMCD == "HGB") |>
+  complete(USUBJID, AVISIT)
 ```
 
-**Combine** multiple columns into one:
+That single line says: "find every distinct `USUBJID` and every distinct
+`AVISIT` in the data; make sure a row exists for every combination of the two;
+for any newly-inserted row, fill non-key columns with `NA`."
 
-```r
-df |>
-  unite("AESTDTC", c(YEAR, MONTH, DAY), sep = "-")
+**Before `complete()`** — subject is missing Week 8 entirely:
+
+```
+USUBJID      PARAMCD  AVISIT      AVAL  TRT01A
+01-701-1015  HGB      Baseline    14.2  Placebo
+01-701-1015  HGB      Week 2      14.0  Placebo
+01-701-1015  HGB      Week 4      14.1  Placebo
+                                                     ← no Week 8 row
+01-701-1015  HGB      Week 12     13.8  Placebo
 ```
 
-**Fill in structural gaps** — add rows for combinations that should exist but are missing:
+**After `complete(USUBJID, AVISIT)`** — Week 8 row is materialised with NAs:
 
-```r
-long_data |>
-  complete(USUBJID, AVISIT)   # ensures every subject × visit slot exists
+```
+USUBJID      PARAMCD  AVISIT      AVAL  TRT01A
+01-701-1015  HGB      Baseline    14.2  Placebo
+01-701-1015  HGB      Week 2      14.0  Placebo
+01-701-1015  HGB      Week 4      14.1  Placebo
+01-701-1015  HGB      Week 8      NA    NA       ← inserted by complete()
+01-701-1015  HGB      Week 12     13.8  Placebo
 ```
 
-**Forward-fill** (LOCF) or back-fill missing values:
+> **Why `TRT01A` is NA on the inserted row** — `complete()` only knows about
+> the columns you pass as keys (`USUBJID`, `AVISIT`). Every other column in
+> the inserted row defaults to `NA`. That is the entire reason `fill()` exists.
+
+---
+
+#### 4.2  `fill()` — LOCF / propagation of subject-level attributes
+
+After `complete()`, columns like `TRT01A` (constant per subject) are `NA` on
+every inserted row. In SAS you would write:
+
+```sas
+DATA adlb_fill;
+  SET adlb_complete;
+  BY USUBJID;
+  RETAIN _TRT01A;
+  IF NOT MISSING(TRT01A) THEN _TRT01A = TRT01A;
+  TRT01A = _TRT01A;
+  DROP _TRT01A;
+RUN;
+```
+
+tidyr collapses that to:
 
 ```r
-df |>
+adlb_complete |>
   group_by(USUBJID) |>
   fill(TRT01A, .direction = "downup") |>
   ungroup()
 ```
 
-All four arise constantly in SDTM derivation, BDS analysis, and TLG production.
+`fill()` walks each group and replaces `NA` with the **most recent non-NA**
+value above it (or below, depending on `.direction`). The grouping is
+critical — without `group_by(USUBJID)` the function leaks values from one
+subject into the next, just as a SAS `RETAIN` without a `BY` group would.
+
+**`.direction` options:**
+
+| value | behaviour | clinical use |
+|---|---|---|
+| `"down"` | NA replaced by the value **above** (default; classic LOCF) | propagate baseline assessment forward |
+| `"up"` | NA replaced by the value **below** | back-fill an early missing visit from a later one |
+| `"downup"` | Down first, then up for any leading NA gaps | safe default for subject-level constants (`TRT01A`, `SEX`) |
+| `"updown"` | Up first, then down | when later visits are more trustworthy than earlier |
+
+**Visual on a single subject's `TRT01A` after `complete()` inserts a Week 8 row:**
+
+```
+                       fill(TRT01A,                    fill(TRT01A,
+AVISIT      TRT01A      .direction="down")             .direction="downup")
+---------   ---------   --------------------           --------------------
+Baseline    Placebo     Placebo                        Placebo
+Week 2      Placebo     Placebo                        Placebo
+Week 4      Placebo     Placebo                        Placebo
+Week 8      NA          Placebo  ← carried down        Placebo
+Week 12     Placebo     Placebo                        Placebo
+```
+
+`complete()` + `fill()` together turn sparse BDS data into a rectangular
+analysis-ready grid — exactly what `tern`, `rtables`, and gtsummary expect.
 
 ### Exercise 4a — split TESTCD_CAT into test code and category
 
@@ -1250,15 +1335,73 @@ quiz(
 
 ### Concept
 
-A **factor** is R's categorical type — values stored as integers with a labels lookup,
-like a permanent SAS format. Two reasons factors matter in clinical work:
+A **factor** is R's categorical type. Internally it is an integer vector with a
+**levels** attribute — a lookup table from integer to label. That is exactly
+what a SAS user-defined format does: PROC FORMAT defines the labels, and
+`ORDER=FORMATTED` controls display order in PROC FREQ / PROC REPORT.
 
-1. **Column/row order in TLGs** — without a factor, `"High Dose"`, `"Low Dose"`,
-   `"Placebo"` sort alphabetically. As a factor with explicit levels, you control the order.
-2. **Model reference categories** — the first factor level is the reference in regression.
+```r
+fct(c("Placebo", "Xanomeline Low Dose", "Xanomeline High Dose"),
+    levels = c("Placebo", "Xanomeline Low Dose", "Xanomeline High Dose"))
+#> [1] Placebo              Xanomeline Low Dose  Xanomeline High Dose
+#> Levels: Placebo Xanomeline Low Dose Xanomeline High Dose
+```
 
-**The rule:** Keep columns as **character** in ADaM datasets (XPT doesn't have factors).
-Convert to **factor with explicit levels** immediately before building a TLG or model.
+#### Why it matters in TLGs
+
+`adsl$TRT01A` is a character column. If you build a frequency table from it,
+**R sorts alphabetically by default** — that is the wrong order clinically:
+
+```
+                            character sort                 factor with explicit levels
+                            (default R / SAS               (clinical order — what the
+                            ORDER=INTERNAL)                regulator expects)
+USUBJID  TRT01A             TRT01A          n              TRT01A               n
+─────────────────────       ───────────────────            ──────────────────────
+A  Placebo                  Placebo          86            Placebo               86
+B  Xanomeline High Dose     Xanomeline High  84            Xanomeline Low Dose   84
+C  Xanomeline Low Dose      Xanomeline Low   84            Xanomeline High Dose  84
+                            ▲ alphabetical                 ▲ regulator-friendly
+```
+
+Without converting `TRT01A` to a factor with explicit `levels`, every TLG
+column will land in the wrong order — `High Dose` will appear **before**
+`Low Dose`, just as `PROC FREQ` with `ORDER=INTERNAL` sorts them.
+
+The other reason: **regression reference category**. The first factor level is
+the baseline group in any `lm()` / `glm()` / `coxph()` model. If you fit a
+logistic regression of AE risk against treatment with the default character
+encoding, R will pick `"Placebo"` alphabetically (often what you want —
+lucky), but for `AESEV` (`"MILD"`, `"MODERATE"`, `"SEVERE"`), R picks
+`"MILD"` alphabetically, which **is** the clinical reference — also lucky.
+**Do not rely on luck.** Set the factor levels explicitly.
+
+#### The 6 forcats functions you will actually use
+
+| function | task | clinical example |
+|---|---|---|
+| `fct(x, levels = ...)` | Build a factor with **exact** level order | order `TRT01A` Placebo → Low → High before a TLG |
+| `fct_recode()` | Rename levels (display labels) | `"Xanomeline High Dose"` → `"High Dose"` for narrow columns |
+| `fct_collapse()` | Merge several levels into one | combine `"Xanomeline Low Dose"` + `"Xanomeline High Dose"` into `"Active"` |
+| `fct_lump_n(n = 5)` | Keep the top N levels, lump the rest into `"Other"` | top-5 AE body systems table |
+| `fct_infreq()` | Reorder levels by frequency, most common first | AE preferred-term listing sorted by occurrence |
+| `fct_relevel()` | Move specific levels to specific positions | force `"Placebo"` to be the reference in a regression |
+
+#### Where factors live in the pharmaverse workflow
+
+```
+              ADaM .xpt              factor conversion              TLG layer
+              (character)            (right before display)         (tern, gtsummary,
+                                                                     rtables, gt)
+adsl$TRT01A   "Placebo"        ──▶   fct(TRT01A, levels = c(    ──▶ column header
+              "Xanomeline...."         "Placebo",                    in correct order
+                                       "Xanomeline Low Dose",
+                                       "Xanomeline High Dose"))
+```
+
+**The rule:** Keep ADaM columns as **character** (XPT has no factor type).
+Convert to a factor with **explicit `levels`** immediately before building a
+TLG, model, or plot — never earlier, never in the ADaM derivation step.
 
 ### Exercise 7a — ordered treatment levels with fct()
 
