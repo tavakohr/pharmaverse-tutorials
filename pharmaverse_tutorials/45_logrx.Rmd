@@ -1,10 +1,11 @@
 ---
 title: "Lesson 45 — logrx: Automated R Session Logging"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Master logrx for producing audit-ready logs from R analysis scripts.

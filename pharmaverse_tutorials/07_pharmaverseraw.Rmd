@@ -1,11 +1,12 @@
 ---
 title: "Lesson 07 — {pharmaverseraw}: Test EDC Data for Pharmaverse Examples"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
     ace_theme: tomorrow
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Understand where pharmaverseraw sits in the data pipeline (raw → SDTM → ADaM).

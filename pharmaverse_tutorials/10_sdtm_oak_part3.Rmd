@@ -1,9 +1,11 @@
 ---
 title: "Lesson 10 — sdtm.oak Part 3: SUPP-- Domains and RELREC"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Build SUPP-- (Supplemental Qualifier) datasets, understand RELREC structure,

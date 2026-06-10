@@ -1,10 +1,11 @@
 ---
 title: "Lesson 32 — Complete TLF Pipeline Capstone: cards → tfrmt → gt → RTF"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 ---
 

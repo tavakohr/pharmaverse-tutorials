@@ -1,10 +1,11 @@
 ---
 title: "Lesson 04 — R Primer for SAS Programmers, Part 2: The DATA Step in dplyr"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Comprehensive translation of SAS DATA step patterns into dplyr: filter, select,

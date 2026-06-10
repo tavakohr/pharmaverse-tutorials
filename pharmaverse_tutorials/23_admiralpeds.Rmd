@@ -1,10 +1,11 @@
 ---
 title: "Lesson 23 — admiral Paediatric Extension (admiralpeds): Growth, Age & Weight-Based Dosing"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Paediatric ADaM derivations using the admiralpeds package: precise age

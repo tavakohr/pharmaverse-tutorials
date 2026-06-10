@@ -1,9 +1,11 @@
 ---
 title: "Lesson 18 — admiral Part 5: Time-to-Event ADaMs (ADTTE)"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
 ---
 
@@ -224,11 +226,179 @@ adsl_real <- pharmaverseadam::adsl
 
 ## Welcome
 
-This lesson covers **ADTTE — Time-to-Event analysis datasets**. You'll learn admiral's declarative `event_source()` / `censor_source()` design and use `derive_param_tte()` to build Overall Survival, Progression-Free Survival, and safety TTE parameters.
+This lesson covers **ADTTE — Time-to-Event analysis datasets**. You'll learn admiral's declarative `event_source()` / `censor_source()` design and use `derive_param_tte()` to build Overall Survival (OS), Progression-Free Survival (PFS), and safety TTE parameters.
+
+**Why ADTTE deserves its own lesson.** ADTTE is not a generic BDS-style analysis dataset. It has a peculiar shape (one row per subject per endpoint), a peculiar arithmetic (`AVAL = ADT - STARTDT + 1`), and a peculiar censoring convention (`CNSR = 0` is the event, `CNSR = 1` is the censor — which is the *opposite* of how some SAS programmers code their own censor flags). The downstream analysis — `PROC LIFETEST`, `PROC PHREG`, Kaplan-Meier curves, Cox proportional hazards models — is among the most consequential in any oncology, cardiovascular, or chronic-disease submission. A misclassified censor or a wrong `STARTDT` quietly distorts the survival curve, and the bug surfaces only when the statistician asks why the median survival looks wrong.
+
+**SAS programmer's translation guide.** In SAS, you typically built a `PROC LIFETEST`-ready dataset in a single DATA step packed with `IF/ELSE` branches: "if DTHDT is not missing then EVENT=1 and TIME = DTHDT - TRTSDT + 1; else EVENT=0 and TIME = LSTALVDT - TRTSDT + 1". admiral inverts this: you declare *each candidate event* and *each candidate censor* as a tiny named object (`event_source()`, `censor_source()`), pass them to a derivation engine, and the engine picks the right row. This separation makes the analysis specification reviewable: a statistician can read the four `event_source()` definitions and immediately verify which rules will fire.
+
+**What you will build.** By the end of this lesson you will:
+
+- Recognize the ADTTE row layout and the meaning of `STARTDT`, `ADT`, `AVAL`, `CNSR`, `EVNTDESC`, `SRCDOM`, `SRCVAR`
+- Build an OS parameter from death events and last-known-alive censors
+- Build a PFS parameter as a composite of progression OR death
+- Build a TTAESER parameter for time to first serious adverse event
+- Use `call_derivation()` to build multiple TTE parameters in a single DRY block
+- Convert `AVAL` between days, months, and years for analysis vs display
+- Run validation diagnostics that match the SAS `PROC LIFETEST` inputs your statistician expects
 
 ---
 
 ## 1 — The ADTTE shape
+
+### 1.1 What "time-to-event" means (clinical)
+
+A **time-to-event endpoint** measures the *duration* from some clinical starting point until the *first occurrence* of a defined event. The two most common endpoints in oncology are:
+
+- **Overall Survival (OS)** — start = randomization or first dose; event = death from any cause
+- **Progression-Free Survival (PFS)** — start = randomization; event = first of (disease progression, death)
+
+In cardiovascular trials you measure **MACE** (Major Adverse Cardiac Events: first of MI, stroke, CV death). In safety analyses you measure **time to first SAE**. The structural pattern is always the same: a (start, end, event-or-censor) triple per subject per endpoint.
+
+**Right-censoring** is the most important concept. A subject who is *alive and event-free* at the database lock contributes information: "we know they were event-free up to date X". That date X is the **censoring time**. The subject is *right-censored* because the event (if it ever occurs) happens to the right of X on the time axis. Survival analysis methods (`PROC LIFETEST`, `PROC PHREG`) explicitly account for censored observations — they do not just drop them.
+
+> **SAS analog mental model.** This is the same data you used to feed into `PROC LIFETEST` with the syntax `TIME AVAL*CNSR(1);` — where `AVAL` is the duration and `CNSR(1)` declares "1 means censored". admiral builds exactly that input dataset for you.
+
+### 1.2 The (PARAMCD, AVAL, CNSR) triple as the analytical key
+
+Every row of ADTTE is uniquely identified by **`USUBJID + PARAMCD`**. The analytical payload of that row is the **(`AVAL`, `CNSR`)** pair:
+
+- `AVAL` — duration in days from `STARTDT` to `ADT`, plus 1
+- `CNSR` — `0` if `ADT` is an event date, `1` (or `2`, `3`, ...) if `ADT` is a censoring date
+
+`PARAMCD` distinguishes the endpoint: `"OS"`, `"PFS"`, `"TTAESER"`, `"MACE"`, etc. A subject typically has *multiple rows* — one per endpoint they are eligible for. This is the same structure as BDS (one row per parameter) but with each row representing the *single* qualifying event or censoring (not a longitudinal series).
+
+### 1.3 STARTDT vs ADT
+
+Two date columns govern the duration:
+
+- **`STARTDT`** — the **start of the risk period**. Pulled from ADSL (`RANDDT` for PFS, `TRTSDT` for OS-from-treatment, etc.)
+- **`ADT`** — the **analysis date**. Either the event date (death, progression, first SAE) or the censoring date (last alive, last assessment, end of study)
+
+The duration `ADT - STARTDT + 1` is `AVAL` (days). The `+ 1` is the CDISC ADaM IG convention that `STARTDT` is **Day 1**, not Day 0 — so an event on the same calendar day as `STARTDT` has `AVAL = 1`, never `AVAL = 0`.
+
+> **SAS analog mental model.** `STARTDT` is what you used to write as `STARTDT = COALESCE(RANDDT, TRTSDT);` at the top of your TTE DATA step. `ADT` is the `EVENT_DT` or `CENSOR_DT` you'd assign in the IF/ELSE branches.
+
+### 1.4 Why ADTTE is "wide-with-PARAMCD" (one row per subject per endpoint)
+
+ADTTE behaves like a BDS dataset (`PARAMCD` is the unit of analysis), but with a critical difference: each row is a **terminal** observation. There is no longitudinal series — just one row per subject per endpoint. The `PARAMCD` discriminates which TTE the row contributes to:
+
+```
+USUBJID    PARAMCD   STARTDT     ADT         AVAL   CNSR   EVNTDESC
+01-001     OS        2023-04-15  2024-03-10  331    0      DEATH
+01-001     PFS       2023-04-08  2023-09-22  168    0      DISEASE PROGRESSION
+01-001     TTAESER   2023-04-15  2023-05-30  46     0      FIRST SERIOUS AE
+01-002     OS        2023-05-01  2025-01-10  620    1      LAST DATE KNOWN ALIVE
+01-002     PFS       2023-04-24  2024-12-15  601    1      LAST TUMOR ASSESSMENT
+01-002     TTAESER   2023-05-01  2025-01-10  620    1      END OF STUDY
+```
+
+Each (subject, endpoint) pair lives on exactly one row. The downstream `PROC LIFETEST` selects rows with `WHERE PARAMCD = "OS";` and runs the survival analysis on that subset.
+
+### 1.5 Comparison with ADaM BDS
+
+| Feature | BDS (ADLB, ADVS) | ADTTE |
+|---|---|---|
+| Row granularity | Subject × Parameter × Visit | Subject × Parameter (terminal) |
+| Multiple rows per subject? | Yes (longitudinal) | Yes (one per endpoint) |
+| `AVAL` semantics | Measurement value | Duration in days |
+| Censoring | N/A | `CNSR` column required |
+| Primary use | Shift tables, change from baseline | Kaplan-Meier, Cox regression |
+
+### 1.6 The censoring convention (CNSR = 0 event, CNSR = 1 censor)
+
+This is the single most error-prone convention in ADTTE. CDISC ADaM IG mandates:
+
+- **`CNSR = 0`** — the row represents an **event** (death, progression, first SAE, ...)
+- **`CNSR = 1`** — the row represents a **censoring** (last known alive, last assessment, end of study, ...)
+- **`CNSR = 2, 3, ...`** — optional secondary censor codes for tracking *which* censoring rule fired
+
+> **WARNING for SAS programmers.** Many homegrown SAS programs use `EVENT = 1` and `CENSOR = 0` (i.e., `1 = event` is intuitive). CDISC ADaM ADTTE is the **inverse**. Always read the `PROC LIFETEST` syntax carefully — `TIME AVAL*CNSR(1);` literally says "the values of CNSR that mean censored are listed in parentheses". For ADTTE that is `CNSR(1)`. If you flip the convention, your survival curve is computed from censoring times rather than event times — a catastrophic, often-undetected error.
+
+### 1.7 SAS PROC LIFETEST input dataset structure
+
+The output of admiral's `derive_param_tte()` is *exactly* the dataset shape that `PROC LIFETEST` expects as input:
+
+```sas
+/* The PROC LIFETEST call your statistician will run on ADTTE */
+proc lifetest data=adtte(where=(paramcd="OS")) method=km plots=(survival);
+  time aval*cnsr(1);   /* CNSR=1 declares censored */
+  strata trt01a;
+run;
+
+/* PROC PHREG uses the same dataset */
+proc phreg data=adtte(where=(paramcd="OS"));
+  class trt01a(ref="Placebo");
+  model aval*cnsr(1) = trt01a age sex;   /* Cox proportional hazards */
+run;
+```
+
+**Key insight:** the entire purpose of `derive_param_tte()` is to produce a dataset that drops straight into these two PROC calls without further processing. Your validation question is always *"Does my AVAL match the survival curve the statistician will produce?"*
+
+### 1.8 The end-to-end picture (SAS vs admiral)
+
+| ADTTE concept | What it represents | Closest SAS analog | SAS code sketch |
+|---|---|---|---|
+| `event_source()` | A row that, if found, becomes the event | `IF DTHDT NE . THEN DO; EVENT=1; ADT=DTHDT; END;` | A branch of an `IF/ELSE` chain emitting `EVENT=1` |
+| `censor_source()` | A row that, if found, becomes the censor | `ELSE DO; EVENT=0; ADT=LSTALVDT; END;` | The `ELSE` branch emitting `EVENT=0` |
+| `start_date` | Anchor for the duration calculation | `STARTDT = COALESCE(RANDDT, TRTSDT);` | A `COALESCE()` of candidate start dates |
+| `derive_param_tte()` | Picks earliest event or latest censor; computes AVAL | One DATA step that iterates candidates and emits the winner | `RETAIN` + `MIN()` logic per subject |
+| `call_derivation()` | DRY: build many PARAMCDs in one call | `%MACRO` looping over a PARAMCD list | `%DO i=1 %TO &n;` macro loop |
+| `AVAL = ADT - STARTDT + 1` | Days on study (Day 1 = STARTDT) | `AVAL = ADT - STARTDT + 1;` | Same arithmetic — `+1` is mandatory |
+| `CNSR(1)` for `PROC LIFETEST` | Censor flag interpretation | `TIME AVAL*CNSR(1);` | Same — admiral preserves the convention |
+
+### 1.9 ASCII picture — ADTTE row layout
+
+```
+                            ── ADTTE ROW LAYOUT ──
+
+   STARTDT             ADT                                  AVAL = ADT - STARTDT + 1
+   │                   │
+   ▼                   ▼
+   ●━━━━━━━━━━━━━━━━━━━●                                    CNSR = 0 (event)    PFS endpoint
+   start of follow-up  ↑ disease progression date
+
+   ●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━●   CNSR = 1 (censor)   OS endpoint
+   start of follow-up                                   ↑ last known alive (no death observed)
+
+   ●━━━━━━●                                                  CNSR = 0 (event)    TTAESER endpoint
+   start   ↑ first serious AE date
+```
+
+### 1.10 SAS DATA step versus admiral side-by-side
+
+```
+─────────────────  THE SAS WAY  ─────────────────       ─────────────────  THE admiral WAY  ─────────────────
+
+data adtte_os;                                           death_event <- event_source(
+  set adsl;                                                dataset_name = "adsl",
+  startdt = trtsdt;                                        filter       = !is.na(DTHDT),
+  if dthdt ne . then do;       /* event */                  date         = DTHDT,
+    adt = dthdt;                                           set_values_to = exprs(EVNTDESC = "DEATH")
+    cnsr = 0;                                            )
+    evntdesc = "DEATH";
+  end;                                                   alive_censor <- censor_source(
+  else do;                     /* censor */                dataset_name = "adsl",
+    adt = lstalvdt;                                        date         = LSTALVDT,
+    cnsr = 1;                                              set_values_to = exprs(EVNTDESC = "LAST KNOWN ALIVE")
+    evntdesc = "LAST KNOWN ALIVE";                       )
+  end;
+  aval = adt - startdt + 1;                              derive_param_tte(
+  paramcd = "OS";                                          dataset_adsl      = adsl,
+  param   = "Overall Survival";                            start_date        = TRTSDT,
+run;                                                       event_conditions  = list(death_event),
+                                                           censor_conditions = list(alive_censor),
+                                                           source_datasets   = list(adsl = adsl),
+                                                           set_values_to     = exprs(
+                                                             PARAMCD = "OS",
+                                                             PARAM   = "Overall Survival"
+                                                           )
+                                                         )
+```
+
+> **SAS analog mental model.** The SAS DATA step *mixes* the event/censor business logic with the loop over subjects. admiral *separates* them: the event/censor rules become small, reviewable, named objects, and `derive_param_tte()` is the engine that loops. The result is more code lines but vastly less ambiguity.
+
+### 1.11 Inspect the toy data
 
 ```{r adtte-shape-demo}
 # One row per (subject × parameter)
@@ -237,6 +407,47 @@ adsl_tte |>
   select(USUBJID, TRTSDT, DTHDT, LSTALVDT, DTHFL) |>
   arrange(USUBJID)
 ```
+
+> **Read the output.** Five subjects. Three are alive (`DTHFL = "N"`, `DTHDT = NA`) — they will become OS rows with `CNSR = 1` and `ADT = LSTALVDT`. Two died (`DTHFL = "Y"`, `DTHDT` populated) — they will become OS rows with `CNSR = 0` and `ADT = DTHDT`. Note that for the dead subjects, `LSTALVDT = DTHDT`: by convention the last known alive date for a deceased subject is their death date.
+
+### 1.12 Exercise: predict the ADTTE row shape
+
+```{r adtte-predict-ex, exercise=TRUE, exercise.lines=14}
+# Without running derive_param_tte yet, predict by hand:
+# For each subject, what should (PARAMCD=OS) ADT and CNSR be?
+#
+# Fill in the expected_cnsr and expected_adt columns.
+# Hint: if DTHDT is missing, CNSR = 1 and ADT = LSTALVDT.
+#       Otherwise CNSR = 0 and ADT = DTHDT.
+
+adsl_tte |>
+  mutate(
+    expected_cnsr = if_else(is.na(DTHDT), ___, ___),
+    expected_adt  = if_else(is.na(DTHDT), ___, ___)
+  ) |>
+  select(USUBJID, DTHDT, LSTALVDT, expected_cnsr, expected_adt)
+```
+
+```{r adtte-predict-ex-hint-1}
+# expected_cnsr = if_else(is.na(DTHDT), 1, 0)
+# CNSR = 1 when censored (no death); CNSR = 0 when event (death observed)
+```
+
+```{r adtte-predict-ex-hint-2}
+# expected_adt = if_else(is.na(DTHDT), LSTALVDT, DTHDT)
+# When there is no death, the last known alive date is the censoring date
+```
+
+```{r adtte-predict-ex-solution}
+adsl_tte |>
+  mutate(
+    expected_cnsr = if_else(is.na(DTHDT), 1, 0),
+    expected_adt  = if_else(is.na(DTHDT), LSTALVDT, DTHDT)
+  ) |>
+  select(USUBJID, DTHDT, LSTALVDT, expected_cnsr, expected_adt)
+```
+
+### 1.13 Quiz — ADTTE shape
 
 ```{r quiz-adtte-shape, echo=FALSE}
 quiz(
@@ -255,6 +466,30 @@ quiz(
     answer("CNSR × 100"),
     answer("A numeric version of PARAMCD"),
     allow_retry = TRUE
+  ),
+  question(
+    "Why does CDISC ADaM IG mandate `AVAL = ADT - STARTDT + 1` rather than just `ADT - STARTDT`?",
+    answer("Because the +1 converts to months"),
+    answer("Because STARTDT is defined as Day 1 (not Day 0) — an event on the same calendar day as STARTDT must have AVAL = 1, not 0", correct = TRUE),
+    answer("Because SAS adds 1 by default"),
+    answer("It is a historical typo that was never fixed"),
+    allow_retry = TRUE
+  ),
+  question(
+    "ADTTE has one row per:",
+    answer("Subject × Visit"),
+    answer("Subject × PARAMCD (endpoint)", correct = TRUE),
+    answer("Subject × AETERM"),
+    answer("Subject only — PARAMCD is in a separate dataset"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which SAS PROC will most commonly consume ADTTE as input?",
+    answer("PROC SORT"),
+    answer("PROC TABULATE"),
+    answer("PROC LIFETEST (and PROC PHREG)", correct = TRUE),
+    answer("PROC SUMMARY"),
+    allow_retry = TRUE
   )
 )
 ```
@@ -262,6 +497,156 @@ quiz(
 ---
 
 ## 2 — event_source() and censor_source()
+
+### 2.1 The source-pattern: data + filter + date + label
+
+The core admiral idea for TTE is that you do **not** code the IF/ELSE chain directly. Instead you declare, one at a time, the *candidate rows* that could become the analysis row. Each declaration is a small named object built from four pieces:
+
+1. **`dataset_name`** — which input dataset has the candidate row? (ADAE, ADRS, ADSL, ADTR, ...)
+2. **`filter`** — which rows in that dataset are candidates? (`AESER == "Y" & TRTEMFL == "Y"`)
+3. **`date`** — which column of that filtered dataset gives the candidate date? (`ASTDT`, `DTHDT`, `LSTALVDT`, ...)
+4. **`set_values_to`** — what label/metadata should the resulting ADTTE row carry? (`EVNTDESC`, `SRCDOM`, `SRCVAR`)
+
+Two flavors of this object exist: `event_source()` (the candidate is an *event*) and `censor_source()` (the candidate is a *censor*). They are nearly identical — the only difference is the implicit `censor` flag (`0` for events, `1+` for censors).
+
+### 2.2 event_source — a row that becomes an event
+
+```
+                         ── event_source() ──
+
+                            ┌──────────────────┐
+                            │   filter rows    │   AESER == "Y" & TRTEMFL == "Y"
+   ADAE  ────────────►      │   from dataset   │   ───────────────────────────────►   candidate event rows
+                            └──────────────────┘
+                                     │
+                                     ▼
+                            ┌──────────────────┐
+                            │   extract date   │   date = ASTDT
+                            └──────────────────┘
+                                     │
+                                     ▼
+                            ┌──────────────────┐
+                            │   tag metadata   │   EVNTDESC = "FIRST SERIOUS AE"
+                            │  (set_values_to) │   SRCDOM   = "ADAE"
+                            └──────────────────┘
+                                     │
+                                     ▼
+                          { CNSR = 0, ADT = ASTDT, ... }
+```
+
+If no row in `adae` passes the filter for a subject, this `event_source` contributes nothing for that subject — the next event source (or a censor source) gets to try.
+
+### 2.3 censor_source — a row that becomes a censoring
+
+```
+                         ── censor_source() ──
+
+                            ┌──────────────────┐
+                            │   filter rows    │   (no filter — use all ADSL rows)
+   ADSL  ────────────►      │   from dataset   │   ───────────────────────────────►   candidate censor rows
+                            └──────────────────┘
+                                     │
+                                     ▼
+                            ┌──────────────────┐
+                            │   extract date   │   date = LSTALVDT
+                            └──────────────────┘
+                                     │
+                                     ▼
+                            ┌──────────────────┐
+                            │   tag metadata   │   EVNTDESC = "LAST KNOWN ALIVE"
+                            │  (set_values_to) │   SRCDOM   = "ADSL"
+                            └──────────────────┘
+                                     │
+                                     ▼
+                          { CNSR = 1, ADT = LSTALVDT, ... }
+```
+
+### 2.4 Event-vs-censor priority
+
+`derive_param_tte()` enforces a simple but powerful rule:
+
+1. Look at *all* event sources. If *any* row qualifies for the subject, the **earliest** event date wins. `CNSR = 0`.
+2. If no event source produces a row, look at *all* censor sources. The **latest** censor date wins. `CNSR` = the censor code of the source that produced it (usually `1`).
+
+The asymmetry — earliest event vs latest censor — is biologically correct: the *first* event is what triggers analysis; the *most recent* evidence of being event-free is the best censor information.
+
+### 2.5 Anatomy of `event_source()`
+
+```r
+death_event <- event_source(
+  dataset_name  = "adsl",                # which dataset
+  filter        = !is.na(DTHDT),         # which rows qualify
+  date          = DTHDT,                 # which date column
+  set_values_to = exprs(                 # row metadata
+    EVNTDESC = "DEATH",
+    SRCDOM   = "ADSL",
+    SRCVAR   = "DTHDT"
+  )
+)
+```
+
+| Argument | Type | What it does | SAS analog |
+|---|---|---|---|
+| `dataset_name` | character | Names a dataset in `source_datasets` | `set adsl;` |
+| `filter` | unevaluated expression | Subsets to candidate rows | `where DTHDT ne .;` |
+| `date` | bare column name | Column whose value becomes `ADT` | `adt = dthdt;` |
+| `set_values_to` | `exprs(...)` list | Columns added to the output row | `evntdesc = "DEATH";` |
+
+> **SAS analog mental model.** Think of `event_source()` as a single branch of a giant `SELECT/WHEN` block: "*WHEN this row pattern matches, emit a candidate event row with this date and these labels.*" The `IF DTHDT NE . THEN OUTPUT EVENTS;` pattern in SAS becomes a small reusable object in R.
+
+### 2.6 Anatomy of `censor_source()`
+
+```r
+last_alive_censor <- censor_source(
+  dataset_name  = "adsl",
+  filter        = NULL,                  # (optional — no filter = all rows)
+  date          = LSTALVDT,
+  set_values_to = exprs(
+    EVNTDESC = "LAST DATE KNOWN ALIVE",
+    SRCDOM   = "ADSL",
+    SRCVAR   = "LSTALVDT"
+  ),
+  censor        = 1                      # (default 1 — secondary censors can be 2, 3, ...)
+)
+```
+
+The only extra argument is `censor`, an integer that becomes `CNSR` in the output. Use `1` for the standard "censored, no event observed" — use `2` or higher when the SAP distinguishes *which* censoring rule fired (e.g., "censored at randomization due to no post-baseline assessment" might be `CNSR = 2`).
+
+### 2.7 SAS equivalent: explicit IF/ELSE in a DATA step
+
+The pattern below is the canonical SAS-only PFS prep — note how every business rule is interleaved with `OUTPUT` statements:
+
+```sas
+data candidates;
+  set adsl;
+  /* candidate 1: death event */
+  if dthdt ne . then do;
+    adt = dthdt; cnsr = 0; evntdesc = "DEATH"; srcdom = "ADSL"; srcvar = "DTHDT";
+    output;
+  end;
+  /* candidate 2: last known alive censor */
+  if lstalvdt ne . then do;
+    adt = lstalvdt; cnsr = 1; evntdesc = "LAST KNOWN ALIVE"; srcdom = "ADSL"; srcvar = "LSTALVDT";
+    output;
+  end;
+run;
+
+proc sort data=candidates; by usubjid cnsr adt; run;
+
+/* Earliest event wins (sort by cnsr asc, adt asc and take first.usubjid) */
+data adtte_os;
+  set candidates;
+  by usubjid;
+  if first.usubjid;
+  startdt = trtsdt;
+  aval = adt - startdt + 1;
+  paramcd = "OS"; param = "Overall Survival";
+run;
+```
+
+The admiral equivalent (next section) collapses all of this into one `derive_param_tte()` call.
+
+### 2.8 Build and inspect the source objects
 
 ```{r source-objects-demo}
 # Define event: death
@@ -291,6 +676,56 @@ last_alive_censor <- censor_source(
 str(death_event)
 ```
 
+> **Read the output.** `str(death_event)` shows a six-element list: `type = "event"`, `dataset_name = "adsl"`, an unevaluated `filter` expression (deferred until the derivation runs), the `date` symbol, the `set_values_to` list of label expressions, and `censor = 0`. None of the source datasets have been touched yet — this object is a *recipe*, not data. The data plumbing happens later in `derive_param_tte()`.
+
+### 2.9 Build a second event_source and inspect the contrast
+
+```{r source-objects-contrast, exercise=TRUE, exercise.lines=18}
+# Build a censor source for end-of-study and inspect the difference
+eos_censor <- censor_source(
+  dataset_name  = "adsl",
+  date          = EOSDT,
+  set_values_to = exprs(EVNTDESC = "END OF STUDY", SRCDOM = "ADSL", SRCVAR = "EOSDT")
+)
+
+cat("--- death_event ---\n")
+cat("type:        ", death_event$type, "\n")
+cat("censor flag: ", death_event$censor, "\n\n")
+
+cat("--- eos_censor ---\n")
+cat("type:        ", ___, "\n")
+cat("censor flag: ", ___, "\n")
+```
+
+```{r source-objects-contrast-hint-1}
+# eos_censor is a list; access fields the same way as death_event
+# eos_censor$type   should be "censor"
+# eos_censor$censor should be 1
+```
+
+```{r source-objects-contrast-hint-2}
+# cat("type:        ", eos_censor$type,   "\n")
+# cat("censor flag: ", eos_censor$censor, "\n")
+```
+
+```{r source-objects-contrast-solution}
+eos_censor <- censor_source(
+  dataset_name  = "adsl",
+  date          = EOSDT,
+  set_values_to = exprs(EVNTDESC = "END OF STUDY", SRCDOM = "ADSL", SRCVAR = "EOSDT")
+)
+
+cat("--- death_event ---\n")
+cat("type:        ", death_event$type, "\n")
+cat("censor flag: ", death_event$censor, "\n\n")
+
+cat("--- eos_censor ---\n")
+cat("type:        ", eos_censor$type, "\n")
+cat("censor flag: ", eos_censor$censor, "\n")
+```
+
+### 2.10 Quiz — source objects
+
 ```{r quiz-source-objects, echo=FALSE}
 quiz(
   question(
@@ -308,6 +743,22 @@ quiz(
     answer("censor_source() uses a different date variable"),
     answer("They are identical — only the name differs"),
     allow_retry = TRUE
+  ),
+  question(
+    "If two event_source objects fire for the same subject (e.g., death AND progression both occurred), which wins?",
+    answer("The one listed first in event_conditions"),
+    answer("Death always wins"),
+    answer("The earlier candidate date wins — the first event to occur drives AVAL", correct = TRUE),
+    answer("Both are kept as two rows"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Why is `filter` stored as an unevaluated expression rather than a logical vector?",
+    answer("Because R requires it"),
+    answer("Because the source object is a recipe — the filter is applied later inside derive_param_tte when the actual dataset is in scope (deferred evaluation)", correct = TRUE),
+    answer("So that the filter can be modified after the object is built"),
+    answer("For performance reasons only"),
+    allow_retry = TRUE
   )
 )
 ```
@@ -315,6 +766,112 @@ quiz(
 ---
 
 ## 3 — Overall Survival with derive_param_tte()
+
+### 3.1 What Overall Survival means (clinical)
+
+**Overall Survival (OS)** is the gold-standard efficacy endpoint in oncology. It measures the time from a clinical anchor (randomization or first dose) until **death from any cause**. There is no ambiguity: any death counts, regardless of attribution. This is why OS is preferred by regulators — it cannot be confounded by adjudication bias or subjective response assessments.
+
+A subject is **censored** for OS if, at database lock, they are *known to be alive* on some date (the last contact with the site). The censoring date is the most recent date for which we have evidence the subject was alive — typically `LSTALVDT` in ADSL.
+
+### 3.2 OS start date: TRTSDT or RANDDT — pick wisely
+
+The Statistical Analysis Plan (SAP) tells you which clock to start. Two common conventions:
+
+- **Randomization-based OS** — `STARTDT = RANDDT`. Captures the entire risk period after randomization, including pre-treatment delays. Required for ITT analyses.
+- **Treatment-based OS** — `STARTDT = TRTSDT`. Excludes pre-treatment time. Used for safety-population OS or for studies where treatment start is the relevant clinical anchor.
+
+> **Common mistake.** If RANDDT is the SAP-specified clock but you use TRTSDT, you systematically *under-state* AVAL for any subject with a dose-delay. P21 will flag this (see Section 7.5 Diagnostic 1).
+
+### 3.3 OS event: death
+
+`event_source(dataset_name = "adsl", filter = !is.na(DTHDT), date = DTHDT, ...)`. Simple and unambiguous.
+
+### 3.4 OS censor: last known alive date
+
+`censor_source(dataset_name = "adsl", date = LSTALVDT, ...)`. By CDISC convention, for a deceased subject `LSTALVDT = DTHDT`, but the event source still wins because events take priority over censors.
+
+### 3.5 The "death wins over alive" priority
+
+For any subject with both a death event and a last-alive date populated, `derive_param_tte()` picks the **event** (because events always take priority over censors). The last-alive censor is *ignored* when an event exists.
+
+### 3.6 Building OS step by step
+
+The mental model:
+
+```
+   For each subject in dataset_adsl:
+   ┌──────────────────────────────────────────────────┐
+   │  1. Try each event_source. Collect candidates.   │
+   │  2. If any candidates exist, pick earliest ADT.  │
+   │     CNSR = 0. Done.                              │
+   │  3. Else try each censor_source. Pick latest ADT.│
+   │     CNSR = censor flag of the winning source.    │
+   │  4. AVAL = ADT - STARTDT + 1.                    │
+   │  5. Attach EVNTDESC, SRCDOM, SRCVAR labels.      │
+   │  6. Emit one row with PARAMCD, PARAM, ...        │
+   └──────────────────────────────────────────────────┘
+```
+
+### 3.7 Anatomy of `derive_param_tte()` for OS
+
+```r
+derive_param_tte(
+  dataset_adsl      = adsl_tte,                 # population frame: one row per subject
+  start_date        = TRTSDT,                   # the STARTDT column to pull from ADSL
+  event_conditions  = list(death_event),        # list of event_source objects
+  censor_conditions = list(last_alive_censor),  # list of censor_source objects
+  source_datasets   = list(adsl = adsl_tte),    # name → actual data.frame
+  set_values_to     = exprs(
+    PARAMCD = "OS",
+    PARAM   = "Overall Survival"
+  )
+)
+```
+
+| Argument | What it does |
+|---|---|
+| `dataset_adsl` | The "population frame". Defines which subjects appear in the output. Filter to the analysis population (e.g., `SAFFL == "Y"`) *here*. |
+| `start_date` | A bare column name from `dataset_adsl`. Becomes `STARTDT`. |
+| `event_conditions` | A `list()` of one or more `event_source()` objects. |
+| `censor_conditions` | A `list()` of one or more `censor_source()` objects. |
+| `source_datasets` | A named list mapping `dataset_name` strings (used in the sources) to the actual data.frames. |
+| `set_values_to` | A list of expressions for row-level metadata. Always include `PARAMCD` and `PARAM`. |
+
+> **SAS analog mental model.** `derive_param_tte()` *is* a parameterized macro. The "fixed" arguments (population frame, start date, source datasets) define the loop scope. The "variable" arguments (event_conditions, censor_conditions, set_values_to) define the business logic. In SAS you would write a macro:
+>
+> `%MACRO derive_tte(adsl=, startdt=, event_rules=, censor_rules=, paramcd=);`
+>
+> ...and call it once per endpoint. `derive_param_tte()` is the directly translated equivalent.
+
+### 3.8 SAS equivalent: PROC SQL with COALESCE
+
+```sas
+proc sql;
+  create table adtte_os as
+  select  a.usubjid,
+          a.trtsdt          as startdt,
+          coalesce(a.dthdt, a.lstalvdt) as adt format=date9.,
+          case when a.dthdt is not null then 0 else 1 end as cnsr,
+          case when a.dthdt is not null then "DEATH"
+               else "LAST DATE KNOWN ALIVE" end as evntdesc,
+          (coalesce(a.dthdt, a.lstalvdt) - a.trtsdt + 1) as aval,
+          "OS"                as paramcd,
+          "Overall Survival"  as param
+  from    adsl as a
+  where   a.saffl = "Y";
+quit;
+```
+
+Compare to the `derive_param_tte()` call: the SAS version *hardcodes* the priority (DTHDT first via `COALESCE`); admiral *declares* it (events before censors). For OS the two are equivalent — but for PFS with multiple events, the admiral declaration scales while the SAS `COALESCE` quickly becomes unreadable.
+
+### 3.9 Common pitfalls
+
+- **Wrong start date** — using `TRTSDT` when the SAP says `RANDDT` (or vice versa). Section 7.5 Diagnostic 1.
+- **Censoring before treatment** — including last-alive dates that precede `STARTDT` produces negative `AVAL`. Always validate that `AVAL >= 1`.
+- **Forgetting the +1** — Section 7.5 Diagnostic 3. The reference date is Day 1, not Day 0.
+- **Mixing date types** — if `DTHDT` is a `Date` but `LSTALVDT` is a numeric, the comparison may fail silently. Standardize before passing into the sources.
+
+### 3.10 Build OS for the toy data
 
 ```{r os-demo}
 # Build OS: event = death, censor = last alive date
@@ -334,6 +891,28 @@ adtte_os |>
   select(USUBJID, PARAMCD, STARTDT, ADT, AVAL, CNSR, EVNTDESC)
 ```
 
+> **Read the output.** Five subjects, five rows. Subjects 01-002 and 01-004 have `CNSR = 0` (death events): `EVNTDESC = "DEATH"`, `ADT = DTHDT`. The other three have `CNSR = 1`: `EVNTDESC = "LAST DATE KNOWN ALIVE"`, `ADT = LSTALVDT`. `AVAL` is days from `TRTSDT` to `ADT` plus 1 — for subject 01-002, `19480 - 19370 + 1 = 111` days. This is precisely the dataset shape `PROC LIFETEST DATA=adtte_os; TIME AVAL*CNSR(1);` expects.
+
+### 3.11 OS diagnostics
+
+```{r os-diagnostics-demo}
+# Three diagnostic angles your statistician will run by hand
+adtte_os |>
+  summarise(
+    n_subjects    = n(),
+    n_events      = sum(CNSR == 0, na.rm = TRUE),
+    n_censored    = sum(CNSR == 1, na.rm = TRUE),
+    median_aval   = median(AVAL, na.rm = TRUE),
+    min_aval      = min(AVAL, na.rm = TRUE),
+    max_aval      = max(AVAL, na.rm = TRUE),
+    any_negative  = any(AVAL < 1, na.rm = TRUE)
+  )
+```
+
+> **Read the output.** The four most common P21/QC checks: (1) every subject in the population is represented; (2) event count matches the death count in ADSL; (3) `min(AVAL) >= 1` — no negatives, no zeros; (4) `median(AVAL)` is in a clinically plausible range. If any of these look wrong, stop and recheck the source definitions before showing the dataset to your statistician.
+
+### 3.12 Quiz — Overall Survival
+
 ```{r quiz-os, echo=FALSE}
 quiz(
   question(
@@ -343,9 +922,35 @@ quiz(
     answer("110 / 365.25"),
     answer("1"),
     allow_retry = TRUE
+  ),
+  question(
+    "Which SAS construct is the closest analog to `derive_param_tte(start_date = TRTSDT, event_conditions = list(death_event), censor_conditions = list(last_alive_censor), ...)`?",
+    answer("`PROC LIFETEST DATA=adtte TIME AVAL*CNSR(1);`"),
+    answer("A DATA step that builds STARTDT, then a COALESCE(DTHDT, LSTALVDT) into ADT with CNSR = 0 if DTHDT non-missing else 1, then AVAL = ADT - STARTDT + 1", correct = TRUE),
+    answer("`PROC SORT BY USUBJID DESCENDING DTHDT;`"),
+    answer("A `RETAIN ADT;` statement carrying forward the last visit date"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A subject is alive at last contact. Their OS row should have:",
+    answer("CNSR = 0, EVNTDESC = 'DEATH'"),
+    answer("CNSR = 1, EVNTDESC = 'LAST DATE KNOWN ALIVE' (or the label from the censor_source)", correct = TRUE),
+    answer("CNSR = NA, ADT = NA — alive subjects are not in ADTTE"),
+    answer("CNSR = 2, EVNTDESC = 'ALIVE'"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Your SAP specifies OS clock starts at randomization. You use `start_date = TRTSDT`. What kind of bug have you introduced?",
+    answer("None — TRTSDT and RANDDT are always equal"),
+    answer("AVAL is systematically understated for subjects with dose delays (time between RANDDT and TRTSDT is excluded from the risk period)", correct = TRUE),
+    answer("AVAL is systematically overstated"),
+    answer("CNSR will be flipped"),
+    allow_retry = TRUE
   )
 )
 ```
+
+### 3.13 Exercise — toy OS with RANDDT as start
 
 ```{r os-ex, exercise=TRUE, exercise.lines=22}
 # Exercise: build OS using adsl_tte

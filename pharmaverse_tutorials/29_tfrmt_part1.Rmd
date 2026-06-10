@@ -1,10 +1,11 @@
 ---
 title: "Lesson 29 — tfrmt Part 1: Table Shells, body_plan(), and frmt()"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Learn the tfrmt package (Table Framework): separate table formatting metadata

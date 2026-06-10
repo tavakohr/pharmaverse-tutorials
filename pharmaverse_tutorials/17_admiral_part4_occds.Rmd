@@ -1,9 +1,11 @@
 ---
 title: "Lesson 17 — admiral Part 4: OCCDS Datasets (ADAE, ADCM)"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
 ---
 
@@ -400,11 +402,100 @@ This lesson covers **OCCDS (Occurrence Data Structure)** ADaMs — ADAE (Adverse
 
 ## 1 — OCCDS at a glance
 
+### 1.1 What OCCDS is
+
+OCCDS = **Occurrence Data Structure**. It is the ADaM class designed to hold *events* — discrete things that happen to a subject during a study. The flagship OCCDS dataset is **ADAE** (Adverse Events). The other OCCDS members are:
+
+| Dataset | What it stores            | SDTM source |
+|---------|---------------------------|-------------|
+| ADAE    | Adverse events            | AE          |
+| ADCM    | Concomitant medications   | CM          |
+| ADMH    | Medical history           | MH          |
+| ADDV    | Protocol deviations       | DV          |
+| ADEX    | Exposure (when modelled as events) | EX |
+
+Each row in an OCCDS dataset is **one event for one subject** — one AE record, one medication record. There is **no PARAMCD** because the events are heterogeneous: "headache" and "nausea" are not the same parameter, they are different terms from a coded medical dictionary.
+
+### 1.2 OCCDS vs BDS — the structural difference
+
+This is the single most important distinction in ADaM, and the one that trips up SAS programmers first.
+
+```
+BDS  (ADLB, ADVS, ADTTE)              OCCDS (ADAE, ADCM, ADMH)
+------------------------              ------------------------
+one row per                           one row per
+  subject x parameter x visit           subject x event
+ALT visit 1                            Subject's headache
+ALT visit 2                            Subject's nausea
+AST visit 1                            Subject's rash
+PARAMCD column                         AEDECOD / CMDECOD column
+AVAL column (numeric)                  no AVAL; categorical attributes
+analysis = baseline, change            analysis = incidence, counts
+```
+
+The mental model: **BDS rows are observations; OCCDS rows are happenings**. A lab value is observed; an AE happens.
+
+### 1.3 The ADAE pipeline at a glance
+
+```
+  SDTM AE  -->  merge ADSL  -->  derive ASTDT/AENDT  -->  severity (ASEVN)
+                                                              |
+                                                              v
+                                                        derive TRTEMFL
+                                                              |
+                                                              v
+                                                  derive AOCCFL / AOCCSFL
+                                                              |
+                                                              v
+                                                derive MedDRA queries (SMQ)
+                                                              |
+                                                              v
+                                                  link last dose (LDOSEDT)
+                                                              |
+                                                              v
+                                                       assign ASEQ
+                                                              |
+                                                              v
+                                                       ADAE (final)
+```
+
+Each downstream step depends on the variables produced by the prior step. TRTEMFL depends on ASTDT and TRTSDT. AOCCFL depends on TRTEMFL. SMQ queries depend on AEDECOD. ASEQ is computed last because it is a sequence number over the analysis-sorted rows.
+
+### 1.4 Incidence vs occurrence — a semantic distinction
+
+SAS programmers often hear "incidence" and "occurrence" used interchangeably. They are **not** the same in OCCDS:
+
+- **Occurrence**: every AE record on the dataset — "subject 01-001 had 3 AEs."
+- **Incidence**: the count of subjects with **at least one** event of a given type — "12 of 86 placebo subjects had nausea."
+
+The occurrence flags (AOCCFL, AOCCSFL, AOCCPFL) exist precisely to support **incidence** analyses: by flagging only the *first* event per subject per stratum, you can count subjects without double-counting.
+
+### 1.5 SAS analog table for the OCCDS pipeline
+
+| Admiral function                | What it does                              | Closest SAS pattern                              |
+|---------------------------------|-------------------------------------------|--------------------------------------------------|
+| `derive_vars_merged`            | Bring ADSL variables onto AE              | `PROC SQL LEFT JOIN adsl ON USUBJID`             |
+| `derive_vars_dt`                | Impute partial dates to numeric ASTDT     | `INPUT(AESTDTC, YYMMDD10.)` + DATA-step IF logic |
+| `derive_vars_dy`                | Compute study day (Day 1 convention)      | `ASTDY = ASTDT - TRTSDT + (ASTDT >= TRTSDT)`     |
+| `mutate(ASEVN = case_when(...))`| Map MILD/MODERATE/SEVERE to 1/2/3         | `PROC FORMAT VALUE ASEVN_F`                      |
+| `derive_var_trtemfl`            | Treatment-emergent flag                   | DATA step `IF ASTDT >= TRTSDT AND ASTDT <= TRTEDT THEN TRTEMFL = "Y";` |
+| `derive_var_extreme_flag` (AOCCFL) | First TEAE per subject                | `PROC SORT NODUPKEY BY USUBJID;` + first.usubjid logic |
+| `derive_vars_query`             | Tag SMQ / CQ membership                   | `PROC SQL LEFT JOIN smq_ref ON AEDECOD = SMQ_TERM` |
+| `derive_vars_joined`            | Link last dose prior to AE                | `PROC SQL` correlated subquery (`MAX(EXSTDT) WHERE EXSTDT <= ASTDT`) |
+| `create_single_dose_dataset`    | Expand QD record to one row per day       | `DATA step DO i = sd TO ed BY 1; OUTPUT;`         |
+| `derive_var_obs_number` (ASEQ)  | Per-subject row counter                   | `PROC SQL ROW_NUMBER() OVER (PARTITION BY USUBJID)` |
+
+> **SAS analog mental model:** ADAE is what you would build with about 8 SAS PROC/DATA steps glued together by `RUN; QUIT;` boundaries. Admiral collapses those into a single piped pipeline where each step's output is the next step's input — and each step is named after the *variable it produces*, not the *engine that produces it*.
+
+### 1.6 The OCCDS-class shape
+
 ```{r occds-shape-demo}
 # OCCDS = one row per event (AE, CM, MH, DV)
-# No PARAMCD — events are heterogeneous
+# No PARAMCD - events are heterogeneous
 ae |> select(USUBJID, AESEQ, AEDECOD, AESOC, AESTDTC, AEENDTC, AESEV, AESER)
 ```
+
+> **Read the output:** every row is one AE. Subject 01-001 has two rows (headache, nausea); subject 01-002 has two rows (dizziness, anaphylactic shock). There is no `PARAMCD` column, and there is no `AVAL`. The "value" of an event is its name (`AEDECOD`), its severity (`AESEV`), and the surrounding categorical attributes.
 
 ```{r quiz-occds-shape, echo=FALSE}
 quiz(
@@ -423,13 +514,148 @@ quiz(
     answer("One event or occurrence per subject record", correct = TRUE),
     answer("One parameter per study"),
     allow_retry = TRUE
+  ),
+  question(
+    "Why does ADAE have no PARAMCD column?",
+    answer("PARAMCD is optional in OCCDS"),
+    answer("Each row is a heterogeneous event identified by its coded term (AEDECOD), not a measurement of a single parameter", correct = TRUE),
+    answer("PARAMCD is stored under a different name (AETERM)"),
+    answer("Only BDS datasets require PARAMCD"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which best describes the distinction between 'occurrence' and 'incidence' in ADAE?",
+    answer("They are synonymous"),
+    answer("Occurrence = every AE record; incidence = count of unique subjects with at least one event of a given type", correct = TRUE),
+    answer("Occurrence = serious AEs only; incidence = all AEs"),
+    answer("Occurrence = pre-treatment AEs; incidence = treatment-emergent AEs"),
+    allow_retry = TRUE
   )
 )
+```
+
+### 1.7 Exercise: Identify OCCDS vs BDS shape
+
+```{r occds-shape-ex, exercise=TRUE, exercise.lines=14}
+# Two test datasets are below. For each, decide if it is OCCDS or BDS shape
+# by counting rows per (USUBJID, PARAMCD-or-AEDECOD).
+# Print the row count for subject "01-001" in `ae`:
+
+n_rows_001 <- ae |>
+  filter(USUBJID == "01-001") |>
+  ___()
+
+cat("Rows for 01-001 in ae:", n_rows_001, "\n")
+cat("Structure: ", ifelse(n_rows_001 > 1, "OCCDS-shaped", "BDS-shaped"), "\n")
+```
+
+```{r occds-shape-ex-hint-1}
+# nrow() counts rows in a data frame
+```
+
+```{r occds-shape-ex-hint-2}
+# n_rows_001 <- ae |> filter(USUBJID == "01-001") |> nrow()
+```
+
+```{r occds-shape-ex-solution}
+n_rows_001 <- ae |>
+  filter(USUBJID == "01-001") |>
+  nrow()
+
+cat("Rows for 01-001 in ae:", n_rows_001, "\n")
+cat("Structure: ", ifelse(n_rows_001 > 1, "OCCDS-shaped", "BDS-shaped"), "\n")
 ```
 
 ---
 
 ## 2 — Merge ADSL and derive analysis dates
+
+### 2.1 Why this step is first
+
+Every downstream derivation in ADAE depends on **subject-level variables** that live in ADSL: `TRTSDT`, `TRTEDT`, `TRT01A`, `SAFFL`, `AGE`, `SEX`, `RACE`. TRTEMFL needs TRTSDT/TRTEDT; subgroup analyses need AGE/SEX/RACE. The first move in any ADAE build is to attach ADSL.
+
+### 2.2 The "SAFFL only" submission rule
+
+Per the standard ADaM IG convention, **ADAE typically contains only Safety Population subjects** (`SAFFL == "Y"`). Subjects who were randomized but never dosed are usually removed by an upstream filter or by the join logic.
+
+SAS analog:
+
+```
+PROC SQL;
+   CREATE TABLE adae AS
+     SELECT a.*, b.TRTSDT, b.TRTEDT, b.TRT01A, b.SAFFL
+       FROM ae    AS a
+       LEFT JOIN adsl AS b
+         ON a.STUDYID = b.STUDYID AND a.USUBJID = b.USUBJID
+       WHERE b.SAFFL = 'Y';
+QUIT;
+```
+
+R/admiral analog: `derive_vars_merged()` + a downstream `filter(SAFFL == "Y")`.
+
+### 2.3 Anatomy of derive_vars_merged()
+
+```r
+derive_vars_merged(
+  dataset     = ae,                              # primary (events)
+  dataset_add = adsl_occ,                        # source of new variables
+  new_vars    = exprs(TRTSDT, TRTEDT, TRT01A),   # columns to bring across
+  by_vars     = exprs(STUDYID, USUBJID)          # join keys
+)
+```
+
+Read it as: *"Onto `ae`, attach the columns `new_vars` from `adsl_occ`, joining by `by_vars`."* The join is implicitly a **left join from `dataset` to `dataset_add`** — every AE row is preserved.
+
+> **SAS analog mental model:** this is the admiral equivalent of `PROC SQL LEFT JOIN` where you list the columns you want to bring across in `SELECT`. The difference is that `new_vars` is *declarative* — you do not write the `ON` clause; you supply `by_vars`.
+
+### 2.4 Date imputation strategy
+
+SDTM dates are character (`AESTDTC`). Analysis dates must be numeric R Dates. SDTM dates can also be **partial** — `"2024-07"` (no day) or `"2024"` (no month or day). Admiral imputes these to a deterministic boundary:
+
+- `date_imputation = "first"`: `"2024"` → `"2024-01-01"`, `"2024-07"` → `"2024-07-01"`. Conservative for **start dates** (push earlier → narrows the treatment-emergent window).
+- `date_imputation = "last"`:  `"2024"` → `"2024-12-31"`, `"2024-07"` → `"2024-07-31"`. Conservative for **end dates** (push later → assumes the AE persisted as long as possible).
+
+SAS analog:
+
+```
+DATA adae;
+   SET ae;
+   IF LENGTH(AESTDTC) = 4 THEN ASTDT = INPUT(AESTDTC || "-01-01", YYMMDD10.);
+   ELSE IF LENGTH(AESTDTC) = 7 THEN ASTDT = INPUT(AESTDTC || "-01", YYMMDD10.);
+   ELSE ASTDT = INPUT(AESTDTC, YYMMDD10.);
+RUN;
+```
+
+### 2.5 The ASTDTF imputation flag
+
+Whenever a date was imputed, admiral sets an **imputation flag** (`ASTDTF`) so reviewers can trace it:
+
+| `ASTDTF` value | Meaning                                       |
+|----------------|-----------------------------------------------|
+| `"Y"`          | Year was the highest non-missing piece — imputed M and D |
+| `"M"`          | Year-month present — imputed D only           |
+| `NA` (blank)   | Full date present — no imputation             |
+
+P21 and reviewers expect this flag for traceability. Never drop it.
+
+### 2.6 ASTDY — the CDISC Day 1 convention
+
+Study day in ADaM follows a specific rule: **TRTSDT is Day 1; there is no Day 0**.
+
+```
+   DAY:  -3   -2   -1    1    2    3    4    5  ...
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                         |
+                         TRTSDT (first dose date)
+
+   Formula:
+     positive days   ASTDY = ASTDT - TRTSDT + 1
+     negative days   ASTDY = ASTDT - TRTSDT      (no Day 0)
+```
+
+`derive_vars_dy()` implements this convention automatically — never roll your own arithmetic for study day.
+
+### 2.7 The standard merge + date pattern
 
 ```{r adae-dates-demo}
 adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P, AGE, SEX, RACE, SAFFL)
@@ -516,9 +742,111 @@ adae_tmp |> filter(USUBJID == "01-001") |>
   select(USUBJID, AETERM, ASTDTC = AESTDTC, ASTDT, ASTDY)
 ```
 
+### 2.8 Knowledge check — merge and dates
+
+```{r quiz-merge-dates, echo=FALSE}
+quiz(
+  question(
+    "Why does ADAE normally include only subjects with SAFFL = 'Y'?",
+    answer("ADAE is the Safety analysis dataset — randomized-but-not-dosed subjects are excluded from AE incidence", correct = TRUE),
+    answer("SAFFL is an admiral requirement"),
+    answer("It is required by P21"),
+    answer("Non-safety subjects have no AEs by definition"),
+    allow_retry = TRUE
+  ),
+  question(
+    "A partial start date 2024-07 should be imputed to:",
+    answer("2024-07-31"),
+    answer("2024-07-15"),
+    answer("2024-07-01 (date_imputation = 'first' — conservative push earlier)", correct = TRUE),
+    answer("Cannot be imputed without month"),
+    allow_retry = TRUE
+  ),
+  question(
+    "ASTDY = 0 in ADAE is:",
+    answer("Valid — represents the dosing date"),
+    answer("Invalid — CDISC convention has no Day 0; first dose = Day 1 (use derive_vars_dy())", correct = TRUE),
+    answer("Allowed only for screening AEs"),
+    answer("Used to represent missing dates"),
+    allow_retry = TRUE
+  )
+)
+```
+
 ---
 
 ## 3 — Severity mapping
+
+### 3.1 Why we need ASEVN (numeric severity)
+
+`AESEV` from SDTM is character: `"MILD"`, `"MODERATE"`, `"SEVERE"`. Analysis tools (max-severity calculations, worsening flags, sort orders) need a **numeric** companion. ADaM names this `ASEVN`.
+
+```
+SDTM      AESEV   = "MILD"     "MODERATE"   "SEVERE"
+                     |            |            |
+                     v            v            v
+ADAE      ASEVN   =  1            2            3
+```
+
+This is the exact pattern of a SAS `PROC FORMAT` `VALUE` statement applied via a `PUT()`:
+
+```
+PROC FORMAT;
+   VALUE $SEVN_F
+      "MILD"     = 1
+      "MODERATE" = 2
+      "SEVERE"   = 3;
+RUN;
+
+DATA adae;
+   SET adae;
+   ASEVN = INPUT(PUT(AESEV, $SEVN_F.), BEST.);
+RUN;
+```
+
+R/admiral does the same with `dplyr::case_when()`.
+
+### 3.2 ASEV vs AESEV — the copy-and-rename pattern
+
+Many ADaM datasets create an `ASEV` column that simply copies `AESEV`. Why duplicate?
+
+- `AESEV` is the **SDTM** source (must remain unmodified for traceability).
+- `ASEV` is the **analysis** version — open to programmatic modification (e.g., re-coding if external grading dictionaries disagree).
+
+The same pattern applies to AEREL → AREL.
+
+### 3.3 Anatomy of the severity mutate
+
+```r
+mutate(
+  ASEV  = AESEV,                       # 1:1 copy for analysis use
+  AREL  = AEREL,                       # 1:1 copy for analysis use
+  ASEVN = case_when(                   # numeric companion
+    ASEV == "MILD"     ~ 1,
+    ASEV == "MODERATE" ~ 2,
+    ASEV == "SEVERE"   ~ 3,
+    TRUE               ~ NA_real_      # safety net
+  )
+)
+```
+
+> **SAS analog mental model:** `ASEV = AESEV` is a SAS assignment statement; `ASEVN = case_when(...)` is the `PUT()` of a `$VALUE` format combined with `INPUT()` back to numeric. The `TRUE ~ NA_real_` is the SAS `OTHERWISE` arm of a `SELECT` block.
+
+### 3.4 CTCAE grading (cross-reference)
+
+For oncology trials, severity uses the **NCI CTCAE** 5-grade scale instead of MILD/MODERATE/SEVERE. `AETOXGR` (toxicity grade 1-5) carries this — admiralonco extensions (see lesson 20) provide specific helpers. The high-level mapping:
+
+| CTCAE Grade | Meaning                              |
+|-------------|--------------------------------------|
+| 1           | Mild — asymptomatic                  |
+| 2           | Moderate — minimal intervention      |
+| 3           | Severe — hospitalisation possible    |
+| 4           | Life-threatening                     |
+| 5           | Death related to AE                  |
+
+In ADAE.AETOXGR sits alongside AESEV; analysis tables may use either.
+
+### 3.5 The severity derivation
 
 ```{r severity-demo}
 adae <- adae |>
@@ -536,9 +864,194 @@ adae <- adae |>
 adae |> select(USUBJID, AETERM, ASEV, ASEVN, AREL)
 ```
 
+> **Read the output:** `ASEV` is the analysis copy of `AESEV`; `ASEVN` is the numeric companion. A row with `ASEV = "SEVERE"` should have `ASEVN = 3` — verify by eye on the anaphylactic shock row.
+
+### 3.6 Exercise: Add a relationship-numeric mapping
+
+```{r areln-ex, exercise=TRUE, exercise.lines=18}
+# Add ARELN: 1 = UNLIKELY, 2 = POSSIBLE, 3 = PROBABLE, 4 = RELATED
+# Use case_when() and NA_real_ as the fallback.
+
+adae_arel <- adae |>
+  mutate(
+    ARELN = case_when(
+      AREL == "UNLIKELY" ~ ___,
+      AREL == "POSSIBLE" ~ ___,
+      AREL == "PROBABLE" ~ ___,
+      AREL == "RELATED"  ~ 4,
+      TRUE               ~ ___
+    )
+  )
+
+adae_arel |> select(USUBJID, AETERM, AREL, ARELN)
+```
+
+```{r areln-ex-hint-1}
+# 1, 2, 3 in order; fallback is NA_real_
+```
+
+```{r areln-ex-hint-2}
+# AREL == "UNLIKELY" ~ 1
+# AREL == "POSSIBLE" ~ 2
+# AREL == "PROBABLE" ~ 3
+# TRUE               ~ NA_real_
+```
+
+```{r areln-ex-solution}
+adae_arel <- adae |>
+  mutate(
+    ARELN = case_when(
+      AREL == "UNLIKELY" ~ 1,
+      AREL == "POSSIBLE" ~ 2,
+      AREL == "PROBABLE" ~ 3,
+      AREL == "RELATED"  ~ 4,
+      TRUE               ~ NA_real_
+    )
+  )
+
+adae_arel |> select(USUBJID, AETERM, AREL, ARELN)
+```
+
+### 3.7 Knowledge check — severity
+
+```{r quiz-severity, echo=FALSE}
+quiz(
+  question(
+    "Why is ASEV typically a 1:1 copy of AESEV?",
+    answer("They have to differ"),
+    answer("ASEV is the analysis-modifiable copy; AESEV remains the immutable SDTM source for traceability", correct = TRUE),
+    answer("ASEV uses different categories"),
+    answer("AESEV is a numeric variable"),
+    allow_retry = TRUE
+  ),
+  question(
+    "The SAS analog of `case_when(ASEV == 'MILD' ~ 1, ...)` is most directly:",
+    answer("PROC SQL UNION ALL"),
+    answer("PROC FORMAT VALUE statement + INPUT(PUT(...))", correct = TRUE),
+    answer("PROC TRANSPOSE"),
+    answer("A DATA step MERGE"),
+    allow_retry = TRUE
+  ),
+  question(
+    "AETOXGR for oncology trials uses which scale?",
+    answer("MILD / MODERATE / SEVERE"),
+    answer("NCI CTCAE grades 1 through 5", correct = TRUE),
+    answer("WHO toxicity criteria 1 through 10"),
+    answer("FDA narrative grading"),
+    allow_retry = TRUE
+  )
+)
+```
+
 ---
 
 ## 4 — Treatment-emergent flag: TRTEMFL
+
+### 4.1 What "treatment-emergent" means clinically
+
+A **treatment-emergent adverse event (TEAE)** is an AE that **emerged during or after exposure to study treatment**. The distinction matters because regulators and reviewers want to know which AEs can plausibly be attributed to drug exposure versus which already existed at baseline.
+
+A subject who entered the study with chronic back pain and continued to report back pain throughout treatment is **not** experiencing a *new* event; that AE is **not** treatment-emergent. A subject who developed a rash three days after first dose **is** experiencing a TEAE.
+
+```
+   AE Onset Timeline:
+
+   Screening    TRTSDT (Day 1)   TRTEDT       TRTEDT + 30 days
+       |                |                  |              |
+       |  Pre-treatment |  Treatment       |  Post-trt    |
+       |  (not TEAE)    |  (TEAE = Y)      |  window      |
+       |                |                  |  (TEAE = Y)  |
+                                                          |
+                                                          v
+                                                       Beyond:
+                                                       not TEAE
+```
+
+### 4.2 The date-comparison logic
+
+```
+TRTEMFL = "Y"   iff   ASTDT >= TRTSDT  AND  ASTDT <= TRTEDT + end_window
+TRTEMFL = NA    otherwise (or when dates are NA)
+```
+
+Two conditions, both must hold. Either ASTDT or TRTSDT being missing collapses the result to `NA`.
+
+### 4.3 Why we use AESTDT, not AEENDT
+
+The TEAE definition is about **onset**, not resolution. An AE that *started* before TRTSDT but resolved during treatment is **not** new — it pre-existed. An AE that *started* during treatment but resolved a year after the study ended **is** a TEAE.
+
+Always pass `start_date = ASTDT` (the **start** date). The `end_date = AENDT` argument is used only for the optional intensity-worsening pathway (Section 4.8).
+
+### 4.4 Pre-treatment vs treatment-emergent vs post-treatment
+
+```
+   AE              Onset           Treatment            TEAE?
+   --------------- --------------- ------------------- -----
+   Headache        2024-01-10      TRTSDT 2024-01-15   No  (before TRTSDT)
+   Nausea          2024-01-20      TRTSDT 2024-01-15   Yes (within window)
+   Rash            2024-02-20      TRTEDT 2024-02-15   Yes (within end_window=30)
+   Insomnia        2024-04-01      TRTEDT 2024-02-15   No  (beyond end_window=30)
+```
+
+### 4.5 Anatomy of derive_var_trtemfl()
+
+```r
+derive_var_trtemfl(
+  dataset         = adae,
+  start_date      = ASTDT,     # AE onset date (analysis numeric)
+  end_date        = AENDT,     # AE resolution date (analysis numeric)
+  trt_start_date  = TRTSDT,    # first dose date
+  trt_end_date    = TRTEDT,    # last dose date
+  end_window      = 30,        # days post-last-dose still considered TEAE
+  initial_intensity = NULL,    # optional: pre-trt intensity (for worsening)
+  intensity         = NULL     # optional: current intensity (for worsening)
+)
+```
+
+Read it as: *"Onto `adae`, add a TRTEMFL column based on the comparison `start_date >= trt_start_date AND start_date <= trt_end_date + end_window`."*
+
+> **SAS analog mental model:** this is one DATA step `IF` statement wrapped into a callable function. The SAS form is so brief that admiral's value-add seems thin — but the magic is the consistent handling of NA, the optional intensity-worsening pathway, and the audit trail.
+
+### 4.6 SAS equivalent: the DATA step IF/THEN
+
+```
+DATA adae;
+   SET adae;
+   IF NOT MISSING(ASTDT) AND NOT MISSING(TRTSDT)
+      AND ASTDT >= TRTSDT
+      AND ASTDT <= TRTEDT + 30
+      THEN TRTEMFL = "Y";
+RUN;
+```
+
+Side by side:
+
+```
+   SAS DATA step                     |  admiral
+   --------------------------------- |  ----------------------------------
+   DATA adae;                        |  adae |>
+     SET adae;                       |
+     IF NOT MISSING(ASTDT)           |    derive_var_trtemfl(
+        AND NOT MISSING(TRTSDT)      |      start_date     = ASTDT,
+        AND ASTDT >= TRTSDT          |      end_date       = AENDT,
+        AND ASTDT <= TRTEDT + 30     |      trt_start_date = TRTSDT,
+        THEN TRTEMFL = "Y";          |      trt_end_date   = TRTEDT,
+   RUN;                              |      end_window     = 30
+                                     |    )
+```
+
+### 4.7 Common pitfalls
+
+1. **Wrong start date** — passing `start_date = AENDT` (resolution) instead of `ASTDT` (onset). Ongoing AEs with missing end dates silently get `TRTEMFL = NA`. Always start_date = ASTDT.
+2. **Off-by-one at TRTEDT** — `end_window = 0` means "exactly up to TRTEDT". `end_window = 30` extends 30 days past last dose. Pick the protocol-specified window.
+3. **Partial-date AEs** — an `AESTDTC = "2024-07"` was imputed by `derive_vars_dt(date_imputation = "first")` to `2024-07-01`. If TRTSDT was `2024-07-15`, that AE looks pre-treatment (`ASTDT < TRTSDT`). Always inspect imputation flags (ASTDTF) before drawing conclusions.
+4. **Time zones / `DTM`** — never mix `DT` and `DTM` arguments. The function compares whatever you pass; if you pass an integer date for one side and a POSIX seconds-since-epoch for the other, results are nonsense.
+
+### 4.8 Multi-period studies and intensity worsening
+
+In some studies (cross-over, multi-period), TRTEMFL must be evaluated per treatment period. Use `derive_var_trtemfl()` once per period and combine results. The `initial_intensity` / `intensity` arguments enable the **worsening** pathway: an AE that pre-existed but worsened on-treatment (e.g., grade 1 at baseline, grade 3 mid-treatment) earns TRTEMFL = "Y" even though its onset predates TRTSDT.
+
+### 4.9 The TRTEMFL derivation
 
 TRTEMFL = "Y" for AEs that started **on or after** first dose and on or before last dose + end_window.
 
@@ -678,9 +1191,209 @@ n_subj_with_teae <- adae_real |>
 cat("\nSubjects with ≥1 TEAE (AOCCFL = 'Y'):", n_subj_with_teae, "\n")
 ```
 
+### 4.10 Exercise: Pre-treatment AE flag (PRETRTFL)
+
+Some sponsors derive a counterpart flag — PRETRTFL = "Y" for AEs that started **before** TRTSDT. Build it with a simple mutate (no admiral helper required).
+
+```{r pretrtfl-ex, exercise=TRUE, exercise.lines=14}
+# Derive PRETRTFL = "Y" if ASTDT < TRTSDT, NA otherwise (NA when ASTDT or TRTSDT missing)
+
+adae_pre <- adae |>
+  mutate(
+    PRETRTFL = case_when(
+      is.na(ASTDT) | is.na(TRTSDT) ~ NA_character_,
+      ASTDT < ___                  ~ "Y",
+      TRUE                         ~ NA_character_
+    )
+  )
+
+adae_pre |> select(USUBJID, AETERM, ASTDT, TRTSDT, TRTEMFL, PRETRTFL)
+```
+
+```{r pretrtfl-ex-hint-1}
+# Compare ASTDT to TRTSDT: AE that STARTED before treatment start.
+```
+
+```{r pretrtfl-ex-hint-2}
+# ASTDT < TRTSDT
+```
+
+```{r pretrtfl-ex-solution}
+adae_pre <- adae |>
+  mutate(
+    PRETRTFL = case_when(
+      is.na(ASTDT) | is.na(TRTSDT) ~ NA_character_,
+      ASTDT < TRTSDT               ~ "Y",
+      TRUE                         ~ NA_character_
+    )
+  )
+
+adae_pre |> select(USUBJID, AETERM, ASTDT, TRTSDT, TRTEMFL, PRETRTFL)
+```
+
+### 4.11 Knowledge check — TRTEMFL
+
+```{r quiz-trtemfl-deep, echo=FALSE}
+quiz(
+  question(
+    "TRTEMFL = NA (missing) on a row. Which is the most likely root cause?",
+    answer("ASTDT or TRTSDT is missing — the date comparison returned NA", correct = TRUE),
+    answer("The AE is severe"),
+    answer("Subject is in placebo arm"),
+    answer("end_window was set to 0"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Why does TRTEMFL use ASTDT (start date) and not AENDT (end date)?",
+    answer("AENDT is preferred for severe AEs"),
+    answer("Treatment-emergence is defined by AE ONSET, not resolution — ASTDT determines when the event began", correct = TRUE),
+    answer("AENDT is always missing"),
+    answer("admiral requires ASTDT by convention only"),
+    allow_retry = TRUE
+  ),
+  question(
+    "end_window = 30 in derive_var_trtemfl()...",
+    answer("Limits TRTEMFL to AEs that resolved within 30 days"),
+    answer("Permits AEs starting up to 30 days AFTER TRTEDT to still be TEAE, capturing delayed-onset drug effects", correct = TRUE),
+    answer("Means only the first 30 AEs per subject are flagged"),
+    answer("Means severity must be moderate or worse"),
+    allow_retry = TRUE
+  ),
+  question(
+    "For a partial AESTDTC = '2024-07' with TRTSDT = 2024-07-15, what is the risk?",
+    answer("Imputation of AESTDTC to 2024-07-01 makes the AE look pre-treatment (ASTDT < TRTSDT) — TRTEMFL = NA when in reality the AE may have started post-dose", correct = TRUE),
+    answer("There is no risk; admiral handles it"),
+    answer("Imputation is ignored when partial"),
+    answer("derive_var_trtemfl errors out on partials"),
+    allow_retry = TRUE
+  )
+)
+```
+
 ---
 
 ## 5 — Occurrence flags: AOCCFL and AOCCSFL
+
+### 5.1 The "occurrence" concept
+
+An **occurrence flag** marks the **first event** of a given type per subject. Why "first"? Because it lets us count *subjects with at least one AE of type X* without double-counting.
+
+If subject 01-001 had three headaches, naive counting would inflate the headache incidence to 3 — but for incidence reporting we want **"1 subject experienced headache"**. Flagging only the first headache per subject solves this.
+
+```
+Subject's AE history:                   First-occurrence flags:
+   USUBJID  AETERM       ASTDT          AOCCFL  AOCCSFL  AOCCPFL
+   01-001   Headache     2024-01-20      Y       Y        Y
+   01-001   Nausea       2024-02-01      .       Y        Y
+   01-001   Headache     2024-02-10      .       .        .       <- not the first headache
+                                         ^       ^        ^
+                                       first   first   first
+                                       AE      per     per
+                                       per     SOC     PT
+                                       subj
+```
+
+### 5.2 AOCCFL — first AE per subject (any term)
+
+`AOCCFL = "Y"` marks the chronologically **earliest** treatment-emergent AE for each subject — regardless of term or system organ class. The denominator for an incidence table built on AOCCFL is **subjects with at least one TEAE**.
+
+### 5.3 AOCCSFL — first AE per subject per SOC
+
+`AOCCSFL = "Y"` marks the **earliest TEAE within each SOC** (System Organ Class). One subject can have many `AOCCSFL = "Y"` rows — one per SOC they experienced.
+
+### 5.4 AOCCPFL — first AE per subject per preferred term
+
+`AOCCPFL = "Y"` marks the **earliest TEAE within each preferred term (AEDECOD)**. One subject can have many `AOCCPFL = "Y"` rows — one per unique AEDECOD they experienced.
+
+The three flags are tuned for three different granularities of incidence reporting:
+
+| Flag      | Group by                          | Used for                           |
+|-----------|-----------------------------------|------------------------------------|
+| AOCCFL    | USUBJID                           | "Subjects with any TEAE"           |
+| AOCCSFL   | USUBJID + AESOC                   | SOC-level incidence                |
+| AOCCPFL   | USUBJID + AEDECOD                 | Preferred-term-level incidence     |
+
+### 5.5 Why occurrence flags exist (the no-double-counting reason)
+
+A safety table titled *"AEs by Preferred Term"* lists each PT with an `n (%)` representing **subjects** with that PT. The standard query is:
+
+```
+   For each AEDECOD:
+     n = count of subjects with AOCCPFL = "Y" for this AEDECOD
+     % = n / (N safety population)
+```
+
+If you used raw AE rows (no occurrence flag), three headache rows in a single subject would inflate the headache subject-count by 3. AOCCPFL guarantees one row per subject per PT.
+
+### 5.6 SAS equivalent: PROC SORT + first.usubjid
+
+```
+PROC SORT DATA=adae OUT=for_aoccfl;
+   WHERE TRTEMFL = 'Y';
+   BY USUBJID ASTDT AESEQ;
+RUN;
+DATA adae;
+   MERGE adae for_aoccfl(KEEP=USUBJID ASTDT AESEQ IN=in_aocc);
+   BY USUBJID ASTDT AESEQ;
+   IF FIRST.USUBJID AND in_aocc THEN AOCCFL = "Y";
+RUN;
+```
+
+Side-by-side:
+
+```
+   SAS                                  |  admiral
+   ------------------------------------ |  ------------------------------------
+   PROC SORT NODUPKEY                   |  derive_var_extreme_flag(
+     BY USUBJID ASTDT AESEQ;            |    by_vars = exprs(USUBJID),
+     WHERE TRTEMFL = "Y";               |    order   = exprs(ASTDT, AESEQ),
+   first.USUBJID -> AOCCFL = "Y"        |    new_var = AOCCFL,
+                                        |    mode    = "first"
+                                        |  ) wrapped in restrict_derivation(
+                                        |    filter = TRTEMFL == "Y"
+                                        |  )
+```
+
+### 5.7 Anatomy of derive_var_extreme_flag()
+
+```r
+derive_var_extreme_flag(
+  dataset  = adae,
+  by_vars  = exprs(STUDYID, USUBJID),     # subject (one flag per subject)
+  order    = exprs(ASTDT, AESEQ),         # sort key: earliest first
+  new_var  = AOCCFL,                      # name of output flag
+  mode     = "first"                      # "first" or "last" of the sort
+)
+```
+
+Wrapped in `restrict_derivation()` to apply *only* to TEAE rows:
+
+```r
+restrict_derivation(
+  derivation = derive_var_extreme_flag,
+  args = params(
+    by_vars = exprs(STUDYID, USUBJID),
+    order   = exprs(ASTDT, AESEQ),
+    new_var = AOCCFL,
+    mode    = "first"
+  ),
+  filter = TRTEMFL == "Y"     # restrict to TEAE rows
+)
+```
+
+> **SAS analog mental model:** `derive_var_extreme_flag` is `PROC SORT NODUPKEY` + a `BY` group `first.` selector packaged as a single function. The `mode` argument is what `first.` vs `last.` would be in a SAS DATA step. The `restrict_derivation()` wrapper is the SAS `WHERE` clause.
+
+### 5.8 Order matters — how the sort key defines "first"
+
+The `order` argument **defines** what "first" means. If `order = exprs(ASTDT, AESEQ)`:
+
+- Sort ascending by ASTDT first, breaking ties by AESEQ → "first" = earliest onset.
+- Switching to `order = exprs(desc(ASTDT), AESEQ)` would make "first" = latest onset.
+- Switching to `order = exprs(ASEVN, ASTDT)` would make "first" = mildest first.
+
+Always pick `order` that matches the **clinical question**. For AOCCFL, the clinical question is *"what was the first event chronologically"* → `order = exprs(ASTDT, AESEQ)`.
+
+### 5.9 The occurrence-flag derivations
 
 ```{r occ-flags-demo}
 # AOCCFL: first treatment-emergent AE per subject
@@ -769,6 +1482,93 @@ adae_02 <- adae |>
 
 adae_02 |> filter(!is.na(AOCC02FL)) |>
   select(USUBJID, AETERM, AETOXGR, AOCC02FL)
+```
+
+### 5.10 Exercise: Derive AOCCPFL (first AE per subject per preferred term)
+
+```{r aoccpfl-ex, exercise=TRUE, exercise.lines=18}
+# AOCCPFL = first TEAE per subject per AEDECOD (preferred term).
+# Mirror AOCCSFL but group by AEDECOD instead of AESOC.
+
+adae_pfl <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, ___),    # subject + PT
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCPFL,
+      mode    = "___"
+    ),
+    filter = TRTEMFL == "Y"
+  )
+
+adae_pfl |> arrange(USUBJID, ASTDT) |>
+  select(USUBJID, AETERM, AEDECOD, AOCCFL, AOCCSFL, AOCCPFL)
+```
+
+```{r aoccpfl-ex-hint-1}
+# Group by USUBJID + AEDECOD (preferred term). mode = "first".
+```
+
+```{r aoccpfl-ex-hint-2}
+# by_vars = exprs(STUDYID, USUBJID, AEDECOD)
+# mode = "first"
+```
+
+```{r aoccpfl-ex-solution}
+adae_pfl <- adae |>
+  restrict_derivation(
+    derivation = derive_var_extreme_flag,
+    args = params(
+      by_vars = exprs(STUDYID, USUBJID, AEDECOD),
+      order   = exprs(ASTDT, AESEQ),
+      new_var = AOCCPFL,
+      mode    = "first"
+    ),
+    filter = TRTEMFL == "Y"
+  )
+
+adae_pfl |> arrange(USUBJID, ASTDT) |>
+  select(USUBJID, AETERM, AEDECOD, AOCCFL, AOCCSFL, AOCCPFL)
+```
+
+### 5.11 Knowledge check — occurrence flags
+
+```{r quiz-occ-deep, echo=FALSE}
+quiz(
+  question(
+    "AOCCFL vs AOCCSFL: what is the key difference?",
+    answer("AOCCSFL flags the most severe AE per subject"),
+    answer("AOCCSFL groups by USUBJID + AESOC (one flag per SOC), enabling SOC-level incidence; AOCCFL groups by USUBJID only", correct = TRUE),
+    answer("AOCCSFL is for serious AEs only"),
+    answer("They are the same"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Why does a safety-table 'AEs by Preferred Term' rely on AOCCPFL rather than raw AE rows?",
+    answer("Raw rows would double-count subjects who had the same PT multiple times; AOCCPFL guarantees one Y per subject per PT", correct = TRUE),
+    answer("Raw rows are too many to count"),
+    answer("AOCCPFL is required by define.xml"),
+    answer("Preferred terms are not in raw AE data"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Changing order from exprs(ASTDT, AESEQ) to exprs(ASEVN, ASTDT) would make AOCCFL flag:",
+    answer("The most severe TEAE per subject (then earliest within that severity)", correct = TRUE),
+    answer("The same row (order does not matter)"),
+    answer("All rows for the subject"),
+    answer("Only Grade 5 AEs"),
+    allow_retry = TRUE
+  ),
+  question(
+    "The SAS analog of derive_var_extreme_flag(mode='first', by_vars=USUBJID) is:",
+    answer("PROC SQL UNION"),
+    answer("PROC SORT BY USUBJID + DATA step IF first.USUBJID THEN AOCCFL='Y'", correct = TRUE),
+    answer("PROC MEANS NWAY"),
+    answer("PROC TRANSPOSE"),
+    allow_retry = TRUE
+  )
+)
 ```
 
 ---

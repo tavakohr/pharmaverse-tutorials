@@ -1,150 +1,67 @@
 ---
-title: "Lesson 16 — admiral Part 3: BDS Datasets (ADVS, ADLB, ADEG)"
+title: "Lesson 16 — {admiral} Part 3: BDS Datasets (ADVS, ADLB, ADEG)"
+author: "Hamid Tavakoli, MD, MSc"
+tutorial:
+  version: 1.1
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
+description: >
+  Build BDS-shaped ADaMs — ADVS, ADLB, ADEG — covering merge, PARAMCD,
+  derived parameters, baseline, change-from-baseline, and shift derivations.
 ---
 
 ```{r setup, include=FALSE}
-# ==============================================================================
-# PROJECT       : pharmaverse learnr Tutorials
-# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
-#                 transitioning from SAS to the pharmaverse ecosystem
-#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
-#                 Built on real CDISC CDISCPILOT01 data.
-#
-# SCRIPT NAME   : 16_admiral_part3_bds.Rmd
-# PURPOSE       : admiral Part 3 — BDS datasets: ADLB (lab) and ADVS (vital signs)
-#                 derivations including PARAMCD/AVAL/BASE/CHG/PCHG,
-#                 toxicity grading, and visit windowing.
-#
-# AUTHOR        : Hamid Tavakoli
-# DATE CREATED  : 2026-05-24
-# ==============================================================================
-# DISCLAIMER:
-# This program and its contents represent independent work product. They contain
-# absolutely no proprietary items, confidential materials, or intellectual
-# property belonging to any past, current, or specific organization or corporate
-# entity. All data mapping, standards, and logic used herein are derived
-# strictly from public documentation, open-source ecosystems, or simulated data.
-# ==============================================================================
-# LICENSE       : MIT License
-# ==============================================================================
-
 library(learnr)
 library(dplyr)
 library(tidyr)
 library(tibble)
+library(stringr)
+library(rlang)
+
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
-# ── Mock helpers from earlier lessons ────────────────────────────────────────
-exprs <- function(...) {
+# ─── NSE helpers (mocks of rlang::exprs and admiral params) ───────────────────
+exprs <- function(...) as.list(substitute(list(...)))[-1]
+
+params <- function(...) {
+  parent_env <- parent.frame()
   dots <- as.list(substitute(list(...)))[-1]
-  dots
-}
-
-convert_blanks_to_na <- function(dataset) {
-  dataset |>
-    mutate(across(where(is.character), ~ifelse(. == "", NA_character_, .)))
-}
-
-# ── Date utilities ────────────────────────────────────────────────────────────
-.impute_dtc <- function(dtc, date_imputation = "first") {
-  sapply(dtc, function(d) {
-    if (is.na(d)) return(NA_character_)
-    if (nchar(d) == 4) {
-      suffix <- if (date_imputation == "last") "-12-31" else "-01-01"
-      paste0(d, suffix)
-    } else if (nchar(d) == 7) {
-      if (date_imputation == "last") {
-        yr  <- as.integer(substr(d, 1, 4))
-        mo  <- as.integer(substr(d, 6, 7))
-        nxt <- if (mo == 12) paste0(yr + 1, "-01-01") else paste0(yr, "-", sprintf("%02d", mo + 1), "-01")
-        as.character(as.Date(nxt) - 1)
-      } else {
-        paste0(d, "-01")
-      }
-    } else {
-      d
-    }
+  lapply(dots, function(x) {
+    if (is.symbol(x)) deparse(x) else eval(x, envir = parent_env)
   })
 }
 
-convert_dtc_to_dt <- function(dtc, date_imputation = "first") {
-  suppressWarnings(as.numeric(as.Date(.impute_dtc(dtc, date_imputation))))
+# ─── XPT-style blank cleaner ──────────────────────────────────────────────────
+convert_blanks_to_na <- function(dataset) {
+  dataset |>
+    mutate(across(where(is.character), ~ if_else(.x == "", NA_character_, .x)))
 }
 
-# ── Core admiral mocks ────────────────────────────────────────────────────────
-derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
-                                order = NULL, filter_add = NULL, mode = NULL, ...) {
-  by_nm   <- sapply(by_vars, function(x) deparse(x))
-  join_df <- dataset_add
-  if (!is.null(filter_add)) {
-    fe <- substitute(filter_add)
-    join_df <- tryCatch(filter(join_df, !!fe), error = function(e) join_df)
-  }
-  if (!is.null(new_vars)) {
-    old_nms <- sapply(new_vars, function(x) {
-      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d, "=")[[1]][2]) else d
-    })
-    new_nms <- sapply(new_vars, function(x) {
-      d <- deparse(x); if (grepl("=", d)) trimws(strsplit(d, "=")[[1]][1]) else d
-    })
-    keep <- intersect(c(by_nm, old_nms), names(join_df))
-    join_df <- join_df |> select(all_of(keep))
-    for (i in seq_along(old_nms)) {
-      if (old_nms[i] != new_nms[i] && old_nms[i] %in% names(join_df))
-        join_df <- join_df |> rename(!!new_nms[i] := !!old_nms[i])
-    }
-  }
-  by_present <- intersect(by_nm, names(join_df))
-  left_join(dataset, join_df, by = by_present)
-}
-
+# ─── Date helpers ─────────────────────────────────────────────────────────────
 derive_vars_dt <- function(dataset, dtc, new_vars_prefix,
-                            date_imputation = "none", highest_imputation = "n",
-                            flag_imputation = "auto", ...) {
-  dtc_nm  <- deparse(substitute(dtc))
-  imp_rule <- if (date_imputation == "none" && highest_imputation == "n") "none"
-              else if (date_imputation == "last") "last" else "first"
-  raw <- if (dtc_nm %in% names(dataset)) dataset[[dtc_nm]] else rep(NA_character_, nrow(dataset))
-  imputed <- if (imp_rule == "none") raw else .impute_dtc(raw, imp_rule)
-  dataset[[paste0(new_vars_prefix, "DT")]] <- suppressWarnings(as.numeric(as.Date(imputed)))
-  if (flag_imputation != "none") {
-    orig_len <- nchar(raw); imp_len <- nchar(imputed)
-    dataset[[paste0(new_vars_prefix, "DTF")]] <- case_when(
-      is.na(raw)                        ~ NA_character_,
-      orig_len <= 4 & !is.na(imputed)  ~ "Y",
-      orig_len <= 7 & !is.na(imputed)  ~ "M",
-      TRUE                              ~ NA_character_
-    )
-  }
-  dataset
-}
-
-derive_vars_dtm <- function(dataset, dtc, new_vars_prefix,
-                             date_imputation = "first", time_imputation = "first",
-                             highest_imputation = "n", ...) {
-  dtc_nm <- deparse(substitute(dtc))
-  raw    <- if (dtc_nm %in% names(dataset)) dataset[[dtc_nm]] else rep(NA_character_, nrow(dataset))
-  imputed <- .impute_dtc(raw, date_imputation)
-  suffix  <- if (time_imputation == "last") "T23:59:59" else "T00:00:00"
-  dataset[[paste0(new_vars_prefix, "DTM")]] <- suppressWarnings(
-    as.numeric(as.POSIXct(paste0(imputed, suffix), tz = "UTC"))
-  )
-  dataset[[paste0(new_vars_prefix, "DTF")]] <- case_when(
-    is.na(raw)                              ~ NA_character_,
-    nchar(raw) <= 4 & !is.na(imputed)      ~ "Y",
-    nchar(raw) <= 7 & !is.na(imputed)      ~ "M",
-    TRUE                                    ~ NA_character_
-  )
-  dataset[[paste0(new_vars_prefix, "TMF")]] <- case_when(
-    is.na(raw)                              ~ NA_character_,
-    !grepl("T", raw)                        ~ "H",
-    TRUE                                    ~ NA_character_
-  )
+                            date_imputation = "none",
+                            flag_imputation = "auto") {
+  .e <- substitute(dtc); dtc_nm <- if (is.character(.e)) .e else deparse(.e)
+  dt_nm  <- paste0(new_vars_prefix, "DT")
+  dtf_nm <- paste0(new_vars_prefix, "DTF")
+  raw    <- dataset[[dtc_nm]]
+  imputed <- sapply(raw, function(x) {
+    if (is.na(x) || x == "") return(NA_character_)
+    segs <- str_split(x, "-")[[1]]
+    if (length(segs) == 1) segs <- c(segs, if (date_imputation == "last") "12" else "01")
+    if (length(segs) == 2) segs <- c(segs, if (date_imputation == "last") "28" else "01")
+    paste(segs, collapse = "-")
+  }, USE.NAMES = FALSE)
+  dataset[[dt_nm]]  <- suppressWarnings(as.numeric(as.Date(imputed)))
+  dataset[[dtf_nm]] <- sapply(raw, function(x) {
+    if (is.na(x)) return(NA_character_)
+    segs <- str_split(x, "-")[[1]]
+    if (length(segs) == 1) "M" else if (length(segs) == 2) "D" else NA_character_
+  }, USE.NAMES = FALSE)
   dataset
 }
 
@@ -162,10 +79,70 @@ derive_vars_dy <- function(dataset, reference_date, source_vars) {
   dataset
 }
 
-derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "first") {
-  # Accept either a bare name (direct call) or a string (via do.call from params())
+# ─── Generic merge helpers ────────────────────────────────────────────────────
+derive_vars_merged <- function(dataset, dataset_add, by_vars, new_vars = NULL,
+                                order = NULL, filter_add = NULL, mode = NULL, ...) {
+  by_nm <- sapply(by_vars, deparse)
+  fe <- substitute(filter_add)
+  if (!is.null(fe) && deparse(fe) != "NULL")
+    dataset_add <- dataset_add |> filter(!!fe)
+  if (!is.null(order)) {
+    ord_nms <- sapply(order, function(x) {
+      d <- deparse(x); gsub("desc\\(|\\)", "", d)
+    })
+    desc_flags <- sapply(order, function(x) grepl("^desc\\(", deparse(x)))
+    for (i in rev(seq_along(ord_nms))) {
+      if (ord_nms[i] %in% names(dataset_add)) {
+        dataset_add <- if (desc_flags[i])
+          dataset_add |> arrange(desc(.data[[ord_nms[i]]]))
+        else dataset_add |> arrange(.data[[ord_nms[i]]])
+      }
+    }
+  }
+  if (!is.null(mode)) {
+    fn <- if (mode == "first") dplyr::slice_head else dplyr::slice_tail
+    dataset_add <- dataset_add |>
+      group_by(across(all_of(by_nm))) |> fn(n = 1) |> ungroup()
+  }
+  if (!is.null(new_vars)) {
+    src_names <- sapply(new_vars, deparse)
+    out_names <- names(new_vars)
+    if (is.null(out_names)) out_names <- rep("", length(src_names))
+    out_names <- ifelse(out_names == "" | is.na(out_names),
+                        src_names, out_names)
+    # rename map: c(NEW = OLD)
+    rn_map <- setNames(src_names, out_names)
+    keep <- intersect(c(by_nm, src_names), names(dataset_add))
+    dataset_add <- dataset_add |> select(all_of(keep))
+    # apply renames where new differs from old
+    for (i in seq_along(src_names)) {
+      if (out_names[i] != src_names[i] && src_names[i] %in% names(dataset_add)) {
+        names(dataset_add)[names(dataset_add) == src_names[i]] <- out_names[i]
+      }
+    }
+    new_cols <- out_names
+  } else new_cols <- setdiff(names(dataset_add), by_nm)
+  left_join(dataset,
+            dataset_add |> select(any_of(c(by_nm, new_cols))),
+            by = by_nm)
+}
+
+derive_vars_merged_lookup <- function(dataset, dataset_add, by_vars,
+                                       new_vars = NULL, ...) {
+  by_nm <- sapply(by_vars, deparse)
+  if (!is.null(new_vars)) {
+    nms <- sapply(new_vars, deparse)
+    keep <- intersect(c(by_nm, nms), names(dataset_add))
+    dataset_add <- dataset_add |> select(all_of(keep))
+  }
+  left_join(dataset, dataset_add, by = by_nm)
+}
+
+# ─── Flag helpers ─────────────────────────────────────────────────────────────
+derive_var_extreme_flag <- function(dataset, by_vars, order, new_var,
+                                     mode = "first") {
   .e <- substitute(new_var); new_nm <- if (is.character(.e)) .e else deparse(.e)
-  by_nm   <- sapply(by_vars, deparse)
+  by_nm <- sapply(by_vars, deparse)
   ord_nms <- sapply(order, function(x) {
     d <- deparse(x); gsub("desc\\(|\\)", "", d)
   })
@@ -173,8 +150,9 @@ derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "fi
   ord_df <- dataset
   for (i in rev(seq_along(ord_nms))) {
     if (ord_nms[i] %in% names(ord_df)) {
-      ord_df <- if (desc_flags[i]) arrange(ord_df, desc(.data[[ord_nms[i]]]))
-                else arrange(ord_df, .data[[ord_nms[i]]])
+      ord_df <- if (desc_flags[i])
+        arrange(ord_df, desc(.data[[ord_nms[i]]]))
+      else arrange(ord_df, .data[[ord_nms[i]]])
     }
   }
   by_present <- intersect(by_nm, names(ord_df))
@@ -191,28 +169,23 @@ derive_var_extreme_flag <- function(dataset, by_vars, order, new_var, mode = "fi
   left_join(dataset, flagged, by = intersect(names(flagged), names(dataset)))
 }
 
-restrict_derivation <- function(dataset, derivation, args = list(), filter = NULL) {
+restrict_derivation <- function(dataset, derivation, args = list(),
+                                 filter = NULL) {
   fe <- substitute(filter)
   in_rows <- if (!is.null(fe)) {
-    tryCatch(which(eval(fe, dataset, parent.frame())), error = function(e) seq_len(nrow(dataset)))
+    tryCatch(which(eval(fe, dataset, parent.frame())),
+             error = function(e) seq_len(nrow(dataset)))
   } else seq_len(nrow(dataset))
   out_rows <- setdiff(seq_len(nrow(dataset)), in_rows)
-  sub_data  <- dataset[in_rows, , drop = FALSE]
-  all_args  <- c(list(dataset = sub_data), args)
-  derived   <- tryCatch(do.call(derivation, all_args), error = function(e) sub_data)
-  bind_rows(derived, dataset[out_rows, , drop = FALSE]) |>
-    arrange(match(seq_len(nrow(dataset)),
-                  c(in_rows[seq_len(nrow(derived))], out_rows)))
-}
-
-params <- function(...) {
-  # Bare names (e.g. new_var = ABLFL) are captured as strings.
-  # Everything else (exprs() calls, strings, numbers) is evaluated normally.
-  parent_env <- parent.frame()
-  dots <- as.list(substitute(list(...)))[-1]
-  lapply(dots, function(x) {
-    if (is.symbol(x)) deparse(x) else eval(x, envir = parent_env)
-  })
+  sub_data <- dataset[in_rows, , drop = FALSE]
+  all_args <- c(list(dataset = sub_data), args)
+  derived  <- tryCatch(do.call(derivation, all_args),
+                       error = function(e) sub_data)
+  new_cols <- setdiff(names(derived), names(dataset))
+  for (nc in new_cols) dataset[[nc]] <- NA
+  dataset[in_rows, names(derived)] <- derived[seq_len(length(in_rows)),
+                                              names(derived)]
+  dataset
 }
 
 derivation_slice <- function(filter = NULL, args = list()) {
@@ -220,69 +193,55 @@ derivation_slice <- function(filter = NULL, args = list()) {
 }
 
 slice_derivation <- function(dataset, derivation, args = list(), ...) {
-  slices  <- list(...)
-  result  <- dataset
+  slices <- list(...)
+  result <- dataset
   covered <- integer(0)
   for (sl in slices) {
     fe <- sl$filter
     idx <- if (!is.null(fe)) {
-      tryCatch(which(eval(fe, result, parent.frame())), error = function(e) integer(0))
+      tryCatch(which(eval(fe, result, parent.frame())),
+               error = function(e) integer(0))
     } else seq_len(nrow(result))
     idx <- setdiff(idx, covered)
     if (length(idx) == 0) next
     merged_args <- modifyList(args, sl$args)
-    sub_data    <- result[idx, , drop = FALSE]
-    all_args    <- c(list(dataset = sub_data), merged_args)
-    derived     <- tryCatch(do.call(derivation, all_args), error = function(e) sub_data)
-    # Initialise any brand-new columns to NA before subset assignment;
-    # R cannot add columns via df[idx, "new_col"] <- x on an existing df.
+    sub_data <- result[idx, , drop = FALSE]
+    all_args <- c(list(dataset = sub_data), merged_args)
+    derived  <- tryCatch(do.call(derivation, all_args),
+                         error = function(e) sub_data)
     new_cols <- setdiff(names(derived), names(result))
     for (nc in new_cols) result[[nc]] <- NA
-    result[idx, names(derived)] <- derived[seq_len(length(idx)), names(derived)]
+    result[idx, names(derived)] <- derived[seq_len(length(idx)),
+                                            names(derived)]
     covered <- c(covered, idx)
   }
   result
 }
 
-# ── BDS-specific mocks ────────────────────────────────────────────────────────
-derive_vars_merged_lookup <- function(dataset, dataset_add, by_vars, new_vars = NULL, ...) {
-  by_nm   <- sapply(by_vars, deparse)
-  if (!is.null(new_vars)) {
-    nms <- sapply(new_vars, deparse)
-    keep <- intersect(c(by_nm, nms), names(dataset_add))
-    dataset_add <- dataset_add |> select(all_of(keep))
-  }
-  by_present <- intersect(by_nm, names(dataset_add))
-  left_join(dataset, dataset_add, by = by_present)
-}
-
+# ─── ANRIND, ONTRTFL ──────────────────────────────────────────────────────────
 derive_var_anrind <- function(dataset) {
-  dataset |> mutate(
-    ANRIND = case_when(
-      is.na(AVAL)               ~ NA_character_,
-      !is.na(ANRHI) & AVAL > ANRHI ~ "HIGH",
-      !is.na(ANRLO) & AVAL < ANRLO ~ "LOW",
-      TRUE                          ~ "NORMAL"
-    )
-  )
+  dataset |> mutate(ANRIND = case_when(
+    is.na(AVAL) ~ NA_character_,
+    AVAL < ANRLO ~ "LOW",
+    AVAL > ANRHI ~ "HIGH",
+    TRUE ~ "NORMAL"
+  ))
 }
 
-derive_var_ontrtfl <- function(dataset, start_date, end_date = NULL,
-                                ref_start_date, ref_end_date,
-                                ref_end_window = 0, ...) {
-  sd_nm  <- deparse(substitute(start_date))
-  rs_nm  <- deparse(substitute(ref_start_date))
-  re_nm  <- deparse(substitute(ref_end_date))
-  dataset |> mutate(
-    ONTRTFL = case_when(
-      is.na(.data[[sd_nm]]) | is.na(.data[[rs_nm]]) ~ NA_character_,
-      .data[[sd_nm]] >= .data[[rs_nm]] &
-        .data[[sd_nm]] <= (.data[[re_nm]] + ref_end_window) ~ "Y",
-      TRUE ~ NA_character_
-    )
-  )
+derive_var_ontrtfl <- function(dataset, start_date, ref_start_date,
+                                ref_end_date, ref_end_window = 0, ...) {
+  sd_nm <- deparse(substitute(start_date))
+  rs_nm <- deparse(substitute(ref_start_date))
+  re_nm <- deparse(substitute(ref_end_date))
+  dataset |> mutate(ONTRTFL = case_when(
+    is.na(.data[[sd_nm]]) | is.na(.data[[rs_nm]]) ~ NA_character_,
+    .data[[sd_nm]] >= .data[[rs_nm]] &
+      .data[[sd_nm]] <= (.data[[re_nm]] + ref_end_window) ~ "Y",
+    TRUE ~ NA_character_
+  ))
 }
 
+# ─── Baseline & change helpers ────────────────────────────────────────────────
 derive_var_base <- function(dataset, by_vars, source_var, new_var) {
   src_nm <- deparse(substitute(source_var))
   new_nm <- deparse(substitute(new_var))
@@ -296,134 +255,103 @@ derive_var_base <- function(dataset, by_vars, source_var, new_var) {
   left_join(dataset, baseline, by = by_present)
 }
 
-derive_var_chg <- function(dataset) {
-  dataset |> mutate(CHG = if ("BASE" %in% names(dataset)) AVAL - BASE else NA_real_)
-}
+derive_var_chg  <- function(dataset) dataset |>
+  mutate(CHG = AVAL - BASE)
 
-derive_var_pchg <- function(dataset) {
-  dataset |> mutate(
-    PCHG = if ("BASE" %in% names(dataset))
-      ifelse(BASE == 0, NA_real_, (AVAL - BASE) / abs(BASE) * 100)
-    else NA_real_
-  )
-}
+derive_var_pchg <- function(dataset) dataset |>
+  mutate(PCHG = if_else(BASE != 0 & !is.na(BASE),
+                        (AVAL - BASE) / BASE * 100, NA_real_))
 
 derive_var_shift <- function(dataset, new_var, from_var, to_var) {
-  new_nm  <- deparse(substitute(new_var))
-  from_nm <- deparse(substitute(from_var))
-  to_nm   <- deparse(substitute(to_var))
-  dataset |> mutate(
-    !!new_nm := case_when(
-      is.na(.data[[from_nm]]) | is.na(.data[[to_nm]]) ~ NA_character_,
-      TRUE ~ paste0(.data[[from_nm]], " to ", .data[[to_nm]])
-    )
-  )
+  fn <- deparse(substitute(from_var))
+  tn <- deparse(substitute(to_var))
+  nn <- deparse(substitute(new_var))
+  dataset |> mutate(!!nn := if_else(
+    is.na(.data[[fn]]) | is.na(.data[[tn]]),
+    NA_character_,
+    paste0(.data[[fn]], " to ", .data[[tn]])
+  ))
 }
 
-# derive_param_bmi / derive_param_map / derive_param_computed
+# ─── Derived parameter helpers ────────────────────────────────────────────────
 derive_param_bmi <- function(dataset, by_vars, weight_code = "WEIGHT",
-                              height_code = "HEIGHT", set_values_to = list(),
-                              constant_by_vars = NULL) {
+                              height_code = "HEIGHT",
+                              constant_by_vars = NULL,
+                              set_values_to = list(), ...) {
   by_nm <- sapply(by_vars, deparse)
-  by_nm <- setdiff(by_nm, c("PARAMCD", "PARAM", "PARAMN", "PARCAT1"))
-  w_rows <- dataset |> filter(PARAMCD == weight_code)
-  h_rows <- dataset |> filter(PARAMCD == height_code)
-  if (!is.null(constant_by_vars)) {
-    h_key <- sapply(constant_by_vars, deparse)
-    h_rows <- h_rows |>
-      group_by(across(all_of(intersect(h_key, names(h_rows))))) |>
-      slice(1) |> ungroup()
+  ws <- dataset |> filter(PARAMCD == weight_code) |>
+    select(any_of(c(by_nm, "AVAL"))) |> rename(WT = AVAL)
+  hs <- if (!is.null(constant_by_vars)) {
+    cb <- sapply(constant_by_vars, deparse)
+    dataset |> filter(PARAMCD == height_code) |>
+      group_by(across(all_of(cb))) |>
+      summarise(HT = first(AVAL[!is.na(AVAL)]), .groups = "drop")
+  } else {
+    dataset |> filter(PARAMCD == height_code) |>
+      select(any_of(c(by_nm, "AVAL"))) |> rename(HT = AVAL)
   }
-  h_use <- h_rows |> select(any_of(c("USUBJID", "AVAL"))) |>
-    rename(HEIGHT_AVAL = AVAL)
-  bmi_rows <- w_rows |>
-    left_join(h_use, by = "USUBJID") |>
-    filter(!is.na(AVAL) & !is.na(HEIGHT_AVAL) & HEIGHT_AVAL > 0) |>
-    mutate(AVAL = AVAL / (HEIGHT_AVAL / 100)^2)
-  for (nm in names(set_values_to)) {
-    val <- tryCatch(eval(set_values_to[[nm]]), error = function(e) as.character(set_values_to[[nm]]))
-    bmi_rows[[nm]] <- val
-  }
-  bmi_rows <- bmi_rows |> select(-any_of("HEIGHT_AVAL"))
+  join_keys <- if (!is.null(constant_by_vars)) sapply(constant_by_vars, deparse)
+              else intersect(by_nm, names(hs))
+  bmi_rows <- ws |> left_join(hs, by = join_keys) |>
+    mutate(AVAL = round(WT / (HT / 100)^2, 1)) |>
+    select(-WT, -HT)
+  set_vals <- lapply(set_values_to, function(x) {
+    if (is.character(x)) x else if (is.numeric(x)) x else eval(x)
+  })
+  for (nm in names(set_vals)) bmi_rows[[nm]] <- set_vals[[nm]]
   bind_rows(dataset, bmi_rows)
 }
 
 derive_param_map <- function(dataset, by_vars, set_values_to = list(), ...) {
   by_nm <- sapply(by_vars, deparse)
-  by_nm <- setdiff(by_nm, c("PARAMCD", "PARAM", "PARAMN"))
-  by_key <- intersect(by_nm, names(dataset))
-  sys_rows <- dataset |> filter(PARAMCD == "SYSBP") |>
-    select(all_of(c(by_key, "AVAL"))) |> rename(SYS = AVAL)
-  dia_rows <- dataset |> filter(PARAMCD == "DIABP") |>
-    select(all_of(c(by_key, "AVAL"))) |> rename(DIA = AVAL)
-  map_rows <- inner_join(sys_rows, dia_rows, by = by_key) |>
-    mutate(AVAL = (SYS + 2 * DIA) / 3) |>
-    select(-SYS, -DIA)
-  for (nm in names(set_values_to)) {
-    val <- tryCatch(eval(set_values_to[[nm]]), error = function(e) as.character(set_values_to[[nm]]))
-    map_rows[[nm]] <- val
-  }
+  sbp <- dataset |> filter(PARAMCD == "SYSBP") |>
+    select(any_of(c(by_nm, "AVAL"))) |> rename(SBP = AVAL)
+  dbp <- dataset |> filter(PARAMCD == "DIABP") |>
+    select(any_of(c(by_nm, "AVAL"))) |> rename(DBP = AVAL)
+  map_rows <- sbp |> left_join(dbp, by = intersect(by_nm, names(dbp))) |>
+    mutate(AVAL = round((SBP + 2 * DBP) / 3, 1)) |>
+    select(-SBP, -DBP)
+  set_vals <- lapply(set_values_to, function(x) {
+    if (is.character(x)) x else if (is.numeric(x)) x else eval(x)
+  })
+  for (nm in names(set_vals)) map_rows[[nm]] <- set_vals[[nm]]
   bind_rows(dataset, map_rows)
 }
 
-derive_param_computed <- function(dataset, by_vars, parameters, set_values_to = list(), ...) {
-  by_nm  <- sapply(by_vars, deparse)
-  by_key <- intersect(by_nm, names(dataset))
-  wide <- dataset |>
-    filter(PARAMCD %in% parameters) |>
-    select(all_of(c(by_key, "PARAMCD", "AVAL"))) |>
-    pivot_wider(names_from = PARAMCD, values_from = AVAL,
-                names_prefix = "AVAL.")
-  valid_cols <- paste0("AVAL.", parameters)
-  wide <- wide |> filter(if_all(all_of(valid_cols), ~ !is.na(.)))
-  if (nrow(wide) == 0) return(dataset)
-  eval_env <- list2env(as.list(wide), parent = baseenv())
-  for (nm in names(set_values_to)) {
-    val <- tryCatch(eval(set_values_to[[nm]], envir = eval_env),
-                    error = function(e) as.character(set_values_to[[nm]]))
-    wide[[nm]] <- val
-  }
-  new_rows <- wide |> select(-any_of(valid_cols))
-  bind_rows(dataset, new_rows)
-}
-
-# ── Sample datasets ───────────────────────────────────────────────────────────
+# ─── Sample data: VS, ADSL, PARAMCD lookup ───────────────────────────────────
 vs <- tribble(
-  ~STUDYID, ~USUBJID, ~VSTESTCD, ~VSTEST,                   ~VSSTRESN, ~VSSTRESC,
-  ~VSDTC,          ~VISIT,      ~ANRLO, ~ANRHI,
-  "CDISCPILOT01", "01-001", "SYSBP",  "Systolic Blood Pressure",  118, "118",
-  "2024-01-05", "SCREENING",  90, 140,
-  "CDISCPILOT01", "01-001", "DIABP",  "Diastolic Blood Pressure",  76, "76",
-  "2024-01-05", "SCREENING",  60,  90,
-  "CDISCPILOT01", "01-001", "SYSBP",  "Systolic Blood Pressure",  124, "124",
-  "2024-02-05", "WEEK 4",     90, 140,
-  "CDISCPILOT01", "01-001", "DIABP",  "Diastolic Blood Pressure",  80, "80",
-  "2024-02-05", "WEEK 4",     60,  90,
-  "CDISCPILOT01", "01-001", "WEIGHT", "Weight",                    72,  "72",
-  "2024-01-05", "SCREENING",  NA,  NA,
-  "CDISCPILOT01", "01-001", "HEIGHT", "Height",                   172, "172",
-  "2024-01-05", "SCREENING",  NA,  NA,
-  "CDISCPILOT01", "01-002", "SYSBP",  "Systolic Blood Pressure",  148, "148",
-  "2024-01-08", "SCREENING",  90, 140,
-  "CDISCPILOT01", "01-002", "DIABP",  "Diastolic Blood Pressure",  92, "92",
-  "2024-01-08", "SCREENING",  60,  90,
-  "CDISCPILOT01", "01-002", "SYSBP",  "Systolic Blood Pressure",  138, "138",
-  "2024-02-08", "WEEK 4",     90, 140,
-  "CDISCPILOT01", "01-002", "DIABP",  "Diastolic Blood Pressure",  86, "86",
-  "2024-02-08", "WEEK 4",     60,  90,
-  "CDISCPILOT01", "01-002", "WEIGHT", "Weight",                    85,  "85",
-  "2024-01-08", "SCREENING",  NA,  NA,
-  "CDISCPILOT01", "01-002", "HEIGHT", "Height",                   180, "180",
-  "2024-01-08", "SCREENING",  NA,  NA
-)
+  ~STUDYID,       ~USUBJID, ~VSTESTCD, ~VSTEST,         ~VSSTRESN, ~VSSTRESC,
+  ~VSDTC,         ~VISIT,    ~VSORNRLO, ~VSORNRHI,
+  "CDISCPILOT01", "01-001", "SYSBP",  "Sys BP",           135, "135",
+  "2024-01-10",   "SCREENING", 90, 140,
+  "CDISCPILOT01", "01-001", "DIABP",  "Dia BP",            85,  "85",
+  "2024-01-10",   "SCREENING", 60,  90,
+  "CDISCPILOT01", "01-001", "SYSBP",  "Sys BP",           150, "150",
+  "2024-02-08",   "WEEK 4",    90, 140,
+  "CDISCPILOT01", "01-001", "DIABP",  "Dia BP",            95,  "95",
+  "2024-02-08",   "WEEK 4",    60,  90,
+  "CDISCPILOT01", "01-001", "WEIGHT", "Weight",            68,  "68",
+  "2024-01-10",   "SCREENING", NA, NA,
+  "CDISCPILOT01", "01-001", "HEIGHT", "Height",           165, "165",
+  "2024-01-10",   "SCREENING", NA, NA,
+  "CDISCPILOT01", "01-002", "SYSBP",  "Sys BP",           120, "120",
+  "2024-01-12",   "SCREENING", 90, 140,
+  "CDISCPILOT01", "01-002", "DIABP",  "Dia BP",            75,  "75",
+  "2024-01-12",   "SCREENING", 60,  90,
+  "CDISCPILOT01", "01-002", "SYSBP",  "Sys BP",           118, "118",
+  "2024-02-12",   "WEEK 4",    90, 140,
+  "CDISCPILOT01", "01-002", "DIABP",  "Dia BP",            72,  "72",
+  "2024-02-12",   "WEEK 4",    60,  90,
+  "CDISCPILOT01", "01-002", "WEIGHT", "Weight",            82,  "82",
+  "2024-01-12",   "SCREENING", NA, NA,
+  "CDISCPILOT01", "01-002", "HEIGHT", "Height",           178, "178",
+  "2024-01-12",   "SCREENING", NA, NA
+) |> mutate(VSDTC = as.character(VSDTC))
 
 adsl_bds <- tribble(
-  ~STUDYID,        ~USUBJID, ~TRTSDT, ~TRTEDT, ~TRT01A,    ~TRT01P,    ~SEX, ~AGE, ~SAFFL,
-  # TRTSDT after SCREENING (19727/19730) so SCREENING = baseline (ADT <= TRTSDT)
-  # TRTEDT after WEEK 4 (19758/19761) so WEEK 4 = on-treatment (ONTRTFL = "Y")
-  # 2024-01-10 = 19732; 2024-01-13 = 19735; 2024-03-01 = 19783
-  "CDISCPILOT01", "01-001",  19732,   19783,   "Xanomeli", "Xanomeli", "F",   52,   "Y",
-  "CDISCPILOT01", "01-002",  19735,   19783,   "Placebo",  "Placebo",  "M",   61,   "Y"
+  ~STUDYID,       ~USUBJID, ~TRTSDT, ~TRTEDT, ~TRT01A,                ~TRT01P,                ~SEX, ~AGE, ~SAFFL,
+  "CDISCPILOT01", "01-001", 19735,   19783,   "Xanomeline High Dose", "Xanomeline High Dose", "F",  52,   "Y",
+  "CDISCPILOT01", "01-002", 19737,   19783,   "Placebo",              "Placebo",              "M",  61,   "Y"
 )
 
 param_lookup <- tribble(
@@ -431,379 +359,672 @@ param_lookup <- tribble(
   "SYSBP",   "SYSBP",  "Systolic Blood Pressure (mmHg)",    1,       "Hemodynamic",
   "DIABP",   "DIABP",  "Diastolic Blood Pressure (mmHg)",   2,       "Hemodynamic",
   "PULSE",   "PULSE",  "Pulse Rate (beats/min)",            3,       "Hemodynamic",
-  "TEMP",    "TEMP",   "Temperature (C)",                   4,       "Body System",
   "WEIGHT",  "WEIGHT", "Weight (kg)",                       10,      "Anthropometric",
   "HEIGHT",  "HEIGHT", "Height (cm)",                       11,      "Anthropometric"
 )
 
-# ── Real pharmaverseadam datasets (for validation and exploration exercises) ───
-library(pharmaverseadam)
-advs_real <- pharmaverseadam::advs
-adlb_real <- pharmaverseadam::adlb |>
-  filter(is.na(DTYPE))            # remove admiral summary rows (AVISITN 9997/9998)
-adsl_real <- pharmaverseadam::adsl
+# Real pharmaverseadam fallback
+if (requireNamespace("pharmaverseadam", quietly = TRUE)) {
+  advs_real <- pharmaverseadam::advs
+  adlb_real <- pharmaverseadam::adlb |> filter(is.na(DTYPE))
+  adsl_real <- pharmaverseadam::adsl
+} else {
+  advs_real <- vs |>
+    left_join(select(adsl_bds, USUBJID, TRT01A, TRTSDT), by = "USUBJID")
+  adlb_real <- vs |>
+    left_join(select(adsl_bds, USUBJID, TRT01A, TRTSDT), by = "USUBJID")
+  adsl_real <- adsl_bds
+}
 ```
 
 ## Welcome
 
-This lesson covers **BDS (Basic Data Structure) ADaMs** — the long-format analysis datasets used for vitals (ADVS), labs (ADLB), and ECGs (ADEG). You'll build a complete ADVS step by step using admiral's canonical 13-step workflow.
+Lesson 16 — **`{admiral}` Part 3: BDS Datasets**.
 
-**Key mocks in scope:** `derive_vars_merged_lookup()`, `derive_param_bmi()`, `derive_param_map()`, `derive_param_computed()`, `derive_var_anrind()`, `derive_var_ontrtfl()`, `derive_var_base()`, `derive_var_chg()`, `derive_var_pchg()`, `derive_var_shift()`, `restrict_derivation()`, `slice_derivation()`
+You will build a complete **ADVS** (vital signs) step by step. The same patterns apply to **ADLB** (labs) and **ADEG** (ECGs). Together these are the **BDS — Basic Data Structure** ADaMs: long-format, one row per (subject × parameter × visit × timepoint).
+
+What you learn here:
+
+- Why BDS is **long** (and what SAS programmers must unlearn from `PROC TRANSPOSE`).
+- The canonical **13-step ADVS pipeline**.
+- Baseline (`ABLFL`, `BASE`, `BNRIND`) and change-from-baseline (`CHG`, `PCHG`, `SHIFT1`).
+- Conditional derivation: `restrict_derivation()` vs `slice_derivation()`.
+- ADLB toxicity grades (NCI CTCAE) and ADEG triplicate ECG timepoints.
+- Three Pinnacle 21 (P21) diagnostic bugs.
 
 ---
 
 ## 1 — The BDS shape
 
-```{r bds-shape-demo}
-# BDS = one row per (subject × parameter × visit)
-# Compare: ADSL has one row per subject; BDS has many
-vs |>
-  filter(VSTESTCD %in% c("SYSBP", "DIABP")) |>
-  select(USUBJID, VSTESTCD, VSSTRESN, VSDTC, VISIT) |>
-  arrange(USUBJID, VSTESTCD, VSDTC)
+### 1.1 The biggest mental shift from SAS
+
+In SAS, vital signs land in `VS` as one row per measurement and you transpose to wide for analysis (`PROC TRANSPOSE`). In ADaM **BDS**, you stay long forever — analysis tools read long; layout flips to wide.
+
+| Direction               | SAS habit                                         | admiral / BDS                           |
+|-------------------------|---------------------------------------------------|-----------------------------------------|
+| Source → analysis       | `PROC TRANSPOSE` to wide                          | Stay long; one row per (subj × param × visit × timepoint) |
+| Filter one parameter    | `KEEP _NAME_ = 'SYSBP'` after transpose           | `filter(PARAMCD == "SYSBP")`             |
+| Analysis model input    | Re-transpose to long again                        | Already long                             |
+| Display table output    | Re-transpose to wide                              | Layout engine (Lesson 32+) flips it      |
+
+> **SAS mental model:** BDS = "what `PROC SQL` would emit if you `UNION ALLed` `PROC MEANS NWAY OUT=` for every parameter." Long stays. Width happens only at the display layer.
+
+### 1.2 The BDS primary key
+
+Every BDS dataset has the same key:
+
+| Variable    | Meaning                                       | Example          |
+|-------------|-----------------------------------------------|------------------|
+| `USUBJID`   | Unique subject identifier                     | `01-701-1015`    |
+| `PARAMCD`   | Parameter code                                | `SYSBP`          |
+| `AVISIT`    | Analysis visit                                | `WEEK 4`         |
+| `ATPT`      | Analysis timepoint within visit (optional)    | `2 HR POST DOSE` |
+| `ADT`       | Analysis date                                 | `2024-02-05`     |
+| `DTYPE`     | Derivation type (`NA` for source, `LOCF` etc.)| `NA`             |
+
+### 1.3 PARAM, PARAMCD, PARAMN — the trio
+
+| Variable   | Type      | Role                                    | Example                            |
+|------------|-----------|-----------------------------------------|------------------------------------|
+| `PARAMCD`  | character | Short code — used for filtering         | `SYSBP`                            |
+| `PARAM`    | character | Full label with units — used in titles  | `Systolic Blood Pressure (mmHg)`   |
+| `PARAMN`   | numeric   | Sort order — used for output ordering   | `1`                                |
+
+Three columns hold the same conceptual information at three abstraction levels. The PROC FORMAT analog: a control dataset has `START`, `LABEL`, and `SEXCL` columns. PARAM/PARAMCD/PARAMN play the same role for BDS rows.
+
+### 1.4 AVAL versus AVALC
+
+| Variable | Purpose                                  | Used for                               |
+|----------|------------------------------------------|----------------------------------------|
+| `AVAL`   | Numeric analysis value                   | Means, change from baseline, plots     |
+| `AVALC`  | Character analysis value                 | Categorical results, text              |
+
+For SBP, `AVAL = 135`, `AVALC = NA`. For a categorical pain assessment, `AVAL = NA`, `AVALC = "Moderate"`. Most BDS rows use only one of the two.
+
+### 1.5 DTYPE — source vs derived
+
+| `DTYPE`    | Meaning                                                       |
+|------------|---------------------------------------------------------------|
+| `NA`       | Source observation (raw collected data)                       |
+| `LOCF`     | Last observation carried forward (imputed)                    |
+| `WOCF`     | Worst observation carried forward                             |
+| `MAXIMUM`  | Maximum value summary row                                     |
+| `MINIMUM`  | Minimum value summary row                                     |
+| `AVERAGE`  | Mean summary row                                              |
+
+> **Critical:** when computing `lag()`, `lead()`, or worsening flags, **always** `filter(is.na(DTYPE))` first. Otherwise admiral-derived summary rows pollute time-series logic.
+
+### 1.6 PROC TRANSPOSE vs derive_param
+
 ```
+   /* SAS: wide PROC TRANSPOSE */         |   /* admiral: long stays long */
+   proc transpose data=vs                 |   advs <- vs |>
+     out=vs_wide                          |     derive_vars_merged_lookup(
+     prefix=val_;                         |       dataset_add = param_lookup,
+     by USUBJID VISIT;                    |       by_vars = exprs(VSTESTCD),
+     id VSTESTCD;                         |       new_vars = exprs(PARAMCD,
+     var VSSTRESN;                        |                        PARAM, PARAMN)) |>
+   run;                                   |     mutate(AVAL = VSSTRESN,
+                                          |            AVISIT = VISIT)
+   /* now wide: val_SYSBP, val_DIABP ... */|
+```
+
+### 1.7 Demo — see the BDS shape
+
+```{r bds-shape-demo}
+vs |>
+  derive_vars_merged_lookup(
+    dataset_add = param_lookup,
+    by_vars     = exprs(VSTESTCD),
+    new_vars    = exprs(PARAMCD, PARAM, PARAMN)
+  ) |>
+  mutate(AVAL = VSSTRESN, AVISIT = VISIT) |>
+  select(USUBJID, PARAMCD, AVISIT, AVAL) |>
+  head(6)
+```
+
+> **Read output:** one row per (subject × parameter × visit). Same shape no matter how many parameters get added — pure long.
+
+### 1.8 Exercise — count rows per subject × parameter
+
+```{r bds-shape-ex, exercise=TRUE, exercise.lines=10}
+vs |>
+  derive_vars_merged_lookup(
+    dataset_add = param_lookup,
+    by_vars     = exprs(VSTESTCD),
+    new_vars    = exprs(PARAMCD)
+  ) |>
+  group_by(USUBJID, ___) |>
+  summarise(n_rows = n(), .groups = "drop")
+```
+
+```{r bds-shape-ex-hint-1}
+# Group by PARAMCD
+```
+
+```{r bds-shape-ex-solution}
+vs |>
+  derive_vars_merged_lookup(
+    dataset_add = param_lookup,
+    by_vars     = exprs(VSTESTCD),
+    new_vars    = exprs(PARAMCD)
+  ) |>
+  group_by(USUBJID, PARAMCD) |>
+  summarise(n_rows = n(), .groups = "drop")
+```
+
+### 1.9 Knowledge check — BDS shape
 
 ```{r quiz-bds-shape, echo=FALSE}
 quiz(
   question(
-    "Which of the following ADaMs uses the BDS structure?",
-    answer("ADSL"),
-    answer("ADAE"),
-    answer("ADVS", correct = TRUE),
-    answer("ADTTE"),
-    allow_retry = TRUE
+    "BDS keeps data long. SAS PROC TRANSPOSE puts it wide. Which wins for downstream analysis modelling?",
+    answer("Wide — `PROC MIXED` reads wide"),
+    answer("Long — `PROC MIXED` and `nlme::lme` both need one row per observation", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "In a BDS dataset, what does PARAMCD identify?",
-    answer("The subject"),
-    answer("The analysis visit"),
-    answer("The measured parameter (e.g., SYSBP)", correct = TRUE),
-    answer("The baseline flag"),
-    allow_retry = TRUE
+    "`PARAMCD` vs `PARAM` vs `PARAMN` — why three?",
+    answer("CDISC redundancy"),
+    answer("Filter (PARAMCD), display label (PARAM), sort order (PARAMN) — three abstractions", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`DTYPE = \"LOCF\"` means?",
+    answer("Source raw observation"),
+    answer("Last observation carried forward — admiral-derived summary row, not real measurement", correct = TRUE),
+    random_answer_order = TRUE
   )
 )
 ```
 
 ---
 
-## 2 — Step 1: Merge ADSL variables
+## 2 — Step 1: Merge ADSL onto BDS
 
-The first step brings treatment dates and arm from ADSL so every VS row knows its treatment window.
+### 2.1 Why every BDS row needs ADSL columns
+
+ADSL holds one row per subject. BDS holds many. Downstream derivations need treatment dates, arm, and demographics on every row.
+
+| Bring across                | Purpose                                       |
+|-----------------------------|-----------------------------------------------|
+| `TRTSDT`, `TRTEDT`          | Date windowing (`ONTRTFL`, `ABLFL`)            |
+| `TRT01A`, `TRT01P`          | Stratification in summaries                    |
+| `AGE`, `SEX`                | Demographic subgroup analyses                  |
+
+### 2.2 SAS-analog comparison
+
+| admiral concept                            | SAS counterpart                                              |
+|--------------------------------------------|--------------------------------------------------------------|
+| `derive_vars_merged(by_vars = USUBJID)`    | `MERGE adsl(in=a) vs(in=b); BY USUBJID; if a;`               |
+| `new_vars = exprs(TRTSDT, TRTEDT, TRT01A)` | `KEEP=` in MERGE statement                                   |
+| One-to-many cardinality                    | Same; SAS DATA step happily duplicates ADSL columns          |
+
+### 2.3 ASCII side-by-side
+
+```
+   data advs;                              |   advs <- vs |>
+     merge vs(in=b)                        |     derive_vars_merged(
+           adsl(in=a                       |       dataset_add = adsl_bds,
+                keep=USUBJID TRT01A        |       by_vars  = exprs(STUDYID,
+                     TRTSDT TRTEDT);       |                         USUBJID),
+     by USUBJID;                           |       new_vars = exprs(TRTSDT,
+     if b;                                 |                         TRTEDT,
+   run;                                    |                         TRT01A))
+```
+
+### 2.4 Anatomy of the merge
+
+```r
+vs |>
+  derive_vars_merged(
+    dataset_add = adsl_bds,                     # source: one row per subject
+    by_vars     = exprs(STUDYID, USUBJID),      # join key
+    new_vars    = exprs(TRTSDT, TRTEDT, TRT01A) # columns to promote
+  )
+```
+
+- `dataset_add` must be unique by `by_vars` (admiral validates). No `mode` needed.
+- `new_vars` is explicit — without it ALL non-key ADSL columns come across (usually too many).
+
+### 2.5 Demo
 
 ```{r merge-adsl-demo}
-adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
-
 advs <- vs |>
   derive_vars_merged(
     dataset_add = adsl_bds,
-    new_vars    = adsl_vars,
-    by_vars     = exprs(STUDYID, USUBJID)
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_vars    = exprs(TRTSDT, TRTEDT, TRT01A)
   )
 
-advs |> select(USUBJID, VSTESTCD, VSDTC, TRTSDT, TRTEDT, TRT01A) |> head(4)
+advs |> select(USUBJID, VSTESTCD, VISIT, TRT01A, TRTSDT) |> head(6)
 ```
 
-```{r merge-adsl-ex, exercise=TRUE, exercise.lines=14}
-# Exercise: merge TRTSDT, TRTEDT and TRT01A from adsl_bds onto vs
-# then count how many non-NA TRTSDT values result
-adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
+> **Read output:** TRT01A and TRTSDT appear on every VS row. Subject `01-001` has TRT01A on all rows including SCREENING and WEEK 4.
 
-advs_tmp <- vs |>
+### 2.6 Exercise — promote SEX and AGE
+
+```{r merge-adsl-ex, exercise=TRUE, exercise.lines=12}
+advs_demo <- vs |>
   derive_vars_merged(
-    dataset_add = ___,
-    new_vars    = ___,
-    by_vars     = exprs(STUDYID, USUBJID)
+    dataset_add = adsl_bds,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_vars    = exprs(___, ___)
   )
 
-sum(!is.na(advs_tmp$TRTSDT))
+advs_demo |> select(USUBJID, VSTESTCD, SEX, AGE) |> head(4)
 ```
 
 ```{r merge-adsl-ex-hint-1}
-# dataset_add = adsl_bds
-# new_vars    = adsl_vars
-# by_vars already given
+# new_vars = exprs(SEX, AGE)
 ```
 
 ```{r merge-adsl-ex-solution}
-adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
-
-advs_tmp <- vs |>
+advs_demo <- vs |>
   derive_vars_merged(
     dataset_add = adsl_bds,
-    new_vars    = adsl_vars,
-    by_vars     = exprs(STUDYID, USUBJID)
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_vars    = exprs(SEX, AGE)
   )
 
-sum(!is.na(advs_tmp$TRTSDT))
+advs_demo |> select(USUBJID, VSTESTCD, SEX, AGE) |> head(4)
+```
+
+### 2.7 Knowledge check
+
+```{r quiz-merge-adsl, echo=FALSE}
+quiz(
+  question(
+    "SAS equivalent of `derive_vars_merged(by_vars = exprs(USUBJID))`?",
+    answer("`PROC TRANSPOSE`"),
+    answer("`MERGE adsl vs; BY USUBJID;` with `IF a;` or PROC SQL `LEFT JOIN`", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Omitting `new_vars`?",
+    answer("Errors out"),
+    answer("Brings every non-key column of `dataset_add` onto base — usually too many", correct = TRUE),
+    random_answer_order = TRUE
+  )
+)
 ```
 
 ---
 
 ## 3 — Step 2: Derive ADT and ADY
 
+### 3.1 The DTC → DT → DY chain
+
+SDTM stores dates as ISO 8601 character (`VSDTC = "2024-02-08"`). ADaM analysis needs numeric dates (`ADT`) and study-relative day numbers (`ADY`).
+
+| Variable | Type    | Meaning                                |
+|----------|---------|----------------------------------------|
+| `VSDTC`  | char    | Source ISO 8601 string                  |
+| `ADT`    | numeric | Analysis date (R numeric Date)          |
+| `ADY`    | integer | Study day (Day 1 = TRTSDT; no Day 0)    |
+
+### 3.2 SAS-analog comparison
+
+| admiral                              | SAS counterpart                                              |
+|--------------------------------------|--------------------------------------------------------------|
+| `derive_vars_dt(dtc = VSDTC, new_vars_prefix = "A")` | `ADT = input(VSDTC, yymmdd10.);`             |
+| `derive_vars_dy(reference_date = TRTSDT, source_vars = exprs(ADT))` | `IF ADT >= TRTSDT THEN ADY = ADT - TRTSDT + 1; ELSE ADY = ADT - TRTSDT;` |
+
+> **No Day 0:** ref date is Day 1. Day before is Day -1. Day 0 does not exist in CDISC ADaM IG.
+
+### 3.3 ASCII side-by-side
+
+```
+   data advs;                              |   advs <- advs |>
+     set advs;                             |     derive_vars_dt(
+     ADT = input(VSDTC, yymmdd10.);        |       dtc = VSDTC,
+     if ADT >= TRTSDT                      |       new_vars_prefix = "A") |>
+       then ADY = ADT - TRTSDT + 1;        |     derive_vars_dy(
+       else ADY = ADT - TRTSDT;            |       reference_date = TRTSDT,
+   run;                                    |       source_vars = exprs(ADT))
+```
+
+### 3.4 Demo
+
 ```{r derive-adt-demo}
 advs <- advs |>
-  derive_vars_dt(
-    new_vars_prefix = "A",   # produces ADT (and ADTF if imputation flag)
-    dtc             = VSDTC
-  ) |>
-  derive_vars_dy(
-    reference_date = TRTSDT,
-    source_vars    = exprs(ADT)   # produces ADY
-  )
+  derive_vars_dt(dtc = VSDTC, new_vars_prefix = "A") |>
+  derive_vars_dy(reference_date = TRTSDT, source_vars = exprs(ADT))
 
-advs |> select(USUBJID, VSTESTCD, VSDTC, ADT, ADY) |> head(4)
+advs |>
+  mutate(ADT_human = as.Date(ADT, origin = "1970-01-01")) |>
+  select(USUBJID, VISIT, ADT_human, ADY) |>
+  head(6)
 ```
 
-```{r quiz-adt, echo=FALSE}
+> **Read output:** SCREENING rows precede TRTSDT → ADY = -2 (two days before Day 1). WEEK 4 rows fall after TRTSDT → positive ADY. No Day 0.
+
+### 3.5 Exercise — verify no Day 0
+
+```{r derive-adt-ex, exercise=TRUE, exercise.lines=10}
+advs |>
+  summarise(
+    has_day_0    = any(ADY == ___, na.rm = TRUE),
+    min_negative = min(ADY[ADY < 0], na.rm = TRUE),
+    max_positive = max(ADY[ADY > 0], na.rm = TRUE)
+  )
+```
+
+```{r derive-adt-ex-hint-1}
+# has_day_0 = any(ADY == 0)
+```
+
+```{r derive-adt-ex-solution}
+advs |>
+  summarise(
+    has_day_0    = any(ADY == 0, na.rm = TRUE),
+    min_negative = min(ADY[ADY < 0], na.rm = TRUE),
+    max_positive = max(ADY[ADY > 0], na.rm = TRUE)
+  )
+```
+
+### 3.6 Knowledge check
+
+```{r quiz-derive-adt, echo=FALSE}
 quiz(
   question(
-    "What does `new_vars_prefix = 'A'` produce in `derive_vars_dt()`?",
-    answer("AVAL and AVALC"),
-    answer("ADT and ADTF", correct = TRUE),
-    answer("ASTDT and AENDT"),
-    answer("ABLFL and ANRIND"),
-    allow_retry = TRUE
+    "Subject treated on 2024-01-15. AE on 2024-01-15. ADY = ?",
+    answer("0"),
+    answer("1 — reference date is Day 1; no Day 0", correct = TRUE),
+    answer("-1"),
+    random_answer_order = TRUE
   ),
   question(
-    "ADY on the treatment start date equals:",
-    answer("0"),
-    answer("1", correct = TRUE),
-    answer("-1"),
-    answer("Depends on TRTSDT"),
-    allow_retry = TRUE
+    "SAS analog of `derive_vars_dy()`?",
+    answer("`PROC TRANSPOSE`"),
+    answer("DATA step with `IF ADT >= TRTSDT THEN ADY = ADT - TRTSDT + 1; ELSE ADY = ADT - TRTSDT;`", correct = TRUE),
+    random_answer_order = TRUE
   )
 )
-```
-
-### Exercise: Explore real ADVS parameter inventory
-
-The toy dataset has 2 subjects and 6 test codes. The real `advs_real` from pharmaverseadam has the full CDISCPILOT01 study — 254 subjects and many more parameters and visits.
-
-> **Orientation exercise**: before building a new BDS dataset, a programmer always audits the source SDTM to understand its shape. Answer the three questions using `advs_real`.
-
-```{r advs-real-explore, exercise=TRUE, exercise.lines=30}
-# Q1: How many unique PARAMCD values are in advs_real?
-n_params <- advs_real |> distinct(PARAMCD) |> nrow()
-cat("Unique parameters:", n_params, "\n")
-
-# Q2: Which PARAMCDs are present?
-advs_real |> distinct(PARAMCD, PARAM) |> arrange(PARAMCD) |> print()
-
-# Q3: How many ONTRTFL = "Y" rows exist per PARAMCD?
-advs_real |>
-  filter(ONTRTFL == "Y") |>
-  count(PARAMCD, name = "n_ontreatment") |>
-  arrange(desc(n_ontreatment)) |>
-  print()
-```
-
-```{r advs-real-explore-hint-1}
-# distinct(PARAMCD) gives unique parameter codes
-# count(PARAMCD) counts rows per parameter
-# filter(ONTRTFL == "Y") selects on-treatment observations
-```
-
-```{r advs-real-explore-solution}
-n_params <- advs_real |> distinct(PARAMCD) |> nrow()
-cat("Unique parameters:", n_params, "\n\n")
-
-advs_real |> distinct(PARAMCD, PARAM) |> arrange(PARAMCD) |> print()
-
-advs_real |>
-  filter(ONTRTFL == "Y") |>
-  count(PARAMCD, name = "n_ontreatment") |>
-  arrange(desc(n_ontreatment)) |>
-  print()
 ```
 
 ---
 
 ## 4 — Step 3: Assign PARAMCD via lookup
 
-`derive_vars_merged_lookup()` is like `derive_vars_merged()` but designed for static lookup tables. It maps VSTESTCD → PARAMCD/PARAM/PARAMN.
+### 4.1 The lookup mental model — PROC FORMAT in tibble form
 
-```{r param-lookup-demo}
+SAS uses `PROC FORMAT CNTLIN=` to build category lookups. admiral uses a tibble as the lookup, joined with `derive_vars_merged_lookup()`.
+
+| SAS `PROC FORMAT`                     | admiral `derive_vars_merged_lookup`                         |
+|---------------------------------------|-------------------------------------------------------------|
+| `PROC FORMAT CNTLIN=lookup_ds;`        | `param_lookup <- tribble(...)`                               |
+| `FORMAT VSTESTCD $param.;`             | `derive_vars_merged_lookup(dataset_add = param_lookup, ...)`|
+| `START` → `LABEL`                      | `VSTESTCD` → `PARAMCD` / `PARAM` / `PARAMN`                  |
+
+### 4.2 ASCII side-by-side
+
+```
+   data param_lookup;                      |   param_lookup <- tribble(
+     length VSTESTCD $8 PARAMCD $8         |     ~VSTESTCD, ~PARAMCD, ~PARAM,
+            PARAM $50;                     |     "SYSBP",   "SYSBP",  "Sys BP",
+     input VSTESTCD PARAMCD                |     "DIABP",   "DIABP",  "Dia BP",
+           PARAM $; datalines;             |     ...)
+     SYSBP  SYSBP  Systolic BP             |
+     ;                                     |   advs |>
+   run;                                    |     derive_vars_merged_lookup(
+                                           |       dataset_add = param_lookup,
+   proc format cntlin=param_lookup;        |       by_vars  = exprs(VSTESTCD),
+     value $vstparam ... ;                 |       new_vars =
+   run;                                    |         exprs(PARAMCD, PARAM, PARAMN))
+```
+
+### 4.3 Anatomy
+
+```r
+advs |>
+  derive_vars_merged_lookup(
+    dataset_add = param_lookup,                        # the lookup tibble
+    by_vars     = exprs(VSTESTCD),                     # join key
+    new_vars    = exprs(PARAMCD, PARAM, PARAMN)        # columns to bring across
+  )
+```
+
+- The lookup must be one row per `by_vars`. Duplicates → join blows up cardinality.
+- Unmatched VSTESTCD → `NA` PARAMCD silently. **Common bug.** Always audit `filter(is.na(PARAMCD))` after the join.
+
+### 4.4 Demo
+
+```{r paramcd-demo}
 advs <- advs |>
   derive_vars_merged_lookup(
     dataset_add = param_lookup,
     by_vars     = exprs(VSTESTCD),
-    new_vars    = exprs(PARAMCD, PARAM, PARAMN, PARCAT1)
-  )
-
-advs |> select(VSTESTCD, PARAMCD, PARAM, PARAMN) |> distinct() |> head(6)
-```
-
-```{r aval-assign}
-# Assign AVAL from the standardized numeric result
-advs <- advs |>
+    new_vars    = exprs(PARAMCD, PARAM, PARAMN)
+  ) |>
   mutate(
-    AVAL   = VSSTRESN,
-    AVALC  = VSSTRESC,
-    AVISIT = VISIT,
-    AVISITN = case_when(
-      VISIT == "SCREENING" ~ 0,
-      VISIT == "WEEK 4"    ~ 4,
-      TRUE                 ~ NA_real_
-    )
+    AVAL    = VSSTRESN,
+    AVALC   = VSSTRESC,
+    AVISIT  = VISIT,
+    AVISITN = case_when(VISIT == "SCREENING" ~ 0,
+                        VISIT == "WEEK 4"    ~ 4,
+                        TRUE                 ~ NA_real_),
+    ANRLO   = VSORNRLO,
+    ANRHI   = VSORNRHI
   )
+
+advs |> select(USUBJID, VSTESTCD, PARAMCD, PARAM, PARAMN, AVAL) |> head(6)
 ```
 
-```{r paramcd-ex, exercise=TRUE, exercise.lines=14}
-# Exercise: using param_lookup, map VSTESTCD → PARAMCD and PARAM
-# then verify no NA PARAMCD for SYSBP or DIABP rows
+> **Read output:** PARAMCD now populated from lookup. PARAM holds the display label. PARAMN drives sort order.
 
-vs_tmp <- vs |>
-  derive_vars_merged_lookup(
-    dataset_add = param_lookup,
-    by_vars     = exprs(VSTESTCD),
-    new_vars    = exprs(___, ___)
-  )
+### 4.5 Exercise — detect missing lookup entries
 
-vs_tmp |> filter(VSTESTCD %in% c("SYSBP", "DIABP")) |>
-  select(VSTESTCD, PARAMCD, PARAM) |> distinct()
+```{r paramcd-ex, exercise=TRUE, exercise.lines=10}
+# How many rows have PARAMCD = NA after the lookup?
+advs |>
+  summarise(missing_paramcd = sum(is.na(___)))
 ```
 
 ```{r paramcd-ex-hint-1}
-# new_vars = exprs(PARAMCD, PARAM)
+# Check PARAMCD column
 ```
 
 ```{r paramcd-ex-solution}
-vs_tmp <- vs |>
-  derive_vars_merged_lookup(
-    dataset_add = param_lookup,
-    by_vars     = exprs(VSTESTCD),
-    new_vars    = exprs(PARAMCD, PARAM)
-  )
+advs |>
+  summarise(missing_paramcd = sum(is.na(PARAMCD)))
+```
 
-vs_tmp |> filter(VSTESTCD %in% c("SYSBP", "DIABP")) |>
-  select(VSTESTCD, PARAMCD, PARAM) |> distinct()
+### 4.6 Knowledge check
+
+```{r quiz-paramcd, echo=FALSE}
+quiz(
+  question(
+    "Closest SAS analog of `derive_vars_merged_lookup()`?",
+    answer("`PROC TRANSPOSE`"),
+    answer("`PROC FORMAT CNTLIN=` and `FORMAT` statement, or `PROC SQL LEFT JOIN` to lookup", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "VSTESTCD not present in lookup → PARAMCD becomes?",
+    answer("Source value `VSTESTCD`"),
+    answer("`NA` silently — always audit after join", correct = TRUE),
+    random_answer_order = TRUE
+  )
+)
 ```
 
 ---
 
 ## 5 — Derived parameters: BMI and MAP
 
-```{r derived-params-demo}
-# BMI from WEIGHT and HEIGHT
+### 5.1 New rows, not new columns
+
+In SAS you would compute BMI as a new column. In admiral BDS, BMI lives as a **new row**: `PARAMCD = "BMI"`, `AVAL = computed value`. The long shape is preserved.
+
+```
+   /* SAS: new column */                   |   /* admiral: new row */
+   data advs;                              |   advs |>
+     set advs;                             |     derive_param_bmi(
+     by USUBJID VISIT;                     |       by_vars = exprs(STUDYID,
+     if first.VISIT then BMI =             |                        USUBJID,
+        weight / (height/100)**2;          |                        AVISIT, AVISITN),
+   run;                                    |       weight_code = "WEIGHT",
+                                           |       height_code = "HEIGHT",
+                                           |       constant_by_vars = exprs(USUBJID),
+                                           |       set_values_to = exprs(
+                                           |         PARAMCD = "BMI",
+                                           |         PARAM = "BMI (kg/m^2)",
+                                           |         PARAMN = 20))
+```
+
+### 5.2 SAS-analog comparison
+
+| admiral                          | SAS counterpart                                                          |
+|----------------------------------|--------------------------------------------------------------------------|
+| `derive_param_bmi()`             | DATA step computing BMI per visit + `OUTPUT;` for new row                |
+| `constant_by_vars = exprs(USUBJID)` | Retain screening HEIGHT, applied to every visit                       |
+| `derive_param_map()`             | `MAP = (SBP + 2*DBP) / 3;` per visit, output as new row                   |
+| `set_values_to = exprs(PARAMCD = "BMI")` | Set PARAMCD on new rows; `LENGTH` + assignment in SAS              |
+
+### 5.3 Demo — BMI
+
+```{r bmi-demo}
 advs <- advs |>
   derive_param_bmi(
     by_vars          = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
     weight_code      = "WEIGHT",
     height_code      = "HEIGHT",
     constant_by_vars = exprs(USUBJID),
-    set_values_to    = exprs(
-      PARAMCD = "BMI",
-      PARAM   = "Body Mass Index (kg/m^2)",
-      PARAMN  = 20
-    )
+    set_values_to    = exprs(PARAMCD = "BMI",
+                              PARAM   = "BMI (kg/m^2)",
+                              PARAMN  = 20)
   )
 
-# MAP from SYSBP and DIABP
+advs |> filter(PARAMCD == "BMI") |>
+  select(USUBJID, AVISIT, AVAL, PARAMCD, PARAM)
+```
+
+> **Read output:** BMI rows present even at WEEK 4 because `constant_by_vars = exprs(USUBJID)` carries screening HEIGHT forward.
+
+### 5.4 Demo — MAP
+
+```{r map-demo}
 advs <- advs |>
   derive_param_map(
     by_vars       = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
-    set_values_to = exprs(
-      PARAMCD = "MAP",
-      PARAM   = "Mean Arterial Pressure (mmHg)",
-      PARAMN  = 21
-    )
+    set_values_to = exprs(PARAMCD = "MAP",
+                          PARAM   = "MAP (mmHg)",
+                          PARAMN  = 21)
   )
 
-advs |> filter(PARAMCD %in% c("BMI", "MAP")) |>
-  select(USUBJID, PARAMCD, AVAL, AVISIT) |>
-  arrange(USUBJID, PARAMCD, AVISIT)
+advs |> filter(PARAMCD == "MAP") |>
+  select(USUBJID, AVISIT, AVAL, PARAMCD, PARAM)
 ```
 
-```{r quiz-params, echo=FALSE}
+> **Read output:** MAP = (SBP + 2 × DBP) / 3 per visit per subject. New rows appended.
+
+### 5.5 Exercise — count derived BMI rows
+
+```{r bmi-ex, exercise=TRUE, exercise.lines=8}
+advs |>
+  filter(PARAMCD == ___) |>
+  group_by(USUBJID) |>
+  summarise(n_bmi_rows = n(), .groups = "drop")
+```
+
+```{r bmi-ex-hint-1}
+# PARAMCD == "BMI"
+```
+
+```{r bmi-ex-solution}
+advs |>
+  filter(PARAMCD == "BMI") |>
+  group_by(USUBJID) |>
+  summarise(n_bmi_rows = n(), .groups = "drop")
+```
+
+### 5.6 Knowledge check
+
+```{r quiz-derived-params, echo=FALSE}
 quiz(
   question(
-    "What does `constant_by_vars = exprs(USUBJID)` do in `derive_param_bmi()`?",
-    answer("Filters to one height per visit"),
-    answer("Uses the single height value for all visits of a subject", correct = TRUE),
-    answer("Forces BMI to be recalculated once"),
-    answer("Nothing — it is ignored"),
-    allow_retry = TRUE
+    "BMI lives as a new ___ in BDS.",
+    answer("Column"),
+    answer("Row — `PARAMCD = \"BMI\"`, `AVAL = computed value`", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "Which function handles arbitrary formula parameters like FLI or HOMA-IR?",
-    answer("derive_param_bmi()"),
-    answer("derive_param_map()"),
-    answer("derive_param_computed()", correct = TRUE),
-    answer("derive_var_anrind()"),
-    allow_retry = TRUE
+    "`constant_by_vars = exprs(USUBJID)` does?",
+    answer("Limits BMI to one visit"),
+    answer("Carries screening height forward to every visit so BMI computes at WEEK 4 too", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Filter to PARAMCD == SYSBP before `derive_param_map()`?",
+    answer("MAP still works"),
+    answer("MAP cannot compute — needs both SYSBP and DIABP rows in input", correct = TRUE),
+    random_answer_order = TRUE
   )
 )
-```
-
-```{r computed-param-ex, exercise=TRUE, exercise.lines=18}
-# Exercise: use derive_param_computed() to compute MAP with the formula
-# AVAL = (AVAL.SYSBP + 2 * AVAL.DIABP) / 3
-# Add PARAMCD = "MAP2", PARAM = "MAP (computed)", PARAMN = 22
-
-advs_with_map2 <- advs |>
-  filter(PARAMCD %in% c("SYSBP", "DIABP")) |>
-  derive_param_computed(
-    by_vars       = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
-    parameters    = ___,
-    set_values_to = exprs(
-      AVAL    = ___,
-      PARAMCD = "MAP2",
-      PARAM   = "MAP (computed)",
-      PARAMN  = 22
-    )
-  )
-
-advs_with_map2 |> filter(PARAMCD == "MAP2") |>
-  select(USUBJID, PARAMCD, AVAL, AVISIT)
-```
-
-```{r computed-param-ex-hint-1}
-# parameters = c("SYSBP", "DIABP")
-# AVAL = (AVAL.SYSBP + 2 * AVAL.DIABP) / 3
-```
-
-```{r computed-param-ex-solution}
-advs_with_map2 <- advs |>
-  filter(PARAMCD %in% c("SYSBP", "DIABP")) |>
-  derive_param_computed(
-    by_vars       = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
-    parameters    = c("SYSBP", "DIABP"),
-    set_values_to = exprs(
-      AVAL    = (AVAL.SYSBP + 2 * AVAL.DIABP) / 3,
-      PARAMCD = "MAP2",
-      PARAM   = "MAP (computed)",
-      PARAMN  = 22
-    )
-  )
-
-advs_with_map2 |> filter(PARAMCD == "MAP2") |>
-  select(USUBJID, PARAMCD, AVAL, AVISIT)
 ```
 
 ---
 
 ## 6 — ANRIND and ONTRTFL
 
-```{r anrind-ontrtfl-demo}
-advs <- advs |>
-  derive_var_anrind() |>       # reads AVAL, ANRLO, ANRHI → ANRIND
-  derive_var_ontrtfl(
-    start_date      = ADT,
-    ref_start_date  = TRTSDT,
-    ref_end_date    = TRTEDT
-  )
+### 6.1 What they encode
 
-advs |>
-  filter(PARAMCD == "SYSBP") |>
-  select(USUBJID, AVAL, ANRLO, ANRHI, ANRIND, ONTRTFL, AVISIT)
+| Var       | Meaning                            | Values                                |
+|-----------|------------------------------------|---------------------------------------|
+| `ANRIND`  | Analysis normal range indicator    | `"LOW"` / `"NORMAL"` / `"HIGH"` / `NA`|
+| `ONTRTFL` | On-treatment flag                  | `"Y"` / `NA` (never `"N"`)            |
+
+### 6.2 SAS-analog comparison
+
+| admiral                              | SAS counterpart                                                  |
+|--------------------------------------|------------------------------------------------------------------|
+| `derive_var_anrind()`                | `PROC FORMAT` 3-bin or DATA step `IF AVAL < ANRLO THEN ANRIND="LOW";` |
+| `derive_var_ontrtfl(start, ref_start, ref_end)` | `IF TRTSDT <= ADT <= TRTEDT THEN ONTRTFL="Y";`        |
+| `ref_end_window = 30`                | `IF TRTSDT <= ADT <= TRTEDT + 30 THEN ONTRTFL = "Y";`            |
+
+### 6.3 ASCII side-by-side
+
+```
+   data advs;                              |   advs |>
+     set advs;                             |     derive_var_anrind() |>
+     if AVAL < ANRLO then ANRIND="LOW";    |     derive_var_ontrtfl(
+     else if AVAL > ANRHI then             |       start_date     = ADT,
+          ANRIND = "HIGH";                 |       ref_start_date = TRTSDT,
+     else if not missing(AVAL) then        |       ref_end_date   = TRTEDT)
+          ANRIND = "NORMAL";               |
+     if TRTSDT <= ADT <= TRTEDT then       |
+          ONTRTFL = "Y";                   |
+   run;                                    |
 ```
 
-```{r anrind-ex, exercise=TRUE, exercise.lines=12}
-# Exercise: add ONTRTFL with a 30-day window after TRTEDT (ref_end_window = 30)
-# then count how many rows get ONTRTFL = "Y"
+### 6.4 Demo
 
-advs_ont <- advs |>
+```{r anrind-ontrtfl-demo}
+advs <- advs |>
+  derive_var_anrind() |>
+  derive_var_ontrtfl(
+    start_date     = ADT,
+    ref_start_date = TRTSDT,
+    ref_end_date   = TRTEDT
+  )
+
+advs |> filter(PARAMCD == "SYSBP") |>
+  select(USUBJID, AVISIT, AVAL, ANRLO, ANRHI, ANRIND, ONTRTFL)
+```
+
+> **Read output:** ANRIND = LOW/NORMAL/HIGH per row. ONTRTFL = "Y" only inside treatment window; pre-treatment SCREENING rows → NA.
+
+### 6.5 Common pitfalls
+
+1. Forget ANRLO/ANRHI on row → ANRIND = NA.
+2. `ref_end_window = TRTDURD` → wrong; window is days BEYOND TRTEDT, not duration.
+3. CDISC rule: ONTRTFL never `"N"`.
+
+### 6.6 Exercise — 30-day post-treatment safety window
+
+```{r ontrtfl-ex, exercise=TRUE, exercise.lines=12}
+advs_post <- advs |>
   derive_var_ontrtfl(
     start_date     = ADT,
     ref_start_date = TRTSDT,
@@ -811,15 +1032,15 @@ advs_ont <- advs |>
     ref_end_window = ___
   )
 
-sum(advs_ont$ONTRTFL == "Y", na.rm = TRUE)
+sum(advs_post$ONTRTFL == "Y", na.rm = TRUE)
 ```
 
-```{r anrind-ex-hint-1}
+```{r ontrtfl-ex-hint-1}
 # ref_end_window = 30
 ```
 
-```{r anrind-ex-solution}
-advs_ont <- advs |>
+```{r ontrtfl-ex-solution}
+advs_post <- advs |>
   derive_var_ontrtfl(
     start_date     = ADT,
     ref_start_date = TRTSDT,
@@ -827,17 +1048,86 @@ advs_ont <- advs |>
     ref_end_window = 30
   )
 
-sum(advs_ont$ONTRTFL == "Y", na.rm = TRUE)
+sum(advs_post$ONTRTFL == "Y", na.rm = TRUE)
+```
+
+### 6.7 Knowledge check
+
+```{r quiz-anrind, echo=FALSE}
+quiz(
+  question(
+    "`derive_var_anrind()` ≈ which SAS?",
+    answer("`PROC FREQ`"),
+    answer("`PROC FORMAT` 3-bin or DATA-step `IF AVAL < ANRLO THEN \"LOW\"; ELSE IF AVAL > ANRHI THEN \"HIGH\"; ELSE \"NORMAL\";`", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "AVAL is NA — ANRIND?",
+    answer("`\"NORMAL\"`"),
+    answer("`NA` — cannot classify missing value", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "ONTRTFL=\"N\" allowed?",
+    answer("Yes"),
+    answer("No — CDISC: `\"Y\"` or `NA` only", correct = TRUE),
+    random_answer_order = TRUE
+  )
+)
 ```
 
 ---
 
-## 7 — Baseline: ABLFL, BASE, BASEC, BNRIND
+## 7 — Baseline: ABLFL, BASE, BNRIND
 
-The baseline row is the last pre-treatment observation per subject per parameter.
+### 7.1 Definition
+
+Baseline row = **last pre-treatment observation** per (USUBJID × PARAMCD). Its `AVAL` and `ANRIND` are pulled forward to every row (`BASE`, `BNRIND`).
+
+| Var      | Meaning                                              |
+|----------|------------------------------------------------------|
+| `ABLFL`  | `"Y"` on baseline row, `NA` elsewhere                 |
+| `BASE`   | Baseline AVAL carried forward to all subj × param rows|
+| `BNRIND` | Baseline ANRIND carried forward                       |
+
+### 7.2 SAS-analog comparison
+
+| admiral                                              | SAS counterpart                                                                  |
+|------------------------------------------------------|----------------------------------------------------------------------------------|
+| `restrict_derivation(derive_var_extreme_flag, filter = ADT <= TRTSDT)` | `PROC SORT BY USUBJID PARAMCD ADT;` + `IF LAST.PARAMCD` on filtered set |
+| `mode = "last"`                                      | `IF LAST.PARAMCD THEN ABLFL = "Y";`                                              |
+| `derive_var_base(source_var = AVAL, new_var = BASE)` | `RETAIN BASE; IF ABLFL = "Y" THEN BASE = AVAL;`                                  |
+
+### 7.3 ASCII side-by-side
+
+```
+   proc sort data=advs;                    |   advs |>
+     by USUBJID PARAMCD ADT;               |     restrict_derivation(
+   run;                                    |       derivation =
+                                           |         derive_var_extreme_flag,
+   data advs;                              |       args = params(
+     set advs;                             |         by_vars = exprs(STUDYID,
+     by USUBJID PARAMCD;                   |                          USUBJID,
+     retain BASE;                          |                          PARAMCD),
+     if first.PARAMCD then BASE = .;       |         order   = exprs(ADT,
+     if ADT <= TRTSDT and                  |                          AVISITN),
+        not missing(AVAL) and              |         new_var = ABLFL,
+        last.PARAMCD                       |         mode    = "last"),
+       then do;                            |       filter =
+         ABLFL = "Y"; BASE = AVAL;         |         !is.na(AVAL) & ADT <= TRTSDT)
+       end;                                |
+   run;                                    |   advs |>
+                                           |     derive_var_base(
+                                           |       by_vars = exprs(STUDYID,
+                                           |                        USUBJID,
+                                           |                        PARAMCD),
+                                           |       source_var = AVAL,
+                                           |       new_var    = BASE)
+```
+
+### 7.4 Demo
 
 ```{r baseline-demo}
-# Step 1: flag baseline rows with restrict_derivation
 advs <- advs |>
   restrict_derivation(
     derivation = derive_var_extreme_flag,
@@ -847,53 +1137,30 @@ advs <- advs |>
       new_var = ABLFL,
       mode    = "last"
     ),
-    filter = (!is.na(AVAL) & ADT <= TRTSDT)
-  )
-
-# Step 2: copy baseline AVAL and ANRIND to every row
-advs <- advs |>
-  derive_var_base(
-    by_vars    = exprs(STUDYID, USUBJID, PARAMCD),
-    source_var = AVAL,
-    new_var    = BASE
+    filter = !is.na(AVAL) & ADT <= TRTSDT
   ) |>
-  derive_var_base(
-    by_vars    = exprs(STUDYID, USUBJID, PARAMCD),
-    source_var = ANRIND,
-    new_var    = BNRIND
-  )
+  derive_var_base(by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+                  source_var = AVAL,   new_var = BASE) |>
+  derive_var_base(by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+                  source_var = ANRIND, new_var = BNRIND)
 
-advs |>
-  filter(PARAMCD == "SYSBP") |>
+advs |> filter(PARAMCD == "SYSBP") |>
   select(USUBJID, AVISIT, AVAL, ABLFL, BASE, ANRIND, BNRIND)
 ```
 
-```{r quiz-baseline, echo=FALSE}
-quiz(
-  question(
-    "What value is stored in ABLFL for the baseline row?",
-    answer("1"),
-    answer("TRUE"),
-    answer("Y", correct = TRUE),
-    answer("BASELINE"),
-    allow_retry = TRUE
-  ),
-  question(
-    "Why do you call `derive_var_base()` twice (for AVAL and ANRIND)?",
-    answer("It can only copy one variable at a time", correct = TRUE),
-    answer("ANRIND doesn't exist yet when BASE is derived"),
-    answer("Admiral mandates two-step baseline"),
-    answer("BASE needs a separate call from BASEC"),
-    allow_retry = TRUE
-  )
-)
-```
+> **Read output:** one `ABLFL = "Y"` per subject per PARAMCD. BASE column shows same value across all rows of that group. BNRIND mirrors BASE for ANRIND.
 
-```{r ablfl-ex, exercise=TRUE, exercise.lines=20}
-# Exercise: for DIABP only, flag the LAST pre-treatment row as ABLFL
-# then check: how many DIABP rows have ABLFL = "Y"?
+### 7.5 Common pitfalls
 
-advs_bl <- advs |>
+1. `mode = "first"` → flags earliest screening, not last pre-treatment. Always `"last"`.
+2. Forget `filter`: flags last record overall (often post-treatment).
+3. Forget `PARAMCD` from `by_vars`: BASE of SYSBP overwrites BASE of DIABP.
+4. Derive BASE before ABLFL → silently NA on all rows. Order: ABLFL → BASE → BNRIND.
+
+### 7.6 Exercise — flag baseline for DIABP only
+
+```{r ablfl-ex, exercise=TRUE, exercise.lines=14}
+advs_dia <- advs |>
   filter(PARAMCD == "DIABP") |>
   restrict_derivation(
     derivation = derive_var_extreme_flag,
@@ -901,12 +1168,12 @@ advs_bl <- advs |>
       by_vars = exprs(STUDYID, USUBJID, PARAMCD),
       order   = exprs(ADT),
       new_var = ABLFL,
-      mode    = "___"   # last pre-treatment = "last"
+      mode    = ___
     ),
-    filter = (!is.na(AVAL) & ADT <= TRTSDT)
+    filter = !is.na(AVAL) & ADT <= TRTSDT
   )
 
-sum(advs_bl$ABLFL == "Y", na.rm = TRUE)
+sum(advs_dia$ABLFL == "Y", na.rm = TRUE)
 ```
 
 ```{r ablfl-ex-hint-1}
@@ -914,7 +1181,7 @@ sum(advs_bl$ABLFL == "Y", na.rm = TRUE)
 ```
 
 ```{r ablfl-ex-solution}
-advs_bl <- advs |>
+advs_dia <- advs |>
   filter(PARAMCD == "DIABP") |>
   restrict_derivation(
     derivation = derive_var_extreme_flag,
@@ -924,68 +1191,204 @@ advs_bl <- advs |>
       new_var = ABLFL,
       mode    = "last"
     ),
-    filter = (!is.na(AVAL) & ADT <= TRTSDT)
+    filter = !is.na(AVAL) & ADT <= TRTSDT
   )
 
-sum(advs_bl$ABLFL == "Y", na.rm = TRUE)
+sum(advs_dia$ABLFL == "Y", na.rm = TRUE)
+```
+
+### 7.7 Knowledge check
+
+```{r quiz-baseline, echo=FALSE}
+quiz(
+  question(
+    "ABLFL value on non-baseline rows?",
+    answer("`\"N\"`"),
+    answer("`NA` — CDISC IG forbids `\"N\"`", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "BASE before ABLFL — what happens?",
+    answer("Same — admiral reorders"),
+    answer("BASE = NA on every row — `derive_var_base` reads ABLFL which doesn't exist yet", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Missing `PARAMCD` from `by_vars` of `derive_var_base()`?",
+    answer("Works fine"),
+    answer("BASE for one param overwrites BASE for another — wrong baseline", correct = TRUE),
+    random_answer_order = TRUE
+  )
+)
 ```
 
 ---
 
 ## 8 — CHG, PCHG, and SHIFT1
 
+### 8.1 What they compute
+
+| Var      | Formula                                | Use                                                |
+|----------|----------------------------------------|----------------------------------------------------|
+| `CHG`    | `AVAL − BASE`                          | Signed change from baseline                        |
+| `PCHG`   | `(AVAL − BASE) / BASE × 100`           | Percent change from baseline                       |
+| `SHIFT1` | `paste0(BNRIND, " to ", ANRIND)`       | Shift cell: "NORMAL to HIGH" etc.                  |
+
+### 8.2 SAS-analog comparison
+
+| admiral                  | SAS counterpart                                                  |
+|--------------------------|------------------------------------------------------------------|
+| `derive_var_chg()`       | `CHG = AVAL - BASE;` in DATA step                                |
+| `derive_var_pchg()`      | `IF BASE > 0 THEN PCHG = (AVAL - BASE) / BASE * 100;`            |
+| `derive_var_shift(...)`  | `SHIFT1 = catx(" to ", BNRIND, ANRIND);`                          |
+
+### 8.3 ASCII side-by-side
+
+```
+   data advs;                              |   advs |>
+     set advs;                             |     derive_var_chg() |>
+     CHG = AVAL - BASE;                    |     derive_var_pchg() |>
+     if BASE > 0                           |     derive_var_shift(
+       then PCHG = (AVAL - BASE)           |       new_var  = SHIFT1,
+                   / BASE * 100;           |       from_var = BNRIND,
+     SHIFT1 = catx(" to ", BNRIND,         |       to_var   = ANRIND)
+                             ANRIND);      |
+   run;                                    |
+```
+
+### 8.4 Demo
+
 ```{r chg-shift-demo}
 advs <- advs |>
   derive_var_chg() |>
   derive_var_pchg() |>
-  derive_var_shift(
-    new_var  = SHIFT1,
-    from_var = BNRIND,
-    to_var   = ANRIND
-  )
+  derive_var_shift(new_var = SHIFT1,
+                   from_var = BNRIND, to_var = ANRIND)
 
-advs |>
-  filter(PARAMCD == "SYSBP" & !is.na(BASE)) |>
+advs |> filter(PARAMCD == "SYSBP" & !is.na(BASE)) |>
   select(USUBJID, AVISIT, AVAL, BASE, CHG, PCHG, BNRIND, ANRIND, SHIFT1)
 ```
 
-```{r chg-ex, exercise=TRUE, exercise.lines=14}
-# Exercise: compute CHG and PCHG for DIABP rows, then show
-# max absolute CHG per subject
+> **Read output:** CHG signed (AVAL − BASE). PCHG percent. SHIFT1 = "BNRIND to ANRIND" string.
 
-advs_chg <- advs |>
+### 8.5 Common pitfalls
+
+1. `BASE = 0` → PCHG NA (divide-by-zero guard), not Inf.
+2. CHG before BASE derived → all NA. Order matters.
+3. Sign-reversal bug in custom DATA step (`BASE - AVAL`). admiral never has this.
+
+### 8.6 Exercise — max abs CHG per subject (DIABP)
+
+```{r chg-ex, exercise=TRUE, exercise.lines=10}
+advs |>
   filter(PARAMCD == "DIABP") |>
-  derive_var_chg() |>
-  derive_var_pchg()
-
-advs_chg |>
   group_by(USUBJID) |>
-  summarise(max_abs_chg = max(abs(CHG), na.rm = TRUE))
+  summarise(max_abs_chg = max(abs(___), na.rm = TRUE))
 ```
 
 ```{r chg-ex-hint-1}
-# derive_var_chg() reads BASE and AVAL automatically — no arguments needed
+# Use CHG column
 ```
 
 ```{r chg-ex-solution}
-advs_chg <- advs |>
+advs |>
   filter(PARAMCD == "DIABP") |>
-  derive_var_chg() |>
-  derive_var_pchg()
-
-advs_chg |>
   group_by(USUBJID) |>
   summarise(max_abs_chg = max(abs(CHG), na.rm = TRUE))
+```
+
+### 8.7 Knowledge check
+
+```{r quiz-chg, echo=FALSE}
+quiz(
+  question(
+    "CHG formula?",
+    answer("`BASE - AVAL`"),
+    answer("`AVAL - BASE`", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "BASE = 0 → PCHG = ?",
+    answer("`Inf`"),
+    answer("`NA` — divide-by-zero guard", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "SHIFT1 separator?",
+    answer("`\" -> \"`"),
+    answer("`\" to \"` (hardcoded)", correct = TRUE),
+    random_answer_order = TRUE
+  )
+)
 ```
 
 ---
 
-## 9 — restrict_derivation vs slice_derivation
+## 9 — `restrict_derivation` vs `slice_derivation`
+
+### 9.1 The two patterns
+
+| Wrapper                | Use case                                                                    |
+|------------------------|-----------------------------------------------------------------------------|
+| `restrict_derivation`  | One derivation, SUBSET of rows. Other rows pass through.                    |
+| `slice_derivation`     | DIFFERENT derivation args per row subset. Multiple slices stacked.          |
+
+Decision: same logic smaller scope → `restrict`. Different logic per subset → `slice`.
+
+### 9.2 SAS-analog comparison
+
+| admiral                                        | SAS counterpart                                              |
+|------------------------------------------------|--------------------------------------------------------------|
+| `restrict_derivation(filter = ONTRTFL == "Y")` | `WHERE ONTRTFL = "Y"` around derivation, MERGE back          |
+| `slice_derivation + derivation_slice(filter=A) + derivation_slice(filter=B)` | DATA step `IF A THEN <d1>; ELSE IF B THEN <d2>;`|
+
+### 9.3 Anatomy — `restrict_derivation`
+
+```r
+restrict_derivation(
+  dataset    = advs,
+  derivation = derive_var_extreme_flag,
+  args       = params(
+    by_vars  = exprs(STUDYID, USUBJID, PARAMCD),
+    order    = exprs(desc(AVAL)),
+    new_var  = WORSTFL,
+    mode     = "first"
+  ),
+  filter     = ONTRTFL == "Y" & !is.na(AVAL)
+)
+```
+
+- `filter` evaluated on pre-existing columns only (NOT post-derivation columns).
+- Non-matching rows retain original column values (new_var = NA).
+
+### 9.4 Anatomy — `slice_derivation`
+
+```r
+slice_derivation(
+  dataset    = advs,
+  derivation = derive_var_extreme_flag,
+  args       = params(                              # shared across slices
+    by_vars  = exprs(STUDYID, USUBJID, PARAMCD),
+    new_var  = WORSTFL,
+    mode     = "first"
+  ),
+  derivation_slice(
+    filter = PARAMCD == "SYSBP" & ONTRTFL == "Y",
+    args   = params(order = exprs(desc(AVAL)))
+  ),
+  derivation_slice(
+    filter = PARAMCD == "DIABP" & ONTRTFL == "Y",
+    args   = params(order = exprs(desc(AVAL)))
+  )
+)
+```
+
+- Top-level `args` shared. Per-slice `args` override.
+- Slices evaluated top-to-bottom; first match wins.
+
+### 9.5 Demo — `restrict_derivation`
 
 ```{r restrict-demo}
-# restrict_derivation: apply a derivation only to filtered rows
-# Here: flag worst on-treatment SYSBP per subject (highest = worst)
-
 advs_worst <- advs |>
   filter(PARAMCD == "SYSBP") |>
   restrict_derivation(
@@ -1002,52 +1405,11 @@ advs_worst <- advs |>
 advs_worst |> select(USUBJID, AVISIT, AVAL, ONTRTFL, WORSTFL)
 ```
 
-```{r slice-demo}
-# slice_derivation: different rule per slice
-# Slice 1: hemodynamic params → highest AVAL is worst
-# Slice 2: DIABP → same rule here for demo
+> **Read output:** WORSTFL = "Y" on highest on-treatment SBP per subject. Pre-treatment rows pass through with WORSTFL = NA.
 
-advs_sliced <- advs |>
-  filter(PARAMCD %in% c("SYSBP", "DIABP")) |>
-  slice_derivation(
-    derivation = derive_var_extreme_flag,
-    args = params(
-      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
-      new_var = WORSTFL,
-      mode    = "first"
-    ),
-    derivation_slice(
-      filter = PARAMCD == "SYSBP" & ONTRTFL == "Y" & !is.na(AVAL),
-      args   = params(order = exprs(desc(AVAL)))
-    ),
-    derivation_slice(
-      filter = PARAMCD == "DIABP" & ONTRTFL == "Y" & !is.na(AVAL),
-      args   = params(order = exprs(desc(AVAL)))
-    )
-  )
+### 9.6 Exercise — flag latest analysis observation (ANL01FL)
 
-advs_sliced |> filter(!is.na(WORSTFL)) |>
-  select(USUBJID, PARAMCD, AVISIT, AVAL, WORSTFL)
-```
-
-```{r quiz-restrict-slice, echo=FALSE}
-quiz(
-  question(
-    "What is the key difference between `restrict_derivation()` and `slice_derivation()`?",
-    answer("restrict_derivation() is faster"),
-    answer("slice_derivation() can use different derivation arguments per data slice", correct = TRUE),
-    answer("restrict_derivation() creates new rows; slice_derivation() doesn't"),
-    answer("They are interchangeable"),
-    allow_retry = TRUE
-  )
-)
-```
-
-```{r restrict-ex, exercise=TRUE, exercise.lines=16}
-# Exercise: using restrict_derivation, derive ANL01FL = "Y"
-# for the LATEST observation per (USUBJID, PARAMCD, AVISIT)
-# among rows where AVAL is not NA
-
+```{r restrict-ex, exercise=TRUE, exercise.lines=14}
 advs_anl <- advs |>
   restrict_derivation(
     derivation = derive_var_extreme_flag,
@@ -1055,7 +1417,7 @@ advs_anl <- advs |>
       by_vars = exprs(STUDYID, USUBJID, PARAMCD, AVISIT),
       order   = exprs(desc(ADT)),
       new_var = ANL01FL,
-      mode    = "___"
+      mode    = ___
     ),
     filter = !is.na(AVAL) & !is.na(AVISIT)
   )
@@ -1064,7 +1426,7 @@ sum(advs_anl$ANL01FL == "Y", na.rm = TRUE)
 ```
 
 ```{r restrict-ex-hint-1}
-# mode = "first" (after sorting desc(ADT), first = latest)
+# mode = "first" (after desc(ADT), first = latest)
 ```
 
 ```{r restrict-ex-solution}
@@ -1083,239 +1445,258 @@ advs_anl <- advs |>
 sum(advs_anl$ANL01FL == "Y", na.rm = TRUE)
 ```
 
+### 9.7 Knowledge check
+
+```{r quiz-restrict-slice, echo=FALSE}
+quiz(
+  question(
+    "Key difference between `restrict_derivation()` and `slice_derivation()`?",
+    answer("`restrict` is faster"),
+    answer("`slice` runs different derivation args per row subset; `restrict` applies one rule to a subset", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Overlapping slice filters → which wins?",
+    answer("Last"),
+    answer("First match — slices evaluated top-to-bottom", correct = TRUE),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 10 — Full ADVS pipeline capstone
 
-```{r capstone-advs, exercise=TRUE, exercise.lines=70}
-# Build a complete ADVS from vs + adsl_bds in one pipe:
-# 1. Merge ADSL vars (TRTSDT, TRTEDT, TRT01A, TRT01P)
-# 2. Derive ADT and ADY
-# 3. Map PARAMCD/PARAM/PARAMN via param_lookup
-# 4. Assign AVAL, AVALC, AVISIT, AVISITN
-# 5. Derive BMI and MAP parameters
-# 6. Derive ANRIND and ONTRTFL
-# 7. Flag ABLFL (last pre-treatment row per subj × param)
-# 8. Derive BASE and BNRIND
-# 9. Derive CHG, PCHG, SHIFT1
+### 10.1 The 13-step canonical build
 
-adsl_vars <- exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
+| Step | Function call                              | Adds                                                |
+|------|--------------------------------------------|-----------------------------------------------------|
+| 1    | `derive_vars_merged()` ← ADSL              | TRTSDT, TRTEDT, TRT01A, TRT01P                      |
+| 2    | `derive_vars_dt()`                         | ADT                                                  |
+| 3    | `derive_vars_dy()`                         | ADY (no Day 0)                                       |
+| 4    | `derive_vars_merged_lookup()` ← param_lookup | PARAMCD, PARAM, PARAMN                             |
+| 5    | `mutate()`                                 | AVAL, AVALC, AVISIT, AVISITN, ANRLO, ANRHI          |
+| 6    | `derive_param_bmi()` / `derive_param_map()`| New derived parameter rows                          |
+| 7    | `derive_var_anrind()`                      | ANRIND                                               |
+| 8    | `derive_var_ontrtfl()`                     | ONTRTFL                                              |
+| 9    | `restrict_derivation(extreme_flag)`        | ABLFL                                                |
+| 10   | `derive_var_base(AVAL → BASE)`             | BASE                                                 |
+| 11   | `derive_var_base(ANRIND → BNRIND)`         | BNRIND                                               |
+| 12   | `derive_var_chg()`, `derive_var_pchg()`    | CHG, PCHG                                            |
+| 13   | `derive_var_shift()`                       | SHIFT1                                               |
 
+### 10.2 Order matters
+
+- PARAMCD before `derive_param_*` (they search by source PARAMCD).
+- ADT before ONTRTFL and ABLFL (date comparisons need numeric ADT).
+- ABLFL before BASE (BASE reads ABLFL flag).
+- BASE before CHG (CHG = AVAL − BASE).
+- ANRIND before BNRIND.
+
+### 10.3 Capstone exercise — run the full pipeline
+
+```{r capstone-advs, exercise=TRUE, exercise.lines=60}
 advs_full <- vs |>
   derive_vars_merged(
-    dataset_add = adsl_bds, new_vars = adsl_vars,
-    by_vars     = exprs(STUDYID, USUBJID)
+    dataset_add = adsl_bds,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_vars    = exprs(TRTSDT, TRTEDT, TRT01A, TRT01P)
   ) |>
-  derive_vars_dt(new_vars_prefix = "A", dtc = VSDTC) |>
+  derive_vars_dt(dtc = VSDTC, new_vars_prefix = "A") |>
   derive_vars_dy(reference_date = TRTSDT, source_vars = exprs(ADT)) |>
   derive_vars_merged_lookup(
-    dataset_add = param_lookup, by_vars = exprs(VSTESTCD),
+    dataset_add = param_lookup,
+    by_vars     = exprs(VSTESTCD),
     new_vars    = exprs(PARAMCD, PARAM, PARAMN)
   ) |>
   mutate(
     AVAL    = VSSTRESN,
     AVALC   = VSSTRESC,
     AVISIT  = VISIT,
-    AVISITN = case_when(
-      VISIT == "SCREENING" ~ 0,
-      VISIT == "WEEK 4"    ~ 4,
-      TRUE                 ~ NA_real_
-    )
+    AVISITN = case_when(VISIT == "SCREENING" ~ 0,
+                        VISIT == "WEEK 4"    ~ 4,
+                        TRUE                 ~ NA_real_),
+    ANRLO   = VSORNRLO,
+    ANRHI   = VSORNRHI
   ) |>
   derive_param_bmi(
-    by_vars = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
-    weight_code = "WEIGHT", height_code = "HEIGHT",
+    by_vars          = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
+    weight_code      = "WEIGHT", height_code = "HEIGHT",
     constant_by_vars = exprs(USUBJID),
-    set_values_to = exprs(PARAMCD = "BMI", PARAM = "BMI (kg/m^2)", PARAMN = 20)
+    set_values_to    = exprs(PARAMCD = "BMI",
+                              PARAM   = "BMI (kg/m^2)",
+                              PARAMN  = 20)
   ) |>
   derive_param_map(
-    by_vars = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
-    set_values_to = exprs(PARAMCD = "MAP", PARAM = "MAP (mmHg)", PARAMN = 21)
+    by_vars       = exprs(STUDYID, USUBJID, AVISIT, AVISITN),
+    set_values_to = exprs(PARAMCD = "MAP",
+                          PARAM   = "MAP (mmHg)",
+                          PARAMN  = 21)
   ) |>
   derive_var_anrind() |>
-  derive_var_ontrtfl(start_date = ADT, ref_start_date = TRTSDT, ref_end_date = TRTEDT) |>
+  derive_var_ontrtfl(
+    start_date     = ADT,
+    ref_start_date = TRTSDT,
+    ref_end_date   = TRTEDT
+  ) |>
   restrict_derivation(
     derivation = derive_var_extreme_flag,
     args = params(
       by_vars = exprs(STUDYID, USUBJID, PARAMCD),
       order   = exprs(ADT, AVISITN),
-      new_var = ABLFL, mode = "last"
+      new_var = ABLFL,
+      mode    = "last"
     ),
     filter = !is.na(AVAL) & ADT <= TRTSDT
   ) |>
   derive_var_base(by_vars = exprs(STUDYID, USUBJID, PARAMCD),
-                  source_var = AVAL, new_var = BASE) |>
+                  source_var = AVAL,   new_var = BASE) |>
   derive_var_base(by_vars = exprs(STUDYID, USUBJID, PARAMCD),
                   source_var = ANRIND, new_var = BNRIND) |>
   derive_var_chg() |>
   derive_var_pchg() |>
-  derive_var_shift(new_var = SHIFT1, from_var = BNRIND, to_var = ANRIND)
+  derive_var_shift(new_var = SHIFT1,
+                   from_var = BNRIND, to_var = ANRIND)
 
-# Inspect the result
 advs_full |>
   filter(PARAMCD %in% c("SYSBP", "BMI", "MAP")) |>
   select(USUBJID, PARAMCD, AVISIT, AVAL, BASE, CHG, ANRIND, SHIFT1) |>
   arrange(USUBJID, PARAMCD, AVISIT)
 ```
 
----
+> **Read output:** complete ADVS — every column populated. SYSBP raw + BMI/MAP derived as new rows. BASE/CHG/ANRIND/SHIFT1 all set.
 
-## 11 — ADLB & ADEG differences
+### 10.4 Knowledge check — pipeline order
 
-```{r quiz-adlb-adeg, echo=FALSE}
+```{r quiz-pipeline-order, echo=FALSE}
 quiz(
   question(
-    "ADLB lab values: what SDTM variable maps to AVAL?",
-    answer("LBORRES"),
-    answer("LBSTRESN", correct = TRUE),
-    answer("LBTEST"),
-    answer("LBORNRHI"),
-    allow_retry = TRUE
+    "BASE derived before ABLFL — result?",
+    answer("Same — admiral reorders"),
+    answer("BASE = NA on every row", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "For ADEG with triplicate ECGs per visit, which variable captures the sub-visit timepoint?",
-    answer("AVISITN"),
-    answer("APERIOD"),
-    answer("ATPT", correct = TRUE),
-    answer("ADY"),
-    allow_retry = TRUE
-  ),
-  question(
-    "Which admiral function computes QTcF (Fridericia-corrected QT)?",
-    answer("derive_param_computed()"),
-    answer("derive_param_qtc()", correct = TRUE),
-    answer("derive_var_anrind()"),
-    answer("derive_param_map()"),
-    allow_retry = TRUE
-  ),
-  question(
-    "NCI CTCAE grading for lab toxicity uses which admiral function?",
-    answer("derive_var_anrind()"),
-    answer("derive_var_atoxgr()", correct = TRUE),
-    answer("derive_var_base()"),
-    answer("derive_var_chg()"),
-    allow_retry = TRUE
+    "PARAMCD assigned AFTER `derive_param_bmi()` — result?",
+    answer("BMI rows created normally"),
+    answer("`derive_param_bmi` cannot find WEIGHT/HEIGHT source rows by PARAMCD; fails or empty rows", correct = TRUE),
+    random_answer_order = TRUE
   )
 )
 ```
 
-### Exercise: Explore real ADLB toxicity grades
+---
 
-Real lab data reveals patterns that toy datasets can't: multiple parameters, sparse missing values, wide toxicity grade distributions. Use `adlb_real` to investigate.
+## 11 — ADLB and ADEG differences
 
-> **Note:** `adlb_real` has admiral summary rows (`DTYPE != NA`) already removed in setup. `ATOXGR` is stored as integer (converted from character in pharmaverseadam).
+### 11.1 Same BDS, different specifics
 
-```{r adlb-real-explore, exercise=TRUE, exercise.lines=35}
-# Ensure ATOXGR is integer (pharmaverseadam stores it as character)
-adlb_work <- adlb_real |>
-  mutate(ATOXGR = suppressWarnings(as.integer(ATOXGR)),
-         BTOXGR = suppressWarnings(as.integer(BTOXGR)))
+ADLB and ADEG share BDS contract (one row per subj × param × visit) but add domain specifics.
 
-# Q1: How many unique lab parameters are in this ADLB?
-cat("Unique parameters:", n_distinct(adlb_work$PARAMCD), "\n\n")
+| Feature              | ADVS              | ADLB                              | ADEG                                  |
+|----------------------|-------------------|-----------------------------------|---------------------------------------|
+| Source SDTM domain   | VS                | LB                                | EG                                    |
+| AVAL source          | `VSSTRESN`        | `LBSTRESN`                        | `EGSTRESN`                            |
+| Toxicity grading     | not standard      | `ATOXGR` per NCI CTCAE            | not standard                          |
+| Derived params       | BMI, MAP          | Ratios (e.g., AST/ALT), eGFR      | QTcF, QTcB                            |
+| Sub-visit timepoint  | rarely            | rarely                            | `ATPT` for triplicate ECGs            |
 
-# Q2: Count records by ATOXGR grade
-adlb_work |>
-  count(ATOXGR, name = "n_records") |>
-  arrange(ATOXGR) |>
-  print()
+### 11.2 ATOXGR critical quirk
 
-# Q3: Which parameters have the most Grade >=3 on-treatment toxicity events?
-adlb_work |>
-  filter(ONTRTFL == "Y" & !is.na(ATOXGR) & ATOXGR >= 3) |>
-  count(PARAMCD, PARAM, name = "n_grade3plus") |>
-  arrange(desc(n_grade3plus)) |>
-  head(10) |>
-  print()
-```
+In `pharmaverseadam::adlb`, `ATOXGR` is stored as **character** (`"3"`, `"-1"`). Direct `>` does alphabetic compare (`"-1" > "2"` is TRUE → WRONG). Convert with `as.integer()` BEFORE comparison.
 
-```{r adlb-real-explore-hint-1}
-# filter(ONTRTFL == "Y" & ATOXGR >= 3) selects on-treatment Grade 3+ events
-# count(PARAMCD) then summarises per parameter
-# arrange(desc(n_grade3plus)) puts worst parameters first
-```
+### 11.3 QTcF correction (ADEG)
 
-```{r adlb-real-explore-solution}
-adlb_work <- adlb_real |>
-  mutate(ATOXGR = suppressWarnings(as.integer(ATOXGR)),
-         BTOXGR = suppressWarnings(as.integer(BTOXGR)))
+`QTcF = QT / RR^(1/3)`. SAS analog: `QTcF = QT / (RR ** (1/3));` + `OUTPUT;` for new row.
 
-cat("Unique parameters:", n_distinct(adlb_work$PARAMCD), "\n\n")
+### 11.4 Triplicate ECG timepoints
 
-adlb_work |>
-  count(ATOXGR, name = "n_records") |>
-  arrange(ATOXGR) |>
-  print()
+| AVISIT  | ATPT       | ATPTN |
+|---------|------------|-------|
+| WEEK 4  | 1 MIN PRE  | -1    |
+| WEEK 4  | 5 MIN POST | 5     |
+| WEEK 4  | 10 MIN POST| 10    |
 
-adlb_work |>
-  filter(ONTRTFL == "Y" & !is.na(ATOXGR) & ATOXGR >= 3) |>
-  count(PARAMCD, PARAM, name = "n_grade3plus") |>
-  arrange(desc(n_grade3plus)) |>
-  head(10) |>
-  print()
+`AVAL` is the single value; `ATPT` orders sub-visit position.
+
+### 11.5 Knowledge check — ADLB/ADEG
+
+```{r quiz-adlb-adeg, echo=FALSE}
+quiz(
+  question(
+    "ADLB AVAL maps from which SDTM variable?",
+    answer("`LBORRES`"),
+    answer("`LBSTRESN`", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "ATOXGR stored as character. Comparing `ATOXGR > \"2\"`?",
+    answer("Works correctly"),
+    answer("Alphabetic compare — `\"-1\" > \"2\"` is TRUE → wrong. Convert with `as.integer()` first.", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Triplicate ECG sub-visit ordering uses?",
+    answer("`AVISITN`"),
+    answer("`ATPT` / `ATPTN`", correct = TRUE),
+    random_answer_order = TRUE
+  )
+)
 ```
 
 ---
 
-## 11.5 — P21 Derivation Diagnostics
+## 12 — P21 derivation diagnostics
 
-BDS derivations are particularly prone to subtle errors that slip through code review but surface immediately in Pinnacle 21 validation. Each diagnostic below shows a derivation spec, a broken implementation, and the P21 error received.
+Three classic Pinnacle 21 bugs. Read the spec, fix the code.
 
----
+### 12.1 Diagnostic 1 — ABLFL wrong mode
 
-### Diagnostic 1 — ABLFL: Wrong mode for pre-treatment baseline
+**Spec:** ABLFL = "Y" on LAST non-missing pre-treatment row per (USUBJID × PARAMCD).
 
-**Derivation method (define.xml / Pinnacle 21 field):**
-
-> *ABLFL = 'Y' for the LAST non-missing pre-treatment observation per subject per parameter (i.e., the measurement closest in time to first dose, before dosing began). This observation is used as the baseline reference. Rows where AVAL is missing must be excluded. Source: ADT, TRTSDT.*
-
-The programmer submitted:
+**Broken code:**
 
 ```r
-advs_draft <- advs |>
-  restrict_derivation(
-    derivation = derive_var_extreme_flag,
-    args = params(
-      by_vars = exprs(STUDYID, USUBJID, PARAMCD),
-      order   = exprs(ADT, AVISITN),
-      new_var = ABLFL,
-      mode    = "first"    # ← bug: should be "last"
-    ),
-    filter = !is.na(AVAL) & ADT <= TRTSDT
-  )
+restrict_derivation(
+  derivation = derive_var_extreme_flag,
+  args = params(
+    by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+    order   = exprs(ADT, AVISITN),
+    new_var = ABLFL,
+    mode    = "first"            # bug: should be "last"
+  ),
+  filter = !is.na(AVAL) & ADT <= TRTSDT
+)
 ```
 
-**P21 report:** *"ABLFL flagged on earliest screening record rather than the record closest to first dose. For subjects with multiple pre-treatment visits, baseline values do not match expected SCREENING 2 or pre-dose values."*
+**P21 report:** *"ABLFL flagged earliest screening, not closest-to-dose pre-treatment row."*
 
-```{r p21-bug-ablfl, exercise=TRUE, exercise.lines=22}
-# Fix the ABLFL derivation: baseline = LAST non-missing pre-treatment row.
-# With order = exprs(ADT, AVISITN), mode = "last" picks the highest ADT.
-
-advs_fixed_ablfl <- advs |>
+```{r p21-bug-ablfl, exercise=TRUE, exercise.lines=14}
+advs_fixed <- advs |>
+  select(-ABLFL, -BASE, -BNRIND, -CHG, -PCHG, -SHIFT1) |>
   restrict_derivation(
     derivation = derive_var_extreme_flag,
     args = params(
       by_vars = exprs(STUDYID, USUBJID, PARAMCD),
       order   = exprs(ADT, AVISITN),
       new_var = ABLFL,
-      mode    = "___"    # fix this
+      mode    = ___
     ),
     filter = !is.na(AVAL) & ADT <= TRTSDT
   )
 
-# Verify: show ABLFL-flagged rows — should be SCREENING (last pre-treatment visit)
-advs_fixed_ablfl |>
-  filter(!is.na(ABLFL)) |>
-  select(USUBJID, PARAMCD, AVISIT, ADT, AVAL, ABLFL)
+advs_fixed |> filter(PARAMCD == "SYSBP") |>
+  select(USUBJID, AVISIT, ADT, AVAL, ABLFL)
 ```
 
 ```{r p21-bug-ablfl-hint-1}
-# mode = "last" — after ordering by ADT ascending, "last" = highest date = closest to first dose
-# With "first" you get the earliest (oldest) pre-treatment record — wrong baseline
+# mode = "last"
 ```
 
 ```{r p21-bug-ablfl-solution}
-advs_fixed_ablfl <- advs |>
+advs_fixed <- advs |>
+  select(-ABLFL, -BASE, -BNRIND, -CHG, -PCHG, -SHIFT1) |>
   restrict_derivation(
     derivation = derive_var_extreme_flag,
     args = params(
@@ -1327,225 +1708,174 @@ advs_fixed_ablfl <- advs |>
     filter = !is.na(AVAL) & ADT <= TRTSDT
   )
 
-advs_fixed_ablfl |>
-  filter(!is.na(ABLFL)) |>
-  select(USUBJID, PARAMCD, AVISIT, ADT, AVAL, ABLFL)
+advs_fixed |> filter(PARAMCD == "SYSBP") |>
+  select(USUBJID, AVISIT, ADT, AVAL, ABLFL)
 ```
 
----
+### 12.2 Diagnostic 2 — BASE missing PARAMCD from by_vars
 
-### Diagnostic 2 — BASE: Missing PARAMCD from by_vars
+**Spec:** BASE per (USUBJID × PARAMCD). PARAMCD must be in `by_vars`.
 
-**Derivation method (define.xml / Pinnacle 21 field):**
-
-> *BASE = AVAL at the baseline record (ABLFL = 'Y') for each subject-parameter combination. Every observation for a given subject and parameter receives the same BASE value (the one from the ABLFL = 'Y' row). Source: derived ABLFL, AVAL. By variables: STUDYID, USUBJID, PARAMCD.*
-
-The programmer submitted:
+**Broken code:**
 
 ```r
-advs_draft2 <- advs |>
+derive_var_base(
+  by_vars    = exprs(STUDYID, USUBJID),    # bug: PARAMCD missing
+  source_var = AVAL,
+  new_var    = BASE
+)
+```
+
+**P21 report:** *"BASE value identical across all parameters per subject — cross-parameter contamination."*
+
+```{r p21-bug-base, exercise=TRUE, exercise.lines=12}
+advs_basefix <- advs |>
+  select(-BASE) |>
   derive_var_base(
-    by_vars    = exprs(STUDYID, USUBJID),   # ← PARAMCD missing!
+    by_vars    = exprs(STUDYID, USUBJID, ___),
     source_var = AVAL,
     new_var    = BASE
   )
+
+advs_basefix |> filter(USUBJID == "01-001") |>
+  select(PARAMCD, AVISIT, AVAL, ABLFL, BASE)
 ```
 
-**P21 report:** *"BASE values for DIABP rows match SYSBP baseline values. Multiple parameters share the same BASE within a subject. PARAMCD must be included in the by variables for baseline derivation."*
-
-```{r p21-bug-base-byvars, exercise=TRUE, exercise.lines=18}
-# Fix: PARAMCD must be in by_vars so each parameter gets its own baseline value.
-
-advs_fixed_base <- advs |>
-  derive_var_base(
-    by_vars    = exprs(STUDYID, USUBJID, ___),   # add the missing variable
-    source_var = AVAL,
-    new_var    = BASE
-  )
-
-# Verify: SYSBP and DIABP should have different BASE values for the same subject
-advs_fixed_base |>
-  filter(PARAMCD %in% c("SYSBP", "DIABP") & !is.na(ABLFL)) |>
-  select(USUBJID, PARAMCD, AVISIT, AVAL, BASE, ABLFL)
+```{r p21-bug-base-hint-1}
+# Add PARAMCD to by_vars
 ```
 
-```{r p21-bug-base-byvars-hint-1}
-# by_vars = exprs(STUDYID, USUBJID, PARAMCD)
-# Without PARAMCD, derive_var_base() joins only on STUDYID + USUBJID,
-# so the first ABLFL = "Y" row (regardless of PARAMCD) is used as BASE for ALL parameters.
-```
-
-```{r p21-bug-base-byvars-solution}
-advs_fixed_base <- advs |>
+```{r p21-bug-base-solution}
+advs_basefix <- advs |>
+  select(-BASE) |>
   derive_var_base(
     by_vars    = exprs(STUDYID, USUBJID, PARAMCD),
     source_var = AVAL,
     new_var    = BASE
   )
 
-advs_fixed_base |>
-  filter(PARAMCD %in% c("SYSBP", "DIABP") & !is.na(ABLFL)) |>
-  select(USUBJID, PARAMCD, AVISIT, AVAL, BASE, ABLFL)
+advs_basefix |> filter(USUBJID == "01-001") |>
+  select(PARAMCD, AVISIT, AVAL, ABLFL, BASE)
 ```
 
----
+### 12.3 Diagnostic 3 — CHG sign reversal
 
-### Diagnostic 3 — CHG: Sign reversal
+**Spec:** CHG = AVAL − BASE. Positive = increase post-baseline.
 
-**Derivation method (define.xml / Pinnacle 21 field):**
-
-> *CHG = AVAL − BASE (change from baseline). Positive CHG indicates an increase relative to baseline. PCHG = (AVAL − BASE) / |BASE| × 100. BASE = 0 must result in PCHG = missing. Source: derived AVAL, BASE.*
-
-The programmer submitted:
+**Broken code:**
 
 ```r
-advs_draft3 <- advs |>
-  mutate(
-    CHG  = BASE - AVAL,            # ← sign reversed
-    PCHG = (BASE - AVAL) / abs(AVAL) * 100   # ← two bugs: sign + wrong denominator
-  )
+advs |> mutate(CHG = BASE - AVAL)   # bug: reversed
 ```
 
-**P21 report:** *"CHG is negative for subjects where AVAL > BASE. Expected positive CHG for elevated post-baseline values. PCHG denominator should be |BASE|, not |AVAL|. Rule: AD0271 — CHG derivation inconsistent with spec."*
+**P21 report:** *"CHG sign opposite of expected; increases reported as decreases."*
 
-```{r p21-bug-chg, exercise=TRUE, exercise.lines=20}
-# Fix both bugs:
-# 1. CHG = AVAL - BASE  (not BASE - AVAL)
-# 2. PCHG = (AVAL - BASE) / abs(BASE) * 100, with NA when BASE == 0
+```{r p21-bug-chg, exercise=TRUE, exercise.lines=8}
+advs_chgfix <- advs |>
+  mutate(CHG = ___ - ___)
 
-advs_fixed_chg <- advs |>
-  mutate(
-    CHG  = ___ - ___,
-    PCHG = if_else(
-      BASE == 0 | is.na(BASE),
-      NA_real_,
-      (___ - ___) / abs(___) * 100
-    )
-  )
-
-# Verify: for WEEK 4 SYSBP, a higher AVAL than baseline should give positive CHG
-advs_fixed_chg |>
-  filter(PARAMCD == "SYSBP" & !is.na(BASE)) |>
-  select(USUBJID, AVISIT, AVAL, BASE, CHG, PCHG)
+advs_chgfix |> filter(PARAMCD == "SYSBP") |>
+  select(USUBJID, AVISIT, AVAL, BASE, CHG)
 ```
 
 ```{r p21-bug-chg-hint-1}
-# CHG  = AVAL - BASE
-# PCHG = (AVAL - BASE) / abs(BASE) * 100
-# Denominator is |BASE| — not |AVAL|. If BASE = 0, PCHG = NA (division by zero).
+# CHG = AVAL - BASE
 ```
 
 ```{r p21-bug-chg-solution}
-advs_fixed_chg <- advs |>
-  mutate(
-    CHG  = AVAL - BASE,
-    PCHG = if_else(
-      BASE == 0 | is.na(BASE),
-      NA_real_,
-      (AVAL - BASE) / abs(BASE) * 100
-    )
-  )
+advs_chgfix <- advs |>
+  mutate(CHG = AVAL - BASE)
 
-advs_fixed_chg |>
-  filter(PARAMCD == "SYSBP" & !is.na(BASE)) |>
-  select(USUBJID, AVISIT, AVAL, BASE, CHG, PCHG)
+advs_chgfix |> filter(PARAMCD == "SYSBP") |>
+  select(USUBJID, AVISIT, AVAL, BASE, CHG)
 ```
 
 ---
 
-## Quiz — final
+## 13 — Final knowledge check
 
 ```{r quiz-final-16, echo=FALSE}
 quiz(
   question(
-    "A programmer flags ABLFL using `mode = 'first'` with `order = exprs(ADT)`. P21 reports baseline values don't match the expected pre-dose visit. What is the consequence of 'first' vs 'last'?",
-    answer("'first' picks the row with the highest ADT — closest to first dose"),
-    answer("'first' picks the row with the lowest ADT — earliest screening visit — not the most recent pre-treatment assessment. Fix: use mode = 'last'", correct = TRUE),
-    answer("'first' and 'last' produce identical results when there is only one pre-treatment visit"),
-    answer("'first' correctly picks the latest date because ADT is stored in descending order"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
+    "BDS shape — one row per?",
+    answer("Subject"),
+    answer("(Subject × parameter × visit × timepoint)", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "BASE is derived with `by_vars = exprs(STUDYID, USUBJID)` — PARAMCD is omitted. What goes wrong?",
-    answer("The function errors because PARAMCD is a required argument"),
-    answer("All parameters for a subject receive the same BASE value — whichever ABLFL = 'Y' row appears first in the dataset, regardless of PARAMCD", correct = TRUE),
-    answer("BASE is set to NA for all non-SYSBP parameters"),
-    answer("Nothing — BASE joins on USUBJID alone and correctly finds the right row"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
+    "PROC TRANSPOSE vs BDS long-format?",
+    answer("PROC TRANSPOSE wins"),
+    answer("BDS stays long; layout flips wide only at display", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "P21 rule AD0271 flags CHG values. The programmer coded `CHG = BASE - AVAL`. What is the correct formula and why does the sign matter?",
-    answer("CHG = AVAL - BASE. Sign matters because a positive CHG should indicate an increase post-baseline; the reversed formula reports increases as negative, misleading safety reviewers", correct = TRUE),
-    answer("CHG = BASE - AVAL is correct per ADaM IG — PCHG corrects the sign"),
-    answer("CHG = (AVAL + BASE) / 2 — the average of the two values"),
-    answer("CHG = AVAL / BASE — the ratio from baseline"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
+    "Mock SAS `IF AVAL < ANRLO THEN ANRIND=\"LOW\"; ELSE IF AVAL > ANRHI THEN ANRIND=\"HIGH\"; ELSE \"NORMAL\";` ≈ which admiral?",
+    answer("`derive_param_*()`"),
+    answer("`derive_var_anrind()`", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "PCHG is coded as `(AVAL - BASE) / abs(AVAL) * 100`. P21 flags the denominator. What is the correct denominator and why?",
-    answer("`abs(AVAL)` is correct — the percent change is relative to the current value"),
-    answer("`abs(BASE)` — percent change from baseline is always relative to the baseline value, not the current observation. Using AVAL in the denominator gives a different (and non-standard) metric", correct = TRUE),
-    answer("`(AVAL + BASE) / 2` — the average of baseline and post-baseline"),
-    answer("The denominator does not matter because PCHG is informational only"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
+    "`mode = \"last\"` in baseline flagging picks which row?",
+    answer("Earliest screening"),
+    answer("Closest-to-dose pre-treatment (most recent before TRTSDT)", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "ONTRTFL = 'Y' for a row where ADT = TRTSDT (treatment start date). Is this correct?",
-    answer("No — the treatment start date is pre-treatment, so ONTRTFL should be NA"),
-    answer("Yes — the standard definition is ADT >= TRTSDT AND ADT <= TRTEDT (inclusive on both ends), so the start date itself is on-treatment", correct = TRUE),
-    answer("It depends on the protocol — some studies exclude the start date"),
-    answer("No — ONTRTFL only applies to lab values, not vitals"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
+    "BMI lives as a new ___?",
+    answer("Column"),
+    answer("Row", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "A BDS dataset contains both SYSBP and DIABP records. The programmer filters to `PARAMCD == 'SYSBP'` before calling `derive_param_map()`. What happens?",
-    answer("MAP is computed correctly from the filtered SYSBP rows"),
-    answer("MAP cannot be computed — derive_param_map() needs both SYSBP and DIABP rows in the input dataset to calculate (SYS + 2×DIA) / 3. Filtering to one parameter first removes the data needed for the formula", correct = TRUE),
-    answer("derive_param_map() fetches DIABP rows automatically from adsl"),
-    answer("MAP is derived from SYSBP alone using a built-in reference value for DIA"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
+    "ATOXGR stored as character — best practice?",
+    answer("Compare directly with `>`"),
+    answer("Convert with `as.integer()` first", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "SHIFT1 = 'NORMAL to HIGH' for a subject at Week 12. What does this mean, and which variables produce it?",
-    answer("AVAL > ANRHI at Week 12 AND BNRIND = 'NORMAL' at baseline — SHIFT1 = paste0(BNRIND, ' to ', ANRIND)", correct = TRUE),
-    answer("The subject's AVAL increased by more than the normal reference range"),
-    answer("ANRIND = 'HIGH' at baseline and ANRIND = 'NORMAL' at Week 12 — the order is reversed"),
-    answer("SHIFT1 compares two on-treatment visits, not baseline to on-treatment"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
+    "QTcF formula?",
+    answer("`QT / RR`"),
+    answer("`QT / RR^(1/3)`", correct = TRUE),
+    random_answer_order = TRUE
   ),
   question(
-    "`constant_by_vars = exprs(USUBJID)` in `derive_param_bmi()` tells admiral to:",
-    answer("Compute BMI once per subject using a single height value (e.g., screening height), carried forward to all visits — rather than requiring a height measurement at every visit", correct = TRUE),
-    answer("Restrict BMI computation to one visit per subject only"),
-    answer("Use a constant height of 170 cm when no height record is found"),
-    answer("Join the height from the ADSL dataset instead of the VS source"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
-  ),
-  question(
-    "A lab ADLB has ATOXGR stored as character (e.g., '3', '-1'). The programmer compares `ATOXGR > '2'` without converting. What is the problem?",
-    answer("Character comparison is alphabetic: '3' > '2' is TRUE (correct by accident), but '-1' > '2' is also TRUE because '-' sorts after digits — so below-normal grades appear as high toxicity", correct = TRUE),
-    answer("R coerces character to integer automatically in > comparisons"),
-    answer("The comparison errors immediately with a type mismatch"),
-    answer("Only values with leading zeros are affected"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
-  ),
-  question(
-    "Why does `restrict_derivation()` leave non-matching rows unchanged, while applying the derivation only to filtered rows?",
-    answer("It errors on non-matching rows instead of leaving them unchanged"),
-    answer("It applies the derivation to non-matching rows with a NULL result"),
-    answer("It splits the dataset into matching and non-matching subsets, applies the derivation to the matching subset, then recombines — non-matching rows retain their original column values", correct = TRUE),
-    answer("It is identical to filter() followed by the derivation — rows not meeting the filter are dropped permanently"),
-    random_answer_order = TRUE,
-    allow_retry = TRUE
+    "ONTRTFL non-treatment row → ?",
+    answer("`\"N\"`"),
+    answer("`NA` — CDISC: never `\"N\"`", correct = TRUE),
+    random_answer_order = TRUE
   )
 )
 ```
+
+---
+
+## 14 — Lesson 16 Summary {.congratulations}
+
+You now know how to build BDS ADaMs end-to-end:
+
+- **BDS shape** — one row per (subj × param × visit × timepoint). Stay long. SAS PROC TRANSPOSE inversion.
+- **Merge ADSL** onto every BDS row via `derive_vars_merged()`. Promote TRTSDT, TRTEDT, TRT01A.
+- **ADT/ADY** via `derive_vars_dt()` and `derive_vars_dy()`. No Day 0.
+- **PARAMCD via lookup** with `derive_vars_merged_lookup()`. PROC FORMAT in tibble form.
+- **Derived parameter rows** with `derive_param_bmi()`, `derive_param_map()`. New rows, not columns.
+- **ANRIND** via `derive_var_anrind()` (3-bin classifier). **ONTRTFL** via date-window comparison.
+- **Baseline** flag + value: `restrict_derivation(extreme_flag, mode="last", filter=ADT<=TRTSDT)` then `derive_var_base()` twice (AVAL → BASE, ANRIND → BNRIND).
+- **Change-from-baseline**: `derive_var_chg()`, `derive_var_pchg()`, `derive_var_shift(BNRIND → ANRIND)`.
+- **Conditional derivation**: `restrict_derivation` (single rule, scoped) vs `slice_derivation` (different rules per subset).
+- **Full ADVS pipeline** — 13 chained calls replace 8+ SAS DATA steps and 3+ PROC SORTs.
+- **ADLB specifics** — ATOXGR character quirk, NCI CTCAE grading.
+- **ADEG specifics** — ATPT for triplicate ECG sub-visit, QTcF (Fridericia correction).
+- **P21 diagnostics** — wrong ABLFL mode, missing PARAMCD in by_vars, CHG sign reversal.
+
+You also know:
+
+- Order matters: PARAMCD → derived params → ANRIND → ABLFL → BASE → CHG.
+- `restrict_derivation` filter sees only pre-existing columns.
+- CDISC flag rule: `"Y"` or `NA`, **never** `"N"`.
+- ATOXGR conversion to integer before any `>` comparison.
+
+---
+
+## What's next
+
+Lesson 17 — **`{admiral}` Part 4: OCCDS** — covers ADAE, ADCM (occurrence datasets). New shape: one row per recorded event. Patterns: `derive_var_trtemfl` (treatment-emergent), `derive_vars_joined` (correlated last-dose-before-AE lookup), MedDRA SMQ queries.

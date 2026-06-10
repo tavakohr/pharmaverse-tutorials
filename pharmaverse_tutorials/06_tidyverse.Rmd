@@ -1,11 +1,12 @@
 ---
 title: "Lesson 06 — R Primer for SAS Programmers, Part 4: The Broader Tidyverse"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
     ace_theme: tomorrow
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Reshape data with pivot_longer/pivot_wider (PROC TRANSPOSE). Handle CDISC ISO 8601

@@ -1,10 +1,11 @@
 ---
 title: "Lesson 44 — datasetjson: CDISC Dataset-JSON"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Master the CDISC Dataset-JSON format and the datasetjson R package.

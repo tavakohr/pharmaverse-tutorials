@@ -1,9 +1,11 @@
 ---
 title: "Lesson 19 — admiral Part 6: Advanced Derivation Patterns"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
 ---
 
@@ -375,9 +377,146 @@ class(mc) <- c("Metacore","list")
 
 This lesson covers **advanced admiral patterns**: period datasets for crossover studies, expected-record insertion, LOCF imputation, `derive_extreme_event()`, `restrict_derivation()` + `slice_derivation()` combinations, metacore integration, custom function authoring, and package-level options.
 
+### What you will learn
+
+By the end of this lesson you will be able to:
+
+1. Build a **period dataset** from `ADSL` columns like `AP01SDT/AP01EDT/AP02SDT/AP02EDT` and assign `APERIOD` to each event using a date-window join.
+2. Insert **expected (missing-by-schedule) records** into a BDS dataset so downstream LOCF or shift-table code sees a regular visit grid.
+3. Apply **LOCF (Last Observation Carried Forward)** correctly: within subject, within parameter, in time order, and stamped with `DTYPE = "LOCF"`.
+4. Use **`derive_extreme_event()`** to pick a worst-event category with priority-ordered conditions (the first matching event wins).
+5. Combine **`slice_derivation()`** and **`restrict_derivation()`** to dispatch different derivation logic to mutually-exclusive subsets of rows.
+6. Configure **admiral options** (`set_admiral_options`) so a sponsor-wide standard for `subject_keys` applies project-wide.
+7. Wrap an admiral pattern in your **own sponsor-specific `derive_var_*()`** function, following admiral's argument-naming convention.
+8. Diagnose **Pinnacle 21** advanced-pattern findings (period out of range, missing AVISIT after expected-record insertion, reversed priority order).
+
+### Big picture — the four "shapes" of admiral advanced patterns
+
+The advanced helpers all reshape data in different ways. Hold this mental model in your head:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ ADD COLUMNS                            ADD ROWS                       │
+│ ────────────                            ─────────                     │
+│ derive_vars_period      (APERIOD…)     derive_expected_records        │
+│ derive_var_locf         (carry vals)   derive_locf_records (insert)   │
+│ derive_extreme_event    (WORSTCAT)                                    │
+│                                                                       │
+│ DISPATCH LOGIC                          REUSABILITY                   │
+│ ──────────────                          ───────────                   │
+│ slice_derivation        (per subset)   set_admiral_options            │
+│ restrict_derivation     (filtered)     custom derive_var_*()          │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+> **SAS mental model.** Almost every admiral "advanced" function maps to a SAS pattern you already know:
+>
+> - `derive_vars_period` ≈ DATA step with conditional `IF date BETWEEN p1s AND p1e THEN APERIOD=1; ELSE IF ...`
+> - `derive_expected_records` ≈ PROC SQL CROSS JOIN of subjects × visits, then LEFT JOIN to observed
+> - `derive_var_locf` ≈ DATA step `BY USUBJID PARAMCD; RETAIN _last; IF NOT MISSING(AVAL) THEN _last = AVAL; IF MISSING(AVAL) THEN AVAL = _last;`
+> - `derive_extreme_event` ≈ PROC SORT with elaborate `BY` key prioritising severity, then `FIRST.usubjid`
+> - `slice_derivation` ≈ DATA step `IF PARAMCD = 'SYSBP' THEN DO ...; ELSE IF PARAMCD = 'PULSE' THEN DO ...;`
+> - `restrict_derivation` ≈ DATA step `WHERE TRTEMFL = 'Y';` applied to a single derivation
+> - `set_admiral_options` ≈ `%let subject_keys = STUDYID USUBJID;` macro variable at the top of every program
+> - Custom `derive_var_*()` ≈ User-written SAS `%macro derive_var_xxx(in=, out=, by=, newvar=)`
+
 ---
 
 ## Section 1 — Period Datasets
+
+### 1.1 What multi-period studies look like
+
+Most parallel-arm studies have one treatment window per subject: `TRTSDT` → `TRTEDT`, one ARM, one analysis period. Advanced study designs break that assumption:
+
+| Design | Example | Periods per subject |
+|--------|---------|---------------------|
+| Parallel-arm | Phase III oncology, randomised once | **1** (no period dataset needed) |
+| Crossover | Each subject gets Treatment A then B in sequence | **2** |
+| Dose-titration | Subject starts low dose, escalates to medium, then high | **3+** |
+| Extension phase | After core study, optional open-label continuation | **2** |
+| Adaptive / multi-stage | Re-randomisation after a futility analysis | **2+** |
+
+For crossover and dose-titration trials, you cannot summarise AEs or labs by "treatment arm" alone — you have to attribute each event to **the period it occurred in**. The period dataset is admiral's idiom for this.
+
+### 1.2 The period concept: APERIOD, APERSDT, APEREDT
+
+The ADaM standard defines a one-row-per-(subject × period) dataset with at minimum:
+
+| Variable | Meaning | Example |
+|----------|---------|---------|
+| `STUDYID` | Study identifier | "STUDY1" |
+| `USUBJID` | Unique subject ID | "01-001" |
+| `APERIOD` | Period number (integer) | 1, 2, 3 |
+| `APERSDT` | Analysis Period Start Date | 2023-01-15 |
+| `APEREDT` | Analysis Period End Date | 2023-04-15 |
+| `TRTA` (optional) | Treatment during this period | "Treatment A" |
+
+`ADSL` typically stores the same information in **wide form**: columns named `AP01SDT/AP01EDT`, `AP02SDT/AP02EDT`, etc. `create_period_dataset()` pivots that wide layout to long form (one row per period).
+
+### 1.3 The phase concept: APHASE, APHASEN
+
+A **phase** is broader than a period: "Screening", "Treatment", "Follow-up". A phase may contain several periods (e.g. Treatment Phase = Period 1 + Period 2 of a crossover). Phases share the same column convention: `APHxxSDT/APHxxEDT` in `ADSL`, `APHASE/APHASEN/APHASESDT/APHASEEDT` in the long form. The same `create_period_dataset()` function handles them.
+
+### 1.4 The sub-period concept: ASPER, ASPERSDT
+
+A **sub-period** subdivides a period — for example, "Period 1, Cycle 1" vs "Period 1, Cycle 2" in oncology. Same column convention (`APxxSWySDT` for Period x Sub-period y start date), same function.
+
+### 1.5 Anatomy of `create_period_dataset()` / `derive_vars_period()`
+
+```
+create_period_dataset(
+  dataset  = adsl_adv,                              <- wide ADSL with AP01SDT, AP01EDT, AP02SDT, AP02EDT...
+  new_vars = exprs(APERSDT = APxxSDT,               <- output: APERSDT  | source: APxxSDT (wildcard for period num)
+                   APEREDT = APxxEDT)               <- output: APEREDT  | source: APxxEDT
+)
+# returns a long tibble: one row per (USUBJID × APERIOD) with APERSDT, APEREDT
+```
+
+Then assign `APERIOD` to events:
+
+```
+derive_vars_joined(
+  dataset      = adae,                              <- the events (LHS)
+  dataset_add  = adperiods,                         <- the period grid (RHS)
+  by_vars      = exprs(USUBJID),                    <- subject join key
+  order        = exprs(APERSDT),                    <- if multiple periods match, take first
+  filter_join  = ASTDT >= APERSDT & ASTDT <= APEREDT, <- date-window predicate
+  mode         = "first"                            <- one period per event
+)
+```
+
+> **SAS mental model.** Wide ADSL with `AP01SDT/AP02SDT` is what you would build in PROC TRANSPOSE if you started from a long period dataset. The admiral function does the reverse: pivots ADSL wide → long.
+
+### 1.6 SAS equivalent — DATA step with conditional period assignment
+
+```
+SAS                                                | admiral
+                                                   |
+DATA adae_periods;                                 | adae |>
+  MERGE adae(IN=a) adsl(IN=b);                     |   derive_vars_joined(
+  BY USUBJID;                                      |     dataset_add = adperiods,
+  IF a;                                            |     by_vars    = exprs(USUBJID),
+  IF AP01SDT <= ASTDT <= AP01EDT THEN APERIOD = 1; |     filter_join = ASTDT >= APERSDT
+  ELSE IF AP02SDT <= ASTDT <= AP02EDT THEN         |                 & ASTDT <= APEREDT,
+       APERIOD = 2;                                |     order      = exprs(APERSDT),
+  ELSE APERIOD = .;                                |     mode       = "first"
+RUN;                                               |   )
+```
+
+The SAS code is short with two periods but explodes for crossover-with-titration trials (5+ periods). The admiral version is data-driven: add a new `AP03SDT/AP03EDT` to `ADSL` and the same code handles it automatically.
+
+### 1.7 Common pitfalls
+
+1. **Overlapping periods.** If `AP01EDT = 2023-04-15` and `AP02SDT = 2023-04-15`, an event on that date falls into both windows. `mode = "first"` picks the earlier APERIOD; document this in your spec.
+2. **Missing period end dates.** If a subject discontinued and `AP02EDT` is missing, the date-window predicate fails. Some sponsors use `APEREDT = coalesce(AP02EDT, EOSDT)`.
+3. **Events outside any period.** Pre-treatment AEs or post-discontinuation labs will have `APERIOD = NA` after the join. This is correct — don't impute a period for them.
+4. **Confusing PERIOD with PHASE.** A "Treatment Phase" might cover Periods 1 + 2 of a crossover. Use a separate join to assign `APHASE`.
+
+### 1.8 Multi-period vs longitudinal — the difference
+
+A longitudinal dataset (ADLB, ADVS) has many rows per subject — one per (visit × parameter). A period dataset is **per-subject**: one row per (subject × period), regardless of how many measurements were collected in that period. Don't confuse them.
+
+
 
 ```{r period-demo}
 # adsl_adv has AP01SDT, AP01EDT, AP02SDT, AP02EDT
@@ -470,9 +609,174 @@ adae_pfl |> filter(!is.na(AOCCPRFL)) |>
   select(USUBJID, AETERM, APERIOD, AOCCPRFL)
 ```
 
+#### Read the output
+
+`AOCCPRFL = "Y"` should appear on **exactly one row per (USUBJID × APERIOD)** — the first treatment-emergent AE of that period. Rows outside the filter (non-TEAE or `APERIOD = NA`) are returned unchanged with `AOCCPRFL = NA`. If you see two `Y`s in the same period for the same subject, your `by_vars` is wrong.
+
+### Additional exercise — count events by period
+
+```{r period-count-ex, exercise=TRUE, exercise.lines=14}
+# Exercise: count TEAEs per (USUBJID × APERIOD) and produce a wide summary
+# Step 1: filter adae_periods to TRTEMFL == "Y" and APERIOD not NA
+# Step 2: count(USUBJID, APERIOD) — long form
+# Step 3: pivot wider on APERIOD with prefix "PER" so columns are PER1, PER2
+
+adae_periods |>
+  filter(TRTEMFL == "Y" & !is.na(APERIOD)) |>
+  count(USUBJID, ___) |>
+  tidyr::pivot_wider(names_from = ___, values_from = n,
+                     names_prefix = "PER", values_fill = 0)
+```
+
+```{r period-count-ex-hint-1}
+# Both blanks are APERIOD: count(USUBJID, APERIOD); pivot_wider(names_from = APERIOD, ...)
+```
+
+```{r period-count-ex-solution}
+adae_periods |>
+  filter(TRTEMFL == "Y" & !is.na(APERIOD)) |>
+  count(USUBJID, APERIOD) |>
+  tidyr::pivot_wider(names_from = APERIOD, values_from = n,
+                     names_prefix = "PER", values_fill = 0)
+```
+
 ---
 
 ## Section 2 — Expected Records: derive_expected_records()
+
+### 2.1 The "missing visit" problem
+
+Imagine the protocol schedules Week 0, Week 4, Week 8, Week 12 vitals for every subject. In practice:
+
+- Subject 01-001 attended all four visits — four rows in ADVS.
+- Subject 01-002 missed Week 8 — three rows in ADVS.
+- Subject 01-003 discontinued at Week 4 — two rows in ADVS.
+
+Most reporting code wants a **regular grid**: one row per (subject × scheduled visit), even if `AVAL` is NA. Without that grid:
+
+- LOCF has nothing to carry forward into (no Week 8 row exists for 01-002).
+- Shift tables miss the "scheduled but not observed" cell.
+- Cross-tabs over (subject × visit) silently drop empty cells instead of counting them as missing.
+
+`derive_expected_records()` solves this by inserting **placeholder rows** — one for each expected (subject × parameter × visit) combination that is absent from the observed data, with a stamp like `DTYPE = "EXPECTED"` so downstream code can distinguish them.
+
+### 2.2 The expected-records template
+
+The "template" is the Cartesian product of:
+
+1. The **subject set** — usually the SAFFL = "Y" cohort from ADSL (so we don't insert rows for screen failures).
+2. The **parameter set** — every `PARAMCD` we care about (`SYSBP`, `DBP`, `PULSE`, …).
+3. The **visit set** — every scheduled `AVISITN/AVISIT` pair.
+
+Multiplied together that's `n_subjects × n_params × n_visits` rows. The function then **anti-joins** that template against the observed data and inserts only the rows that are missing.
+
+### 2.3 Outer-join-with-template pattern (diagram)
+
+```
+                Subjects        Params       Visits
+                ────────         ──────      ──────
+                01-001           SYSBP       0
+                01-002           DBP         4
+                01-003                       8
+                                             12
+
+                          (cross_join)
+                                ↓
+                          full_grid (3 × 2 × 4 = 24 expected rows)
+                                ↓
+                          anti_join(full_grid, observed)
+                                ↓
+                          missing rows  ←──  stamped DTYPE="EXPECTED"
+                                ↓
+                          bind_rows(observed, missing)
+                                ↓
+                          final BDS (regular grid)
+```
+
+### 2.4 Anatomy of `derive_expected_records()`
+
+```
+derive_expected_records(
+  dataset       = advs_adv,                     <- the observed BDS rows
+  dataset_ref   = ref_pop,                      <- subject roster (typically SAFFL=="Y" from ADSL)
+  by_vars       = exprs(STUDYID, USUBJID,       <- columns that uniquely identify a row in the grid:
+                        PARAMCD, AVISITN,            STUDYID, USUBJID come from dataset_ref;
+                        AVISIT),                     PARAMCD/AVISITN/AVISIT come from dataset
+  set_values_to = exprs(DTYPE = "EXPECTED")     <- constants stamped on each newly-inserted row
+)
+```
+
+### 2.5 SAS equivalent — three ways to build the expected grid
+
+**Approach A — PROC SQL CROSS JOIN:**
+
+```
+PROC SQL;
+  CREATE TABLE _grid AS
+    SELECT a.STUDYID, a.USUBJID, p.PARAMCD, v.AVISITN, v.AVISIT
+    FROM   adsl  AS a
+    CROSS JOIN visits AS v
+    CROSS JOIN params AS p
+    WHERE  a.SAFFL = 'Y';
+  CREATE TABLE _expected AS
+    SELECT g.*, vs.AVAL,
+           CASE WHEN vs.AVAL IS MISSING THEN 'EXPECTED' END AS DTYPE
+    FROM _grid g
+    LEFT JOIN advs vs
+      ON  g.USUBJID = vs.USUBJID
+      AND g.PARAMCD = vs.PARAMCD
+      AND g.AVISITN = vs.AVISITN;
+QUIT;
+```
+
+**Approach B — DATA step with DO loop:**
+
+```
+DATA expected;
+  SET adsl(WHERE=(SAFFL='Y'));
+  DO PARAMCD = 'SYSBP', 'DBP', 'PULSE';
+    DO AVISITN = 0, 4, 8, 12;
+      OUTPUT;
+    END;
+  END;
+RUN;
+PROC SORT DATA=expected; BY USUBJID PARAMCD AVISITN; RUN;
+PROC SORT DATA=advs;     BY USUBJID PARAMCD AVISITN; RUN;
+DATA final;
+  MERGE expected(IN=e) advs(IN=a);
+  BY USUBJID PARAMCD AVISITN;
+  IF e AND NOT a THEN DTYPE = 'EXPECTED';
+RUN;
+```
+
+**Approach C — PROC EXPAND METHOD=NONE:**
+
+`PROC EXPAND` can interpolate or just expand a sparse grid to a regular one. With `METHOD=NONE` it inserts missing rows without imputing values — essentially the same outcome as `derive_expected_records()`, but it requires SAS/ETS.
+
+### 2.6 Why this matters — LOCF needs a continuous grid
+
+LOCF cannot carry a value forward into a row that doesn't exist. If subject 01-002 has no Week 8 row, `lag(AVAL)` at Week 12 will pull Week 4's value — skipping Week 8 entirely. By inserting the expected Week 8 row first, LOCF carries Week 4 into both Week 8 **and** Week 12 (correct behaviour for "no observation since Week 4").
+
+```
+WITHOUT expected_records              WITH expected_records
+───────────────────                   ──────────────────
+Week 0:  120  (obs)                   Week 0:  120  (obs)
+Week 4:  125  (obs)                   Week 4:  125  (obs)
+Week 12: 130  (obs)                   Week 8:   NA  (expected) →  LOCF → 125
+         ↑ lag = 125                  Week 12: 130  (obs)
+         (correct here, but no                          ↑ lag = 125 (after LOCF Week 8 still 125)
+          Week 8 row to flag missingness)
+```
+
+### 2.7 Common pitfall — forgetting to add expected rows before LOCF
+
+This is the single most common bug in BDS pipelines. The order is **always**:
+
+1. `derive_expected_records()` first → regular grid.
+2. `derive_var_locf()` or `derive_locf_records()` second → impute carried-forward values.
+3. Analysis (CHG from BASE, shift tables, …).
+
+Reversing the order silently under-imputes.
 
 ```{r expected-demo}
 # advs_adv has a missing Week 8 row for 01-003
@@ -558,9 +862,203 @@ list(
 )
 ```
 
+#### Read the output
+
+`total_rows = original_rows + expected_rows`. If `expected_rows = 0`, either nothing was missing (every subject attended every visit) or your `by_vars` doesn't match the columns in `dataset`. If `total_rows < original_rows`, something is wrong — `derive_expected_records()` only adds rows, it never deletes.
+
+### Additional exercise — verify the grid is now complete
+
+```{r expected-grid-ex, exercise=TRUE, exercise.lines=18}
+# Exercise: after inserting expected rows, confirm every (USUBJID × AVISIT)
+# now appears exactly once for PARAMCD == "SYSBP".
+# Expected: 3 subjects × 3 visits = 9 rows, all counts equal to 1.
+
+ref_pop <- adsl_adv |> filter(SAFFL == "Y") |> select(STUDYID, USUBJID)
+
+advs_grid <- advs_adv |>
+  derive_expected_records(
+    dataset_ref   = ref_pop,
+    by_vars       = exprs(STUDYID, USUBJID, PARAMCD, AVISITN, AVISIT),
+    set_values_to = exprs(DTYPE = "EXPECTED")
+  )
+
+advs_grid |>
+  filter(PARAMCD == "___") |>
+  count(USUBJID, AVISITN) |>
+  arrange(USUBJID, AVISITN)
+```
+
+```{r expected-grid-ex-hint-1}
+# The parameter code for systolic blood pressure in our demo data is "SYSBP".
+```
+
+```{r expected-grid-ex-solution}
+ref_pop <- adsl_adv |> filter(SAFFL == "Y") |> select(STUDYID, USUBJID)
+
+advs_grid <- advs_adv |>
+  derive_expected_records(
+    dataset_ref   = ref_pop,
+    by_vars       = exprs(STUDYID, USUBJID, PARAMCD, AVISITN, AVISIT),
+    set_values_to = exprs(DTYPE = "EXPECTED")
+  )
+
+advs_grid |>
+  filter(PARAMCD == "SYSBP") |>
+  count(USUBJID, AVISITN) |>
+  arrange(USUBJID, AVISITN)
+```
+
+### Section 2 knowledge check
+
+```{r quiz-expected-kc, echo=FALSE}
+quiz(
+  question(
+    "Which SAS construct is the closest analog to `derive_expected_records()`?",
+    answer("PROC SORT NODUPKEY"),
+    answer("PROC SQL CROSS JOIN of subjects × parameter × visit, then LEFT JOIN to observed", correct = TRUE),
+    answer("PROC TRANSPOSE"),
+    answer("PROC FREQ MISSING"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "Why is `derive_expected_records()` upstream of LOCF?",
+    answer("It is faster to run first"),
+    answer("LOCF can only carry a value into a row that exists — the expected grid creates those rows", correct = TRUE),
+    answer("LOCF requires DTYPE to be set"),
+    answer("admiral mandates this order"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "If `dataset_ref` is the full ADSL (no SAFFL filter), what is the consequence?",
+    answer("No change — admiral filters internally"),
+    answer("Expected rows are inserted for screen failures and non-safety subjects, polluting the dataset", correct = TRUE),
+    answer("All rows are duplicated"),
+    answer("LOCF will fail"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  ),
+  question(
+    "What value should `set_values_to` typically stamp on each inserted row?",
+    answer("AVAL = 0"),
+    answer("A DTYPE flag like 'EXPECTED' so the SAP rules can distinguish inserted rows from observed", correct = TRUE),
+    answer("AVISIT = 'MISSING'"),
+    answer("Nothing — admiral handles it"),
+    random_answer_order = TRUE, allow_retry = TRUE
+  )
+)
+```
+
 ---
 
 ## Section 3 — LOCF Imputation
+
+### 3.1 What LOCF means clinically
+
+**LOCF = Last Observation Carried Forward.** When a subject misses a scheduled measurement, you replace the missing value with the **most recent observed value from a prior visit** for that subject and parameter.
+
+```
+Visit:   Wk0    Wk4    Wk8    Wk12
+AVAL:    120    125    NA     130
+                          ↑
+                         imputed = 125 (Wk4 carried forward)
+```
+
+It is a **simple imputation** — one number replaces one missing — and it's used when the SAP says so.
+
+### 3.2 When LOCF is appropriate (and when it isn't)
+
+LOCF is appropriate when:
+
+- The protocol or SAP specifies it (this is decisive).
+- The trial is short and measurement-to-measurement variability is low.
+- The number of missing observations is small.
+
+LOCF is **problematic** because:
+
+- It assumes the subject's true value did not change from the last measurement — biased toward the null in long trials.
+- ICH E9(R1) (estimands) and FDA's "Missing Data in Clinical Trials" (National Research Council, 2010) explicitly recommend more sophisticated methods.
+- Modern preference: **MMRM** (Mixed-Model Repeated Measures), **Multiple Imputation**, or **reference-based imputation** (jump-to-reference, copy-reference, washout).
+
+LOCF still appears in legacy studies, sensitivity analyses, and some indications (oncology tumour assessments where "missing = no change" is biologically plausible for short windows).
+
+### 3.3 The carry-forward algorithm step by step
+
+```
+Step 1: SORT by  (STUDYID, USUBJID, PARAMCD, AVISITN)
+Step 2: GROUP by (STUDYID, USUBJID, PARAMCD)
+Step 3: For each row in the group, in order:
+        IF AVAL is NA THEN
+          AVAL_LOCF = last non-NA AVAL seen so far in this group
+          DTYPE     = "LOCF"
+        ELSE
+          AVAL_LOCF = AVAL
+          DTYPE     = NA
+```
+
+### 3.4 Anatomy of `derive_locf_records()`
+
+```
+derive_locf_records(
+  dataset    = advs_exp,                <- the BDS dataset with expected (NA) rows already inserted
+  dataset_ref = NULL,                   <- optional: subject roster to bound the carry-forward window
+  by_vars    = exprs(STUDYID, USUBJID,  <- groups within which LOCF operates
+                     PARAMCD),
+  order      = exprs(AVISITN),          <- the time axis along which to carry forward
+  keep_vars  = exprs(AVAL, AVALC,       <- which columns get carried-forward values
+                     ANRIND)
+)
+```
+
+### 3.5 SAS equivalent — retain + by-group processing
+
+```
+SAS                                                | admiral
+                                                   |
+PROC SORT DATA=advs;                                | advs_exp |>
+  BY USUBJID PARAMCD AVISITN;                       |   derive_locf_records(
+RUN;                                                |     by_vars  = exprs(STUDYID, USUBJID, PARAMCD),
+DATA advs_locf;                                     |     order    = exprs(AVISITN),
+  SET advs;                                         |     keep_vars = exprs(AVAL)
+  BY USUBJID PARAMCD AVISITN;                       |   )
+  RETAIN _last_aval;                                |
+  IF FIRST.PARAMCD THEN _last_aval = .;             |
+  IF NOT MISSING(AVAL) THEN _last_aval = AVAL;      |
+  ELSE IF NOT MISSING(_last_aval) THEN DO;          |
+    AVAL  = _last_aval;                             |
+    DTYPE = 'LOCF';                                 |
+  END;                                              |
+  DROP _last_aval;                                  |
+RUN;                                                |
+```
+
+Alternative SAS approach — `PROC EXPAND METHOD=NONE`:
+
+```
+PROC EXPAND DATA=advs OUT=advs_locf
+            FROM=WEEK METHOD=NONE;
+  BY USUBJID PARAMCD;
+  ID AVISITDT;
+  CONVERT AVAL = AVAL_LOCF / TRANSFORMOUT = (CDLAG 1);
+RUN;
+```
+
+`METHOD=NONE` tells PROC EXPAND not to interpolate — just carry forward.
+
+### 3.6 Restricting to actual on-study window
+
+LOCF should not carry a value backward into pre-treatment visits, nor forward past discontinuation. The `dataset_ref` argument restricts the carry-forward window to subjects who are actually on study at that time point. In SAS, this is typically a `WHERE AVISITDT BETWEEN TRTSDT AND EOSDT` clause.
+
+### 3.7 Composite imputation strategies
+
+| Strategy | Meaning |
+|----------|---------|
+| **LOCF** | Carry last value forward |
+| **BOCF** | Baseline Observation Carried Forward (substitute baseline for all missing) |
+| **WOCF** | Worst Observation Carried Forward (substitute the worst value observed so far) |
+| **LOCF-then-WOCF** | LOCF for early dropouts, WOCF if the last value is uninformative |
+| **MMRM** | Mixed-model — no imputation; the model handles missingness via maximum likelihood |
+| **MI** | Multiple Imputation — draws several plausible values, pools the estimates |
+
+For grade-based safety endpoints (ATOXGR), WOCF is often more conservative than LOCF.
 
 ```{r locf-demo}
 # advs_adv has NA AVAL at Week 8 for 01-001

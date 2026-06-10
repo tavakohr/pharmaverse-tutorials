@@ -1,0 +1,172 @@
+/* =============================================================
+   cards & cardx Interactive Training — Custom Theme
+   White background, premium violet/indigo accents
+   ============================================================= */
+
+:root {
+  --cards-violet:        #8b5cf6;   /* primary violet */
+  --cards-violet-soft:   #a78bfa;   /* hover / accent */
+  --cards-violet-dark:   #7c3aed;   /* active / strong */
+  --cards-ink:          #2c3e50;   /* body text */
+  --cards-muted:        #7f8c8d;
+  --cards-border:       #ecf0f1;
+  --cards-bg:           #ffffff;
+}
+
+/* ---------- Global ---------- */
+body,
+.topics,
+.topic,
+.bandContent,
+.band {
+  background: var(--cards-bg);
+  color: var(--cards-ink);
+  font-family: "Lato", "Segoe UI", -apple-system, BlinkMacSystemFont,
+               "Helvetica Neue", Arial, sans-serif;
+}
+
+/* ---------- Left Navigation Bar ---------- */
+
+.topicsContainer,
+.topicsList,
+.topics {
+  background: var(--cards-bg);
+  border-right: 1px solid var(--cards-border);
+}
+
+.topicsList {
+  padding: 14px 8px;
+}
+
+/* Individual topic items — white bg, violet text */
+.topicsList .topic {
+  display: block;
+  margin: 4px 4px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  color: var(--cards-violet) !important;
+  background: var(--cards-bg);
+  font-weight: 500;
+  font-size: 0.95rem;
+  text-decoration: none;
+  border-left: 3px solid transparent;
+  transition: background-color 0.15s ease, color 0.15s ease,
+              border-left-color 0.15s ease;
+}
+
+.topicsList .topic:hover {
+  background: #fdfcff;
+  color: var(--cards-violet-soft) !important;
+  border-left-color: var(--cards-violet-soft);
+  cursor: pointer;
+}
+
+/* Active / current topic */
+.topicsList .topic.current,
+.topicsList .topic.active {
+  background: #faf5ff;
+  color: var(--cards-violet-dark) !important;
+  font-weight: 600;
+  border-left-color: var(--cards-violet-dark);
+}
+
+/* Completed topic checkmark */
+.topicsList .topic.done::before {
+  content: "✓ ";
+  color: var(--cards-violet);
+  font-weight: 700;
+  margin-right: 4px;
+}
+
+/* Header at the top of the sidebar */
+.bandContent .topicsHeader,
+.topicsHeader {
+  background: var(--cards-bg);
+  color: var(--cards-violet-dark);
+  padding: 16px 18px;
+  font-weight: 700;
+  font-size: 1rem;
+  border-bottom: 1px solid var(--cards-border);
+}
+
+/* Progress bar */
+.progressBar,
+.progress {
+  background: var(--cards-border);
+  border-radius: 999px;
+  overflow: hidden;
+  height: 5px;
+}
+.progressBar .progressBarFill,
+.progress .progress-bar {
+  background: var(--cards-violet);
+}
+
+/* ---------- Main content area ---------- */
+
+.section,
+.section.level2,
+.section.level3 {
+  background: var(--cards-bg);
+}
+
+h1, h2, h3, h4 {
+  color: var(--cards-ink);
+  font-weight: 600;
+}
+
+a {
+  color: var(--cards-violet-dark);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--cards-violet-soft);
+  text-decoration: underline;
+}
+
+/* ---------- Sidebar scrollbar ---------- */
+.topicsContainer::-webkit-scrollbar,
+.topicsList::-webkit-scrollbar {
+  width: 6px;
+}
+.topicsContainer::-webkit-scrollbar-track,
+.topicsList::-webkit-scrollbar-track {
+  background: transparent;
+}
+.topicsContainer::-webkit-scrollbar-thumb,
+.topicsList::-webkit-scrollbar-thumb {
+  background: var(--cards-violet-soft);
+  border-radius: 999px;
+  opacity: 0.5;
+}
+
+/* ---------- Subtitle / Author — same font as topicsHeader ---------- */
+.subtitle,
+h3.subtitle,
+.bandContent .subtitle,
+.author,
+h4.author {
+  background: var(--cards-bg);
+  color: var(--cards-violet-dark);
+  padding: 4px 18px;
+  font-weight: 700;
+  font-family: inherit;
+  font-style: normal;
+  margin: 0;
+}
+
+.subtitle,
+h3.subtitle,
+.bandContent .subtitle {
+  font-size: 1.25rem;
+  padding-top: 8px;
+}
+
+.author,
+h4.author {
+  font-size: 0.85rem;
+  font-weight: 500;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--cards-border);
+}
+

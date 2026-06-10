@@ -1,10 +1,11 @@
 ---
-title: "Pharmaverse Learning System — Module 0: Setup & Orientation"
+title: "Module 0: Setup & Orientation"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Set up your pharmaverse environment and get oriented with the clinical data

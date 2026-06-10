@@ -1,9 +1,13 @@
 ---
 title: "Lesson 14 — {admiral} Part 1: Foundations and Philosophy"
+author: "Hamid Tavakoli, MD, MSc"
+tutorial:
+  version: 1.1
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Admiral's design manifesto, function naming convention, exprs(), date/time
@@ -361,11 +365,17 @@ dm  <- convert_blanks_to_na(dm_raw)
 ex  <- convert_blanks_to_na(ex_raw)
 lb  <- convert_blanks_to_na(lb_raw)
 
-# ── Real pharmaversesdtm data ─────────────────────────────────────────────────
-library(pharmaversesdtm)
-dm_real <- pharmaversesdtm::dm
-ex_real <- pharmaversesdtm::ex
-lb_real <- pharmaversesdtm::lb
+# ── Real pharmaversesdtm data (with fallback to mock if package missing) ─────
+if (requireNamespace("pharmaversesdtm", quietly = TRUE)) {
+  dm_real <- pharmaversesdtm::dm
+  ex_real <- pharmaversesdtm::ex
+  lb_real <- pharmaversesdtm::lb
+} else {
+  # Fallback: reuse the mock SDTM datasets defined above so all chunks still run
+  dm_real <- dm_raw
+  ex_real <- ex_raw
+  lb_real <- lb_raw
+}
 ```
 
 ## Welcome
@@ -390,6 +400,58 @@ All admiral functions are mocked and run without package installation.
 
 ## 1 — The manifesto
 
+Admiral is a *toolbox*. There is no `make_adsl()` function that magically produces an ADSL from raw SDTM. Instead, you assemble ADaMs by **chaining many small, auditable function calls** — each doing one identifiable thing. This is the single most important mindset shift for a SAS programmer.
+
+### 1.1 Toolbox vs. canned PROC vs. macro library
+
+A SAS programmer entering pharmaverse usually arrives with one of three mental models. None of them is quite right, and the differences matter.
+
+| Mental model | Where SAS folks know it from | Why admiral is different |
+|---|---|---|
+| **Canned PROC** (`PROC LIFETEST`, `PROC FREQ`) | One call, dozens of options, opaque output dataset | admiral has *no* canned PROC — every variable you add is its own function call, fully visible in the code |
+| **Macro library** (e.g. `%adslmacro`, `%trtemfl`) | A black box: pass `%let drug=XAN;`, get back an ADSL | admiral is more granular than a typical macro library — even a single derivation like TRTSDT is one function call, not bundled with TRTEDT |
+| **Function-level utility library** (`%macro daysbtwn`) | Tiny helpers you `%include` from a shared folder | This is closest. admiral is a library of small, single-purpose functions that you compose explicitly in your program. |
+
+The pharmaverse manifesto puts it this way: admiral functions have **clear purpose, no multi-purpose functions**. There is `derive_vars_dt()` and there is `derive_vars_dtm()`. There is no `derive_vars_dt_or_dtm()` with a `type=` switch. The maintainers refuse to add such a function on principle, because it would make code less predictable.
+
+### 1.2 "Monolithic PROC" vs. "many small derivations"
+
+```
+   /* SAS DATA STEP — one giant block,           |   # admiral — many small calls,
+      hard to audit, harder to test piece by      |     each one independently verifiable
+      piece */                                    |
+   data adsl;                                     |   adsl <- dm |>
+     set dm;                                      |     derive_vars_dt(
+     RFXSTDT = input(RFXSTDTC, yymmdd10.);        |       dtc = RFXSTDTC,
+     if RFXSTDT ne . then TRTSDT = RFXSTDT;       |       new_vars_prefix = "RFXST"
+     /* ... 200 more lines of derivations ... */  |     ) |>
+     SAFFL = 'N';                                 |     derive_vars_merged(
+     if EXDOSE > 0 then SAFFL = 'Y';              |       dataset_add = ex,
+     /* ... and so on ... */                      |       new_vars    = exprs(TRTSDT = EXSTDT),
+   run;                                           |       by_vars     = exprs(STUDYID, USUBJID),
+                                                  |       mode        = "first"
+                                                  |     ) |>
+                                                  |     derive_var_merged_exist_flag(
+                                                  |       dataset_add = ex,
+                                                  |       new_var     = SAFFL,
+                                                  |       condition   = EXDOSE > 0
+                                                  |     )
+```
+
+> **SAS analog mental model:** Admiral is to ADaM derivation what a well-organized macro folder is to a SAS production area — except the macros are versioned, regression-tested, on CRAN, and named so consistently that you can guess a function's behavior from its name.
+
+### 1.3 The 3-year deprecation cycle (vs. the SAS tradition)
+
+Pharma data flows have a long memory. A Phase III pivotal trial may have been programmed in 2022 and is still being re-run for a regulatory request in 2026. SAS solves this by **never deprecating anything** — `PROC LIFETEST` from SAS 6 still runs in SAS 9.4. Admiral takes a different approach:
+
+- **Year 1:** the function is marked deprecated, emits a warning at runtime, but still works.
+- **Year 2:** the function emits an error message pointing to its replacement, but still runs if you set an option.
+- **Year 3:** the function is removed entirely; you must rewrite the call.
+
+The point is to give study teams time to migrate without surprise breakage mid-cycle. If you `library(admiral)` in 2026 and your code from 2023 throws a deprecation warning, you have until 2026 to fix it.
+
+> **SAS analog mental model:** Imagine if SAS announced in 2025 that `PROC MEANS NWAY` would print a warning, in 2026 it would print an error you had to suppress, and in 2027 it would be removed entirely. That would be the admiral lifecycle.
+
 ```{r quiz-manifesto, echo=FALSE}
 quiz(
   question(
@@ -412,6 +474,20 @@ quiz(
     answer("Studies run for years; a mid-study package update should never break existing code without ample warning time", correct = TRUE),
     answer("CRAN requires 3-year cycles"),
     random_answer_order = TRUE
+  ),
+  question(
+    "Which best describes admiral's relationship to a typical SAS macro library like `%adslmacro`?",
+    answer("admiral is a single big macro you parameterize and call once"),
+    answer("admiral is more granular — a typical macro might bundle TRTSDT, TRTEDT, and TRTDURD into one call; admiral splits them into three named functions", correct = TRUE),
+    answer("admiral and SAS macro libraries have no analog"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Why doesn't admiral ship a `derive_dates(type = 'dt'|'dtm')` switch instead of two separate functions?",
+    answer("R doesn't support optional arguments"),
+    answer('It violates the "clear purpose, no multi-purpose functions" rule — predictable, single-purpose names make code more auditable and easier to grep', correct = TRUE),
+    answer("The pharmaverse maintainers haven't gotten around to it yet"),
+    random_answer_order = TRUE
   )
 )
 ```
@@ -419,6 +495,90 @@ quiz(
 ---
 
 ## 2 — Function naming convention
+
+Admiral function names are highly structured. Once you internalize the prefix taxonomy, you can guess what a function does from its name alone — and you can grep the package for the exact function you need.
+
+### 2.1 The six prefixes
+
+| Prefix | Singular/Plural | What it does | Closest SAS analog | Example function names |
+|---|---|---|---|---|
+| `derive_var_*` | singular | Adds **one** variable to a dataset | A `DATA` step assignment: `TRTDURD = TRTEDT - TRTSDT + 1;` | `derive_var_trtdurd()`, `derive_var_extreme_flag()`, `derive_var_merged_exist_flag()` |
+| `derive_vars_*` | plural | Adds **multiple related** variables in one call (e.g. DT + DTF flag) | A macro that emits several `OUTPUT` columns | `derive_vars_dt()`, `derive_vars_dtm()`, `derive_vars_merged()`, `derive_vars_duration()` |
+| `derive_param_*` | parameter | Adds a **new parameter row** (PARAMCD) to a BDS dataset | `PROC TRANSPOSE` then `SET old new;` to append a derived parameter | `derive_param_bmi()`, `derive_param_bsa()`, `derive_param_extreme_record()` |
+| `compute_*` | scalar | Returns a **scalar value** (does not modify a dataset) | A SAS function used inside a DATA step: `AGE = YRDIF(BRTHDT, RFSTDT, 'AGE');` | `compute_age_years()`, `compute_duration()`, `compute_bmi()` |
+| `get_*` | retrieval | Returns a **value or object** from inputs (often a tibble of derived records) | `PROC SQL SELECT ... INTO :macrovar` — fetch and stash | `get_summary_records()`, `get_one_to_many_dataset()` |
+| `filter_*` | reducer | Returns a **subset** of an input dataset based on a clinical rule | `DATA out; SET in; IF condition; RUN;` or `PROC SQL WHERE` | `filter_extreme()`, `filter_relative()`, `filter_date_sources()` |
+
+### 2.2 ASCII tree of the prefix taxonomy
+
+```
+admiral function name
+│
+├── derive_*           ──→ "modifies a dataset by adding columns"
+│   ├── derive_var_*       (singular: ONE new column)
+│   │     e.g. derive_var_trtdurd, derive_var_extreme_flag
+│   ├── derive_vars_*      (plural: MULTIPLE columns, usually related — DT + DTF, etc.)
+│   │     e.g. derive_vars_dt, derive_vars_dtm, derive_vars_merged
+│   └── derive_param_*     (adds a new PARAMETER ROW to a BDS dataset)
+│         e.g. derive_param_bmi, derive_param_extreme_record
+│
+├── compute_*          ──→ "pure: scalar in → scalar out, no dataset"
+│         e.g. compute_age_years, compute_bmi, compute_duration
+│
+├── get_*              ──→ "fetch / retrieve some derived object"
+│         e.g. get_summary_records, get_one_to_many_dataset
+│
+└── filter_*           ──→ "shrink a dataset based on a clinical rule"
+          e.g. filter_extreme, filter_relative, filter_date_sources
+```
+
+### 2.3 When to reach for which prefix
+
+| You need to... | Pick this prefix |
+|---|---|
+| Add TRTSDT to ADSL using a date from EX | `derive_vars_merged()` — it joins another dataset and adds variable(s) |
+| Add a `BASE` (baseline value) column derived from a flag | `derive_var_base()` — single variable |
+| Add a new BMI row alongside HEIGHT and WEIGHT in ADVS | `derive_param_bmi()` — new parameter row, not a new column |
+| Compute someone's age in years given two dates, no dataset | `compute_age_years()` — scalar function |
+| Pull the latest non-missing date from a long lab dataset | `get_summary_records()` or `derive_vars_merged()` with `mode = "last"` |
+| Subset AEs to only "treatment-emergent" rows | `filter_*` family (or a plain `dplyr::filter()` for simple cases) |
+
+### 2.4 SAS analog comparison: function naming
+
+```
+   /* SAS — no convention; macro names    |   # admiral — convention enforced
+      may be anything */                  |
+   %adsl_dates;        /* what does this  |   adsl |>
+                          do? */          |     derive_vars_dt(...)      # CLEARLY adds vars (plural)
+   %trtem_flag;        /* one var or      |     derive_var_trtemfl(...)  # CLEARLY adds ONE var
+                          many? */        |     derive_param_bmi(...)   # CLEARLY adds a PARAM row
+   %compute_age;       /* dataset or      |     compute_age_years(...)  # CLEARLY a scalar function
+                          scalar? */      |
+```
+
+> **SAS analog mental model:** Imagine you converted your shop's macro library to follow a strict naming rule where the first word of every macro name tells you exactly what kind of thing it returns. That convention is what admiral enforces at the package level — you read the name and you know whether to expect a column, a row, a scalar, or a subset.
+
+### 2.5 Anatomy of a name
+
+Take `derive_var_merged_exist_flag()`:
+
+```
+derive_  var_  merged_  exist_  flag
+   │      │       │         │      │
+   │      │       │         │      └── what's added: a flag (Y/NA)
+   │      │       │         └── the rule for setting it: existence in another dataset
+   │      │       └── how it's computed: by merging
+   │      └── singular: ONE new variable is added
+   └── dataset-mutating action
+```
+
+You can read the function and predict its signature before opening the help page:
+
+- It takes a `dataset` (the one we are adding to).
+- It takes a `dataset_add` (the one we look up in).
+- It takes `by_vars` (the join keys).
+- It takes a `condition` (the existence rule).
+- It produces a single new column whose name you provide via `new_var`.
 
 ```{r quiz-naming, echo=FALSE}
 quiz(
@@ -442,15 +602,124 @@ quiz(
     answer("A scalar numeric value without modifying a dataset", correct = TRUE),
     answer("A plot of age distribution"),
     random_answer_order = TRUE
+  ),
+  question(
+    "You are asked to add a BMI row to a long-format ADVS dataset (so PARAMCD=BMI appears alongside HEIGHT and WEIGHT). Which prefix?",
+    answer("derive_var_*"),
+    answer("derive_param_* — you are adding a new parameter row, not a column", correct = TRUE),
+    answer("compute_*"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A function named `filter_extreme()` most likely:",
+    answer("Adds a flag for extreme records"),
+    answer("Returns a subset of the dataset keeping only extreme records", correct = TRUE),
+    answer("Removes outliers using a statistical rule"),
+    random_answer_order = TRUE
   )
 )
 ```
+
+### 2.6 Exercise: Guess the prefix
+
+For each task below, reason about which prefix family the right admiral function belongs to. Use the dataset names and SAS-side intent to choose.
+
+```{r naming-guess, exercise=TRUE, exercise.lines=18}
+# For each row, replace ___ with one of:
+#   "derive_var", "derive_vars", "derive_param", "compute", "get", "filter"
+prefix_guess <- tribble(
+  ~task,                                                 ~prefix,
+  "Add TRTSDT (one new variable) to ADSL from EX",        ___,
+  "Add both ASTDT and ASTDTF (two related vars) to ADAE", ___,
+  "Add a derived BMI row (PARAMCD='BMI') to ADVS",        ___,
+  "Compute someone's age in years from two date vectors", ___,
+  "Reduce AE rows down to treatment-emergent only",       ___
+)
+prefix_guess
+```
+
+```{r naming-guess-hint-1}
+# Singular vs plural variable count drives "derive_var" vs "derive_vars".
+# A new row in a BDS dataset is "derive_param".
+# A scalar in / scalar out function is "compute".
+```
+
+```{r naming-guess-hint-2}
+# Reducing rows = "filter_". Adding a single column = "derive_var_".
+```
+
+```{r naming-guess-solution}
+prefix_guess <- tribble(
+  ~task,                                                 ~prefix,
+  "Add TRTSDT (one new variable) to ADSL from EX",        "derive_var",
+  "Add both ASTDT and ASTDTF (two related vars) to ADAE", "derive_vars",
+  "Add a derived BMI row (PARAMCD='BMI') to ADVS",        "derive_param",
+  "Compute someone's age in years from two date vectors", "compute",
+  "Reduce AE rows down to treatment-emergent only",       "filter"
+)
+prefix_guess
+```
+
+> **Read the output:** look at the `prefix` column. Notice that "Add TRTSDT" alone is `derive_var_*` because TRTSDT is *one* variable — even though it requires a join to derive it (joins don't change the prefix family; the *count of variables produced* does).
 
 ---
 
 ## 3 — `convert_blanks_to_na()`: always your first call
 
 SAS XPT files store missing character values as `""` (empty string), not `NA`. R's `is.na()` returns `FALSE` for empty strings — so downstream derivations silently produce wrong results if you skip this step.
+
+### 3.1 SAS analog comparison
+
+| admiral function | What it does | Closest SAS analog | SAS code sketch |
+|---|---|---|---|
+| `convert_blanks_to_na()` | Replace `""` with `NA` in every character column | A DATA step pass that converts `if VAR=" " then call missing(VAR);` | `data dm; set dm; if ARM=" " then ARM=" "; ... run;` (SAS treats blank-only strings as missing automatically; R does not) |
+
+The reason this is needed is a quirk of the SAS XPT file format and how `haven::read_xpt()` reads it into R.
+
+### 3.2 Why XPT stores `""` and not `.`
+
+In SAS, *numeric* missing is the single character `.`. *Character* missing is a string of one or more blanks (`" "`, `"  "`, or longer). SAS handles both transparently — `if ARM=" " then` matches whether ARM is one blank or thirty.
+
+When SAS writes an XPT (a Version 5 transport file), character missings are stored as their literal blank padding. When `haven::read_xpt()` reads that file into R, it left-trims those blanks. A character variable that was missing in SAS becomes `""` (a zero-length string) in R.
+
+R's `is.na("")` returns `FALSE`. R's `is.na(NA)` returns `TRUE`. These are different — and admiral derivations that branch on `is.na()` (which is most of them) will silently produce the wrong answer if you forget this conversion.
+
+```
+   /* SAS — missing character handled       |   # R after read_xpt() — blank is NOT NA
+      transparently */                      |
+   if ARM = " " then put "missing";         |   "" |> is.na()      # FALSE  (oops!)
+   if missing(ARM) then put "missing";      |   NA_character_ |> is.na()  # TRUE
+   /* Both detect "missing" correctly */    |
+                                            |   # Fix: convert blanks BEFORE any derivation
+                                            |   dm <- convert_blanks_to_na(dm)
+                                            |   dm$ARM |> is.na()   # TRUE  (now correct)
+```
+
+### 3.3 Anatomy of the call
+
+```r
+convert_blanks_to_na(
+  dataset    # the input data frame; every character column is scanned
+)
+```
+
+- Only **character columns** are touched. Numeric, logical, date, and factor columns pass through unchanged.
+- The function replaces only **fully empty strings** (`""`). It does **not** trim whitespace, so a value of `" "` (one literal space) is *not* converted. If you suspect padded blanks, do `mutate(across(where(is.character), str_trim))` first.
+- It is **idempotent** — calling it twice is the same as calling it once.
+
+> **SAS analog mental model:** `convert_blanks_to_na()` is the R equivalent of running a `DATA` step pass with `array c[*] _character_; do i = 1 to dim(c); if c[i]=" " then call missing(c[i]); end;` — except admiral does it for you in one line, and it is the *only* line you should ever write between `read_xpt()` and your first derivation.
+
+### 3.4 Contrast with `read_xpt()` and `PROC IMPORT`
+
+| Reader | Blank handling | Action required |
+|---|---|---|
+| `haven::read_xpt()` | Leaves blank as `""` | **MUST** call `convert_blanks_to_na()` |
+| `haven::read_sas()` (SAS7BDAT) | Leaves blank as `""` | Same — must convert |
+| `pharmaverseadam::adsl` (built tibble) | Already uses `NA` | Optional but harmless |
+| SAS `PROC IMPORT` (SAS-side) | Reads CSV blanks as missing automatically | N/A — different ecosystem |
+| `read_xpt()` in older `SASxport` package | Sometimes converted, sometimes not | Inconsistent — always convert defensively |
+
+> **Defensive habit:** call `convert_blanks_to_na()` on *every* SDTM dataset you import, even if you think it is already clean. It is cheap, idempotent, and saves you from one of the most insidious bug classes in pharmaverse.
 
 ```{r blanks-demo}
 # Demonstrate the problem
@@ -474,7 +743,9 @@ dm_fixed |>
 cat("ARM is NA after conversion:", is.na(dm_fixed$ARM[dm_fixed$USUBJID == "01-703-1211"]), "\n")
 ```
 
-### Exercise: Convert blanks and verify with is.na
+> **Read the output:** look at the cat() line that prints `is.na test`. Before conversion, the ARM column for subject `01-703-1211` is the literal `""` (zero-length string) — and `is.na("")` returns FALSE. After `convert_blanks_to_na()` the same cell is genuine `NA_character_` and `is.na()` returns TRUE. Every admiral derivation that branches on `is.na()` (most do) only works correctly after this transformation.
+
+### 3.5 Exercise: Convert blanks and verify with is.na
 
 ```{r blanks-exercise, exercise=TRUE, exercise.lines=14}
 # Create a dataset with blanks in multiple columns
@@ -495,7 +766,7 @@ cat("NAs in RACE (after):", sum(is.na(test_clean$RACE)), "\n")
 test_clean
 ```
 
-### Exercise: Blank audit on real pharmaversesdtm DM
+### 3.6 Exercise: Blank audit on real pharmaversesdtm DM
 
 The real `dm_real` arrives as if read from a SAS XPT. Check whether it carries any blank strings, then apply `convert_blanks_to_na()` defensively. This pattern belongs at the top of every admiral script regardless of whether blanks are expected.
 
@@ -542,11 +813,181 @@ na_summary <- sapply(select(dm_real_clean, where(is.character)),
 print(na_summary[na_summary > 0])
 ```
 
+> **Read the output:** look at the `na_summary` printout — every entry is a count of *genuine* NAs that admiral derivations will correctly treat as missing. Without `convert_blanks_to_na()`, any cell that used to be `""` would have been silently treated as a present value of length zero.
+
+### 3.7 Exercise: Diagnose the wrong-result bug
+
+The chunk below shows what happens when you skip `convert_blanks_to_na()` and try to count "subjects with no recorded arm." Fix the bug.
+
+```{r blanks-diagnose, exercise=TRUE, exercise.lines=18}
+test_ds <- tibble(
+  USUBJID = c("S001", "S002", "S003", "S004"),
+  ARM     = c("Placebo", "", "Active", "")   # S002 and S004 have blank ARM
+)
+
+# Wrong: counts ZERO because is.na("") is FALSE
+n_missing_wrong <- test_ds |>
+  filter(is.na(ARM)) |>
+  nrow()
+cat("Subjects with missing ARM (WRONG):", n_missing_wrong, "\n")
+
+# Fix: convert blanks to NA first
+test_ds_fixed <- ___(test_ds)
+n_missing_right <- test_ds_fixed |>
+  filter(is.na(ARM)) |>
+  nrow()
+cat("Subjects with missing ARM (RIGHT):", n_missing_right, "\n")
+```
+
+```{r blanks-diagnose-hint-1}
+# Wrap test_ds in convert_blanks_to_na() before the filter.
+```
+
+```{r blanks-diagnose-hint-2}
+# test_ds_fixed <- convert_blanks_to_na(test_ds)
+```
+
+```{r blanks-diagnose-solution}
+test_ds <- tibble(
+  USUBJID = c("S001", "S002", "S003", "S004"),
+  ARM     = c("Placebo", "", "Active", "")
+)
+
+n_missing_wrong <- test_ds |>
+  filter(is.na(ARM)) |>
+  nrow()
+cat("Subjects with missing ARM (WRONG):", n_missing_wrong, "\n")
+
+test_ds_fixed <- convert_blanks_to_na(test_ds)
+n_missing_right <- test_ds_fixed |>
+  filter(is.na(ARM)) |>
+  nrow()
+cat("Subjects with missing ARM (RIGHT):", n_missing_right, "\n")
+```
+
+> **Read the output:** the WRONG count is 0 — `filter(is.na(ARM))` matches nothing because `""` is not `NA` in R. After conversion, the RIGHT count is 2. This is the exact bug class that motivates the existence of `convert_blanks_to_na()`.
+
+### 3.8 Knowledge check
+
+```{r quiz-blanks, echo=FALSE}
+quiz(
+  question(
+    "Why does `haven::read_xpt()` produce empty strings instead of NAs for missing character values?",
+    answer("haven has a bug"),
+    answer("The XPT file format stores character missing as padded blanks; haven left-trims them to '' instead of converting them to NA", correct = TRUE),
+    answer("R does not support character NAs"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A SAS programmer writes `if missing(ARM) then ...`. The closest R equivalent (after `convert_blanks_to_na()`) is:",
+    answer("if (ARM == 'NA') ..."),
+    answer("if (is.na(ARM)) ...", correct = TRUE),
+    answer("if (ARM == '') ..."),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`convert_blanks_to_na()` does NOT trim whitespace. A value of `' '` (one literal space) is:",
+    answer("Converted to NA"),
+    answer("Left unchanged — only zero-length '' is converted", correct = TRUE),
+    answer("Dropped from the dataset"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Calling `convert_blanks_to_na()` twice in a row will:",
+    answer("Throw an error"),
+    answer("Have no extra effect — the function is idempotent", correct = TRUE),
+    answer("Convert NAs back to blanks"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 4 — `derive_vars_dt()`: ISO 8601 DTC → numeric Date
 
 The workhorse for converting character SDTM dates to numeric dates suitable for arithmetic.
+
+### 4.1 What it produces
+
+For every call, `derive_vars_dt()` adds **two** variables (hence the plural `vars`): the numeric date and an imputation flag describing what (if anything) was filled in.
+
+| Output variable | Type | Content |
+|---|---|---|
+| `<prefix>DT` | numeric (days since 1970-01-01) | The fully resolved analysis date |
+| `<prefix>DTF` | character | `"D"` (day imputed), `"M"` (month+day imputed), `"Y"` (year imputed), `NA` (nothing imputed) |
+
+### 4.2 SAS analog comparison
+
+| admiral function | What it does | Closest SAS analog | SAS code sketch |
+|---|---|---|---|
+| `derive_vars_dt()` | DTC string → numeric date + imputation flag | `INPUT()` with informat, plus a length-check macro | `RFXSTDT = INPUT(RFXSTDTC, E8601DA10.);` plus `if length(RFXSTDTC)=7 then RFXSTDTF="D";` |
+| `derive_vars_dt(date_imputation="first")` | Impute missing day to "01" | Macro that pads partial date with `01` | `if length(RFXSTDTC)=7 then RFXSTDT = INPUT(cats(RFXSTDTC,"-01"), E8601DA10.);` |
+| `derive_vars_dt(date_imputation="last")` | Impute missing day to month-end | Macro with `INTNX('month',d,0,'E')` | `RFXSTDT = INTNX('MONTH', INPUT(cats(RFXSTDTC,"-01"), E8601DA10.), 0, 'E');` |
+
+### 4.3 ASCII side-by-side
+
+```
+   /* SAS — informat input + manual flag */     |   # admiral — one call, both vars
+   data adsl;                                   |   adsl |>
+     set adsl;                                  |     derive_vars_dt(
+     RFXSTDT = input(RFXSTDTC, E8601DA10.);     |       dtc             = RFXSTDTC,
+     if length(RFXSTDTC)=7 then do;             |       new_vars_prefix = "RFXST",
+       RFXSTDT = input(cats(RFXSTDTC,"-01"),    |       date_imputation = "first"
+                       E8601DA10.);             |     )
+       RFXSTDTF = "D";                          |
+     end;                                       |
+     else if length(RFXSTDTC)=4 then do;        |
+       RFXSTDT = input(cats(RFXSTDTC,"-01-01"), |
+                       E8601DA10.);             |
+       RFXSTDTF = "M";                          |
+     end;                                       |
+   run;                                         |
+```
+
+### 4.4 Anatomy of the call
+
+```r
+derive_vars_dt(
+  dataset         = dm,         # input dataset
+  dtc             = RFXSTDTC,   # character ISO 8601 column to parse
+  new_vars_prefix = "RFXST",    # name stem; output is RFXSTDT + RFXSTDTF
+  date_imputation = "first",    # "first", "last", or "none"
+  flag_imputation = "auto"      # whether to emit the *DTF flag automatically
+)
+```
+
+- **`dtc`** is the *character* date column in ISO 8601 form (`"2014-01-02"` or partial `"2014-01"` or `"2014"`). It is passed unquoted, tidy-evaluation style.
+- **`new_vars_prefix`** is a stem. If you pass `"RFXST"`, you get `RFXSTDT` (numeric) and `RFXSTDTF` (flag). If you pass `"A"`, you get `ADT` and `ADTF` (the canonical CDISC analysis-date naming).
+- **`date_imputation`** controls how partial dates are filled in. `"first"` pads to January 1st / first of month. `"last"` pads to December 31st / month-end. `"none"` returns NA for any partial date.
+- **`flag_imputation`** defaults to `"auto"` — admiral emits the DTF flag any time it had to impute. Set to `"none"` to suppress the flag column entirely (rare; usually you want the audit trail).
+
+### 4.5 ISO 8601 partial-date imputation rules
+
+| DTC input | Length | `imputation="first"` → `<prefix>DT` | DTF flag | `imputation="last"` → `<prefix>DT` | DTF flag |
+|---|---|---|---|---|---|
+| `"2014-01-02"` | 10 | 2014-01-02 | `NA` (no imputation) | 2014-01-02 | `NA` |
+| `"2014-01"` | 7 | 2014-01-01 | `"D"` | 2014-01-31 | `"D"` |
+| `"2014"` | 4 | 2014-01-01 | `"M"` | 2014-12-31 | `"M"` |
+| `"--"` or `""` | 0 | `NA` | `NA` | `NA` | `NA` |
+| `"2014-02"` (last) | 7 | 2014-02-01 | `"D"` | 2014-02-28 *(or 29 in leap year)* | `"D"` |
+
+Note that month-end imputation is **calendar-aware** — February 2014 resolves to the 28th, February 2016 to the 29th. SAS's `INTNX('MONTH', d, 0, 'E')` does the same thing.
+
+### 4.6 SAS analog mental model
+
+> **SAS analog mental model:** `derive_vars_dt()` is your PROC equivalent of `INPUT(DTC, E8601DA10.)` + a length-check macro for partial dates + an automatic flag variable, all in one call. In SAS you would typically write a `%macro impute_date(dtc=, prefix=)` that does the length test and conditional `INTNX`. admiral ships that macro as a versioned, tested function.
+
+### 4.7 Common pitfalls vs SAS `INPUT()`
+
+| Pitfall | SAS behavior | admiral behavior |
+|---|---|---|
+| Partial date `"2014-01"` | `INPUT("2014-01", E8601DA10.)` → `.` (missing) | With `date_imputation="first"` → `2014-01-01` |
+| Empty/missing DTC | `INPUT("", E8601DA10.)` → `.` | Returns `NA` regardless of `date_imputation` |
+| Trailing `T` (datetime form) `"2014-01-02T08:30"` | `INPUT()` with `DATE` informat → `.` | admiral strips the time portion gracefully |
+| Day=15 imputation (common SAS shop convention) | Custom macro: `date('15Jan2014')` | admiral does **not** support `"mid"` imputation; if you need day-15 you must override post hoc |
+
+> **Note:** Some SAS shops use day-15 imputation for partial dates (the "middle of the month" convention) on the argument that it minimizes mean absolute imputation error. Admiral's built-in choices are only `"first"` and `"last"`. If your SAP mandates day-15, derive with `"first"` then overwrite: `mutate(RFXSTDT = if_else(RFXSTDTF == "D", RFXSTDT + 14, RFXSTDT))`.
 
 ```{r derive-dt-demo}
 # Pre-process DM to get a numeric date from RFXSTDTC
@@ -578,7 +1019,9 @@ partial_dm |>
   mutate(STARTDT_human = as.Date(STARTDT, origin = "1970-01-01"))
 ```
 
-### Exercise: Derive a date with "last" imputation
+> **Read the output:** S001 had `STARTDTC = "2014-07"` (year+month, no day). With `date_imputation = "first"`, the resolved `STARTDT` is `2014-07-01` and `STARTDTF` is `"D"` (flag = "day was imputed"). S002 had a full DTC, so its `STARTDTF` is `NA` (no imputation needed). The flag column is your audit trail — never throw it away.
+
+### 4.8 Exercise: Derive a date with "last" imputation
 
 Impute the same partial date dataset using `date_imputation = "last"`. Subject S001's date should now resolve to the last day of July 2014.
 
@@ -617,7 +1060,7 @@ partial_dm2 |>
   mutate(STARTDT_human = as.Date(STARTDT, origin = "1970-01-01"))
 ```
 
-### Exercise: Derive numeric dates from real pharmaversesdtm DM
+### 4.9 Exercise: Derive numeric dates from real pharmaversesdtm DM
 
 `dm_real` contains `RFXSTDTC` — the reference date for first treatment exposure. Derive `RFXSTDT` from it, then check how many subjects had partial dates that triggered the imputation flag.
 
@@ -667,11 +1110,208 @@ cat("RFXSTDTF imputation flag counts:\n")
 table(dm_real_dates$RFXSTDTF, useNA = "ifany")
 ```
 
+> **Read the output:** the `table()` of `RFXSTDTF` tells you the imputation profile of the dataset — how many rows had complete DTCs (NA flag), how many had day-only imputation ("D"), etc. In a real ADaM build this is the table you paste into your derivation listings as evidence that you handled partial dates correctly.
+
+### 4.10 Exercise: Compare "first" vs "last" on the same partial DTC
+
+Apply both imputation modes to the same partial DTC vector and inspect the difference. This is the test you would run when your SAP changes between drafts.
+
+```{r derive-dt-firstlast, exercise=TRUE, exercise.lines=20}
+test_partial <- tibble(
+  USUBJID = c("S001", "S002", "S003", "S004"),
+  ASTDTC  = c("2014-02", "2014",   "2014-11-15", "2016-02")
+  #            ^ no day  ^ no mo   ^ complete    ^ feb in leap year
+)
+
+# Apply "first" imputation
+res_first <- test_partial |>
+  derive_vars_dt(
+    dtc             = ASTDTC,
+    new_vars_prefix = "AST",
+    date_imputation = ___
+  ) |>
+  mutate(ASTDT_human = as.Date(ASTDT, origin = "1970-01-01")) |>
+  select(USUBJID, ASTDTC, ASTDT_first = ASTDT_human, ASTDTF_first = ASTDTF)
+
+# Apply "last" imputation
+res_last <- test_partial |>
+  derive_vars_dt(
+    dtc             = ASTDTC,
+    new_vars_prefix = "AST",
+    date_imputation = ___
+  ) |>
+  mutate(ASTDT_human = as.Date(ASTDT, origin = "1970-01-01")) |>
+  select(USUBJID, ASTDT_last = ASTDT_human, ASTDTF_last = ASTDTF)
+
+left_join(res_first, res_last, by = "USUBJID")
+```
+
+```{r derive-dt-firstlast-hint-1}
+# Set date_imputation = "first" in the first call,
+# and date_imputation = "last" in the second.
+```
+
+```{r derive-dt-firstlast-hint-2}
+# "first" pads to the earliest valid day (01-01 or month-01).
+# "last" pads to the latest valid day (12-31 or month-end, leap-aware).
+```
+
+```{r derive-dt-firstlast-solution}
+test_partial <- tibble(
+  USUBJID = c("S001", "S002", "S003", "S004"),
+  ASTDTC  = c("2014-02", "2014", "2014-11-15", "2016-02")
+)
+
+res_first <- test_partial |>
+  derive_vars_dt(
+    dtc             = ASTDTC,
+    new_vars_prefix = "AST",
+    date_imputation = "first"
+  ) |>
+  mutate(ASTDT_human = as.Date(ASTDT, origin = "1970-01-01")) |>
+  select(USUBJID, ASTDTC, ASTDT_first = ASTDT_human, ASTDTF_first = ASTDTF)
+
+res_last <- test_partial |>
+  derive_vars_dt(
+    dtc             = ASTDTC,
+    new_vars_prefix = "AST",
+    date_imputation = "last"
+  ) |>
+  mutate(ASTDT_human = as.Date(ASTDT, origin = "1970-01-01")) |>
+  select(USUBJID, ASTDT_last = ASTDT_human, ASTDTF_last = ASTDTF)
+
+left_join(res_first, res_last, by = "USUBJID")
+```
+
+> **Read the output:** S003 has identical first and last dates (the DTC was complete and the flag is NA). S001 (`2014-02`) resolves to `2014-02-01` vs `2014-02-28`. S004 (`2016-02`, a leap year) resolves to `2016-02-01` vs `2016-02-29` — proof that admiral's month-end imputation is calendar-aware. S002 (`2014`) shows month+day imputation, with flag `"M"`.
+
+### 4.11 Knowledge check
+
+```{r quiz-dt, echo=FALSE}
+quiz(
+  question(
+    "A subject's `RFSTDTC` is `'2014'`. With `date_imputation = 'last'`, what does `RFSTDT` become?",
+    answer("2014-01-01"),
+    answer("2014-12-31", correct = TRUE),
+    answer("NA — admiral cannot impute year-only"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A SAS programmer writes `RFSTDT = INPUT(RFSTDTC, E8601DA10.);` and the DTC is `'2014-02'`. SAS returns `.` (missing). admiral's `derive_vars_dt(date_imputation='first')` returns:",
+    answer("Also missing"),
+    answer("2014-02-01 with DTF = 'D'", correct = TRUE),
+    answer("An error"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The `DTF` flag value `'M'` means:",
+    answer("The month-only portion was wrong"),
+    answer("Both the month and the day had to be imputed (DTC was year-only)", correct = TRUE),
+    answer("The date is missing"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You need to impute partial dates to day-15 (the 'middle of the month' SAS convention). Does admiral support this directly?",
+    answer("Yes, via `date_imputation = 'mid'`"),
+    answer("No — only 'first' and 'last' are built in; you must override post hoc with mutate()", correct = TRUE),
+    answer("Yes, but only for SAS-compatible XPT inputs"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "After `derive_vars_dt(new_vars_prefix = 'AST', ...)`, which two columns will be present?",
+    answer("ASTDT and ASTDY"),
+    answer("ASTDT and ASTDTF", correct = TRUE),
+    answer("ASTDT and ASTDTC"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 5 — `derive_vars_dtm()`: DTC → numeric Datetime
 
-For treatment-window calculations you often need datetimes (not just dates), because two records can share a date but have different times of day.
+For treatment-window calculations you often need datetimes (not just dates), because two records can share a date but have different times of day. `derive_vars_dtm()` is the sister function of `derive_vars_dt()` — same idea, but for full ISO 8601 datetime strings (`"2014-01-02T08:30:00"`).
+
+### 5.1 What it produces
+
+| Output variable | Type | Content |
+|---|---|---|
+| `<prefix>DTM` | numeric (seconds since 1970-01-01 UTC) | Fully resolved analysis datetime |
+| `<prefix>DTF` | character | Date imputation flag — `"D"`, `"M"`, `"Y"`, or `NA` |
+| `<prefix>TMF` | character | Time imputation flag — `"H"` (hour), `"M"` (minute), `"S"` (second), or `NA` |
+
+### 5.2 SAS analog comparison
+
+| admiral function | What it does | Closest SAS analog | SAS code sketch |
+|---|---|---|---|
+| `derive_vars_dtm()` | DTC string → numeric datetime + date/time flags | `INPUT()` with `E8601DT19.` informat, plus length checks | `EXSTDTM = INPUT(EXSTDTC, E8601DT19.);` |
+| `time_imputation = "first"` | Pad missing time to `00:00:00` | Macro: append `'T00:00:00'` if length=10 | `if length(EXSTDTC)=10 then EXSTDTM = DHMS(INPUT(EXSTDTC,YYMMDD10.),0,0,0);` |
+| `time_imputation = "last"` | Pad missing time to `23:59:59` | Macro: append `'T23:59:59'` if length=10 | `if length(EXSTDTC)=10 then EXSTDTM = DHMS(INPUT(EXSTDTC,YYMMDD10.),23,59,59);` |
+| `derive_vars_dtm_to_dt()` | Strip time → date | `DATEPART(dtm)` SAS function | `EXSTDT = DATEPART(EXSTDTM);` |
+
+### 5.3 ASCII side-by-side
+
+```
+   /* SAS — INPUT then pad time */          |   # admiral — one call
+   data ex;                                 |   ex |>
+     set ex;                                |     derive_vars_dtm(
+     if length(EXSTDTC)>=19 then            |       dtc             = EXSTDTC,
+       EXSTDTM = INPUT(EXSTDTC,             |       new_vars_prefix = "EXST",
+                       E8601DT19.);         |       date_imputation = "first",
+     else if length(EXSTDTC)=10 then        |       time_imputation = "first"
+       EXSTDTM = DHMS(INPUT(EXSTDTC,        |     )
+                            YYMMDD10.),     |
+                      0,0,0);               |
+     if length(EXSTDTC)<19 then             |
+       EXSTTMF = "H";                       |
+   run;                                     |
+```
+
+### 5.4 Anatomy of the call
+
+```r
+derive_vars_dtm(
+  dataset         = ex,         # input dataset
+  dtc             = EXSTDTC,    # ISO 8601 datetime column
+  new_vars_prefix = "EXST",     # stem; produces EXSTDTM, EXSTDTF, EXSTTMF
+  date_imputation = "first",    # how to handle partial date portion
+  time_imputation = "first",    # how to handle missing time portion
+  flag_imputation = "auto"      # emit DTF/TMF audit flags
+)
+```
+
+- **`time_imputation`** is the new argument vs `derive_vars_dt()`. `"first"` pads to `00:00:00`. `"last"` pads to `23:59:59`. This matters most for end-of-day datetimes (e.g. AE end time, treatment end time).
+- The output is **numeric seconds since 1970-01-01 UTC** — the standard R `POSIXct` representation. Display with `as.POSIXct(x, origin = "1970-01-01", tz = "UTC")`.
+- Three flag columns instead of two: the extra `TMF` flag distinguishes "time was imputed" from "date was imputed".
+
+### 5.5 Time zone discussion
+
+Admiral assumes **UTC** internally. There is no `tz` argument on `derive_vars_dtm()`. This is by design — clinical data in CDISC SDTM is recorded with the assumption that DTC strings are local clock time of the site, and the analysis collapses everything to a study-level convention without DST conversions.
+
+| System | Default time zone |
+|---|---|
+| SAS | Local server time, modified by `OPTIONS TIMEZONE='...'` |
+| admiral | UTC always |
+| `lubridate::ymd_hms()` | UTC unless `tz=` is passed |
+
+> **Practical implication:** when you derive a treatment-emergent flag with `TRTSDTM <= AESTDTM`, both sides are UTC numerics. Comparison is exact-second precision. There is no daylight saving time gotcha because nothing is local.
+
+### 5.6 SAS analog mental model
+
+> **SAS analog mental model:** `derive_vars_dtm()` is `INPUT(DTC, E8601DT19.)` plus a length-conditional `DHMS()` to pad missing time, plus two audit flags, all bundled in one call. The output is a *numeric seconds-since-epoch* analog of SAS's `DATETIME20.` format.
+
+### 5.7 Datetime → date conversion (`derive_vars_dtm_to_dt()`)
+
+CDISC ADaM convention is that every datetime variable has a companion date variable — `ASTDTM` always pairs with `ASTDT`. You derive the date by stripping the time portion.
+
+| admiral | SAS analog |
+|---|---|
+| `derive_vars_dtm_to_dt(source_vars = exprs(EXSTDTM, EXENDTM))` | `EXSTDT = DATEPART(EXSTDTM); EXENDT = DATEPART(EXENDTM);` |
+
+### 5.8 The "no Day 0" gotcha is not here
+
+A subtle point worth stating clearly: `derive_vars_dtm()` does **not** apply the no-Day-0 rule. It is a pure DTC-to-datetime converter. The +1-day, no-Day-0 logic only kicks in at `derive_vars_dy()` (the study day function in the next section). Mixing these up is one of the most common SAS-to-admiral translation errors.
 
 ```{r derive-dtm-demo}
 # Pre-process EX with start and end datetimes
@@ -693,6 +1333,8 @@ ex_ext |>
   select(USUBJID, EXSTDTC, EXSTDTM, EXSTTMF, EXENDTC, EXENDTM)
 ```
 
+> **Read the output:** `EXSTDTM` and `EXENDTM` are numeric seconds-since-1970. `EXSTTMF` is the time-imputation flag — it tells you "the start time was missing in the raw DTC, so we filled 00:00:00 in." The DTC strings in the input were date-only (`"2014-01-02"` not `"2014-01-02T08:30"`), so every row has a time flag set.
+
 ```{r dtm-to-dt-demo}
 # Convert datetimes back to dates (strip time component)
 ex_ext2 <- ex_ext |>
@@ -703,11 +1345,171 @@ ex_ext2 |>
   head(4)
 ```
 
+> **Read the output:** notice that `EXSTDT` is derived directly from `EXSTDTM` by stripping the time portion (dividing by 86400 seconds per day and truncating to a whole day). This is the admiral equivalent of SAS's `DATEPART()` function.
+
+### 5.9 Exercise: Derive a datetime with last-time imputation
+
+When an AE end date is recorded as a date-only DTC (`"2014-03-15"`), the analysis should treat it as "the AE could have ended any time up to end-of-day on that date." Use `time_imputation = "last"`.
+
+```{r derive-dtm-last, exercise=TRUE, exercise.lines=18}
+mock_ae <- tibble(
+  USUBJID  = c("S001", "S002", "S003"),
+  AEENDTC  = c("2014-03-15",          # date only
+               "2014-03-15T18:45:00", # full datetime
+               "2014-03")             # partial (year-month only)
+)
+
+ae_end <- mock_ae |>
+  derive_vars_dtm(
+    dtc             = AEENDTC,
+    new_vars_prefix = "AEEN",
+    date_imputation = ___,    # for "2014-03", pad day to month-end
+    time_imputation = ___     # for date-only inputs, pad time to 23:59:59
+  )
+
+ae_end |>
+  mutate(AEENDTM_human = as.POSIXct(AEENDTM, origin = "1970-01-01", tz = "UTC")) |>
+  select(USUBJID, AEENDTC, AEENDTM_human, AEENDTF, AEENTMF)
+```
+
+```{r derive-dtm-last-hint-1}
+# AE end semantics: "last possible moment" interpretation.
+# date_imputation = "last" pads partial date to month-end.
+# time_imputation = "last" pads missing time to 23:59:59.
+```
+
+```{r derive-dtm-last-hint-2}
+# Both arguments should be "last".
+```
+
+```{r derive-dtm-last-solution}
+mock_ae <- tibble(
+  USUBJID  = c("S001", "S002", "S003"),
+  AEENDTC  = c("2014-03-15",
+               "2014-03-15T18:45:00",
+               "2014-03")
+)
+
+ae_end <- mock_ae |>
+  derive_vars_dtm(
+    dtc             = AEENDTC,
+    new_vars_prefix = "AEEN",
+    date_imputation = "last",
+    time_imputation = "last"
+  )
+
+ae_end |>
+  mutate(AEENDTM_human = as.POSIXct(AEENDTM, origin = "1970-01-01", tz = "UTC")) |>
+  select(USUBJID, AEENDTC, AEENDTM_human, AEENDTF, AEENTMF)
+```
+
+> **Read the output:** S001 had a date-only DTC — the resolved datetime is `2014-03-15 23:59:59` (time padded to end of day) with `AEENTMF = "H"`. S002 had a complete DTC and both flags are NA. S003 had only year-month — the date was padded to `2014-03-31 23:59:59` with `AEENDTF = "D"` and `AEENTMF = "H"`.
+
+### 5.10 Knowledge check
+
+```{r quiz-dtm, echo=FALSE}
+quiz(
+  question(
+    "What does the `TMF` flag track that `DTF` does not?",
+    answer("Time zone changes"),
+    answer("Imputation of the time portion (hour/minute/second), as distinct from the date portion", correct = TRUE),
+    answer("Whether the datetime is in UTC"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A SAS programmer is used to setting OPTIONS TIMEZONE='America/New_York'. In admiral:",
+    answer("There is an equivalent `set_admiral_timezone()` function"),
+    answer("All datetimes are UTC by design; admiral has no timezone option", correct = TRUE),
+    answer("Pass tz='America/New_York' to derive_vars_dtm()"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "After `derive_vars_dtm()` with `new_vars_prefix = 'EXST'`, how many new columns are added?",
+    answer("One (EXSTDTM)"),
+    answer("Three (EXSTDTM, EXSTDTF, EXSTTMF)", correct = TRUE),
+    answer("Two (EXSTDTM and EXSTDT)"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`derive_vars_dtm_to_dt()` is the admiral analog of which SAS function?",
+    answer("INTNX('day', dtm, 0)"),
+    answer("DATEPART(dtm)", correct = TRUE),
+    answer("INPUT(dtm, DATE9.)"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 6 — `derive_vars_dy()`: study day (no Day 0)
 
-CDISC ADaM convention: the day of the reference event is Day 1. The day before is Day -1. There is no Day 0.
+CDISC ADaM convention: the day of the reference event is **Day 1**. The day before is **Day -1**. **There is no Day 0**. This rule trips up almost every SAS programmer's first ADaM build because every SAS date function (`INTCK`, simple subtraction) gives you a continuous integer with zero in the middle.
+
+### 6.1 The "no Day 0" rule, in one sentence
+
+```
+   raw_diff = event_date - reference_date
+   if raw_diff >= 0 then ADY = raw_diff + 1
+   else                    ADY = raw_diff
+```
+
+The `+1` shift applies only on the **positive** side of the reference. The negative side is left alone. The net effect is that Day 0 is skipped over.
+
+### 6.2 SAS analog comparison
+
+| admiral function | What it does | Closest SAS analog | SAS code sketch |
+|---|---|---|---|
+| `derive_vars_dy()` | Compute study day from reference date, with no Day 0 | A DATA step with `INTCK('day', ref, dt)` plus a sign-aware +1 | `if dt >= ref then ADY = dt - ref + 1; else ADY = dt - ref;` |
+
+### 6.3 Side-by-side
+
+```
+   /* SAS — typical "no Day 0" pattern */     |   # admiral
+   data lb;                                   |   lb |>
+     set lb;                                  |     derive_vars_dy(
+     if ADT ne . and TRTSDT ne . then do;     |       reference_date = TRTSDT,
+       if ADT >= TRTSDT then                  |       source_vars    = exprs(ADT)
+         ADY = ADT - TRTSDT + 1;              |     )
+       else                                   |
+         ADY = ADT - TRTSDT;                  |
+     end;                                     |
+   run;                                       |
+```
+
+### 6.4 Anatomy of the call
+
+```r
+derive_vars_dy(
+  dataset        = lb,                  # input dataset (rows where you want ADY)
+  reference_date = TRTSDT,              # the Day 1 anchor (typically TRTSDT or RFSTDT)
+  source_vars    = exprs(ADT, AENDT)    # one or more dates to convert to study days
+)
+```
+
+- **`reference_date`** is the anchor day — Day 1. Almost always `TRTSDT` for treatment-relative analyses, or `RFSTDT` for randomization-relative.
+- **`source_vars`** accepts one or more date columns. For each `X_DT` in the list, admiral creates `X_DY`. So `exprs(ADT, AENDT)` produces both `ADY` and `AENDY` in one call.
+- Both inputs must be **numeric dates** (output of `derive_vars_dt()`). Passing a character DTC will error.
+
+### 6.5 Worked table
+
+| Reference date | Event date | raw_diff | ADY (after no-Day-0) |
+|---|---|---|---|
+| 2014-01-10 | 2014-01-15 | 5 | **6** (+1 shift) |
+| 2014-01-10 | 2014-01-10 | 0 | **1** (+1 shift — the reference day itself is Day 1) |
+| 2014-01-10 | 2014-01-09 | -1 | **-1** (no shift on negative side) |
+| 2014-01-10 | 2014-01-08 | -2 | **-2** |
+| 2014-01-10 | NA | NA | **NA** |
+
+> **SAS analog mental model:** `derive_vars_dy()` is the function form of the SAS one-liner `ADY = ADT - TRTSDT + (ADT >= TRTSDT);` — same logic, but it works on a vector of dates in one call and handles NAs without warnings.
+
+### 6.6 Why "no Day 0"?
+
+The convention dates back to clinical pharmacology — when reporting an AE that occurred "two days after dosing started," there's no useful concept of "Day 0 = the day of dosing AND the day before dosing." Either you count the dose day as Day 1 (and shift everything after) or you make it Day 0 (and have to explain why screening Day -1 is right next to dosing Day 0). The CDISC convention chose the former. Once you internalize it, all your tables and listings line up.
+
+### 6.7 Common pitfall: forgetting to merge the reference date first
+
+`derive_vars_dy()` looks up `reference_date` *from the dataset you pass in*. If your LB dataset doesn't already have a TRTSDT column, you must merge it on first (typically with `derive_vars_merged()` or a plain `left_join()` from ADSL).
 
 ```{r study-day-demo}
 # First: derive numeric analysis dates for LB
@@ -737,7 +1539,9 @@ lb_with_day |>
   select(USUBJID, ADT_human, TRTSDT_human, ADY)
 ```
 
-### Exercise: Explain the "no Day 0" convention
+> **Read the output:** the `ADY` column is the integer study day. Subject `01-701-1015` has its first LB observation on the same day as TRTSDT (Day 1, not Day 0). Subject `01-701-1023` has the same property. Walk through the math: `ADT - TRTSDT = 0`, then `+1` because the diff is `>= 0`, so `ADY = 1`. This is the rule visible in the data.
+
+### 6.8 Exercise: Explain the "no Day 0" convention
 
 ```{r quiz-study-day, echo=FALSE}
 quiz(
@@ -758,7 +1562,7 @@ quiz(
 )
 ```
 
-### Exercise: Derive study day for an EX dataset
+### 6.9 Exercise: Derive study day for an EX dataset
 
 ```{r study-day-ex, exercise=TRUE, exercise.lines=18}
 # Add numeric date to EX
@@ -809,11 +1613,310 @@ ex_study_day |>
   select(USUBJID, EXSTDTC, ADT_human, TRTSDT_human, ADY)
 ```
 
+> **Read the output:** every `ADY` value is `>= 1` (since these are dosing records on or after first treatment). If you ran the same derivation on an AE that happened before treatment, you would see negative ADY values — and Day -1 would jump straight to Day 1, skipping Day 0.
+
+### 6.10 Exercise: Two source vars in one call
+
+`derive_vars_dy()` can compute several study-day columns in one shot — useful for AEs where you need both `ASTDY` (start) and `AENDY` (end).
+
+```{r study-day-two, exercise=TRUE, exercise.lines=20}
+mock_ae <- tibble(
+  USUBJID = c("S001", "S001", "S002"),
+  AESTDTC = c("2014-01-15", "2014-02-01", "2012-08-10"),
+  AEENDTC = c("2014-01-20", "2014-02-05", "2012-08-12"),
+  TRTSDT  = as.numeric(as.Date(c("2014-01-10", "2014-01-10", "2012-08-05")))
+)
+
+ae_with_dy <- mock_ae |>
+  derive_vars_dt(dtc = AESTDTC, new_vars_prefix = "AST") |>
+  derive_vars_dt(dtc = AEENDTC, new_vars_prefix = "AEN") |>
+  derive_vars_dy(
+    reference_date = ___,
+    source_vars    = exprs(___, ___)
+  )
+
+ae_with_dy |>
+  mutate(
+    ASTDT_h = as.Date(ASTDT, origin = "1970-01-01"),
+    AENDT_h = as.Date(AENDT, origin = "1970-01-01"),
+    TRTSDT_h = as.Date(TRTSDT, origin = "1970-01-01")
+  ) |>
+  select(USUBJID, TRTSDT_h, ASTDT_h, ASTDY, AENDT_h, AENDY)
+```
+
+```{r study-day-two-hint-1}
+# reference_date = TRTSDT
+# Source variables are the analysis date columns we just derived: ASTDT and AENDT.
+```
+
+```{r study-day-two-hint-2}
+# source_vars = exprs(ASTDT, AENDT)
+# Output columns: ASTDY and AENDY (the trailing DT becomes DY).
+```
+
+```{r study-day-two-solution}
+mock_ae <- tibble(
+  USUBJID = c("S001", "S001", "S002"),
+  AESTDTC = c("2014-01-15", "2014-02-01", "2012-08-10"),
+  AEENDTC = c("2014-01-20", "2014-02-05", "2012-08-12"),
+  TRTSDT  = as.numeric(as.Date(c("2014-01-10", "2014-01-10", "2012-08-05")))
+)
+
+ae_with_dy <- mock_ae |>
+  derive_vars_dt(dtc = AESTDTC, new_vars_prefix = "AST") |>
+  derive_vars_dt(dtc = AEENDTC, new_vars_prefix = "AEN") |>
+  derive_vars_dy(
+    reference_date = TRTSDT,
+    source_vars    = exprs(ASTDT, AENDT)
+  )
+
+ae_with_dy |>
+  mutate(
+    ASTDT_h = as.Date(ASTDT, origin = "1970-01-01"),
+    AENDT_h = as.Date(AENDT, origin = "1970-01-01"),
+    TRTSDT_h = as.Date(TRTSDT, origin = "1970-01-01")
+  ) |>
+  select(USUBJID, TRTSDT_h, ASTDT_h, ASTDY, AENDT_h, AENDY)
+```
+
+> **Read the output:** for S001's first AE, `ASTDY = 6` (event on 2014-01-15, ref on 2014-01-10, so raw_diff=5, +1 = 6) and `AENDY = 11`. The "+1 on positives" pattern is visible. Verify by hand that no row has ADY=0.
+
+### 6.11 Knowledge check
+
+```{r quiz-dy, echo=FALSE}
+quiz(
+  question(
+    "A reference date is 2014-01-10. An AE start date is 2014-01-10 (same day). What is ASTDY?",
+    answer("0"),
+    answer("1 — the reference day is Day 1", correct = TRUE),
+    answer("NA"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A reference date is 2014-01-10. A screening LB was drawn on 2014-01-09. What is ADY?",
+    answer("-1 — no +1 shift on the negative side", correct = TRUE),
+    answer("0"),
+    answer("-2 (because of the no-Day-0 rule)"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "What is the SAS one-liner equivalent of `derive_vars_dy()`?",
+    answer("ADY = ADT - TRTSDT"),
+    answer("ADY = ADT - TRTSDT + (ADT >= TRTSDT)", correct = TRUE),
+    answer("ADY = INTCK('day', TRTSDT, ADT)"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You call `derive_vars_dy(reference_date = TRTSDT)` but get an error that TRTSDT is not found. The likely cause:",
+    answer("TRTSDT must be character"),
+    answer("TRTSDT is not yet on the input dataset — merge it on first (e.g., with derive_vars_merged() from ADSL)", correct = TRUE),
+    answer("The pipe operator was used incorrectly"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 7 — `derive_vars_merged()`: the most important function
 
-`derive_vars_merged()` is the left-join equivalent with filter, ordering, and first/last selection built in. You'll use it for almost every variable that comes from a non-DM source.
+`derive_vars_merged()` is the workhorse of every admiral pipeline. You will call it 10-30 times per ADaM build. Understand it deeply and most of admiral becomes a remix of patterns you already know.
+
+### 7.1 What it does in one sentence
+
+Left-join one variable (or several) from a *source* dataset onto a *base* dataset, optionally filtering the source first, optionally sorting and picking the first or last row per by-group, optionally renaming on arrival, and optionally filling defaults for unmatched rows.
+
+That single sentence packs five SQL primitives — SUBSET, JOIN, GROUP, ORDER, LIMIT — into one call.
+
+### 7.2 SAS analog comparison
+
+| `derive_vars_merged()` argument | What it controls          | Closest SAS counterpart                                |
+|---------------------------------|---------------------------|--------------------------------------------------------|
+| `dataset`                       | Left-hand (base) table    | The dataset on `DATA=` of the outer DATA step          |
+| `dataset_add`                   | Right-hand (source) table | The second dataset in a `MERGE a b; BY USUBJID;`       |
+| `by_vars`                       | Join keys                 | `BY USUBJID;` after `MERGE`                            |
+| `filter_add`                    | Pre-merge subset          | `WHERE` clause applied to the right side               |
+| `order`                         | Tie-breaker sort          | `PROC SORT BY` ahead of `FIRST.` / `LAST.` processing  |
+| `mode = "first" \| "last"`      | Pick one row per group    | `IF FIRST.USUBJID;` / `IF LAST.USUBJID;`               |
+| `new_vars`                      | Rename-on-arrival         | `RENAME=(EXSTDTM=TRTSDTM)` on the source `MERGE`       |
+| `missing_values`                | Default for unmatched     | `COALESCE(TRTSDTM, '01JAN9999'd)` after the merge      |
+| `check_type`                    | Many-to-one duplication   | `PROC SORT NODUPKEY` + a downstream existence check    |
+
+Where a single SAS DATA step would chain together a `PROC SORT`, a `PROC SQL` subquery, a `MERGE`, and a `WHERE` plus `RETAIN`, `derive_vars_merged()` declares the whole intent in one call. The mental model "build the right-hand side, then left-join" maps very cleanly to PROC SQL.
+
+### 7.3 ASCII side-by-side: PROC SQL vs `derive_vars_merged()`
+
+```
+   proc sql;                              |   adsl_base |>
+     create table adsl_trt as             |     derive_vars_merged(
+     select a.*,                          |       dataset_add = ex_dtm,
+            min(b.EXSTDTM) as TRTSDTM     |       filter_add  =
+       from adsl_base as a                |         EXDOSE > 0 |
+       left join ex_dtm as b              |         (EXDOSE == 0 &
+         on a.STUDYID = b.STUDYID         |          str_detect(EXTRT, "PLACEBO")),
+        and a.USUBJID = b.USUBJID         |       new_vars    =
+        and (b.EXDOSE > 0                 |         exprs(TRTSDTM = EXSTDTM),
+             or (b.EXDOSE = 0             |       order       =
+                 and b.EXTRT              |         exprs(EXSTDTM, EXSEQ),
+                 contains "PLACEBO"))     |       mode        = "first",
+      group by a.STUDYID, a.USUBJID;      |       by_vars     =
+   quit;                                  |         exprs(STUDYID, USUBJID))
+```
+
+Both produce identical results. The PROC SQL form crams JOIN, WHERE, and GROUP-BY-MIN into one query; the admiral form factors them into named arguments that read like English. The admiral form is also auditable: each argument can be inspected, validated, and explained independently.
+
+### 7.4 ASCII side-by-side: DATA-step MERGE vs `derive_vars_merged()`
+
+```
+   proc sort data=ex_dtm out=ex_sorted;   |   (admiral does this internally
+     where EXDOSE > 0                     |    once filter_add and order
+        or (EXDOSE = 0 and                |    are provided)
+            index(EXTRT, "PLACEBO"));     |
+     by STUDYID USUBJID EXSTDTM EXSEQ;    |
+   run;                                   |
+                                          |
+   data adsl_trt;                         |   adsl_trt <- adsl_base |>
+     merge adsl_base (in=a)               |     derive_vars_merged(
+           ex_sorted (in=b                |       dataset_add = ex_dtm,
+                      keep=STUDYID        |       filter_add  = ...,
+                           USUBJID        |       new_vars    =
+                           EXSTDTM        |         exprs(TRTSDTM = EXSTDTM),
+                      rename=             |       order       =
+                       (EXSTDTM=TRTSDTM));|         exprs(EXSTDTM, EXSEQ),
+     by STUDYID USUBJID;                  |       mode        = "first",
+     if a;                                |       by_vars     =
+     if first.USUBJID;                    |         exprs(STUDYID, USUBJID))
+   run;                                   |
+```
+
+The SAS workflow needs a separate PROC SORT, a careful `IF a;` to keep all left rows, and an `IF FIRST.USUBJID;` to pick one row per subject. `derive_vars_merged()` packs all four steps into one call.
+
+### 7.5 Anatomy of the call
+
+```r
+adsl_base |>
+  derive_vars_merged(
+    dataset_add = ex_dtm,                    # right-hand source (after upstream prep)
+    by_vars     = exprs(STUDYID, USUBJID),   # join keys — base × source
+    filter_add  = EXDOSE > 0 |               # WHERE clause on source ONLY
+                  (EXDOSE == 0 &
+                   str_detect(EXTRT, "PLACEBO")),
+    order       = exprs(EXSTDTM, EXSEQ),     # tie-breaker sort within group
+    mode        = "first",                   # pick FIRST after the order — i.e. earliest
+    new_vars    = exprs(TRTSDTM = EXSTDTM)   # rename EXSTDTM to TRTSDTM during join
+  )
+```
+
+- **`dataset_add`** must be a tibble or data frame, already pre-processed (dates parsed, blanks handled, etc.). Admiral does not chain upstream functions inside the call — pre-process explicitly so the audit trail is visible.
+- **`by_vars`** is always wrapped in `exprs()` so the bare column names are captured as expressions, not evaluated. Multi-column keys are common (`exprs(STUDYID, USUBJID, PARAMCD)`).
+- **`filter_add`** runs *before* the join. It scopes which rows in the source are eligible. The expression sees columns of `dataset_add` only.
+- **`order`** is a list of bare column names (also wrapped in `exprs()`). The sort runs ascending unless wrapped in `desc()`.
+- **`mode`** is one of `"first"`, `"last"`, or omitted. If omitted, the source is expected to be unique by `by_vars` already — admiral checks and errors out if it is not (controlled by `check_type`).
+- **`new_vars`** is a named-list-of-expressions: `exprs(NEWNAME = OLDNAME, ALSONEW = SRCCOL)`. Without it, *every* non-key column of the source is brought across — usually too many.
+
+> **SAS analog mental model:** `derive_vars_merged()` is what a SAS programmer would write if they could declare a `MERGE` with built-in `WHERE`, `BY`, `IF FIRST.` / `IF LAST.`, and `RENAME=` flags, all in one statement. The composite-argument design replaces three or four small DATA steps with one named, auditable call.
+
+### 7.6 The `by_vars` argument: matching keys
+
+The cardinality rule is enforced. If the source has more than one row per `by_vars` combination *after* `filter_add` and *before* `mode` selection, admiral errors out unless `mode` is set. This protects against the SAS pitfall where a one-to-many MERGE silently duplicates the left side.
+
+- **One-to-one join** (e.g., source already unique by `STUDYID × USUBJID`): omit `mode`, admiral validates uniqueness.
+- **Many-to-one join** (e.g., multiple EX records per subject, you want one): set `mode = "first"` or `"last"` with a sensible `order`.
+- **Many-to-many join**: not directly supported. Pre-process the source to many-to-one first.
+
+### 7.7 The `dataset_add` argument: the right-side source
+
+`dataset_add` is the source table to pull variables *from*. The base dataset (the one piped into `derive_vars_merged()`) is the table being augmented. Mnemonic: *add* — what you are *adding to* the base.
+
+A common pattern is to prepare `dataset_add` in a `WORK` step right before the call:
+
+```r
+ex_dtm <- ex |>
+  derive_vars_dtm(dtc = EXSTDTC, new_vars_prefix = "EXST")
+
+adsl_base |> derive_vars_merged(dataset_add = ex_dtm, ...)
+```
+
+This separation mirrors the SAS habit of building a `WORK.ex_sorted` intermediate before the `MERGE`.
+
+### 7.8 The `filter_add` argument: pre-merge subset
+
+`filter_add` is evaluated **inside `dataset_add`** before the join. Two implications:
+
+1. You can reference columns that exist in `dataset_add` but not in the base — e.g., `EXDOSE > 0` works even though `EXDOSE` is not in `adsl_base`.
+2. You cannot reference columns of the base — for that, you need `derive_vars_joined()` (covered in Lesson 17).
+
+> **Common pitfall:** writing `filter_add = TRTSDT >= 1` and expecting it to apply to the base — it errors because `TRTSDT` does not exist in `dataset_add`.
+
+### 7.9 The `order` argument: tie-breaker sort
+
+`order` controls the row ordering inside each `by_vars` group *before* `mode` picks one. Mode `"first"` picks the earliest row by this ordering; `"last"` picks the latest.
+
+The order argument almost always includes the analysis date as the primary sort key plus the sequence variable (`EXSEQ`, `AESEQ`) as a deterministic tie-breaker:
+
+```r
+order = exprs(EXSTDTM, EXSEQ)
+```
+
+If two records share the same EXSTDTM, the lower EXSEQ wins (with `mode = "first"`). This deterministic tie-break protects against subtle bugs when the source is re-sorted or refreshed.
+
+### 7.10 The `mode` argument: first vs last vs NULL
+
+| `mode` value      | Effect                                              | Use case                          |
+|-------------------|-----------------------------------------------------|-----------------------------------|
+| `"first"`         | After `order`, take row 1 per `by_vars` group       | TRTSDT, ABLFL, first dose date    |
+| `"last"`          | After `order`, take last row per group              | TRTEDT, last visit date           |
+| omitted / `NULL`  | Require source uniqueness per `by_vars`             | One-to-one lookups                |
+
+### 7.11 The `new_vars` argument: rename-on-arrival
+
+`new_vars = exprs(TRTSDTM = EXSTDTM)` reads as "create `TRTSDTM` in the base by taking `EXSTDTM` from the source." Without this argument, *every* non-key source column comes across with its original name. That is rarely what you want — be explicit.
+
+Multiple renames are common:
+
+```r
+new_vars = exprs(
+  TRTSDTM = EXSTDTM,
+  TRTEDTM = EXENDTM,
+  TRTSEQ  = EXSEQ
+)
+```
+
+### 7.12 The `missing_values` argument: filling unmatched rows
+
+If a base row has no matching source row (after `filter_add`), the new variable is `NA` by default. `missing_values = exprs(TRTSDTM = as.POSIXct("1900-01-01"))` fills with a sentinel.
+
+> **SAS analog:** the `COALESCE(x, sentinel)` you'd write after the MERGE.
+
+### 7.13 Why not just `left_join() + filter + slice`?
+
+You could write the equivalent in raw dplyr:
+
+```r
+adsl_trt <- adsl_base |>
+  left_join(
+    ex_dtm |>
+      filter(EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) |>
+      arrange(EXSTDTM, EXSEQ) |>
+      group_by(STUDYID, USUBJID) |>
+      slice_head(n = 1) |>
+      ungroup() |>
+      transmute(STUDYID, USUBJID, TRTSDTM = EXSTDTM),
+    by = c("STUDYID", "USUBJID")
+  )
+```
+
+That works. But it is 8 lines of conditional, sequential dplyr that has to be re-read carefully every time. `derive_vars_merged()` standardizes the intent: every reviewer recognizes the pattern instantly, and the named arguments make the audit trail readable. Consistency across 30 calls in an ADSL program is the win.
+
+### 7.14 Common pitfalls
+
+1. **Forgetting `mode`** when the source is many-to-one. Admiral errors out — that is the design — but the message can confuse first-time users.
+2. **Wrong `order` direction.** "First exposure" needs ascending EXSTDTM; "last exposure end" needs ascending EXENDTM with `mode = "last"`. Wrapping in `desc()` flips it.
+3. **`filter_add` referencing base columns.** Move the filter to `restrict_derivation()` outside the call (covered in Lesson 19), or pre-filter the base before the pipe.
+4. **`new_vars` omitted, source has 30 columns.** All 30 land in the base, polluting the output. Always be explicit.
+5. **Source not pre-processed.** If `EXSTDTM` was never derived, you get `NA`s silently. Pre-process the source with `derive_vars_dtm()` first.
+
+### 7.15 Worked demo: TRTSDTM step-by-step
 
 ```{r derive-merged-demo}
 # Merge TRTSDT from DM onto a base dataset
@@ -842,7 +1945,9 @@ adsl_trt |>
   mutate(TRTSDTM_human = as.POSIXct(TRTSDTM, origin = "1970-01-01", tz = "UTC"))
 ```
 
-### Exercise: Derive TRTEDTM (last qualifying exposure end datetime)
+> **Read the output:** five subjects, five TRTSDTM values. Subject `01-701-1015` had two EX records (EXSEQ 1 and 2); `mode = "first"` ordered by EXSTDTM picked the earliest (2014-01-02). The downstream layout step will format this datetime as the table-shell "First Exposure" cell.
+
+### 7.16 Exercise: Derive TRTEDTM (last qualifying exposure end datetime)
 
 Use `mode = "last"` and `EXENDTM` instead of `EXSTDTM`.
 
@@ -960,9 +2065,162 @@ adsl_real_trts |>
   select(USUBJID, ARM, TRTSDT_human)
 ```
 
+### 7.18 New exercise: Merge a calculated max dose per subject
+
+Build a tiny "max-dose lookup" from `ex` (the cumulative-maximum EXDOSE per subject), then merge it onto `adsl_base` as `MAXDOSE`. Mode must be `"last"` and the order must put the highest dose at the bottom of the group.
+
+```{r derive-merged-maxdose, exercise=TRUE, exercise.lines=18}
+# Source: highest single-record EXDOSE per subject
+ex_max_lookup <- ex |>
+  group_by(STUDYID, USUBJID) |>
+  summarise(MAXDOSE_SRC = max(EXDOSE, na.rm = TRUE), .groups = "drop")
+
+adsl_max <- adsl_base |>
+  derive_vars_merged(
+    dataset_add = ex_max_lookup,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_vars    = exprs(___ = ___)
+    # No mode/order needed — the lookup is already unique per subject.
+  )
+
+adsl_max |> select(USUBJID, ACTARM, MAXDOSE)
+```
+
+```{r derive-merged-maxdose-hint-1}
+# new_vars = exprs(MAXDOSE = MAXDOSE_SRC)
+```
+
+```{r derive-merged-maxdose-hint-2}
+# Because ex_max_lookup is already one row per subject, omit `mode`.
+# Admiral will validate uniqueness — if duplicates existed, it would error.
+```
+
+```{r derive-merged-maxdose-solution}
+ex_max_lookup <- ex |>
+  group_by(STUDYID, USUBJID) |>
+  summarise(MAXDOSE_SRC = max(EXDOSE, na.rm = TRUE), .groups = "drop")
+
+adsl_max <- adsl_base |>
+  derive_vars_merged(
+    dataset_add = ex_max_lookup,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_vars    = exprs(MAXDOSE = MAXDOSE_SRC)
+  )
+
+adsl_max |> select(USUBJID, ACTARM, MAXDOSE)
+```
+
+> **Read the output:** every subject has a single `MAXDOSE` because the lookup was pre-aggregated. This pattern — "summarise upstream, then merge" — is the most common simplification for SAS programmers used to a `PROC SUMMARY` followed by a `MERGE`.
+
+### 7.19 Knowledge check
+
+```{r quiz-sec7, echo=FALSE}
+quiz(
+  question(
+    "Which SAS construct is the closest single-statement analog of `derive_vars_merged()` with `mode = \"first\"`?",
+    answer("`PROC MEANS DATA= NOPRINT;` with `OUTPUT OUT=`"),
+    answer("`PROC SORT` then `DATA step` with `MERGE BY USUBJID;` and `IF FIRST.USUBJID;`", correct = TRUE),
+    answer("`PROC FREQ` with `BY USUBJID;`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`filter_add` is applied:",
+    answer("After the join, against the merged dataset"),
+    answer("Before the join, against `dataset_add` only", correct = TRUE),
+    answer("On both sides of the join simultaneously"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "You set `mode = \"first\"` and `order = exprs(EXSTDTM, EXSEQ)`. Two records share the same EXSTDTM. Which one is kept?",
+    answer("Both — admiral returns one row per match"),
+    answer("Whichever appears first in the source — ordering is non-deterministic"),
+    answer("The record with the lower EXSEQ — EXSEQ is the deterministic tie-breaker", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Omitting `new_vars` causes:",
+    answer("Admiral to error out demanding the argument"),
+    answer("Every non-key column of the source to be brought onto the base — usually too many", correct = TRUE),
+    answer("Only the first numeric column to be brought across"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`derive_vars_merged()` errors with \"check_type = 'error': dataset_add contains duplicates by by_vars\". The fix is:",
+    answer("Add `check_type = \"none\"` to suppress the error"),
+    answer("Set `mode = \"first\"` (or `\"last\"`) with a sensible `order` — this is many-to-one, declare it explicitly", correct = TRUE),
+    answer("Switch to `derive_var_extreme_flag()`"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 8 — `derive_var_extreme_flag()`: first/last record flags
+
+### 8.1 What it does
+
+Inside a `by_vars` group, sort rows by `order`, then mark exactly one row with the value `"Y"` in a new flag column. All other rows get `NA`. This is the admiral idiom for **`ABLFL`** (baseline flag), **first/last visit flags**, **first/last AE per term**, and any other one-of-many indicator that lives on the source dataset rather than as a merged column.
+
+### 8.2 SAS analog comparison
+
+| Concept                | SAS                                                      | admiral                                                |
+|------------------------|----------------------------------------------------------|--------------------------------------------------------|
+| Sort first             | `PROC SORT BY USUBJID LBTESTCD ADT;`                     | `order = exprs(ADT)` inside the call                   |
+| Detect first per group | `IF FIRST.LBTESTCD;`                                     | `mode = "first"`                                       |
+| Detect last per group  | `IF LAST.LBTESTCD;`                                      | `mode = "last"`                                        |
+| Set the flag           | `IF FIRST.LBTESTCD THEN ABLFL = "Y";`                    | `new_var = ABLFL` (admiral writes `"Y"` automatically) |
+| Keep all rows          | The DATA step naturally keeps all rows; only the flag changes | derive_var_extreme_flag mutates a new column in place |
+
+> **SAS analog mental model:** `derive_var_extreme_flag()` is `PROC SORT BY ... ; DATA ...; SET sorted; BY ...; IF FIRST.x THEN FL = "Y";` — but the sort, the BY group, and the flag assignment are declared in one named-argument call instead of three SAS steps.
+
+### 8.3 ASCII side-by-side
+
+```
+   proc sort data=lb out=lb_sorted;       |   lb_flagged <- lb |>
+     by STUDYID USUBJID LBTESTCD ADT;     |     derive_vars_dt(
+   run;                                   |       dtc = LBDTC,
+                                          |       new_vars_prefix = "A") |>
+   data lb_flagged;                       |     derive_var_extreme_flag(
+     set lb_sorted;                       |       by_vars = exprs(STUDYID,
+     by STUDYID USUBJID LBTESTCD;         |                       USUBJID,
+     if first.LBTESTCD                    |                       LBTESTCD),
+       then ABLFL = "Y";                  |       order   = exprs(ADT),
+   run;                                   |       new_var = ABLFL,
+                                          |       mode    = "first")
+```
+
+The SAS form needs an explicit PROC SORT then a DATA-step BY processing. Admiral folds both into a single call.
+
+### 8.4 Anatomy of the call
+
+```r
+derive_var_extreme_flag(
+  dataset  = lb,                                  # base, piped in
+  by_vars  = exprs(STUDYID, USUBJID, LBTESTCD),   # group within which "first/last" applies
+  order    = exprs(ADT),                          # sort within group ascending by date
+  new_var  = ABLFL,                               # column name for the "Y"/NA flag
+  mode     = "first"                              # "first" → earliest; "last" → most recent
+)
+```
+
+- **`by_vars`** must uniquely partition the rows you want to flag. For baseline, partition by `(STUDYID, USUBJID, LBTESTCD)` so each (subject × test) gets exactly one ABLFL.
+- **`order`** drives the "first/last" semantic. Wrap a variable in `desc()` to flip direction without changing `mode`.
+- **`new_var`** is a bare name. The flag column is created on the output regardless of whether it existed before; if it did exist, it is overwritten.
+- **`mode`** values: `"first"` (lowest in sorted order) and `"last"` (highest).
+- **Filter via `restrict_derivation()`** if you need to flag only a subset (e.g., pre-treatment records only). Pre-filtering before the pipe is also fine.
+
+### 8.5 Step-by-step decomposition
+
+1. **Sort:** apply `order` within `by_vars` groups. Default is ascending; wrap in `desc()` to reverse.
+2. **Group:** within each `by_vars` combination, isolate the sorted rows.
+3. **Rank:** assign `row_number()` 1..N inside the group.
+4. **Flag:** set `new_var = "Y"` where rank == 1 (`mode = "first"`) or rank == max (`mode = "last"`); set `NA` elsewhere.
+5. **Return:** the base dataset with the new flag column appended.
+
+> **CDISC convention:** the flag is `"Y"` or `NA`, **never** `"N"`. ADaM IG explicitly forbids `"N"` in flag variables. This matches the SAS `IF FIRST.x THEN FL="Y";` pattern (no ELSE clause).
+
+### 8.6 Worked demo
 
 ```{r extreme-flag-demo}
 # Add an analysis date to LB, then flag the baseline (first) record per subject per test
@@ -980,7 +2238,16 @@ lb_flagged |>
   select(USUBJID, LBTESTCD, ADT_human, ABLFL)
 ```
 
-### Exercise: Flag the LAST (most recent) lab record per subject per test
+> **Read the output:** subject `01-701-1015` has two ALT records (2014-01-02 and 2014-02-10). The earlier one carries `ABLFL = "Y"`; the later carries `NA`. The same logic, applied per `(USUBJID, LBTESTCD)`, would scale to thousands of subjects and dozens of tests without changing one character of code.
+
+### 8.7 Common pitfalls
+
+1. **Wrong `by_vars` granularity.** Forgetting `LBTESTCD` would flag the first record per *subject*, not per *test* — every test except the first would lose its baseline.
+2. **Wrong `order` direction.** "Most recent" needs `mode = "last"` *or* `order = exprs(desc(ADT))` with `mode = "first"`. Pick one and stick with it.
+3. **Forgetting to derive ADT first.** Sorting on `LBDTC` (character) would order alphabetically — `"2014-02-10"` sorts after `"2014-01-02"` but `"2014-1-2"` (unzero-padded) would sort wrong. Always sort on the numeric `ADT`, not the character `DTC`.
+4. **Pre-treatment vs post-treatment confusion.** ABLFL should usually be defined as the *last pre-treatment* record, not the *first overall* record. Pre-filter `lb |> filter(ADT < TRTSDT)` before flagging, or use `restrict_derivation()`.
+
+### 8.8 Exercise: Flag the LAST (most recent) lab record per subject per test
 
 Change `mode` to `"last"` to flag the most recent observation instead.
 
@@ -1018,11 +2285,188 @@ lb_last_flagged |>
   select(USUBJID, LBTESTCD, ADT_human, LAST_FL)
 ```
 
+### 8.9 New exercise: Flag the most-severe AE per subject
+
+Build a tiny AE table and flag the *highest-severity* AE per subject. Use `mode = "last"` with `order = exprs(AESEVN)` — the highest severity will sort to the end.
+
+```{r extreme-flag-ae, exercise=TRUE, exercise.lines=20}
+ae_mock <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("S001","S001","S001","S002","S002","S003"),
+  AESEQ   = 1:6,
+  AEDECOD = c("HEADACHE","NAUSEA","FATIGUE","HEADACHE","FATIGUE","FATIGUE"),
+  AESEVN  = c(1, 2, 3, 1, 2, 1)   # 1=mild, 2=moderate, 3=severe
+)
+
+ae_worst <- ae_mock |>
+  derive_var_extreme_flag(
+    by_vars = exprs(STUDYID, ___),
+    order   = exprs(___),
+    new_var = AWORSTFL,
+    mode    = ___
+  )
+
+ae_worst
+```
+
+```{r extreme-flag-ae-hint-1}
+# by_vars: one row per (STUDYID, USUBJID); we want one worst per subject.
+# order: AESEVN — higher = more severe.
+# mode: "last" picks the highest in ascending sort.
+```
+
+```{r extreme-flag-ae-hint-2}
+# by_vars = exprs(STUDYID, USUBJID)
+# order   = exprs(AESEVN)
+# mode    = "last"
+```
+
+```{r extreme-flag-ae-solution}
+ae_mock <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("S001","S001","S001","S002","S002","S003"),
+  AESEQ   = 1:6,
+  AEDECOD = c("HEADACHE","NAUSEA","FATIGUE","HEADACHE","FATIGUE","FATIGUE"),
+  AESEVN  = c(1, 2, 3, 1, 2, 1)
+)
+
+ae_worst <- ae_mock |>
+  derive_var_extreme_flag(
+    by_vars = exprs(STUDYID, USUBJID),
+    order   = exprs(AESEVN),
+    new_var = AWORSTFL,
+    mode    = "last"
+  )
+
+ae_worst
+```
+
+> **Read the output:** S001 has three AEs ranging from mild to severe; only the severe row carries `AWORSTFL = "Y"`. S002 has two AEs; the moderate one wins. S003 has only one AE; it wins by default. This is the canonical pattern for "worst-event" derivations in OCCDS (Lesson 17) and BDS (Lesson 16).
+
+### 8.10 Knowledge check
+
+```{r quiz-sec8, echo=FALSE}
+quiz(
+  question(
+    "`derive_var_extreme_flag()` writes `\"N\"` to non-extreme records. True or false?",
+    answer("True"),
+    answer("False — non-extreme records receive `NA`. CDISC ADaM IG forbids `\"N\"` in flag variables.", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Which SAS construct mirrors `derive_var_extreme_flag(... , mode = \"first\")`?",
+    answer("`PROC FREQ;` with `BY USUBJID;`"),
+    answer("`PROC SORT BY USUBJID ADT;` followed by `DATA step; SET; BY USUBJID; IF FIRST.USUBJID THEN FL = \"Y\";`", correct = TRUE),
+    answer("`PROC SQL;` `SELECT DISTINCT USUBJID FROM lb`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "To flag the LATEST visit per subject per test, the safest declaration is:",
+    answer("`mode = \"first\"`, `order = exprs(desc(ADT))` — equivalent to `mode = \"last\"`, `order = exprs(ADT)`", correct = TRUE),
+    answer("Two separate calls, one for `first` and one for `last`"),
+    answer("`mode = \"last\"`, `order = exprs(desc(ADT))` — double-reversal gives latest"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "ABLFL should be defined as:",
+    answer("The first record overall per subject"),
+    answer("The last pre-treatment record per subject per parameter — requiring a pre-filter or `restrict_derivation()`", correct = TRUE),
+    answer("The record with the lowest AVAL"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 9 — `derive_var_merged_exist_flag()`: population flags
 
-Population flags (SAFFL, ITTFL, RANDFL) take the value `"Y"` if a condition is met in another dataset, or `NA` otherwise. Never `"N"` — CDISC ADaM IG specifies this.
+### 9.1 What it does
+
+For each row in the base dataset, look up the matching `by_vars` group in another dataset. If at least one row in that group satisfies the `condition`, set the new flag to `"Y"`. If no matching group exists, set `NA`. This is the admiral idiom for **SAFFL, ITTFL, RANDFL, FASFL, PPROTFL** — the entire family of population flags.
+
+### 9.2 The "Y or NA, never N" CDISC rule
+
+CDISC ADaM IG Section 4.1.2 specifies that flag variables (`*FL`) take the values `"Y"` or `NA`. **`"N"` is forbidden.** This is *not* how a SAS programmer typically writes flag logic:
+
+```
+   SAS habit (wrong for CDISC):           |   admiral (right):
+                                          |
+   data adsl;                             |   adsl |>
+     set adsl;                            |     derive_var_merged_exist_flag(
+     if condition                         |       dataset_add = ex,
+       then SAFFL = "Y";                  |       by_vars     = exprs(USUBJID),
+       else SAFFL = "N";  /* WRONG */     |       new_var     = SAFFL,
+   run;                                   |       condition   = EXDOSE > 0)
+```
+
+The reason is downstream tabulation: a `"N"` row would appear as an explicit zero in a frequency table, while `NA` correctly drops out of the denominator. A subject who never met the safety condition is simply absent from the safety population, not actively "no."
+
+> **SAS analog:** the closest SAS analog is `IF condition THEN FL = "Y";` with **no ELSE**, deliberately leaving non-matchers as missing.
+
+### 9.3 SAS analog comparison
+
+| `derive_var_merged_exist_flag()` argument | Closest SAS equivalent                                          |
+|-------------------------------------------|-----------------------------------------------------------------|
+| `dataset_add`                             | The source dataset in a `PROC SQL EXISTS` subquery               |
+| `by_vars`                                 | The correlated key columns                                       |
+| `condition`                               | The `WHERE` clause inside the subquery                           |
+| `new_var`                                 | The output column on the parent dataset                          |
+| Default value when no match               | `NA` — corresponds to leaving the variable unset (no ELSE)       |
+
+### 9.4 ASCII side-by-side
+
+```
+   proc sql;                              |   adsl_for_saffl <- adsl_base |>
+     create table adsl_for_saffl as       |     derive_var_merged_exist_flag(
+     select a.*,                          |       dataset_add = ex,
+            case when exists              |       by_vars     =
+              (select 1 from ex as b      |         exprs(STUDYID, USUBJID),
+                where a.STUDYID =         |       new_var     = SAFFL,
+                      b.STUDYID           |       condition   =
+                  and a.USUBJID =         |         EXDOSE > 0 |
+                      b.USUBJID           |         (EXDOSE == 0 &
+                  and (b.EXDOSE > 0       |          str_detect(EXTRT, "PLACEBO")))
+                    or (b.EXDOSE = 0      |
+                        and b.EXTRT       |
+                        contains          |
+                        "PLACEBO")))      |
+            then "Y" end as SAFFL         |
+       from adsl_base as a;               |
+   quit;                                  |
+```
+
+The PROC SQL `CASE WHEN EXISTS` subquery is the closest single-statement SAS equivalent. The DATA-step alternative is uglier (sort + merge + retain + reset). Either way, `derive_var_merged_exist_flag()` collapses many lines into a named-argument call.
+
+### 9.5 Anatomy of the call
+
+```r
+derive_var_merged_exist_flag(
+  dataset     = adsl_base,                   # base (left), piped in
+  dataset_add = ex,                          # source (right) — does at least one row exist matching condition?
+  by_vars     = exprs(STUDYID, USUBJID),     # correlate by these keys
+  new_var     = SAFFL,                       # output flag column name
+  condition   = EXDOSE > 0 |                 # the EXISTS condition; sees columns of dataset_add only
+                (EXDOSE == 0 &
+                 str_detect(EXTRT, "PLACEBO"))
+)
+```
+
+- **`condition`** is an unevaluated expression. Quote it with `exprs()` if you build it dynamically; otherwise write it inline.
+- **`by_vars`** must reference columns present in both base and source — typically `STUDYID + USUBJID` for population flags.
+- The function does **not** sort or pick rows. It is a pure EXISTS lookup. Any single row in the source meeting `condition` triggers `"Y"`.
+- The output is the base dataset with one new column. No row count change.
+
+> **SAS analog mental model:** `derive_var_merged_exist_flag()` is a `PROC SQL CASE WHEN EXISTS (correlated subquery) THEN "Y" END`. There is no ELSE branch — that is intentional and correct for CDISC.
+
+### 9.6 Common pitfalls
+
+1. **Writing `condition = "EXDOSE > 0"` as a string.** Pass an unquoted expression, not a string.
+2. **Adding an `else_val = "N"` argument.** It does not exist — admiral enforces the CDISC rule by not offering an "N" path.
+3. **Forgetting to filter to safety-eligible subjects upstream.** Sometimes the desired population is "treated AND alive at first dose," requiring a multi-condition `condition` or a pre-filtered `dataset_add`.
+4. **Source has duplicates that don't match `by_vars`.** Duplicate matches still produce one `"Y"` — duplicates do *not* trigger an error here (unlike `derive_vars_merged()`), because EXISTS only cares if *any* row matches.
+
+### 9.7 Worked demo
 
 ```{r exist-flag-demo}
 adsl_for_saffl <- adsl_base |>
@@ -1036,6 +2480,10 @@ adsl_for_saffl <- adsl_base |>
 adsl_for_saffl |> select(USUBJID, ACTARM, SAFFL)
 ```
 
+> **Read the output:** every subject has `SAFFL = "Y"` here because every subject in `ex` has at least one record meeting the condition. Subjects who appear in `adsl_base` but **not** in `ex` would carry `SAFFL = NA` — they were never dosed, so they cannot be in the safety population.
+
+### 9.8 Knowledge check on the CDISC flag convention
+
 ```{r quiz-flag-convention, echo=FALSE}
 quiz(
   question(
@@ -1048,7 +2496,7 @@ quiz(
 )
 ```
 
-### Exercise: Derive ITTFL based on whether RANDDT exists
+### 9.9 Exercise: Derive ITTFL based on whether RANDDT exists
 
 A subject is in the ITT population if they have a randomization date (RANDDT is not NA). For now, we'll simulate RANDDT from DM:
 
@@ -1095,11 +2543,177 @@ adsl_ittfl <- adsl_base |>
 adsl_ittfl |> select(USUBJID, ACTARM, ITTFL)
 ```
 
+### 9.10 New exercise: Derive PPROTFL (per-protocol)
+
+Per-protocol = randomized AND treated AND no major protocol deviations. Build a small `devs` table of major deviations, then derive `PPROTFL`. A subject is per-protocol if they are NOT in the deviation list.
+
+This is a *complementary* exist-flag: existence of a row → `"N"` semantically, which CDISC writes as flipping the logic so existence → `NA`, absence → `"Y"`. The trick is to compute PPROTFL in two steps: first flag deviations, then derive PPROTFL based on the absence.
+
+```{r pprotfl-exercise, exercise=TRUE, exercise.lines=22}
+# Subjects with major deviations
+major_devs <- tibble(
+  STUDYID    = "CDISCPILOT01",
+  USUBJID    = c("01-701-1015"),      # one subject deviates
+  DVSEV      = "MAJOR"
+)
+
+# Step 1: flag deviation existence
+adsl_dev <- adsl_base |>
+  derive_var_merged_exist_flag(
+    dataset_add = major_devs,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = DEVFL,
+    condition   = DVSEV == ___
+  )
+
+# Step 2: PPROTFL = "Y" where DEVFL is NA
+adsl_pp <- adsl_dev |>
+  mutate(PPROTFL = if_else(is.na(___), "Y", NA_character_))
+
+adsl_pp |> select(USUBJID, ACTARM, DEVFL, PPROTFL)
+```
+
+```{r pprotfl-exercise-hint-1}
+# condition = DVSEV == "MAJOR"
+# is.na(DEVFL) — the subject is in PP if they did NOT trigger DEVFL
+```
+
+```{r pprotfl-exercise-hint-2}
+# Final: if_else(is.na(DEVFL), "Y", NA_character_)
+```
+
+```{r pprotfl-exercise-solution}
+major_devs <- tibble(
+  STUDYID    = "CDISCPILOT01",
+  USUBJID    = c("01-701-1015"),
+  DVSEV      = "MAJOR"
+)
+
+adsl_dev <- adsl_base |>
+  derive_var_merged_exist_flag(
+    dataset_add = major_devs,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = DEVFL,
+    condition   = DVSEV == "MAJOR"
+  )
+
+adsl_pp <- adsl_dev |>
+  mutate(PPROTFL = if_else(is.na(DEVFL), "Y", NA_character_))
+
+adsl_pp |> select(USUBJID, ACTARM, DEVFL, PPROTFL)
+```
+
+> **Read the output:** four subjects get `PPROTFL = "Y"` (no deviation); subject `01-701-1015` gets `PPROTFL = NA` (deviation flagged). Note the strict CDISC rule: PPROTFL is never `"N"`. A SAS programmer would write `ELSE PPROTFL = "N";` — admiral writes `NA_character_` instead, preserving the missing-as-not-met semantics for downstream tabulation.
+
+### 9.11 Knowledge check
+
+```{r quiz-sec9, echo=FALSE}
+quiz(
+  question(
+    "`derive_var_merged_exist_flag()` is closest to which SAS construct?",
+    answer("`PROC SQL ... CASE WHEN EXISTS (correlated subquery) THEN \"Y\" END`", correct = TRUE),
+    answer("`PROC SUMMARY NWAY OUT=`"),
+    answer("`PROC FREQ TABLES ... / NOFREQ;`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "ITTFL is `NA` (not `\"N\"`) for non-ITT subjects because:",
+    answer("Admiral has a bug"),
+    answer("CDISC ADaM IG Section 4.1.2 forbids `\"N\"` in flag variables; `NA` correctly drops from tabulation denominators", correct = TRUE),
+    answer("`\"N\"` and `NA` are equivalent in R"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The source dataset has 3 duplicate rows that all match the condition. The flag receives:",
+    answer("`\"YYY\"` — one `Y` per match"),
+    answer("`\"Y\"` — the function reports existence, not count", correct = TRUE),
+    answer("An error — duplicates are forbidden"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "To derive PPROTFL (per-protocol), the most reliable pattern is:",
+    answer("Flag deviation existence with `derive_var_merged_exist_flag`, then set `PPROTFL = \"Y\"` where the deviation flag is `NA`", correct = TRUE),
+    answer("Call `derive_var_merged_exist_flag` directly with `condition = !exists(deviation)`"),
+    answer("Use `derive_vars_merged()` with `mode = \"first\"`"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 10 — `call_derivation()`: DRY derivation of multiple variables
 
-When you need to apply the same function multiple times with slightly different arguments, `call_derivation()` keeps the code concise.
+### 10.1 The DRY problem
+
+A SAS programmer building EXSTDTM and EXENDTM would typically write *two* near-identical `derive_vars_dtm()` calls that differ only in the source variable and the imputation direction. Multiply that pattern over ADT/ADY derivations for 8 lab parameters and you end up with 16 nearly-identical calls. `call_derivation()` is admiral's "DRY" wrapper that runs one derivation function multiple times with shared and per-iteration arguments.
+
+### 10.2 SAS analog comparison
+
+| `call_derivation()` argument | What it controls                          | SAS analog                                                |
+|------------------------------|-------------------------------------------|-----------------------------------------------------------|
+| `derivation`                 | The function to invoke each iteration     | The macro `%name` being expanded                          |
+| `variable_params`            | List of per-iteration argument sets       | A `%DO i = 1 %TO N` loop body with positional macro args  |
+| `...` (shared args)          | Arguments held constant across iterations | Macro variables defined once outside the loop             |
+
+> **SAS analog mental model:** `call_derivation()` is a `%DO` loop over a list of parameter sets, calling the same derivation macro each iteration with one set, while shared parameters stay constant.
+
+### 10.3 ASCII side-by-side
+
+```
+   %macro dtm_one(dtc, prefix, time_imp); |   ex_both_dtm <- ex |>
+     data ex;                             |     call_derivation(
+       set ex;                            |       derivation = derive_vars_dtm,
+       &prefix.DTM = input(&dtc,          |       variable_params = list(
+                          E8601DT19.);    |         params(dtc = EXSTDTC,
+       /* (imputation logic) */           |                new_vars_prefix = "EXST"),
+     run;                                 |         params(dtc = EXENDTC,
+   %mend;                                 |                new_vars_prefix = "EXEN",
+                                          |                time_imputation = "last")
+   %dtm_one(EXSTDTC, EXST, first);        |       ),
+   %dtm_one(EXENDTC, EXEN, last);         |       date_imputation = "first"
+                                          |     )
+```
+
+### 10.4 The `exprs()` vs `params()` distinction
+
+This catches everyone the first time.
+
+- `exprs(EXSTDTC, EXSEQ)` captures bare *column-name expressions* for use *inside* an admiral derivation, where tidy-evaluation kicks in.
+- `params(dtc = EXSTDTC, new_vars_prefix = "EXST")` captures *named arguments* for use as one row of `variable_params`. Each `params(...)` block represents one iteration's argument set.
+
+Mnemonically: `exprs()` makes a list of column references; `params()` makes a list of named arguments.
+
+### 10.5 Anatomy of the call
+
+```r
+ex |>
+  call_derivation(
+    derivation      = derive_vars_dtm,           # what function to invoke
+    variable_params = list(                      # what changes per iteration
+      params(dtc = EXSTDTC, new_vars_prefix = "EXST"),
+      params(dtc = EXENDTC, new_vars_prefix = "EXEN",
+             time_imputation = "last")
+    ),
+    date_imputation = "first"                    # what stays constant (shared args)
+  )
+```
+
+- **`derivation`** is the unquoted function name. Admiral resolves it at runtime — any `derive_*` function with consistent argument conventions works here.
+- **`variable_params`** is a list of `params(...)` blocks. Each block becomes one invocation of `derivation`.
+- **Shared args** (`date_imputation` above) are passed via `...`. They are merged into every iteration's call.
+- A per-iteration arg shadows a shared arg: in the example, `time_imputation = "last"` for EXEN overrides any shared `time_imputation`.
+
+### 10.6 When to use call_derivation vs explicit chained calls
+
+| Situation                                                   | Preferred                           |
+|-------------------------------------------------------------|-------------------------------------|
+| Two derivations differ only in source variable              | `call_derivation()`                 |
+| Three or more parameters share the same derivation pattern  | `call_derivation()`                 |
+| Each derivation has substantially different logic           | Explicit chained calls (clarity wins) |
+| You need different *functions* per iteration                | Explicit chained calls — call_derivation runs one function |
+
+### 10.7 Worked demo
 
 ```{r call-derivation-demo}
 # Instead of two separate derive_vars_dtm() calls:
@@ -1116,6 +2730,115 @@ ex_both_dtm <- ex |>
 ex_both_dtm |>
   select(USUBJID, EXSTDTC, EXSTDTM, EXENDTC, EXENDTM) |>
   head(3)
+```
+
+> **Read the output:** both `EXSTDTM` and `EXENDTM` appear in the same output despite a single `call_derivation()` call. EXSTDTM used the shared `date_imputation = "first"` with the default `time_imputation = "first"`; EXENDTM used the shared `date_imputation = "first"` overridden in its own block to `time_imputation = "last"`. Per-iteration args win over shared args.
+
+### 10.8 New exercise: derive_vars_dt across three DTCs in one call
+
+You have three DTC variables on a mock DM table — `BRTHDTC`, `RFSTDTC`, `RFXSTDTC`. Derive the numeric versions (`BRTHDT`, `RFSTDT`, `RFXSTDT`) in one `call_derivation()` block.
+
+```{r call-derivation-3dtc, exercise=TRUE, exercise.lines=22}
+dm_multi <- tibble(
+  USUBJID  = c("S001", "S002", "S003"),
+  BRTHDTC  = c("1950-04-12", "1948-10-30", "1952-07-22"),
+  RFSTDTC  = c("2014-01-02", "2014-01-15", "2014-02-01"),
+  RFXSTDTC = c("2014-01-04", "2014-01-18", "2014-02-04")
+)
+
+dm_3dt <- dm_multi |>
+  call_derivation(
+    derivation      = ___,
+    variable_params = list(
+      params(dtc = BRTHDTC,  new_vars_prefix = "BRTH"),
+      params(dtc = RFSTDTC,  new_vars_prefix = "RFST"),
+      params(dtc = RFXSTDTC, new_vars_prefix = "RFXST")
+    ),
+    date_imputation = "first"
+  )
+
+dm_3dt |>
+  mutate(
+    BRTHDT_h = as.Date(BRTHDT,  origin = "1970-01-01"),
+    RFSTDT_h = as.Date(RFSTDT,  origin = "1970-01-01"),
+    RFXSTDT_h = as.Date(RFXSTDT, origin = "1970-01-01")
+  ) |>
+  select(USUBJID, BRTHDT_h, RFSTDT_h, RFXSTDT_h)
+```
+
+```{r call-derivation-3dtc-hint-1}
+# derivation = derive_vars_dt
+```
+
+```{r call-derivation-3dtc-hint-2}
+# derivation = derive_vars_dt
+# The same date_imputation applies to all three iterations because it
+# is passed as a shared argument.
+```
+
+```{r call-derivation-3dtc-solution}
+dm_multi <- tibble(
+  USUBJID  = c("S001", "S002", "S003"),
+  BRTHDTC  = c("1950-04-12", "1948-10-30", "1952-07-22"),
+  RFSTDTC  = c("2014-01-02", "2014-01-15", "2014-02-01"),
+  RFXSTDTC = c("2014-01-04", "2014-01-18", "2014-02-04")
+)
+
+dm_3dt <- dm_multi |>
+  call_derivation(
+    derivation      = derive_vars_dt,
+    variable_params = list(
+      params(dtc = BRTHDTC,  new_vars_prefix = "BRTH"),
+      params(dtc = RFSTDTC,  new_vars_prefix = "RFST"),
+      params(dtc = RFXSTDTC, new_vars_prefix = "RFXST")
+    ),
+    date_imputation = "first"
+  )
+
+dm_3dt |>
+  mutate(
+    BRTHDT_h = as.Date(BRTHDT,  origin = "1970-01-01"),
+    RFSTDT_h = as.Date(RFSTDT,  origin = "1970-01-01"),
+    RFXSTDT_h = as.Date(RFXSTDT, origin = "1970-01-01")
+  ) |>
+  select(USUBJID, BRTHDT_h, RFSTDT_h, RFXSTDT_h)
+```
+
+> **Read the output:** three new numeric date columns appear, all from a single derivation invocation pattern. Without `call_derivation()`, you would write `derive_vars_dt()` three times — 12-15 lines of near-duplicate code. The DRY win is small for three derivations but becomes large at 10+ parameters in ADLB.
+
+### 10.9 Knowledge check
+
+```{r quiz-sec10, echo=FALSE}
+quiz(
+  question(
+    "`call_derivation()` is most useful when:",
+    answer("Each derivation uses a totally different function"),
+    answer("The same derivation function is applied to multiple parameter sets that share most arguments", correct = TRUE),
+    answer("You want to bypass argument validation"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`params(dtc = EXSTDTC, new_vars_prefix = \"EXST\")` and `exprs(EXSTDTC, EXSEQ)` differ how?",
+    answer("They are synonyms"),
+    answer("`params()` captures named arguments for one iteration; `exprs()` captures a list of bare column-name expressions", correct = TRUE),
+    answer("`params()` works only inside `call_derivation`; `exprs()` works only inside `derive_vars_*`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A shared `date_imputation = \"first\"` argument is overridden in one `params()` block. Which value applies for that iteration?",
+    answer("The shared value (`first`)"),
+    answer("The per-iteration value — it shadows the shared value", correct = TRUE),
+    answer("Admiral errors out — conflicting arguments are forbidden"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The closest SAS analog to `call_derivation()` is:",
+    answer("`PROC SQL` with `UNION ALL`"),
+    answer("A `%macro` invoked inside a `%DO i = 1 %TO N` loop with positional arguments", correct = TRUE),
+    answer("`PROC TRANSPOSE`"),
+    random_answer_order = TRUE
+  )
+)
 ```
 
 ---
@@ -1194,9 +2917,98 @@ quiz(
     answer("You need to apply the same derivation function to multiple sets of variables (e.g., EXSTDTC and EXENDTC) with shared arguments, avoiding copy-paste", correct = TRUE),
     answer("You are calling admiral functions from a loop in base R"),
     random_answer_order = TRUE
+  ),
+  question(
+    "Which admiral prefix tells you the function adds *one* variable as a *new row* (not a new column) to a BDS dataset?",
+    answer("`derive_var_*`"),
+    answer("`derive_vars_*`"),
+    answer("`derive_param_*`", correct = TRUE),
+    answer("`compute_*`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A SAS programmer writes `PROC SORT BY USUBJID ADT;` then `DATA; SET; BY USUBJID; IF FIRST.USUBJID;`. The closest admiral equivalent is:",
+    answer("`derive_vars_merged()` with `mode = \"first\"`"),
+    answer("`derive_var_extreme_flag()` with `mode = \"first\"` — flags one row per group", correct = TRUE),
+    answer("`derive_var_merged_exist_flag()`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A subject's EXSTDTC partial date is `\"2014\"` (year only). With `date_imputation = \"first\"`, the resulting EXSTDT is:",
+    answer("NA — admiral refuses year-only dates"),
+    answer("2014-01-01 — admiral imputes month and day to January 1", correct = TRUE),
+    answer("2014-12-31"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`derive_vars_dtm()` with `time_imputation = \"last\"` is correct when:",
+    answer("You want to bias the datetime toward the start of the day"),
+    answer("You want to bias the datetime toward the end of the day — typically for a treatment-window END boundary", correct = TRUE),
+    answer("The source DTC is character"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Which is NOT a valid value of the `DTF` imputation flag?",
+    answer("`\"D\"`"),
+    answer("`\"M\"`"),
+    answer("`\"Y\"`"),
+    answer("`\"H\"` — that is for time imputation (TMF), not date (DTF)", correct = TRUE),
+    random_answer_order = TRUE
+  ),
+  question(
+    "In a multi-period crossover study, the closest SAS analog to admiral's APERIOD/APERSDT/APEREDT triple is:",
+    answer("A `PROC FORMAT` lookup"),
+    answer("A DATA-step with `IF date1 <= DT <= date2 THEN APERIOD = 1;` plus `ELSE IF date3 <= DT <= date4 THEN APERIOD = 2;`", correct = TRUE),
+    answer("A `PROC LIFETEST` covariate"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`derive_var_merged_exist_flag(condition = AESER == \"Y\")` sets `new_var = NA` for subjects with no matching row. Is this CDISC-compliant?",
+    answer("No — CDISC requires `\"N\"`"),
+    answer("Yes — CDISC ADaM IG requires `\"Y\"` or `NA`; `\"N\"` is forbidden in flag variables", correct = TRUE),
+    answer("Only for SAFFL — other flag variables can use `\"N\"`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`derive_vars_merged()` with no `mode` argument and a source containing 3 rows per USUBJID will:",
+    answer("Silently keep the first row (default behavior)"),
+    answer("Error out — `check_type = \"error\"` is the default, refusing to silently duplicate the left side", correct = TRUE),
+    answer("Cross-join 3× the base"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The SAS habit `IF condition THEN FL = \"Y\"; ELSE FL = \"N\";` violates CDISC because:",
+    answer("ELSE branches are slow in SAS"),
+    answer("`\"N\"` rows appear as explicit zeros in downstream PROC FREQ tabulations; CDISC requires absence (`NA`) so non-population subjects drop from the denominator", correct = TRUE),
+    answer("`\"N\"` is reserved for non-numeric flags"),
+    random_answer_order = TRUE
   )
 )
 ```
+
+---
+
+## 12 — Lesson 14 Summary {.congratulations}
+
+You now know how to:
+
+- **Internalize the manifesto** — admiral is a toolbox of small, audit-friendly derivations, not a black-box ADaM factory. Each derive_* function does one identifiable thing, mapping cleanly to a SAS DATA step, PROC SQL clause, or macro.
+- **Decode function names** — `derive_var_*` (one new column), `derive_vars_*` (multiple related columns), `derive_param_*` (a new BDS row), `compute_*` (a scalar value), `get_*` (a lookup), `filter_*` (a row subset). The prefix tells you 80% of what a function does.
+- **Sanitize SAS XPT imports with `convert_blanks_to_na()`** — XPT character missing is `""`, not `.`. Run this defensively at the top of every admiral script to prevent silently wrong downstream derivations.
+- **Convert ISO-8601 DTC strings to numeric dates with `derive_vars_dt()`** — handle partial-date imputation (`"first"` or `"last"`), and read the DTF flag (`"D"`/`"M"`/`"Y"`/`NA`) to know what was imputed. Mental analog: SAS `INPUT(DTC, YYMMDD10.)` plus a partial-date macro plus a flag variable, in one call.
+- **Convert DTC to datetime with `derive_vars_dtm()`** — same as `dt` but adds time-of-day imputation and produces a POSIXct-like numeric. Use `time_imputation = "first"` for window starts, `"last"` for window ends.
+- **Compute study day with `derive_vars_dy()`** — the no-Day-0 convention. Reference date is Day 1; the day before is Day -1; there is no Day 0. SAS analog: `INTCK('day', ref, dt) + 1` for non-negative differences.
+- **Master `derive_vars_merged()`** — the workhorse left-join with built-in `filter_add`, `order`, `mode`, `new_vars`, and `missing_values`. One call replaces a PROC SORT + DATA-step MERGE + IF FIRST. processing.
+- **Flag first/last records with `derive_var_extreme_flag()`** — the admiral counterpart to SAS `IF FIRST.x;` / `IF LAST.x;`. CDISC convention: `"Y"` or `NA`, never `"N"`.
+- **Build population flags with `derive_var_merged_exist_flag()`** — the EXISTS subquery in admiral form. The CDISC `"Y"` or `NA` rule is enforced by the function's API (no `else_val` parameter).
+- **DRY-up repeated derivations with `call_derivation()`** — equivalent to a SAS `%DO` loop wrapping a macro call. Shared arguments stay constant; per-iteration `params()` blocks override.
+- **Map every admiral call to a SAS analog** — every derivation in Lesson 14 has a clear PROC SQL or DATA-step equivalent. The mental shift is from "imperative DATA-step chain" to "declarative named-argument call."
+
+You also know:
+
+- All flag variables follow the CDISC `"Y" or NA` rule (never `"N"`).
+- All admiral expressions are wrapped in `exprs()` (column references) or `params()` (named argument sets) — tidy-eval primitives that mirror dplyr's NSE style.
+- The 3-year deprecation cycle is admiral's promise: a function that exists today will at minimum warn (year 1), error (year 2), then disappear (year 3) — giving multi-year studies time to migrate.
 
 ---
 

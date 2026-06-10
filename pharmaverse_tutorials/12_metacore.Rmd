@@ -1,9 +1,11 @@
 ---
 title: "Lesson 12 — {metacore}: The Centralized Spec Object"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Build and query a metacore spec object — the R equivalent of an Excel

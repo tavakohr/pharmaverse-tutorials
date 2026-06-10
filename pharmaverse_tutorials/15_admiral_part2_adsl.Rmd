@@ -1,9 +1,13 @@
 ---
 title: "Lesson 15 — {admiral} Part 2: Building ADSL End-to-End"
+author: "Hamid Tavakoli, MD, MSc"
+tutorial:
+  version: 1.1
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Build a production-grade ADSL step by step: treatment dates, durations,
@@ -337,12 +341,19 @@ lb <- tibble(
   LBORRES  = c("28", "35", "22", "41")
 ) |> convert_blanks_to_na()
 
-# ── Real pharmaverse datasets (for validation exercises) ──────────────────────
-library(pharmaversesdtm)
-library(pharmaverseadam)
-dm_real   <- pharmaversesdtm::dm |> convert_blanks_to_na()
-ex_real   <- pharmaversesdtm::ex |> convert_blanks_to_na()
-adsl_real <- pharmaverseadam::adsl
+# ── Real pharmaverse datasets (with fallback if packages missing) ────────────
+if (requireNamespace("pharmaversesdtm", quietly = TRUE)) {
+  dm_real <- pharmaversesdtm::dm |> convert_blanks_to_na()
+  ex_real <- pharmaversesdtm::ex |> convert_blanks_to_na()
+} else {
+  dm_real <- dm
+  ex_real <- ex
+}
+if (requireNamespace("pharmaverseadam", quietly = TRUE)) {
+  adsl_real <- pharmaverseadam::adsl
+} else {
+  adsl_real <- dm |> mutate(TRT01A = ACTARM, TRT01P = ARM)
+}
 ```
 
 ## Welcome
@@ -363,6 +374,63 @@ This lesson walks through a complete ADSL build using admiral, step by step:
 ---
 
 ## 1 — What's in an ADSL?
+
+### 1.1 The "one row per subject" contract
+
+ADSL is the **Subject Level Analysis Dataset**. By CDISC ADaM convention, it holds *exactly one row per subject* — no exceptions. Every other ADaM dataset (ADAE, ADLB, ADVS, ADTTE, etc.) joins to ADSL by `USUBJID` to pick up treatment dates, population flags, demographics, and disposition information.
+
+> **SAS analog — "one row per subject":** In SAS you would build this with `PROC SUMMARY NWAY` or a `BY USUBJID; IF FIRST.USUBJID;` DATA step. The pharmaverse equivalent is implicit — every admiral derivation routine treats `USUBJID` (plus `STUDYID`) as the unique key and refuses to create duplicates.
+
+### 1.2 The canonical ADSL variable inventory
+
+A production ADSL typically carries 30 to 60 variables. They split into six functional groups:
+
+| Group | Example variables | What they tell you |
+|---|---|---|
+| **Identifiers** | `STUDYID`, `USUBJID`, `SUBJID`, `SITEID` | Who, where, what study |
+| **Demographics** | `AGE`, `AGEU`, `SEX`, `RACE`, `ETHNIC`, `COUNTRY` | Patient characteristics, mostly copied from DM |
+| **Treatment** | `ARM`, `ACTARM`, `TRT01P`, `TRT01A`, `TRTSDT`, `TRTEDT`, `TRTSDTM`, `TRTEDTM`, `TRTDURD` | Planned vs actual treatment + exposure window |
+| **Disposition** | `RANDDT`, `EOSDT`, `EOSSTT`, `DCSREAS`, `DCSDT` | End-of-study status, why they left |
+| **Outcome** | `DTHFL`, `DTHDT`, `DTHCAUS`, `LSTALVDT` | Death and last-known-alive metadata |
+| **Population flags** | `SAFFL`, `ITTFL`, `RANDFL`, `COMPLFL`, `PPROTFL` | Which analysis populations the subject belongs to |
+| **Categorical groupings** | `AGEGR1`, `AGEGR1N`, `RACEGR1`, `REGION1` | Pre-computed grouping variables for tables |
+
+### 1.3 SAS-analog cheat sheet for ADSL derivations
+
+| Derived variable | What it represents | Closest SAS analog | Gotcha vs SAS |
+|---|---|---|---|
+| `TRTSDT` | First active-treatment date | `PROC SQL; SELECT MIN(EXSTDT) AS TRTSDT FROM ex WHERE EXDOSE>0 GROUP BY USUBJID;` | Need to include placebo zero-dose rows; admiral does it via `filter_add` |
+| `TRTEDT` | Last active-treatment date | `PROC SQL; SELECT MAX(EXENDT)...` | Must impute missing day/time before MAX |
+| `TRTDURD` | Treatment duration (days, inclusive) | `INTCK('day', TRTSDT, TRTEDT) + 1` | The `+1` is mandatory; `add_one = TRUE` in admiral |
+| `RANDDT` | Randomization date | DATA step: `IF DSDECOD='RANDOMIZED' THEN RANDDT=DSSTDT;` then `RETAIN` | admiral does the filter + merge in one call |
+| `EOSDT` | End-of-study date | DATA step against DS filtered to `DSCAT='DISPOSITION EVENT'` | Don't forget to exclude `SCREEN FAILURE` |
+| `DTHCAUS` | Cause of death | `COALESCE(DTHCAUS_DS, DTHCAUS_AE, DTHCAUS_DM)` | admiral uses `derive_vars_extreme_event` for priority-ranked sources |
+| `LSTALVDT` | Last known alive date | `MAX(of date1-date20)` over many SDTM domains | admiral takes the *latest* event date across event sources |
+| `SAFFL` | Safety population flag | `IF first.USUBJID AND EXDOSE>0 THEN SAFFL='Y';` | CDISC says use `'Y'` or **missing**, never `'N'` |
+| `AGEGR1` | Age band | `PROC FORMAT; VALUE agegr LOW-<18='<18' 18-64='18-64' 65-HIGH='>=65';` | admiral uses `case_when` — no separate FORMAT catalog |
+
+### 1.4 Why admiral feels different from SAS
+
+In SAS, an ADSL is typically built across **10–20 DATA steps and PROC SQL joins**, with `WORK.` intermediates piling up. Programmers spend most of their time naming intermediate datasets and remembering which one is current.
+
+admiral collapses this to roughly **15 function calls in a single pipe**. Each call is *declarative* — you say *what* you want (the latest qualifying EX record per subject), not *how* to compute it (sort, retain, first-dot-USUBJID).
+
+> **SAS analog mental model:** Think of each `derive_vars_*()` call as a self-contained, well-named macro `%DERIVE_TRTSDT()`. The macro already knows the pattern (filter → sort → first record per subject → merge). You only specify what's variable: which dataset, which filter, which output name.
+
+```
+  PROC SQL;                                |   adsl <- adsl |>
+    CREATE TABLE trt AS                    |     derive_vars_merged(
+      SELECT USUBJID, MIN(EXSTDT) AS TRTSDT|       dataset_add = ex,
+      FROM ex                              |       filter_add  = EXDOSE > 0,
+      WHERE EXDOSE > 0                     |       new_vars    = exprs(TRTSDT = EXSTDT),
+      GROUP BY USUBJID;                    |       order       = exprs(EXSTDT),
+  QUIT;                                    |       mode        = "first",
+  DATA adsl;                               |       by_vars     = exprs(USUBJID))
+    MERGE dm(IN=a) trt(IN=b);              |
+    BY USUBJID;                            |
+    IF a;                                  |
+  RUN;                                     |
+```
 
 ```{r quiz-adsl-overview, echo=FALSE}
 quiz(
@@ -386,6 +454,22 @@ quiz(
     answer("They are identical — both store dates"),
     answer("TRTSDT comes from DS; TRTSDTM comes from EX"),
     random_answer_order = TRUE
+  ),
+  question(
+    "Which SAS construct most closely mirrors the way admiral builds ADSL in a single pipe?",
+    answer("A long DATA step with many KEEP/DROP statements"),
+    answer("A series of named %macro calls chained by reusing the same library dataset", correct = TRUE),
+    answer("PROC IML"),
+    answer("PROC FCMP"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "ADSL has exactly one row per subject. Which SAS PROC most directly produces a one-row-per-subject summary from a many-row source?",
+    answer("PROC SUMMARY NWAY", correct = TRUE),
+    answer("PROC TRANSPOSE"),
+    answer("PROC SORT NODUPKEY"),
+    answer("PROC FORMAT"),
+    random_answer_order = TRUE
   )
 )
 ```
@@ -393,6 +477,45 @@ quiz(
 ---
 
 ## 2 — Setup and base dataset
+
+### 2.1 Why we start from DM
+
+Every ADSL begins life as a copy of DM (Demographics), one row per subject. DM already carries the identifiers (`STUDYID`, `USUBJID`), demographics (`AGE`, `SEX`, `RACE`), and planned treatment (`ARM`, `ACTARM`). The ADSL build is essentially the process of *augmenting* DM with derived variables from other SDTM domains (EX, DS, AE, LB, etc.).
+
+| Setup step | What it does | SAS analog |
+|---|---|---|
+| `convert_blanks_to_na(dm)` | Replace `""` (empty character) with `NA` | None — SAS treats `""` and missing the same |
+| `mutate(TRT01P = ARM)` | Initialize planned treatment for period 1 | `TRT01P = ARM;` inside DATA step |
+| `mutate(TRT01A = ACTARM)` | Initialize actual treatment for period 1 | `TRT01A = ACTARM;` |
+
+### 2.2 The `convert_blanks_to_na()` rationale
+
+XPT (SAS Transport) files store missing character values as empty strings `""`. R distinguishes `""` from `NA` — and most admiral derivations test `!is.na(x)`. If you skip `convert_blanks_to_na()`, an empty-string `ARM` will pass `!is.na(ARM)` checks but fail `ARM == "Placebo"` equality. Result: silent miss-flagging of subjects.
+
+> **SAS analog:** In SAS, the character missing value is just an empty string and there is no distinction. You never had to think about this. In R it is mandatory — and pharmaverse handles it with one helper.
+
+```
+   SAS WORK.DM after PROC IMPORT      |   R after PROC IMPORT-equivalent (haven::read_xpt)
+                                      |
+   USUBJID    ARM                     |   USUBJID    ARM
+   01-701-1   "Placebo"               |   01-701-1   "Placebo"
+   01-701-2   "" (treated as missing) |   01-701-2   ""   ← NOT NA in R!
+                                      |
+   IF ARM = "" THEN ...               |   if_else(is.na(ARM), ...)   would MISS this row
+                                      |   ↑ until we run convert_blanks_to_na()
+```
+
+### 2.3 Anatomy of the base-dataset call
+
+```r
+adsl <- dm |>                      # start from DM (already blank-converted in setup)
+  mutate(
+    TRT01P = ARM,                  # planned treatment for period 1 = planned arm
+    TRT01A = ACTARM                # actual treatment for period 1 = actual arm
+  )
+```
+
+> **SAS analog mental model:** This is the equivalent of `DATA adsl; SET dm; TRT01P = ARM; TRT01A = ACTARM; RUN;`. The native pipe `|>` plays the role of `SET` followed by assignment statements.
 
 ```{r adsl-base-setup}
 # Step 0: All SDTM already loaded and blanks converted (see setup)
@@ -406,9 +529,85 @@ adsl <- dm |>
 glimpse(adsl)
 ```
 
+> **Read the output:** `glimpse()` prints one column per row — the analog of `PROC CONTENTS` in SAS. You should see 5 rows (one per subject) and the original DM columns plus the two new ones (`TRT01P`, `TRT01A`). If you see 6+ rows here something is wrong — DM must be unique on USUBJID.
+
+### 2.4 Exercise: Inspect the base ADSL
+
+Count rows and columns and confirm there are no duplicate `USUBJID`s before any derivation runs.
+
+```{r adsl-base-inspect, exercise=TRUE, exercise.lines=10}
+adsl_base <- dm |>
+  mutate(TRT01P = ARM, TRT01A = ACTARM)
+
+# How many rows, columns, and unique subjects?
+cat("rows:    ", nrow(adsl_base), "\n")
+cat("cols:    ", ncol(adsl_base), "\n")
+cat("unique:  ", n_distinct(adsl_base$___), "\n")
+```
+
+```{r adsl-base-inspect-hint-1}
+# Unique subject identifier is USUBJID
+```
+
+```{r adsl-base-inspect-hint-2}
+# n_distinct(adsl_base$USUBJID) should equal nrow(adsl_base)
+```
+
+```{r adsl-base-inspect-solution}
+adsl_base <- dm |>
+  mutate(TRT01P = ARM, TRT01A = ACTARM)
+
+cat("rows:    ", nrow(adsl_base), "\n")
+cat("cols:    ", ncol(adsl_base), "\n")
+cat("unique:  ", n_distinct(adsl_base$USUBJID), "\n")
+```
+
+> **Read the output:** rows == unique subjects (5 == 5) — this confirms the "one row per subject" contract.
+
 ---
 
 ## 3 — Pre-process EX and DS
+
+### 3.1 Why pre-process at all?
+
+In SAS, you might be tempted to derive datetime variables inline inside the same DATA step that builds ADSL. In admiral the convention is the opposite: **pre-process the source datasets** so they each carry the derived numerical date/datetime columns *before* you ever merge them onto ADSL.
+
+| Derived variable | What it represents | SAS analog | Gotcha vs SAS |
+|---|---|---|---|
+| `EXSTDTM` (numeric) | EX start datetime imputed from `EXSTDTC` | `EXSTDTM = INPUT(EXSTDTC, IS8601DT.);` | admiral imputes partial dates; SAS `INPUT` returns missing |
+| `EXENDTM` | EX end datetime | `EXENDTM = INPUT(EXENDTC, IS8601DT.);` | use `date_imputation="last"` for end dates |
+| `DSSTDT` (numeric date) | DS event date | `DSSTDT = INPUT(SUBSTR(DSSTDTC,1,10), YYMMDD10.);` | use `derive_vars_dt()` for date-only output |
+| `EXSTTMF`, `EXSTDTF` | Imputation flags ("D" for day imputed, "Y" for year only) | None — SAS expects a separate flag DATA step | admiral emits them automatically |
+
+### 3.2 Separation of concerns
+
+Pre-processing achieves three goals that are hard to get from a single mega-DATA-step:
+
+1. **Auditability.** A define.xml entry for `EXSTDTM` points at one function call on EX. Reviewers can re-run it in isolation.
+2. **Testability.** You can unit-test `ex_ext` against a known answer set without rebuilding ADSL.
+3. **Reuse.** The same `ex_ext` and `ds_ext` feed *both* TRTSDT/TRTEDT derivations *and* SAFFL/EOSDT. Pre-computing once avoids re-imputing dates twice.
+
+> **SAS analog:** Think of `ex_ext` and `ds_ext` as named `WORK.` intermediate datasets — `WORK.EX_EXT`, `WORK.DS_EXT`. The pipe just makes the chaining explicit and lets the names die when the pipeline ends.
+
+### 3.3 The `slice_derivation` / `restrict_derivation` companions
+
+For derivations that need *different behavior for different subsets* (e.g. impute year for AE start dates but not for AE end dates), admiral provides `slice_derivation()` and `restrict_derivation()`. These wrap any `derive_vars_*` call and dispatch to different imputation rules based on a filter. They're outside the scope of this lesson but are the canonical answer to the SAS programmer's question: *"How do I do an IF-THEN-ELSE around a whole imputation?"*
+
+### 3.4 Anatomy of `derive_vars_dtm()` on EX
+
+```r
+ex_ext <- ex |>
+  derive_vars_dtm(
+    dtc             = EXSTDTC,   # input ISO 8601 character column (SAS char(19))
+    new_vars_prefix = "EXST",    # output prefix → creates EXSTDTM, EXSTDTF, EXSTTMF
+    date_imputation = "first",   # missing day  → 01; missing month → 01
+    time_imputation = "first"    # missing time → 00:00:00
+  )
+```
+
+> **SAS analog mental model:** This single call replaces a DATA step that would (a) `INPUT()` the character to numeric, (b) handle partial dates with a custom format or `SUBSTR`+`IF MISSING()` block, and (c) emit a `DTF`/`TMF` flag column manually. admiral wraps all three in one function with auditable arguments.
+
+### 3.5 EX pre-processing in action
 
 Before merging, derive datetime variables on the source datasets.
 
@@ -450,9 +649,227 @@ ds_ext |>
   mutate(DSSTDT_human = as.Date(DSSTDT, origin = "1970-01-01"))
 ```
 
+> **Read the output:** `EXSTDTM` and `EXENDTM` are numeric seconds-since-1970 (the internal admiral representation). The `_human` columns show the date you'd actually see in a CRF. For the second EX record of subject 1015 (`EXSTDTC = "2014-02-02"`), confirm `EXST_human` reads `2014-02-02 00:00:00 UTC` — that confirms time imputation to midnight worked.
+
+### 3.6 Exercise: Pre-process EX with end-of-day time imputation
+
+Re-run `derive_vars_dtm()` on `ex` but impute time as `23:59:59` instead of `00:00:00` for both start and end dates. This mirrors a "last possible second of the day" convention some sponsors use for windowing.
+
+```{r ex-preprocess-lastlast, exercise=TRUE, exercise.lines=18}
+ex_late <- ex |>
+  derive_vars_dtm(
+    dtc             = EXSTDTC,
+    new_vars_prefix = "EXST",
+    date_imputation = "first",
+    time_imputation = ___        # impute to end of day
+  ) |>
+  derive_vars_dtm(
+    dtc             = EXENDTC,
+    new_vars_prefix = "EXEN",
+    date_imputation = "last",
+    time_imputation = ___
+  )
+
+ex_late |>
+  select(USUBJID, EXSTDTC, EXSTDTM, EXENDTC, EXENDTM) |>
+  mutate(EXST_human = as.POSIXct(EXSTDTM, origin = "1970-01-01", tz = "UTC"))
+```
+
+```{r ex-preprocess-lastlast-hint-1}
+# time_imputation = "last" → 23:59:59
+```
+
+```{r ex-preprocess-lastlast-hint-2}
+# Both time_imputation arguments should be "last"
+```
+
+```{r ex-preprocess-lastlast-solution}
+ex_late <- ex |>
+  derive_vars_dtm(
+    dtc = EXSTDTC, new_vars_prefix = "EXST",
+    date_imputation = "first", time_imputation = "last"
+  ) |>
+  derive_vars_dtm(
+    dtc = EXENDTC, new_vars_prefix = "EXEN",
+    date_imputation = "last",  time_imputation = "last"
+  )
+
+ex_late |>
+  select(USUBJID, EXSTDTC, EXSTDTM, EXENDTC, EXENDTM) |>
+  mutate(EXST_human = as.POSIXct(EXSTDTM, origin = "1970-01-01", tz = "UTC"))
+```
+
+> **Read the output:** `EXST_human` now reads `2014-01-02 23:59:59` for subject 1015 — the time-imputation flag worked.
+
+### 3.7 Exercise: Pre-process DS for date-only output
+
+Use `derive_vars_dt()` (note: `dt`, not `dtm`) on `ds$DSSTDTC` with `date_imputation = "first"` and prefix `"DSST"`. Confirm the new variable is `DSSTDT` (date) plus `DSSTDTF` (imputation flag).
+
+```{r ds-preprocess-exercise, exercise=TRUE, exercise.lines=12}
+ds_minimal <- ds |>
+  derive_vars_dt(
+    dtc             = ___,
+    new_vars_prefix = ___,
+    date_imputation = "first"
+  )
+
+ds_minimal |>
+  select(USUBJID, DSCAT, DSSTDTC, DSSTDT, DSSTDTF)
+```
+
+```{r ds-preprocess-exercise-hint-1}
+# dtc = DSSTDTC, new_vars_prefix = "DSST"
+```
+
+```{r ds-preprocess-exercise-solution}
+ds_minimal <- ds |>
+  derive_vars_dt(
+    dtc = DSSTDTC, new_vars_prefix = "DSST", date_imputation = "first"
+  )
+
+ds_minimal |>
+  select(USUBJID, DSCAT, DSSTDTC, DSSTDT, DSSTDTF)
+```
+
+> **Read the output:** `DSSTDT` is a numeric date (days since 1970). `DSSTDTF` is `NA` here because every `DSSTDTC` is a full date — there was nothing to impute.
+
 ---
 
 ## 4 — Treatment start and end datetimes
+
+### 4.1 The treatment-window concept (TRTSDT vs RFXSTDT)
+
+Two date variables look superficially similar but mean very different things:
+
+| Variable | Source | Meaning | Used by |
+|---|---|---|---|
+| `RFXSTDTC` | DM (per SDTM IG) | Date/time of *first study treatment* — populated by the data manager | SDTM submission, traceability |
+| `TRTSDT` | derived from EX in ADSL | First date the subject *actually received* a qualifying dose | Every downstream ADaM via study day calcs |
+
+In a perfect data world they agree. In the real world they sometimes diverge — for example, when EX records the first administration of a placebo run-in but RFXSTDTC was already populated from the screening visit. **You always derive `TRTSDT` from EX yourself**; you never trust RFXSTDTC alone.
+
+| Derived variable | What it represents | Closest SAS analog | Gotcha vs SAS |
+|---|---|---|---|
+| `TRTSDTM` | Numeric datetime of first qualifying dose | `PROC SQL; SELECT MIN(EXSTDTM)... GROUP BY USUBJID;` | Need partial-date imputation BEFORE the MIN |
+| `TRTSDT` | Date-only version of TRTSDTM | `TRTSDT = DATEPART(TRTSDTM);` | admiral uses `derive_vars_dtm_to_dt()` for consistency |
+| `TRTEDTM` | Last qualifying dose end datetime | `PROC SQL; SELECT MAX(EXENDTM)... GROUP BY USUBJID;` | Use `time_imputation = "last"` to push to 23:59:59 |
+| `TRTSTMF` | Time imputation flag for TRTSDTM | None — SAS programmers track it manually | admiral auto-emits — copy along with TRTSDTM |
+
+### 4.2 The placebo + dose>0 filter (why both)
+
+The canonical filter in admiral templates is:
+
+```r
+filter_add = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))
+```
+
+Read this in English: *"Include the record if the subject received a non-zero dose, OR if the dose is zero but they were receiving placebo."*
+
+Why both? Because **placebo IS treatment** in CDISC terms — a placebo subject IS in the safety population and DOES have a TRTSDT. If you filter `EXDOSE > 0` alone, your placebo arm vanishes from every downstream analysis. This is one of the top-five P21 findings.
+
+> **SAS analog:** The same logic in a DATA step:
+> ```
+> IF EXDOSE > 0 OR (EXDOSE = 0 AND INDEX(EXTRT, 'PLACEBO') > 0) THEN OUTPUT;
+> ```
+> The OR clause is mandatory; never simplify it away.
+
+### 4.3 First exposure: `derive_vars_merged()` with `mode = "first"`
+
+`derive_vars_merged()` is the workhorse of admiral. It performs four steps that in SAS would each be a separate program:
+
+1. Apply `filter_add` to the source dataset (filter).
+2. Sort by `order` (sort).
+3. Pick the `mode = "first"` (or last) record per `by_vars` group (first.USUBJID).
+4. Merge the named `new_vars` onto the input dataset (merge).
+
+```
+   PROC SORT DATA=ex_ext OUT=ex_first;       |   derive_vars_merged(
+     BY USUBJID EXSTDTM EXSEQ;                |     dataset_add = ex_ext,
+   RUN;                                       |     filter_add  = (EXDOSE > 0 |
+   DATA ex_first;                             |                    (EXDOSE == 0 &
+     SET ex_first;                            |                    str_detect(EXTRT, "PLACEBO"))),
+     BY USUBJID;                              |     order       = exprs(EXSTDTM, EXSEQ),
+     WHERE (EXDOSE > 0) OR                    |     mode        = "first",
+           (EXDOSE = 0 AND                    |     new_vars    = exprs(TRTSDTM = EXSTDTM,
+            INDEX(EXTRT,'PLACEBO')>0);        |                          TRTSTMF = EXSTTMF),
+     IF FIRST.USUBJID;                        |     by_vars     = exprs(STUDYID, USUBJID))
+     RENAME EXSTDTM=TRTSDTM EXSTTMF=TRTSTMF;  |
+   RUN;                                       |
+   DATA adsl;                                 |
+     MERGE adsl(IN=a) ex_first(KEEP=USUBJID   |
+       TRTSDTM TRTSTMF);                      |
+     BY USUBJID; IF a;                        |
+   RUN;                                       |
+```
+
+### 4.4 Last exposure: `derive_vars_merged()` with `mode = "last"`
+
+For TRTEDTM the pattern is identical except (a) the order column is `EXENDTM`, (b) `mode = "last"`, and (c) the imputation rule on the source was `time_imputation = "last"` (push missing times to 23:59:59 so a missing-time row doesn't *appear* earlier than a 14:00 row).
+
+### 4.5 Imputing missing exposure end dates
+
+Real EX datasets routinely have partial dates: `EXENDTC = "2014-06"` (year-month, no day) or `EXENDTC = ""` (missing entirely). The `date_imputation` / `time_imputation` arguments on `derive_vars_dtm()` resolve these to *some* datetime so MIN/MAX has something to compare. Convention:
+
+| Variable | date_imputation | time_imputation | Why |
+|---|---|---|---|
+| TRTSDTM (start) | `"first"` | `"first"` | A missing day is conservatively early — first of month, midnight |
+| TRTEDTM (end) | `"last"` | `"last"` | A missing day is conservatively late — last of month, 23:59:59 |
+
+This convention is the **"furthest exposure window" rule** — when you don't know exactly when treatment started or stopped, you imagine the widest possible window. It gives you a conservative TRTDURD (longer rather than shorter) and avoids accidentally putting an AE *before* TRTSDT just because the day was missing.
+
+### 4.6 Anatomy of the TRTEDTM call
+
+```r
+derive_vars_merged(
+  dataset_add = ex_ext,                                 # pre-processed EX with EXENDTM derived
+  filter_add  = (EXDOSE > 0 |                           # active dose...
+                 (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &  # ...or zero-dose placebo
+                !is.na(EXENDTM),                        # AND end datetime known
+  new_vars    = exprs(TRTEDTM = EXENDTM,                # rename in-flight: EXENDTM → TRTEDTM
+                      TRTETMF = EXENTMF),               # carry over the time-imputation flag
+  order       = exprs(EXENDTM, EXSEQ),                  # sort: end dt, then seq as tiebreaker
+  mode        = "last",                                 # pick the LATEST end per subject
+  by_vars     = exprs(STUDYID, USUBJID)                 # group key — never just USUBJID
+)
+```
+
+> **SAS analog mental model:** Imagine a macro `%LAST_EX(dataset=ex_ext, var=EXENDTM, output=TRTEDTM)` — admiral's argument names map 1:1 to the macro's parameters. The `order=` argument is the macro's `BY` statement; `mode="last"` is `LAST.USUBJID`; `new_vars=` is `RENAME=()`.
+
+### 4.7 SAS equivalent: PROC SQL with MAX/MIN
+
+The closest SQL formulation in SAS:
+
+```
+PROC SQL;
+  CREATE TABLE trt AS
+    SELECT  USUBJID,
+            MIN(EXSTDTM) AS TRTSDTM FORMAT=IS8601DT.,
+            MAX(EXENDTM) AS TRTEDTM FORMAT=IS8601DT.
+    FROM    ex_ext
+    WHERE  (EXDOSE > 0) OR (EXDOSE = 0 AND INDEX(EXTRT,'PLACEBO') > 0)
+    GROUP BY USUBJID;
+QUIT;
+
+DATA adsl;
+  MERGE adsl(IN=a) trt;
+  BY USUBJID;
+  IF a;
+RUN;
+```
+
+That's two PROC SQL aggregations + one MERGE step — three programs. admiral does it in two `derive_vars_merged()` calls, each self-documenting.
+
+### 4.8 Common pitfalls
+
+| Pitfall | Symptom | Fix |
+|---|---|---|
+| Forgot `(EXDOSE == 0 & PLACEBO)` clause | Placebo subjects have `TRTSDT = NA`, missing from safety summaries | Use the canonical filter verbatim |
+| Used `mode = "first"` for end date | `TRTEDT` is the earliest END (often = same day as start) | `mode = "last"` for end variables |
+| Forgot `time_imputation = "last"` for end | Missing-time end rows look earlier than full-time end rows | Use `"last"` time imputation for end variables |
+| Joined on `USUBJID` only, missing `STUDYID` | Works in single-study data; fails silently in pooled analyses | Always `by_vars = exprs(STUDYID, USUBJID)` |
+| Did not `convert_blanks_to_na()` on EX | `is.na(EXTRT)` evaluates FALSE for empty strings; filter passes wrong rows | Apply at SDTM ingestion |
+
+### 4.9 Live derivation
 
 The standard EX filter: `(EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))` — counts active doses AND zero-dose placebo records.
 
@@ -486,7 +903,9 @@ adsl |>
   )
 ```
 
-### Exercise: Convert datetimes to dates and compute treatment duration
+> **Read the output:** Subject `01-701-1015` got dosed twice (rows 1 and 2 in EX). `TRTS_human` should be `2014-01-02` (first dose start) and `TRTE_human` should be `2014-06-15` (last dose end). Subject `01-702-1042` is on Placebo (`EXDOSE = 0`) — *they should still get TRTSDTM populated* (the placebo OR clause). If you see NA here, your filter is wrong.
+
+### 4.10 Exercise: Convert datetimes to dates and compute treatment duration
 
 ```{r trt-dates-to-dt, exercise=TRUE, exercise.lines=20}
 # Step 1: convert TRTSDTM/TRTEDTM → TRTSDT/TRTEDT
@@ -505,7 +924,7 @@ adsl_dur |>
   )
 ```
 
-### Exercise: Validate TRTSDT against real pharmaverseadam data
+### 4.11 Exercise: Validate TRTSDT against real pharmaverseadam data
 
 Use `dm_real` and `ex_real` (the full CDISCPILOT01 SDTM datasets from pharmaversesdtm) to re-derive TRTSDT for the first 10 subjects, then compare to the published values in `adsl_real`.
 
@@ -604,9 +1023,229 @@ left_join(derived10 |> select(USUBJID, ARM, TRTSDT_derived), ref, by = "USUBJID"
   print()
 ```
 
+> **Read the output:** "Matching subjects: 10 / 10" means your derivation is byte-identical to pharmaverseadam's TRTSDT. Anything less and you have a filter or imputation discrepancy to investigate.
+
+### 4.12 Exercise: Derive TRTSDTM only from active doses (deliberately wrong)
+
+Re-derive `TRTSDTM` using only `EXDOSE > 0` — *without* the placebo OR clause. Then compare to the correct version and identify which subjects end up missing.
+
+```{r trt-wrong-filter, exercise=TRUE, exercise.lines=22}
+adsl_wrong <- dm |>
+  derive_vars_merged(
+    dataset_add = ex_ext,
+    filter_add  = ___ & !is.na(EXSTDTM),    # active dose ONLY — no placebo clause
+    new_vars    = exprs(TRTSDTM_wrong = EXSTDTM),
+    order       = exprs(EXSTDTM, EXSEQ),
+    mode        = "first",
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+# adsl already has TRTSDTM derived correctly above
+left_join(
+  adsl |> select(USUBJID, ACTARM, TRTSDTM_correct = TRTSDTM),
+  adsl_wrong |> select(USUBJID, TRTSDTM_wrong),
+  by = "USUBJID"
+) |>
+  mutate(missing_in_wrong = is.na(TRTSDTM_wrong) & !is.na(TRTSDTM_correct))
+```
+
+```{r trt-wrong-filter-hint-1}
+# filter_add = EXDOSE > 0  ← the deliberately broken filter
+```
+
+```{r trt-wrong-filter-hint-2}
+# Look for rows where missing_in_wrong = TRUE — those are the Placebo subjects
+# whose TRTSDTM disappears because EXDOSE = 0.
+```
+
+```{r trt-wrong-filter-solution}
+adsl_wrong <- dm |>
+  derive_vars_merged(
+    dataset_add = ex_ext,
+    filter_add  = EXDOSE > 0 & !is.na(EXSTDTM),
+    new_vars    = exprs(TRTSDTM_wrong = EXSTDTM),
+    order       = exprs(EXSTDTM, EXSEQ),
+    mode        = "first",
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+left_join(
+  adsl |> select(USUBJID, ACTARM, TRTSDTM_correct = TRTSDTM),
+  adsl_wrong |> select(USUBJID, TRTSDTM_wrong),
+  by = "USUBJID"
+) |>
+  mutate(missing_in_wrong = is.na(TRTSDTM_wrong) & !is.na(TRTSDTM_correct))
+```
+
+> **Read the output:** Two subjects (`01-702-1042` and `01-703-1211`, both Placebo) have `missing_in_wrong = TRUE`. Their TRTSDTM vanished because the wrong filter excluded `EXDOSE = 0`. In a real submission this would show up in the safety table as "Placebo n = 0".
+
+### 4.13 Exercise: Derive TRTEDT directly with end-of-day imputation
+
+Skip the datetime step entirely: use `derive_vars_dt()` directly on `EXENDTC` to produce `EXENDT` (a date), then merge the LAST per subject as `TRTEDT`.
+
+```{r trtedt-direct, exercise=TRUE, exercise.lines=20}
+ex_dt_only <- ex |>
+  derive_vars_dt(
+    dtc             = EXENDTC,
+    new_vars_prefix = "EXEN",
+    date_imputation = ___      # impute partial dates to end of month
+  )
+
+adsl_direct <- dm |>
+  derive_vars_merged(
+    dataset_add = ex_dt_only,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &
+                  !is.na(EXENDT),
+    new_vars    = exprs(TRTEDT_direct = EXENDT),
+    order       = exprs(EXENDT, EXSEQ),
+    mode        = ___,          # last end date per subject
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_direct |>
+  select(USUBJID, ACTARM, TRTEDT_direct) |>
+  mutate(TRTEDT_human = as.Date(TRTEDT_direct, origin = "1970-01-01"))
+```
+
+```{r trtedt-direct-hint-1}
+# date_imputation = "last"  for end dates
+```
+
+```{r trtedt-direct-hint-2}
+# mode = "last" picks the maximum date per subject
+```
+
+```{r trtedt-direct-solution}
+ex_dt_only <- ex |>
+  derive_vars_dt(
+    dtc = EXENDTC, new_vars_prefix = "EXEN", date_imputation = "last"
+  )
+
+adsl_direct <- dm |>
+  derive_vars_merged(
+    dataset_add = ex_dt_only,
+    filter_add  = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) &
+                  !is.na(EXENDT),
+    new_vars    = exprs(TRTEDT_direct = EXENDT),
+    order       = exprs(EXENDT, EXSEQ),
+    mode        = "last",
+    by_vars     = exprs(STUDYID, USUBJID)
+  )
+
+adsl_direct |>
+  select(USUBJID, ACTARM, TRTEDT_direct) |>
+  mutate(TRTEDT_human = as.Date(TRTEDT_direct, origin = "1970-01-01"))
+```
+
+> **Read the output:** Each subject's `TRTEDT_human` is the latest `EXENDTC` from their EX records. This is the "shortcut" pattern — useful when you don't need TRTEDTM (datetime) downstream, only TRTEDT.
+
+### 4.14 Knowledge check — treatment dates
+
+```{r quiz-trt-dates, echo=FALSE}
+quiz(
+  question(
+    "The canonical EX filter for TRTSDTM derivation includes a placebo OR clause. Why?",
+    answer("Because PLACEBO is the SAS function used to flag placebo records"),
+    answer("Because placebo subjects record EXDOSE = 0 but are still part of the safety population and need TRTSDTM populated", correct = TRUE),
+    answer("Because admiral requires both clauses for syntactic reasons"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "What is the SAS PROC SQL equivalent of derive_vars_merged(mode = 'first', by_vars = exprs(USUBJID), order = exprs(EXSTDTM))?",
+    answer("PROC SQL SELECT FIRST(USUBJID) FROM ex"),
+    answer("PROC SQL SELECT MIN(EXSTDTM) AS TRTSDTM FROM ex GROUP BY USUBJID", correct = TRUE),
+    answer("PROC SQL SELECT * FROM ex WHERE EXSTDTM IS NOT NULL"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "For TRTEDTM you set time_imputation = 'last'. What would go wrong with time_imputation = 'first'?",
+    answer("admiral would throw an error — 'first' is invalid for end variables"),
+    answer("A row with a missing time would impute to 00:00:00 and could be sorted *earlier* than rows with valid afternoon times, producing the wrong MAX", correct = TRUE),
+    answer("The TRTEDTM would still be correct; the flag would just be wrong"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A pooled-study ADSL must group by STUDYID and USUBJID, not USUBJID alone. Why?",
+    answer("STUDYID is mandatory for the metadata"),
+    answer("USUBJID could in theory repeat across studies in a pooled dataset — STUDYID makes the key truly unique", correct = TRUE),
+    answer("STUDYID drives the JOIN performance"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "RFXSTDTC (from DM) and TRTSDT (derived in ADSL) usually agree. When they disagree, which one should ADSL trust?",
+    answer("RFXSTDTC — it was set by the data manager"),
+    answer("TRTSDT derived from EX — it reflects the actual administered exposure, which is what every downstream analysis needs", correct = TRUE),
+    answer("Whichever is earlier"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 5 — Disposition dates
+
+### 5.1 What "disposition" means in SDTM/ADaM
+
+In SDTM, the DS (Disposition) domain records every milestone in a subject's journey: screening, randomization, treatment phase end, end-of-study. Each row has a `DSCAT` (the bucket — `"PROTOCOL MILESTONE"` or `"DISPOSITION EVENT"`) and a `DSDECOD` (the codified verb — `"RANDOMIZED"`, `"COMPLETED"`, `"ADVERSE EVENT"`, `"DEATH"`, etc.).
+
+ADSL extracts three derived facts from DS:
+
+| Derived variable | What it represents | Closest SAS analog | Gotcha vs SAS |
+|---|---|---|---|
+| `RANDDT` | Date of randomization | DATA step `IF DSDECOD='RANDOMIZED' THEN RANDDT=DSSTDT;` + RETAIN | Subjects who screen-failed never randomized → RANDDT = NA |
+| `EOSDT` | End of study date | DATA step `IF DSCAT='DISPOSITION EVENT' THEN EOSDT=DSSTDT;` | Must exclude `"SCREEN FAILURE"` rows |
+| `EOSSTT` | End of study status | DATA step `IF DSDECOD='COMPLETED' THEN EOSSTT='COMPLETED'; ELSE EOSSTT='DISCONTINUED';` | Tri-state: completed / discontinued / ongoing |
+| `DCSREAS` | Discontinuation reason | DATA step `IF DSCAT='DISPOSITION EVENT' THEN DCSREAS=DSTERM;` | Free-text DSTERM; sponsors sometimes use DSDECOD |
+| `DCSDT` | Discontinuation date | Same date as EOSDT for discontinuers | NA for completers |
+
+### 5.2 The tri-state EOSSTT
+
+End-of-study status has three valid values, not two:
+
+| `EOSSTT` | When | Example DSDECOD |
+|---|---|---|
+| `"COMPLETED"` | Subject finished the protocol | `"COMPLETED"` |
+| `"DISCONTINUED"` | Subject left early for any reason | `"ADVERSE EVENT"`, `"WITHDRAWAL BY SUBJECT"`, `"LOST TO FOLLOW-UP"` |
+| `"ONGOING"` | Study is still running and subject hasn't reached EOS yet | (no DISPOSITION EVENT row exists yet) |
+
+> **SAS analog:** A typical SAS implementation:
+> ```
+> IF DSCAT = 'DISPOSITION EVENT' AND DSDECOD = 'COMPLETED' THEN EOSSTT = 'COMPLETED';
+> ELSE IF DSCAT = 'DISPOSITION EVENT' THEN EOSSTT = 'DISCONTINUED';
+> ELSE EOSSTT = 'ONGOING';
+> ```
+> The R equivalent uses `case_when()` — same three branches, no fall-through bug because case_when stops at first TRUE.
+
+### 5.3 Anatomy of the RANDDT call
+
+```r
+derive_vars_merged(
+  dataset_add = ds_ext,                                   # DS with DSSTDT already derived
+  filter_add  = DSCAT == "PROTOCOL MILESTONE" &           # randomization is a milestone...
+                DSDECOD == "RANDOMIZED",                  # ...specifically this one
+  new_vars    = exprs(RANDDT = DSSTDT),                   # promote the date as RANDDT
+  by_vars     = exprs(STUDYID, USUBJID)                   # one record per subject expected
+)
+```
+
+Note there's no `mode =` argument — because the filter is so tight (one record per subject) there's nothing to pick "first" or "last" from. If subjects could have multiple `"RANDOMIZED"` rows you would add `mode = "first"` to be defensive.
+
+### 5.4 SAS PROC SQL equivalent
+
+```
+PROC SQL;
+  CREATE TABLE rand AS
+    SELECT  USUBJID, DSSTDT AS RANDDT
+    FROM    ds
+    WHERE   DSCAT = 'PROTOCOL MILESTONE' AND DSDECOD = 'RANDOMIZED';
+QUIT;
+DATA adsl; MERGE adsl(IN=a) rand; BY USUBJID; IF a; RUN;
+```
+
+> **SAS analog mental model:** Each `derive_vars_merged()` call replaces "PROC SQL + DATA-step MERGE" — about 10 lines of SAS condensed to 5 named arguments of a function call.
+
+### 5.5 Live derivation
 
 Both RANDDT and EOSDT come from DS with different DSDECOD filters:
 
@@ -635,7 +1274,9 @@ adsl |>
   )
 ```
 
-### Exercise: Derive the discontinuation reason (DCSREAS)
+> **Read the output:** All five subjects should have both `RANDDT` and `EOSDT` populated — every subject in our mock data was randomized AND had a DISPOSITION EVENT. Subject `01-702-1042` (the AE discontinuation) has `EOSDT_human = 2013-09-15` — earlier than their `RFXENDTC` because they discontinued mid-treatment.
+
+### 5.6 Exercise: Derive the discontinuation reason (DCSREAS)
 
 Merge the DS term for "DISPOSITION EVENT" records onto ADSL as `DCSREAS`.
 
@@ -670,9 +1311,169 @@ adsl_dcsreas |>
   select(USUBJID, ACTARM, DCSREAS)
 ```
 
+> **Read the output:** Subject `01-702-1042` should show `DCSREAS = "DISCONTINUED DUE TO AE"` — sourced from DS.DSTERM. The other four subjects, who completed, all show `DCSREAS = "COMPLETED STUDY"`.
+
+### 5.7 Exercise: Derive the tri-state EOSSTT
+
+Build `EOSSTT` using `case_when()`. Use `DSDECOD == "COMPLETED"` for the COMPLETED branch and treat any other DISPOSITION EVENT as DISCONTINUED.
+
+```{r eosstt-exercise, exercise=TRUE, exercise.lines=16}
+adsl_eosstt <- adsl |>
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(DCSDECOD = DSDECOD),
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  mutate(
+    EOSSTT = case_when(
+      DCSDECOD == ___           ~ "COMPLETED",
+      !is.na(DCSDECOD)          ~ "DISCONTINUED",
+      TRUE                      ~ ___          # no DISPOSITION row → still on study
+    )
+  )
+
+adsl_eosstt |> select(USUBJID, ACTARM, DCSDECOD, EOSSTT)
+```
+
+```{r eosstt-exercise-hint-1}
+# DCSDECOD == "COMPLETED"  ~ "COMPLETED"
+# TRUE branch returns "ONGOING"
+```
+
+```{r eosstt-exercise-hint-2}
+# In our sample data every subject has a DISPOSITION row, so no one is ONGOING.
+# In a real study mid-conduct, subjects without a DS row stay ONGOING.
+```
+
+```{r eosstt-exercise-solution}
+adsl_eosstt <- adsl |>
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    filter_add  = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE",
+    new_vars    = exprs(DCSDECOD = DSDECOD),
+    by_vars     = exprs(STUDYID, USUBJID)
+  ) |>
+  mutate(
+    EOSSTT = case_when(
+      DCSDECOD == "COMPLETED" ~ "COMPLETED",
+      !is.na(DCSDECOD)        ~ "DISCONTINUED",
+      TRUE                    ~ "ONGOING"
+    )
+  )
+
+adsl_eosstt |> select(USUBJID, ACTARM, DCSDECOD, EOSSTT)
+```
+
+> **Read the output:** Four subjects → `EOSSTT = "COMPLETED"`, one (1042, AE) → `"DISCONTINUED"`. No one is `"ONGOING"` because our mock data is end-of-study; in a snapshot during conduct you'd see ONGOINGs.
+
+### 5.8 Knowledge check — disposition
+
+```{r quiz-disposition, echo=FALSE}
+quiz(
+  question(
+    "EOSSTT is a tri-state variable. What are the three permitted values?",
+    answer("'Y', 'N', NA"),
+    answer("'COMPLETED', 'DISCONTINUED', 'ONGOING'", correct = TRUE),
+    answer("'PASS', 'FAIL', 'PENDING'"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A subject screen-failed (DSDECOD = 'SCREEN FAILURE'). What does the standard filter_add do to them?",
+    answer("Includes them with EOSDT set to screening date"),
+    answer("Excludes them — they never reached randomization or treatment, so they're not in any analysis population", correct = TRUE),
+    answer("Includes them with a special flag SCRNFLAG = 'Y'"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The SAS equivalent of `derive_vars_merged(filter_add = DSCAT == 'PROTOCOL MILESTONE' & DSDECOD == 'RANDOMIZED', new_vars = exprs(RANDDT = DSSTDT))` is:",
+    answer("DATA adsl; SET ds; IF DSCAT='PROTOCOL MILESTONE' AND DSDECOD='RANDOMIZED'; RANDDT=DSSTDT; RUN; — then MERGE back by USUBJID", correct = TRUE),
+    answer("PROC RANK GROUPS=2 OUT=randomization"),
+    answer("PROC TRANSPOSE OUT=rand"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Why is DCSREAS sourced from DSTERM (the free-text reason) rather than DSDECOD (the coded reason)?",
+    answer("DSTERM is required; DSDECOD is optional"),
+    answer("DSDECOD has only a handful of codes; DSTERM carries the protocol-specific reason wording sponsors want in the final ADaM", correct = TRUE),
+    answer("DSDECOD is dropped from XPT exports"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 6 — Cause of death: multi-source derivation
+
+### 6.1 Why death has multiple sources
+
+In a clinical trial, a subject's death is captured in at least three places, often four:
+
+| Source | Field carrying cause | Field carrying date |
+|---|---|---|
+| DM | `DTHDTC` (when known at randomization) | `DTHDTC` |
+| DS | `DSDECOD == "DEATH"`, `DSTERM` (cause text) | `DSSTDTC` |
+| AE | `AEOUT == "FATAL"`, `AEDECOD` (preferred term) | `AEDTHDTC` |
+| Sometimes CE/EX/lab | adverse-event-like records | various |
+
+The DTHCAUS variable in ADSL must take the *first* (earliest) of these with a defined priority order. That's the multi-source derivation pattern.
+
+### 6.2 SAS analog: COALESCE() and DATA-step priority
+
+In SAS you'd typically build per-source intermediate tables and then COALESCE:
+
+```
+PROC SQL;
+  SELECT USUBJID,
+         COALESCE(DTHCAUS_DS, DTHCAUS_AE, DTHCAUS_DM) AS DTHCAUS,
+         COALESCE(DTHDT_DS,   DTHDT_AE,   DTHDT_DM)   AS DTHDT  FORMAT=DATE9.
+    FROM dthsources;
+QUIT;
+```
+
+The drawback: `COALESCE` picks the first *non-missing* source, not the earliest *date*. If DM has a wrong cause and DS has the right one, COALESCE picks DM. admiral's `derive_vars_extreme_event()` fixes this by sorting all source events together and picking the true first/last by date.
+
+| Derived variable | What it represents | Closest SAS analog | Gotcha vs SAS |
+|---|---|---|---|
+| `DTHDT` | Death date | `COALESCE(DTHDT_DS, DTHDT_AE, ...)` | admiral picks by event order, not source order |
+| `DTHCAUS` | Cause of death | `COALESCE(DTHCAUS_DS, ...)` | Free text from the source row |
+| `DTHFL` | Death flag | `IF NOT MISSING(DTHDT) THEN DTHFL='Y';` | Derived from DTHDT existence |
+
+### 6.3 The `event_source()` builder
+
+Each event source is described by a small "list" object that says: "look in this dataset, with this filter, taking this date column, and copying these output values." It's a lightweight declarative DSL — exactly the kind of thing SAS macros end up reinventing.
+
+```r
+src_ds_death <- event_source(
+  dataset_name = "ds",                           # which input dataset key to look up
+  filter       = DSDECOD == "DEATH",             # apply this filter to that dataset
+  date         = DSSTDT,                          # this is the event date column
+  set_values_to = exprs(                          # assign these output columns:
+    DTHCAUS = DSTERM,                            #   DTHCAUS comes from DSTERM
+    DTHDT   = DSSTDT                              #   DTHDT comes from DSSTDT
+  )
+)
+```
+
+### 6.4 Anatomy of `derive_vars_extreme_event()`
+
+```r
+adsl <- adsl |>
+  derive_vars_extreme_event(
+    by_vars         = exprs(STUDYID, USUBJID),    # one record per subject
+    events          = list(src_ds_death,           # candidate sources, ordered by priority
+                           src_ae_death),
+    order           = exprs(DTHDT),                # sort events by this column
+    mode            = "first",                     # take the EARLIEST death record
+    source_datasets = list(ds = ds_ext, ae = ae),  # lookup table: name → actual dataset
+    new_vars        = exprs(DTHCAUS, DTHDT)        # which output columns survive
+  )
+```
+
+> **SAS analog mental model:** Think of `events = list(...)` as a SAS macro array `&srcds1`, `&srcds2`. The macro loops over them, filters each, stacks the result, sorts by `order`, and picks `FIRST.USUBJID`. admiral's wrapper just gives the pattern a name and a tidy signature.
+
+### 6.5 Live derivation
 
 DTHCAUS can come from DS (death recorded as a disposition event) OR from AE (fatal adverse event). `derive_vars_extreme_event()` handles multi-source lookups elegantly.
 
@@ -715,7 +1516,9 @@ adsl |>
   mutate(DTHDT_human = as.Date(DTHDT, origin = "1970-01-01"))
 ```
 
-### Exercise: Verify no subjects have a death event in our sample data
+> **Read the output:** All five subjects show `DTHCAUS = NA` and `DTHDT = NA` because our mock DS has no `DSDECOD == "DEATH"` and AE has no `AEOUT == "FATAL"`. In a study with deaths you would see the cause text and date populated for the affected subjects only.
+
+### 6.6 Exercise: Verify no subjects have a death event in our sample data
 
 Our sample `ds` has no `DSDECOD == "DEATH"` and `ae` has no `AEOUT == "FATAL"`. Confirm DTHCAUS is NA for all subjects.
 
@@ -742,11 +1545,176 @@ cat("Subjects with DTHCAUS:", n_deaths, "\n")
 cat("Expected: 0 — no deaths in sample data\n")
 ```
 
+> **Read the output:** `Subjects with DTHCAUS: 0` confirms no death events. In a real study, this is a useful sanity check before tabulating mortality.
+
+### 6.7 Exercise: Derive DTHFL from DTHDT existence
+
+`DTHFL` is the death flag — `"Y"` if any death record exists, `NA` otherwise. Derive it from DTHDT.
+
+```{r dthfl-exercise, exercise=TRUE, exercise.lines=10}
+adsl_dthfl <- adsl |>
+  mutate(
+    DTHFL = if_else(!is.na(___), "Y", NA_character_)
+  )
+
+adsl_dthfl |> select(USUBJID, DTHDT, DTHCAUS, DTHFL)
+```
+
+```{r dthfl-exercise-hint-1}
+# Test !is.na(DTHDT) — the death date column
+```
+
+```{r dthfl-exercise-hint-2}
+# DTHFL = if_else(!is.na(DTHDT), "Y", NA_character_)
+# Per ADaM IG, flag is "Y" or missing — never "N"
+```
+
+```{r dthfl-exercise-solution}
+adsl_dthfl <- adsl |>
+  mutate(
+    DTHFL = if_else(!is.na(DTHDT), "Y", NA_character_)
+  )
+
+adsl_dthfl |> select(USUBJID, DTHDT, DTHCAUS, DTHFL)
+```
+
+> **Read the output:** All five rows show `DTHFL = NA` — consistent with our death-free mock data. In a real study, any row with a populated DTHDT would flip to `"Y"`. The classic bug is using `"N"` for the false branch — ADaM IG forbids that for `*FL` variables.
+
+### 6.8 Knowledge check — cause of death
+
+```{r quiz-dthcaus, echo=FALSE}
+quiz(
+  question(
+    "DTHCAUS can come from DS, AE, or DM. Why is derive_vars_extreme_event() better than a SAS COALESCE() chain?",
+    answer("COALESCE picks the first non-missing source by *priority order*; derive_vars_extreme_event() picks the first source by *event date*, which is the correct semantic", correct = TRUE),
+    answer("COALESCE only works on numeric columns in SAS"),
+    answer("derive_vars_extreme_event() is faster than COALESCE"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "DTHFL = 'Y' when DTHDT is non-missing. What value does DTHFL take for a non-died subject per ADaM IG?",
+    answer("'N'"),
+    answer("missing (NA)", correct = TRUE),
+    answer("'A' (alive)"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "The SAS construct closest to admiral's `event_source()` + `derive_vars_extreme_event(mode='first')` is:",
+    answer("PROC FORMAT"),
+    answer("Multiple PROC SQL queries with UNION ALL into a stack, then `BY USUBJID date; IF FIRST.USUBJID;`", correct = TRUE),
+    answer("PROC MEANS"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "A subject has both an AE with AEOUT='FATAL' on 2014-05-10 AND a DS row with DSDECOD='DEATH' on 2014-05-12. With mode='first' and order=exprs(DTHDT), which date wins?",
+    answer("2014-05-10 (the AE date — earliest event)", correct = TRUE),
+    answer("2014-05-12 (the DS date — DS has priority over AE)"),
+    answer("The function errors because of conflicting dates"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 7 — Last known alive date (LSTALVDT)
 
-LSTALVDT is the latest date we have *any* evidence the subject was alive. It comes from multiple sources — we take the maximum (latest) across all of them.
+### 7.1 Clinical meaning
+
+`LSTALVDT` = latest date with *any* evidence subject alive. Used downstream as censoring date in Overall Survival (Lesson 18). Wrong LSTALVDT → wrong OS censor → wrong KM curve.
+
+Evidence sources (any of these prove subject alive at that date):
+
+- AE record start date (AE happened → subject alive)
+- LB sample collection date (sample collected → subject alive)
+- VS measurement date
+- EX dosing date
+- DS disposition date if non-death
+
+Output = max across all sources.
+
+### 7.2 SAS-analog comparison
+
+| admiral concept            | What it does                                | SAS counterpart                                                              |
+|----------------------------|---------------------------------------------|------------------------------------------------------------------------------|
+| `event_source(dataset, filter, date)` | Declare one candidate-date source  | `PROC SQL` `SELECT MAX(date) FROM src WHERE filter GROUP BY USUBJID;`         |
+| `derive_vars_extreme_event(events=)`  | Stack many sources, pick max/min   | `DATA all; SET ae(in=a) lb(in=b) vs(in=c); ...; PROC SQL SELECT MAX(date)` |
+| `mode = "last"`            | Pick latest date across sources             | `MAX(of d1-dN)` after a multi-source MERGE / SET                             |
+| `set_values_to = exprs(LSTALVDT = ...)` | Project the chosen date into ADSL  | Final `MERGE adsl maxdates BY USUBJID;`                                      |
+
+> **SAS mental model:** SAS pattern = `PROC SQL` UNION ALL of (USUBJID, date) from each source, then `SELECT USUBJID, MAX(date) GROUP BY USUBJID`, then MERGE back to ADSL. admiral `derive_vars_extreme_event` collapses all 3 steps.
+
+### 7.3 ASCII side-by-side
+
+```
+   proc sql;                              |   src_ae <- event_source(
+     create table alive_candidates as     |     dataset_name = "ae",
+       select USUBJID, AESTDT as DT       |     filter = !is.na(AESTDTC),
+         from ae                          |     date = convert_dtc_to_dt(AESTDTC),
+        where AESTDTC ne ""               |     set_values_to =
+       union all                          |       exprs(LSTALVDT =
+       select USUBJID, LBDT as DT         |         convert_dtc_to_dt(AESTDTC)))
+         from lb                          |
+        where LBDTC ne "";                |   src_lb <- event_source(
+                                          |     dataset_name = "lb",
+     create table lstalv as               |     filter = !is.na(LBDTC),
+       select USUBJID, max(DT) LSTALVDT   |     date = convert_dtc_to_dt(LBDTC),
+         from alive_candidates            |     set_values_to =
+        group by USUBJID;                 |       exprs(LSTALVDT =
+                                          |         convert_dtc_to_dt(LBDTC)))
+     create table adsl as                 |
+       select a.*, b.LSTALVDT             |   adsl |>
+         from adsl a                      |     derive_vars_extreme_event(
+         left join lstalv b               |       by_vars = exprs(STUDYID,USUBJID),
+           on a.USUBJID = b.USUBJID;      |       events  = list(src_ae, src_lb),
+   quit;                                  |       order   = exprs(LSTALVDT),
+                                          |       mode    = "last",
+                                          |       source_datasets = list(ae=ae,lb=lb),
+                                          |       new_vars = exprs(LSTALVDT))
+```
+
+### 7.4 Anatomy of `event_source()`
+
+```r
+event_source(
+  dataset_name  = "ae",                          # name (key into source_datasets list)
+  filter        = !is.na(AESTDTC),               # row predicate in src — drop rows w/o date
+  date          = convert_dtc_to_dt(AESTDTC),    # candidate date expr
+  set_values_to = exprs(                         # what to project onto ADSL row
+    LSTALVDT = convert_dtc_to_dt(AESTDTC)
+  )
+)
+```
+
+- `dataset_name` → string. Must match key in `source_datasets = list(ae=ae,...)` passed to `derive_vars_extreme_event`.
+- `filter` → unevaluated expr. Drops rows lacking a usable date.
+- `date` → expr returning numeric Date. Used by `order` to rank candidates.
+- `set_values_to` → named-list-of-exprs. Output column(s) to write onto ADSL.
+
+### 7.5 Anatomy of `derive_vars_extreme_event()`
+
+```r
+adsl |>
+  derive_vars_extreme_event(
+    by_vars         = exprs(STUDYID, USUBJID),     # ADSL key
+    events          = list(src_ae, src_lb),         # candidate sources
+    order           = exprs(LSTALVDT),              # sort within group
+    mode            = "last",                       # "last" = max date
+    source_datasets = list(ae = ae, lb = lb),       # actual data frames
+    new_vars        = exprs(LSTALVDT)               # which projected vars to keep
+  )
+```
+
+`mode="last"` + `order=exprs(LSTALVDT)` = "max LSTALVDT wins per subject across all sources."
+
+### 7.6 Common pitfalls
+
+1. Forget death record exclusion → death date may sneak in as "alive evidence." Filter DS dispositions excluding death.
+2. Use character `AESTDTC` (ISO string) directly in `order` → alphabetic sort → wrong winner for partial dates. Always wrap in `convert_dtc_to_dt()`.
+3. Forget `source_datasets=list(...)` arg → admiral throws "dataset not found." Names in list must match `dataset_name` strings.
+4. Use `mode="first"` accidentally → earliest evidence wins instead of latest → LSTALVDT becomes screening date. Always `"last"`.
+
+### 7.7 Live derivation
 
 ```{r lstalvdt-demo}
 # Source 1: latest AE start date (subject was alive when the AE started)
@@ -780,13 +1748,113 @@ adsl |>
   mutate(LSTALVDT_human = as.Date(LSTALVDT, origin = "1970-01-01"))
 ```
 
+> **Read output:** one LSTALVDT per subject = max(AE start date, LB collection date). Downstream OS censor date pulls directly from this column.
+
+### 7.8 Exercise: Add VS as a third alive-evidence source
+
+Add `src_vs_alive` (mock — assume `vs` dataset with `VSDTC`). Stack three sources.
+
+```{r lstalvdt-three-src, exercise=TRUE, exercise.lines=24}
+# Mock vs dataset
+vs <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015","01-701-1023"),
+  VSTESTCD = "SYSBP",
+  VSDTC    = c("2014-03-15","2012-09-01")
+)
+
+src_vs_alive <- event_source(
+  dataset_name = "vs",
+  filter       = !is.na(___),
+  date         = convert_dtc_to_dt(___),
+  set_values_to = exprs(LSTALVDT = convert_dtc_to_dt(VSDTC))
+)
+
+adsl_3src <- adsl |>
+  derive_vars_extreme_event(
+    by_vars = exprs(STUDYID, USUBJID),
+    events  = list(src_ae_alive, src_lb_alive, ___),
+    order   = exprs(LSTALVDT),
+    mode    = "last",
+    source_datasets = list(ae = ae, lb = lb, vs = vs),
+    new_vars = exprs(LSTALVDT)
+  )
+
+adsl_3src |> select(USUBJID, LSTALVDT) |>
+  mutate(LSTALVDT_human = as.Date(LSTALVDT, origin = "1970-01-01"))
+```
+
+```{r lstalvdt-three-src-hint-1}
+# filter = !is.na(VSDTC)
+# date   = convert_dtc_to_dt(VSDTC)
+```
+
+```{r lstalvdt-three-src-hint-2}
+# events = list(src_ae_alive, src_lb_alive, src_vs_alive)
+# source_datasets must include vs=vs
+```
+
+```{r lstalvdt-three-src-solution}
+vs <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015","01-701-1023"),
+  VSTESTCD = "SYSBP",
+  VSDTC    = c("2014-03-15","2012-09-01")
+)
+
+src_vs_alive <- event_source(
+  dataset_name = "vs",
+  filter       = !is.na(VSDTC),
+  date         = convert_dtc_to_dt(VSDTC),
+  set_values_to = exprs(LSTALVDT = convert_dtc_to_dt(VSDTC))
+)
+
+adsl_3src <- adsl |>
+  derive_vars_extreme_event(
+    by_vars = exprs(STUDYID, USUBJID),
+    events  = list(src_ae_alive, src_lb_alive, src_vs_alive),
+    order   = exprs(LSTALVDT),
+    mode    = "last",
+    source_datasets = list(ae = ae, lb = lb, vs = vs),
+    new_vars = exprs(LSTALVDT)
+  )
+
+adsl_3src |> select(USUBJID, LSTALVDT) |>
+  mutate(LSTALVDT_human = as.Date(LSTALVDT, origin = "1970-01-01"))
+```
+
+> **Read output:** subject `01-701-1015` LSTALVDT now reflects VS date (`2014-03-15`) if it exceeds AE/LB max. Pattern scales: add EX, DS-non-death, FA dates the same way.
+
+### 7.9 Knowledge check — LSTALVDT
+
 ```{r quiz-lstalvdt, echo=FALSE}
 quiz(
   question(
-    "For LSTALVDT you use mode = 'last' because:",
-    answer("You want the most recent date at which the subject was confirmed alive", correct = TRUE),
-    answer("You want the earliest date"),
-    answer("Both first and last produce the same result"),
+    "`mode = \"last\"` chosen because:",
+    answer("Want most recent date subject confirmed alive", correct = TRUE),
+    answer("Want earliest date"),
+    answer("Both first and last produce same result"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Closest SAS analog to `derive_vars_extreme_event()` for LSTALVDT?",
+    answer("`PROC MEANS NMISS`"),
+    answer("`PROC SQL` UNION ALL of source dates + `SELECT USUBJID, MAX(date) GROUP BY USUBJID` + MERGE back", correct = TRUE),
+    answer("`PROC TRANSPOSE`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Why must DS death records be excluded from alive-evidence sources?",
+    answer("DS has no DTC variable"),
+    answer("Death date proves subject NOT alive — including it makes LSTALVDT = date of death, biasing OS censoring", correct = TRUE),
+    answer("admiral errors on DS"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`source_datasets = list(ae = ae, lb = lb)` purpose?",
+    answer("Tells admiral which real data frames correspond to the `dataset_name` strings in `event_source()`", correct = TRUE),
+    answer("Sorts the source data"),
+    answer("Validates schema"),
     random_answer_order = TRUE
   )
 )
@@ -795,6 +1863,63 @@ quiz(
 ---
 
 ## 8 — Treatment duration
+
+### 8.1 The +1 inclusive-counting rule
+
+TRTDURD = TRTEDT − TRTSDT + 1. The `+1` exists because both endpoints are *inclusive*: a subject treated only on 2014-01-05 (start = end) has duration **1 day**, not 0.
+
+SAS counterpart: `INTCK('day', TRTSDT, TRTEDT) + 1` — same `+1`.
+
+| Subject scenario       | TRTSDT     | TRTEDT     | Diff | +1 → TRTDURD |
+|------------------------|------------|------------|------|--------------|
+| One-day exposure       | 2014-01-05 | 2014-01-05 | 0    | 1            |
+| Two-day exposure       | 2014-01-05 | 2014-01-06 | 1    | 2            |
+| Standard 28-day cycle  | 2014-01-02 | 2014-01-29 | 27   | 28           |
+
+> **Pitfall:** raw subtraction without `+1` undercounts by 1 every time. Causes downstream PK-exposure metrics to be wrong by ~3-4% in 28-day cycles.
+
+### 8.2 SAS-analog comparison
+
+| admiral                    | What it does                              | SAS equivalent                                   |
+|----------------------------|-------------------------------------------|--------------------------------------------------|
+| `derive_var_trtdurd()`     | TRTEDT − TRTSDT + 1 in days               | `TRTDURD = INTCK('day', TRTSDT, TRTEDT) + 1;`    |
+| `derive_vars_duration(out_unit="months")` | Convert to months         | `TRTDURM = INTCK('month', TRTSDT, TRTEDT, 'CONTINUOUS');` |
+| `derive_vars_duration(out_unit="years")`  | Convert to years          | `TRTDURY = YRDIF(TRTSDT, TRTEDT, 'ACTUAL');`     |
+| `add_one = TRUE/FALSE`     | Toggle inclusive vs exclusive             | Explicit `+1` (or not) in SAS expression         |
+
+### 8.3 ASCII side-by-side
+
+```
+   data adsl;                             |   adsl |>
+     set adsl;                            |     derive_var_trtdurd(
+     TRTDURD = TRTEDT - TRTSDT + 1;       |       new_var    = TRTDURD,
+   run;                                   |       start_date = TRTSDT,
+                                          |       end_date   = TRTEDT)
+```
+
+### 8.4 Anatomy of `derive_vars_duration()`
+
+```r
+derive_vars_duration(
+  dataset    = adsl,        # piped in
+  new_var    = TRTDURM,     # output var name
+  start_date = TRTSDT,      # numeric date or datetime
+  end_date   = TRTEDT,      # numeric date or datetime
+  out_unit   = "months",    # "days" | "weeks" | "months" | "years"
+  add_one    = FALSE        # +1 inclusive (default TRUE for days, FALSE for months/years)
+)
+```
+
+- `add_one = TRUE` only makes sense for "days" — days are atomic. Months/years are continuous quantities; `+1` would shift by a whole unit incorrectly.
+- `out_unit` controls divisor: months = `/30.4375`, years = `/365.25`.
+
+### 8.5 Common pitfalls
+
+1. `add_one = TRUE` with `out_unit = "months"` → off by 1 whole month. Disable for non-day units.
+2. TRTSDT/TRTEDT not yet derived → silently NA result. Run duration AFTER treatment-date derivation.
+3. Datetime instead of date inputs → fractional days. Use `derive_vars_dtm_to_dt()` first.
+
+### 8.6 Live derivation
 
 ```{r trt-duration}
 # TRTSDT and TRTEDT are now available — derive TRTDURD
@@ -810,7 +1935,9 @@ adsl |>
   )
 ```
 
-### Exercise: Derive TRTDURM (treatment duration in months)
+> **Read output:** TRTDURD = (TRTEDT − TRTSDT) + 1. Sanity check: subject treated 2014-01-02 → 2014-01-31 should show 30 days.
+
+### 8.7 Exercise: Derive TRTDURM (treatment duration in months)
 
 Use `derive_vars_duration()` with `out_unit = "months"`.
 
@@ -846,11 +1973,148 @@ adsl_with_months |>
   select(USUBJID, TRTDURD, TRTDURM)
 ```
 
+### 8.8 Exercise: Derive TRTDURY (treatment duration in years)
+
+```{r trt-duration-years, exercise=TRUE, exercise.lines=12}
+adsl_with_years <- adsl |>
+  derive_vars_duration(
+    new_var    = TRTDURY,
+    start_date = TRTSDT,
+    end_date   = TRTEDT,
+    out_unit   = ___,
+    add_one    = FALSE
+  )
+
+adsl_with_years |> select(USUBJID, TRTDURD, TRTDURY)
+```
+
+```{r trt-duration-years-hint-1}
+# out_unit = "years"
+```
+
+```{r trt-duration-years-hint-2}
+# add_one stays FALSE — years are continuous, +1 makes no sense
+```
+
+```{r trt-duration-years-solution}
+adsl_with_years <- adsl |>
+  derive_vars_duration(
+    new_var    = TRTDURY,
+    start_date = TRTSDT,
+    end_date   = TRTEDT,
+    out_unit   = "years",
+    add_one    = FALSE
+  )
+
+adsl_with_years |> select(USUBJID, TRTDURD, TRTDURY)
+```
+
+> **Read output:** TRTDURY = (TRTEDT − TRTSDT) / 365.25. Used in PK exposure-time covariates.
+
+### 8.9 Knowledge check — treatment duration
+
+```{r quiz-trtdur, echo=FALSE}
+quiz(
+  question(
+    "Why does `derive_var_trtdurd()` add 1?",
+    answer("SAS legacy"),
+    answer("Both endpoints inclusive — subject treated only on day X has duration 1, not 0", correct = TRUE),
+    answer("To round up"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Closest SAS expression for TRTDURD?",
+    answer("`INTCK('day', TRTSDT, TRTEDT) + 1`", correct = TRUE),
+    answer("`TRTEDT - TRTSDT`"),
+    answer("`DATDIF(TRTSDT, TRTEDT, 'ACT/ACT')`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Why set `add_one = FALSE` for `out_unit = \"months\"`?",
+    answer("Months continuous → `+1` shifts result by whole month → wrong", correct = TRUE),
+    answer("admiral errors otherwise"),
+    answer("Performance"),
+    random_answer_order = TRUE
+  )
+)
+```
+
 ---
 
 ## 9 — Population flags
 
-### SAFFL: Safety population
+### 9.1 What are populations?
+
+Analysis populations = pre-defined subject subsets. Each table footer says "Population: SAFFL='Y'". Inclusion logic comes from protocol.
+
+| Flag      | Meaning                              | Inclusion logic                                  |
+|-----------|--------------------------------------|--------------------------------------------------|
+| `SAFFL`   | Safety population                    | Received ≥ 1 dose (active or placebo)            |
+| `ITTFL`   | Intent-to-treat                      | Randomized (RANDDT not NA)                        |
+| `RANDFL`  | Randomized                           | Same as ITT in most studies                       |
+| `FASFL`   | Full Analysis Set                    | ITT + ≥ 1 baseline efficacy assessment            |
+| `PPROTFL` | Per-protocol                         | FAS minus major protocol deviations               |
+| `COMPLFL` | Study completion                     | DCSREAS = "COMPLETED STUDY"                       |
+
+### 9.2 The CDISC `"Y" or NA, never "N"` rule
+
+ADaM IG Section 4.1.2: flag vars (`*FL`) take `"Y"` or `NA`. **`"N"` forbidden.**
+
+```
+   SAS habit (WRONG for CDISC):           |   admiral / CDISC (RIGHT):
+   if condition then SAFFL = "Y";         |   condition = ...        →  "Y"
+                else SAFFL = "N";  /*X*/  |   no match               →  NA
+```
+
+Reason: PROC FREQ on `SAFFL` should show only `"Y"` row. `"N"` rows leak into denominators → wrong percentages.
+
+### 9.3 SAS-analog comparison
+
+| admiral concept                  | SAS counterpart                                                       |
+|----------------------------------|-----------------------------------------------------------------------|
+| `derive_var_merged_exist_flag()` | `PROC SQL CASE WHEN EXISTS (subquery) THEN "Y" END`                   |
+| `condition = EXDOSE > 0 \| ...`  | `WHERE` clause inside EXISTS subquery                                 |
+| Output `"Y"` or `NA`             | No `ELSE` branch in `IF condition THEN FL="Y";`                       |
+| `if_else(!is.na(RANDDT), "Y", NA_character_)` | `IF NOT MISSING(RANDDT) THEN ITTFL = "Y";`             |
+
+### 9.4 ASCII side-by-side (SAFFL)
+
+```
+   proc sql;                              |   adsl |>
+     create table adsl as                 |     derive_var_merged_exist_flag(
+     select a.*,                          |       dataset_add = ex,
+            case when exists              |       by_vars =
+              (select 1 from ex b         |         exprs(STUDYID, USUBJID),
+                where a.USUBJID = b.USUBJID|      new_var = SAFFL,
+                  and (b.EXDOSE > 0       |       condition =
+                       or (b.EXDOSE = 0   |         EXDOSE > 0 |
+                       and b.EXTRT        |         (EXDOSE == 0 &
+                       contains "PLACEBO")))|        str_detect(EXTRT,
+            then "Y" end as SAFFL         |                    "PLACEBO")))
+       from adsl a;                       |
+   quit;                                  |
+```
+
+### 9.5 Anatomy of `derive_var_merged_exist_flag()`
+
+```r
+derive_var_merged_exist_flag(
+  dataset     = adsl,                         # piped in
+  dataset_add = ex,                           # source — search for ≥1 matching row per subject
+  by_vars     = exprs(STUDYID, USUBJID),      # join key
+  new_var     = SAFFL,                        # output flag var
+  condition   = EXDOSE > 0 |                  # row predicate; sees columns of dataset_add only
+                (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))
+)
+```
+
+- `condition` is unquoted expression. Evaluated against rows of `dataset_add` only.
+- Function has **no** `else_val` arg — enforces CDISC rule by API design.
+- Output = base + one new column. Row count unchanged.
+
+> **SAS mental model:** correlated `CASE WHEN EXISTS (...)` subquery in PROC SQL. No `ELSE NULL` needed — admiral defaults to `NA` automatically.
+
+### 9.6 SAFFL: Safety population
 
 A subject is in the safety population if they received at least one dose (positive dose OR placebo).
 
@@ -866,7 +2130,9 @@ adsl <- adsl |>
 adsl |> select(USUBJID, ACTARM, SAFFL)
 ```
 
-### ITTFL and RANDFL: Intent-to-treat and randomized populations
+> **Read output:** every subject with ≥ 1 qualifying EX row gets `SAFFL = "Y"`. Subjects without EX rows would get `NA` (screen failures, non-dosed). Downstream PROC FREQ would show only the `"Y"` row — exactly what tables need.
+
+### 9.7 ITTFL and RANDFL: Intent-to-treat and randomized populations
 
 These are derived from RANDDT — a subject is in ITT if they were randomized.
 
@@ -880,19 +2146,110 @@ adsl <- adsl |>
 adsl |> select(USUBJID, SAFFL, ITTFL, RANDFL)
 ```
 
+> **Note:** `mutate(ITTFL = if_else(!is.na(RANDDT), "Y", NA_character_))` is the manual analog of `derive_var_merged_exist_flag` when the qualifying variable is already on ADSL. Either works.
+
+### 9.8 New exercise — Derive PPROTFL (per-protocol)
+
+Per-protocol = randomized AND treated AND no major protocol deviations. Two-step pattern: flag deviation existence, then PPROTFL = `"Y"` where deviation flag is NA.
+
+```{r pprotfl-ex15, exercise=TRUE, exercise.lines=22}
+# Mock major deviations
+major_devs <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015"),
+  DVSEV   = "MAJOR"
+)
+
+adsl_dev <- adsl |>
+  derive_var_merged_exist_flag(
+    dataset_add = major_devs,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = DEVFL,
+    condition   = DVSEV == ___
+  )
+
+adsl_pp <- adsl_dev |>
+  mutate(PPROTFL = if_else(
+    SAFFL == "Y" & is.na(___),
+    "Y",
+    NA_character_
+  ))
+
+adsl_pp |> select(USUBJID, SAFFL, DEVFL, PPROTFL)
+```
+
+```{r pprotfl-ex15-hint-1}
+# condition = DVSEV == "MAJOR"
+# is.na(DEVFL) — PP requires no major deviation
+```
+
+```{r pprotfl-ex15-hint-2}
+# PPROTFL = if_else(SAFFL == "Y" & is.na(DEVFL), "Y", NA_character_)
+```
+
+```{r pprotfl-ex15-solution}
+major_devs <- tibble(
+  STUDYID = "CDISCPILOT01",
+  USUBJID = c("01-701-1015"),
+  DVSEV   = "MAJOR"
+)
+
+adsl_dev <- adsl |>
+  derive_var_merged_exist_flag(
+    dataset_add = major_devs,
+    by_vars     = exprs(STUDYID, USUBJID),
+    new_var     = DEVFL,
+    condition   = DVSEV == "MAJOR"
+  )
+
+adsl_pp <- adsl_dev |>
+  mutate(PPROTFL = if_else(
+    SAFFL == "Y" & is.na(DEVFL),
+    "Y",
+    NA_character_
+  ))
+
+adsl_pp |> select(USUBJID, SAFFL, DEVFL, PPROTFL)
+```
+
+> **Read output:** subject `01-701-1015` gets `DEVFL="Y"` → `PPROTFL=NA`. Other safety-population subjects with no deviation get `PPROTFL="Y"`.
+
+### 9.9 Knowledge check — population flags
+
 ```{r quiz-flag-values, echo=FALSE}
 quiz(
   question(
-    "Why do population flags use 'Y' or NA, not 'Y' or 'N'?",
-    answer("CDISC ADaM IG specifies 'Y'/NA — a blank means 'not in population'; 'N' is redundant and not standard", correct = TRUE),
-    answer("'N' is a reserved value in R"),
-    answer("It saves storage space"),
+    "Why population flags use `\"Y\"` or `NA`, not `\"Y\"` or `\"N\"`?",
+    answer("CDISC ADaM IG Section 4.1.2: blank = 'not in population'; `\"N\"` is forbidden — would leak into PROC FREQ denominators", correct = TRUE),
+    answer("`\"N\"` reserved in R"),
+    answer("Saves storage space"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`derive_var_merged_exist_flag()` ≈ which SAS construct?",
+    answer("`PROC SQL CASE WHEN EXISTS (correlated subquery) THEN \"Y\" END`", correct = TRUE),
+    answer("`PROC FREQ`"),
+    answer("`PROC TABULATE`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "ITT inclusion logic typically?",
+    answer("Received ≥ 1 dose"),
+    answer("Randomized (RANDDT not NA)", correct = TRUE),
+    answer("Completed study"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "PPROTFL derivation pattern?",
+    answer("Direct `derive_var_merged_exist_flag` with `condition = no_deviation`"),
+    answer("Flag deviation existence → `PPROTFL = \"Y\"` where deviation flag is NA AND SAFFL = \"Y\"", correct = TRUE),
+    answer("`PROC SORT NODUPKEY`"),
     random_answer_order = TRUE
   )
 )
 ```
 
-### Exercise: Derive COMPLFL (completion flag)
+### 9.10 Exercise: Derive COMPLFL (completion flag)
 
 A subject is a completer if their DCSREAS is `"COMPLETED STUDY"`. Derive `COMPLFL` using a direct `mutate()`.
 
@@ -933,7 +2290,71 @@ adsl_with_dcsreas |>
 
 ## 10 — Age groups
 
-AGEGR1 (character) and AGEGR1N (numeric companion) are the standard age categorization:
+### 10.1 Why age groups?
+
+Demographics tables present age both continuous (mean ± SD) and categorical (AGEGR1 strata). AGEGR1 enables stratified subgroup analysis: "AE incidence in age ≥ 65 stratum" etc.
+
+### 10.2 SAS-analog comparison
+
+| admiral concept                | SAS counterpart                                                       |
+|--------------------------------|-----------------------------------------------------------------------|
+| `case_when(AGE < 18 ~ "<18", ...)` | `PROC FORMAT VALUE agegrp LOW-17="<18" 18-64="18-64" 65-HIGH=">=65";` |
+| AGEGR1 (character)             | `FORMAT AGE agegrp.;` then use in `PROC FREQ`                          |
+| AGEGR1N (numeric)              | Companion ordering var: `IF AGE<18 THEN AGEGR1N=1;` etc.              |
+| `mutate(...)` direct           | `DATA` step with `IF/THEN/ELSE` chain                                  |
+
+> **SAS mental model:** PROC FORMAT for the labels + a DATA step `IF/ELSE` chain for the numeric companion. admiral fuses both into a single `case_when()` pair.
+
+### 10.3 ASCII side-by-side
+
+```
+   proc format;                           |   adsl |>
+     value agegrp                         |     mutate(
+       low-17  = "<18"                    |       AGEGR1 = case_when(
+       18-64   = "18-64"                  |         AGE < 18             ~ "<18",
+       65-high = ">=65";                  |         between(AGE, 18, 64) ~ "18-64",
+   run;                                   |         AGE >= 65            ~ ">=65"),
+                                          |       AGEGR1N = case_when(
+   data adsl;                             |         AGE < 18             ~ 1,
+     set adsl;                            |         between(AGE, 18, 64) ~ 2,
+     length AGEGR1 $8;                    |         AGE >= 65            ~ 3))
+     if AGE < 18 then do;                 |
+       AGEGR1 = "<18";  AGEGR1N = 1; end; |
+     else if 18 <= AGE <= 64 then do;     |
+       AGEGR1 = "18-64"; AGEGR1N = 2; end;|
+     else if AGE >= 65 then do;           |
+       AGEGR1 = ">=65"; AGEGR1N = 3; end; |
+   run;                                   |
+```
+
+### 10.4 Anatomy of `case_when()` for age groups
+
+```r
+mutate(
+  AGEGR1  = case_when(
+    AGE < 18             ~ "<18",       # ordered: <18 evaluated first
+    between(AGE, 18, 64) ~ "18-64",     # next condition
+    AGE >= 65            ~ ">=65"       # catch-all upper
+  ),
+  AGEGR1N = case_when(
+    AGE < 18             ~ 1L,          # 1L = integer companion
+    between(AGE, 18, 64) ~ 2L,
+    AGE >= 65            ~ 3L
+  )
+)
+```
+
+- `case_when` evaluates conditions top-to-bottom, first match wins.
+- Always pair AGEGR1 (character display) with AGEGR1N (numeric order). PROC FREQ orders categories by AGEGR1N alphabetically-on-numeric so `>=65` sorts after `18-64`.
+- Use `L` suffix on integer literals (`1L`) → AGEGR1N becomes integer, not double.
+
+### 10.5 Common pitfalls
+
+1. Missing AGEGR1N → PROC FREQ orders alphabetically: `"18-64" < "<18" < ">=65"` → wrong row order in table.
+2. Overlapping bins (`AGE <= 18` then `18 <= AGE <= 64`) → 18-year-olds match both, first wins by case_when semantics but logic intent unclear. Use strict inequalities + `between()`.
+3. Forget `NA` handling → subjects with AGE=NA fall through all conditions → AGEGR1=NA. Add explicit `TRUE ~ NA_character_` row only if needed; default `case_when` already returns NA on no match.
+
+### 10.6 Live derivation
 
 ```{r age-groups-demo}
 adsl <- adsl |>
@@ -954,7 +2375,9 @@ adsl |>
   select(USUBJID, AGE, AGEGR1, AGEGR1N)
 ```
 
-### Exercise: Add a finer age categorization (AGEGR2)
+> **Read output:** AGEGR1 and AGEGR1N align row-by-row. PROC FREQ TABLES AGEGR1 / ORDER=FORMATTED ↔ pivot on AGEGR1N for correct visual ordering.
+
+### 10.7 Exercise: Add a finer age categorization (AGEGR2)
 
 Create `AGEGR2` with categories: `<40`, `40-54`, `55-64`, `>=65`.
 
@@ -971,6 +2394,36 @@ adsl_agegr2 <- adsl |>
 
 adsl_agegr2 |>
   select(USUBJID, AGE, AGEGR1, AGEGR2)
+```
+
+> **Read output:** AGEGR2 partitions adults more finely — useful for elderly subgroup analyses (`55-64` vs `>=65`).
+
+### 10.8 Knowledge check — age groups
+
+```{r quiz-agegr, echo=FALSE}
+quiz(
+  question(
+    "Closest SAS analog of `case_when()` for AGEGR1?",
+    answer("`PROC FREQ`"),
+    answer("`PROC FORMAT VALUE agegrp ...` + `FORMAT AGE agegrp.;`", correct = TRUE),
+    answer("`PROC TRANSPOSE`"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "Why pair AGEGR1 (char) with AGEGR1N (num)?",
+    answer("PROC FREQ orders alphabetically on AGEGR1 → `\"18-64\" < \"<18\" < \">=65\"` wrong order. AGEGR1N forces correct numeric ordering.", correct = TRUE),
+    answer("ADaM IG mandates redundancy"),
+    answer("Speed"),
+    random_answer_order = TRUE
+  ),
+  question(
+    "`between(AGE, 18, 65)` includes endpoint 65?",
+    answer("No — exclusive on upper"),
+    answer("Yes — `between()` is inclusive on both ends. Use `between(AGE, 18, 64)` if 65 belongs in next group.", correct = TRUE),
+    answer("Only if specified"),
+    random_answer_order = TRUE
+  )
+)
 ```
 
 ---
@@ -1373,6 +2826,32 @@ quiz(
   )
 )
 ```
+
+---
+
+## 14 — Lesson 15 Summary {.congratulations}
+
+You now know how to build a production ADSL end-to-end:
+
+- **Frame ADSL** — one row per subject, 30-40 canonical variables (identifiers, treatment, disposition, demographics, population flags, derived dates). SAS analog: a `PROC SUMMARY NWAY OUT=` collapsed dataset built from multiple SDTM domains.
+- **Pre-process EX and DS** — separation of concerns: pre-derive numeric dates and clean blanks BEFORE merging onto ADSL. WORK-dataset analog to the SAS habit of building intermediate `WORK` datasets between steps.
+- **Derive treatment dates (TRTSDT/TRTSDTM, TRTEDT/TRTEDTM)** — `derive_vars_merged()` with `mode = "first"/"last"`, the dose-greater-than-zero-OR-placebo filter, and `derive_vars_dtm_to_dt()` to project date-only versions. SAS analog: `PROC SQL SELECT MIN(EXSTDT) FROM ex WHERE EXDOSE > 0 GROUP BY USUBJID;` plus MERGE back.
+- **Derive disposition dates (RANDDT, EOSDT, DCSREAS, EOSSTT)** — pull from DS via `derive_vars_merged()` with `filter_add = DSCAT == "DISPOSITION EVENT"`. Tri-state EOSSTT via `case_when()`.
+- **Derive cause of death (DTHCAUS, DTHDT, DTHFL)** — multi-source via `derive_vars_extreme_event()` with `event_source()` objects from DS and AE. SAS analog: `COALESCE(DTHCAUS_DS, DTHCAUS_AE)` after multi-source DATA-step priority logic.
+- **Derive LSTALVDT** — max of (AE start, LB collection, VS, EX, DS-non-death) via `derive_vars_extreme_event()` with `mode = "last"`. Drives downstream OS censoring.
+- **Treatment duration (TRTDURD, TRTDURM, TRTDURY)** — `derive_var_trtdurd()` and `derive_vars_duration()`. Inclusive-day rule: `+1` for days, `add_one = FALSE` for months/years.
+- **Population flags (SAFFL, ITTFL, RANDFL, COMPLFL, PPROTFL)** — `derive_var_merged_exist_flag()` with `condition = ...`. Strict CDISC rule: `"Y"` or `NA`, **never** `"N"`.
+- **Age groups (AGEGR1/AGEGR1N, AGEGR2)** — paired character + numeric via `case_when()`. PROC FORMAT analog. The numeric companion fixes alphabetical-ordering pitfalls in PROC FREQ.
+- **Validate against pharmaverseadam reference** — diffdf-style comparison: re-derive then check row-by-row match to published ADSL.
+- **Read P21 diagnostics** — three classic submission bugs: SAFFL missing placebo subjects, TRTDURD off-by-one, COMPLFL using `"N"`.
+
+You also know:
+
+- All flag vars follow CDISC `"Y" or NA` rule. No ELSE branch.
+- `derive_vars_merged()` is the workhorse — used 10+ times in one ADSL build.
+- `derive_vars_extreme_event()` is the multi-source variant — used for DTHCAUS, LSTALVDT.
+- Always pair character display vars (AGEGR1) with numeric companions (AGEGR1N) for correct table ordering.
+- The build order matters: dates → merged vars → flags → groups → duration. Reversing creates `NA` cascades.
 
 ---
 

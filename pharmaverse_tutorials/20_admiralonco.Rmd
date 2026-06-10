@@ -1,10 +1,11 @@
 ---
 title: "Lesson 20 — admiral Oncology Extension (admiralonco): ADRS, ADTR & Oncology TTE"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Oncology ADaM derivations using the admiralonco package: RECIST 1.1 response

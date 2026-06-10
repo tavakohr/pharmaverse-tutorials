@@ -1,10 +1,11 @@
 ---
 title: "Lesson 34 — tern: Analysis Functions for rtables"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   tern provides pre-built afuns (analyze_vars, count_occurrences,

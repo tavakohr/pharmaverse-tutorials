@@ -1,10 +1,11 @@
 ---
 title: "Lesson 46 — diffdf & riskmetric: Dataset QC and Package Risk"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Master diffdf for dataset comparison and QC, and riskmetric for scoring

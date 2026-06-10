@@ -1,10 +1,11 @@
 ---
 title: "Lesson 47 — Capstone Part 1: SDTM → ADaM Pipeline"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   End-to-end pharmaverse capstone Part 1: derive ADSL and ADAE from

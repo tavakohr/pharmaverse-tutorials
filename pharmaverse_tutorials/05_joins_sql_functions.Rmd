@@ -1,11 +1,12 @@
 ---
 title: "Lesson 05 — R Primer for SAS Programmers, Part 3: Joins, SQL, and Functions"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
     ace_theme: tomorrow
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Translate PROC SQL and DATA step MERGE into dplyr joins. Diagnose fanout and key

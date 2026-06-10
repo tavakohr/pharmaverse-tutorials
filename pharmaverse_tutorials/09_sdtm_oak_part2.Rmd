@@ -1,11 +1,12 @@
 ---
 title: "Lesson 09 — {sdtm.oak} Part 2: Building SDTM Domains End-to-End"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
     ace_theme: tomorrow
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Build a complete VS (Findings) domain and AE (Events) domain from raw data using

@@ -1,10 +1,11 @@
 ---
 title: "Lesson 42 — teal Capstone: Full Clinical Data Review App"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
-    theme: flatly
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Build a complete, production-quality CDISCPILOT01 clinical data review

@@ -1,9 +1,11 @@
 ---
 title: "Lesson 13 — {metatools}: Using the Spec to Build and Validate Datasets"
+author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
     progressive: true
     allow_skip: true
+    css: www/custom.css
 runtime: shiny_prerendered
 description: >
   Use metacore objects to build datasets spec-first, derive codelist-driven
