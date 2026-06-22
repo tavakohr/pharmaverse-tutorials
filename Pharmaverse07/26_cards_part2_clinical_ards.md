@@ -1,7 +1,7 @@
-# Lesson 26 — `{cards}` Part 2: Building Clinical ARDs
+# Lesson 26 — `{cards}` Part 2: Full Clinical ARD Pipeline
 
 **Module**: 6 — TLG: the Cardinal-future stack
-**Estimated length**: ~22 min spoken
+**Estimated length**: ~35 min spoken
 **Prerequisites**: Lesson 25 (cards Part 1)
 
 ---
@@ -10,12 +10,14 @@
 
 By the end of this lesson, you will be able to:
 
-1. Build a complete demographics ARD with continuous and categorical summaries
-2. Build an AE incidence ARD using `ard_hierarchical()` with proper denominators
-3. Build a lab change-from-baseline ARD with by-visit summaries
-4. Apply `ard_stack()` with `.by`, `.overall`, and `.total_n` arguments for typical clinical layouts
-5. Handle missing categories explicitly using `denominator` and `everything()`
-6. Use cards' tidying utilities (`shuffle_ard()`, `bind_ard()`) to prepare ARDs for display
+1. Build a complete study-wide ARD covering demographics, AE incidence, labs, vitals, exposure, and disposition
+2. Apply the correct population filter and denominator strategy for each table type
+3. Handle the "missing zero-count levels" problem with factor typing and denominator data frames
+4. Build multi-level grouping ARDs for lab shift tables and subgroup analyses
+5. Use the `ard_*()` traceability metadata pattern for ARS-aligned output
+6. Construct ARDs for concomitant medications, disposition, and vital signs
+7. Understand the validation strategy: dual-program the ARD, not the display
+8. Prepare a study-wide ARD package for archival and submission
 
 ---
 
@@ -25,366 +27,646 @@ By the end of this lesson, you will be able to:
 library(cards)
 library(dplyr)
 library(pharmaverseadam)
+library(purrr)
 
-adsl <- pharmaverseadam::adsl |> filter(SAFFL == "Y")
-adae <- pharmaverseadam::adae
-adlb <- pharmaverseadam::adlb |> filter(SAFFL == "Y")
-adtte <- pharmaverseadam::adtte
+# Load and filter ADaMs
+adsl   <- pharmaverseadam::adsl
+adae   <- pharmaverseadam::adae
+adlb   <- pharmaverseadam::adlb
+adtte  <- pharmaverseadam::adtte
+
+# Safety population
+adsl_saf  <- adsl |> filter(SAFFL == "Y")
+adae_saf  <- adae |> filter(SAFFL == "Y")
+adlb_saf  <- adlb |> filter(SAFFL == "Y")
 ```
 
-We'll build four canonical ARDs against these datasets, then connect them to display layers in later lessons.
+---
 
-## 2. Demographics ARD
+## 2. Demographics ARD — the canonical template
 
-The standard demographics table has continuous variables (Age, BMI, Height, Weight) summarized as N/Mean/SD/Median/Min/Max and categorical variables (Age Group, Sex, Race, Ethnicity) summarized as n (%). Columns are treatment arms plus an Overall column with a Big-N header per arm.
+The standard demographics table: continuous variables (AGE, BMI, Weight, Height) and categorical variables (Age Group, Sex, Race, Ethnicity) by treatment arm with an Overall column.
 
 ```r
 demog_ard <- ard_stack(
-  adsl,
+  adsl_saf,
+  # Continuous variables: N, Mean, SD, Median, Q1, Q3, Min, Max
   ard_continuous(
     variables = c(AGE, BMIBL, WEIGHTBL, HEIGHTBL),
     statistic = ~ continuous_summary_fns(
       c("N", "mean", "sd", "median", "p25", "p75", "min", "max")
     )
   ),
+  # Categorical variables: n, N, p per level
   ard_categorical(
     variables = c(AGEGR1, SEX, RACE, ETHNIC)
   ),
-  .by = TRT01A,
-  .overall = TRUE,         # adds a column with all subjects combined
-  .total_n = TRUE          # adds Big-N header per arm
+  .by      = TRT01A,        # columns by treatment arm
+  .overall = TRUE,          # add "Overall" column
+  .total_n = TRUE           # add Big-N header rows
 )
-
-head(demog_ard, 15)
 ```
 
-A few comments on the design:
-
-- `.by = TRT01A` splits results by treatment arm; each row gets `group1 = "TRT01A"` and `group1_level` = the arm name
-- `.overall = TRUE` adds rows with `group1_level = "Overall"` for the all-subjects column
-- `.total_n = TRUE` adds Big-N rows (one per group, the total count) — these become the column header subtitles like "Placebo (N=86)"
-- Continuous variables use `continuous_summary_fns()` to limit to the specific stats your SAP requires
-- Categorical variables get defaults (n, N, p)
-
-The output ARD has potentially hundreds of rows, but each row is a single computed statistic with all metadata needed to identify it.
-
-## 3. Inspecting the demographics ARD
+### Validating the demographics ARD
 
 ```r
-# Filter to see AGE stats per arm
+# Structure check
+check_ard_structure(demog_ard)
+
+# Condition check (warnings / errors)
+print_ard_conditions(demog_ard)
+
+# Spot-check: mean age by arm
 demog_ard |>
-  filter(variable == "AGE") |>
-  select(group1_level, stat_name, stat_label, stat)
-#   group1_level     stat_name  stat_label  stat
-# 1 Placebo          N          N           86.000
-# 2 Placebo          mean       Mean        75.209
-# 3 Placebo          sd         SD          8.590
-# ...
-# 9 Xanomeline Low   N          N           84.000
-# 10 Xanomeline Low  mean       Mean        74.381
-# ...
+  filter(variable == "AGE" & stat_name == "mean") |>
+  mutate(mean_age = map_dbl(stat, 1)) |>
+  select(group1_level, mean_age)
+#   group1_level           mean_age
+# 1 Placebo                75.209
+# 2 Xanomeline Low Dose    74.381
+# 3 Xanomeline High Dose   75.667
+# 4 Overall                75.087
 
-# Filter to see SEX counts per arm
-demog_ard |>
-  filter(variable == "SEX" & stat_name %in% c("n", "p")) |>
-  select(group1_level, variable_level, stat_name, stat)
+# Spot-check: Sex frequency (Female, Placebo)
+get_ard_statistics(
+  demog_ard,
+  filter = variable == "SEX" & variable_level == "F" &
+           group1_level == "Placebo" & stat_name %in% c("n", "p")
+)
+# list(n = 53, p = 0.616)  → 53/86 = 61.6% female in placebo
 ```
 
-This is the kind of ad-hoc validation you'd do during programming. The ARD is queryable like any tibble; you can sanity-check individual values before piping into a display.
+### The factor-typing pattern for categorical variables
 
-## 4. AE incidence ARD
-
-The signature safety table: "Adverse Event Incidence by System Organ Class and Preferred Term." Counts of subjects (with percentages) per SOC, with sub-rows per preferred term. The denominator: the safety population per arm.
+If any arm has zero subjects in a category level, that level disappears from the ARD. For consistency across all arms, factor-type before building the ARD:
 
 ```r
-ae_incidence_ard <- adae |>
-  filter(SAFFL == "Y" & TRTEMFL == "Y") |>
-  ard_hierarchical(
-    by = "ARM",
-    variables = c("AEBODSYS", "AEDECOD"),
-    denominator = adsl                       # uses ADSL row count per ARM as denominator
-  )
-
-head(ae_incidence_ard, 10)
-```
-
-A few critical details:
-
-- `filter(SAFFL == "Y" & TRTEMFL == "Y")` restricts to safety-population subjects with treatment-emergent AEs
-- `ard_hierarchical()` produces counts and percentages at each level of the hierarchy. Top level: counts per (ARM × SOC). Bottom level: counts per (ARM × SOC × PT).
-- `denominator = adsl` says: use ADSL (specifically, subject counts per ARM) as the proportion denominator. Otherwise the denominator would be event-level (wrong for "incidence" = subject-level).
-
-For a "subjects with at least one AE" overall row (the typical first row of an AE table), you'd construct a separate ARD:
-
-```r
-ae_overall_ard <- adae |>
-  filter(SAFFL == "Y" & TRTEMFL == "Y") |>
-  distinct(USUBJID, ARM) |>
-  ard_categorical(
-    by = "ARM",
-    variables = "USUBJID",        # "at least one AE" presence flag
-    denominator = adsl
-  )
-```
-
-Or use the `derive_var_extreme_flag()` pattern earlier in your pipeline (Lesson 17) to add `AOCCFL` and then count `AOCCFL = "Y"` records — typically cleaner.
-
-The two ARDs (overall row + by SOC/PT) can be `bind_ard()`'d together for the full AE table.
-
-## 5. The "missing categories" trap
-
-A subtle pharma-specific issue: what if a treatment arm has zero subjects in a given category? The naive output drops that level entirely — but for safety tables, you want to *show* zeros explicitly ("Placebo: 0 / 86 (0.0%)").
-
-cards handles this when categorical variables are explicitly **factor-typed** with all levels declared:
-
-```r
-adsl_with_factors <- adsl |>
+adsl_factored <- adsl_saf |>
   mutate(
-    AGEGR1 = factor(AGEGR1, levels = c("<65", "65-80", ">80"))   # all expected levels
+    AGEGR1 = factor(AGEGR1, levels = c("<65", "65-80", ">80")),
+    SEX    = factor(SEX,    levels = c("F", "M")),
+    RACE   = factor(RACE,   levels = c(
+      "WHITE", "BLACK OR AFRICAN AMERICAN", "ASIAN",
+      "AMERICAN INDIAN OR ALASKA NATIVE", "OTHER"
+    )),
+    ETHNIC = factor(ETHNIC, levels = c(
+      "NOT HISPANIC OR LATINO", "HISPANIC OR LATINO", "NOT REPORTED", "UNKNOWN"
+    ))
   )
 
-ard_categorical(
-  adsl_with_factors,
-  by = "TRT01A",
-  variables = "AGEGR1"
+demog_ard <- ard_stack(
+  adsl_factored,
+  ard_categorical(variables = c(AGEGR1, SEX, RACE, ETHNIC)),
+  .by = TRT01A,
+  .overall = TRUE,
+  .total_n = TRUE
 )
+# Now every arm has every level, even if n = 0
 ```
 
-Now any arm with zero subjects in (say) ">80" gets explicit `n = 0`, `p = 0` rows, not omission. This matters for table consistency — every arm should have every category row.
+---
 
-If you can't declare factors upstream, `denominator` can take a data frame specifying the expected levels, but factor-typing is cleaner.
+## 3. AE incidence ARD — the safety table
 
-## 6. Lab change-from-baseline ARD
-
-A typical lab summary: for each parameter (HGB, ALT, etc.), report N, mean, SD, median, min, max of the baseline value, the post-baseline value, and the change-from-baseline (CHG), per visit per arm.
-
-The ADLB structure (long format, one row per visit per parameter) lends itself to this:
+The canonical adverse event table: subjects with at least one TEAE (overall row), then counts by System Organ Class, then by Preferred Term within each SOC.
 
 ```r
-adlb_chg_ard <- adlb |>
-  filter(PARAMCD %in% c("HGB", "ALT") & !is.na(AVISIT) & ANL01FL == "Y") |>
-  ard_stack(
-    ard_continuous(
-      variables = c(AVAL, CHG),
-      statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
-    ),
-    .by = c(PARAMCD, AVISIT, TRTA)
+# Key filters for TEAEs
+adae_te <- adae_saf |>
+  filter(TRTEMFL == "Y")
+
+# AE incidence by SOC and PT
+ae_incidence_ard <- adae_te |>
+  ard_hierarchical(
+    by       = "ARM",
+    variables = c("AEBODSYS", "AEDECOD"),
+    denominator = adsl_saf,    # N = safety-pop subjects per arm
+    id       = "USUBJID"       # count distinct subjects, not events
   )
 
-adlb_chg_ard |> filter(PARAMCD == "HGB" & AVISIT == "Week 4") |> head()
+# "Subjects with at least one TEAE" — the overall header row
+# Method 1: flag approach (preferred)
+adae_any_ard <- adae_te |>
+  distinct(USUBJID, ARM) |>               # one row per subject with any TEAE
+  mutate(any_teae = "Y") |>
+  ard_categorical(
+    by          = "ARM",
+    variables   = "any_teae",
+    denominator = adsl_saf
+  )
+
+# Combine
+ae_full_ard <- bind_ard(adae_any_ard, ae_incidence_ard)
 ```
 
-`.by = c(PARAMCD, AVISIT, TRTA)` creates a three-level group split. The result has rows like `group1 = "PARAMCD"`, `group2 = "AVISIT"`, `group3 = "TRTA"` (cards extends to additional group columns as needed).
+### Why `denominator = adsl_saf` is non-negotiable
 
-For each (parameter × visit × arm), you get N/mean/SD/median/min/max of both AVAL and CHG — exactly the data needed for the canonical "lab change from baseline by visit" table.
-
-## 7. Exposure summary ARD
-
-A simple but useful ARD: treatment duration summary from ADSL.
+Without the denominator argument:
 
 ```r
-expo_ard <- ard_stack(
-  adsl,
+# WRONG: N would be the count of TEAE *rows* in adae_te per arm
+# (some subjects have multiple AEs → N is inflated → percentages wrong)
+ard_hierarchical(adae_te, by = "ARM", variables = c("AEBODSYS", "AEDECOD"))
+# stat for N might be 120 for Placebo even though only 86 subjects exist
+```
+
+With the denominator:
+
+```r
+# CORRECT: N is the safety-population subject count per arm
+ard_hierarchical(adae_te, by = "ARM", variables = c("AEBODSYS", "AEDECOD"),
+                 denominator = adsl_saf)
+# stat for N is 86 for Placebo — the actual population
+```
+
+### Variants: serious TEAEs, drug-related TEAEs
+
+```r
+# Serious TEAEs
+ae_serious_ard <- adae_saf |>
+  filter(TRTEMFL == "Y" & AESER == "Y") |>
+  ard_hierarchical(
+    by          = "ARM",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = adsl_saf,
+    id          = "USUBJID"
+  )
+
+# Drug-related TEAEs
+ae_related_ard <- adae_saf |>
+  filter(TRTEMFL == "Y" & AEREL %in% c("POSSIBLE", "PROBABLE", "DEFINITE")) |>
+  ard_hierarchical(
+    by          = "ARM",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = adsl_saf,
+    id          = "USUBJID"
+  )
+
+# Severity grading (CTCAE)
+ae_grade_ard <- adae_saf |>
+  filter(TRTEMFL == "Y") |>
+  mutate(AETOXGR = factor(AETOXGR, levels = c("1", "2", "3", "4", "5"))) |>
+  ard_categorical(
+    by          = "ARM",
+    variables   = "AETOXGR",
+    denominator = adsl_saf
+  )
+```
+
+---
+
+## 4. Lab change-from-baseline ARD
+
+For a "Lab Values by Visit" table: N, mean, SD, median, min, max of AVAL and CHG per PARAMCD × AVISIT × treatment arm.
+
+```r
+# Filter to analysis observations
+adlb_analysis <- adlb_saf |>
+  filter(ANL01FL == "Y" & !is.na(AVISIT)) |>
+  filter(PARAMCD %in% c("HGB", "ALT", "AST", "ALK", "BILI", "CREAT",
+                         "SODIUM", "POTASSIUM", "CHOL"))
+
+# Build the ARD: 3-level grouping
+lab_ard <- ard_stack(
+  adlb_analysis,
   ard_continuous(
-    variables = TRTDURD,
+    variables = c(AVAL, CHG),
     statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
   ),
+  .by = c(PARAMCD, AVISIT, TRTA)
+)
+
+# Inspect structure: 3 group columns
+names(lab_ard)[startsWith(names(lab_ard), "group")]
+# [1] "group1"       "group1_level"  "group2"       "group2_level"
+# [5] "group3"       "group3_level"
+
+# Example: mean CHG of ALT at Week 4 across arms
+lab_ard |>
+  filter(group1_level == "ALT" &  # PARAMCD = ALT
+         group2_level == "Week 4" & # AVISIT = Week 4
+         variable == "CHG" &
+         stat_name == "mean") |>
+  mutate(mean_chg = map_dbl(stat, 1)) |>
+  select(group3_level, mean_chg)
+```
+
+### Lab shift table ARD
+
+For shift tables (normal-to-high, etc.), you need baseline category and post-baseline category:
+
+```r
+adlb_shift <- adlb_saf |>
+  filter(ANL01FL == "Y" & AVISIT == "End of Treatment") |>
+  filter(!is.na(BNRIND) & !is.na(ANRIND)) |>
+  mutate(
+    BNRIND = factor(BNRIND, levels = c("L", "N", "H")),
+    ANRIND = factor(ANRIND, levels = c("L", "N", "H"))
+  )
+
+lab_shift_ard <- adlb_shift |>
   ard_categorical(
-    variables = TRTDURD_CAT       # if you've derived a categorical version
+    by        = c("PARAMCD", "TRTA"),
+    variables = "ANRIND",
+    # denominator stratified by BNRIND (baseline category):
+    # this requires a nested approach
+  )
+
+# For a true shift table (baseline × post-baseline):
+lab_shift_nested_ard <- adlb_shift |>
+  ard_hierarchical(
+    by        = c("PARAMCD", "TRTA"),
+    variables = c("BNRIND", "ANRIND"),
+    denominator = adlb_shift |> distinct(USUBJID, PARAMCD, TRTA)
+  )
+```
+
+---
+
+## 5. Vital signs ARD
+
+Vital signs follow the same pattern as labs but typically need analysis flags for specific visit windows:
+
+```r
+library(pharmaverseadam)  # contains advs
+
+advs <- pharmaverseadam::advs |>
+  filter(SAFFL == "Y" & ANL01FL == "Y")
+
+# Build the vital signs ARD
+vs_ard <- ard_stack(
+  advs |> filter(!is.na(AVISIT)),
+  ard_continuous(
+    variables = c(AVAL, CHG),
+    statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
   ),
-  .by = TRT01A,
+  .by = c(PARAMCD, AVISIT, TRTA)
+)
+
+# Worst post-baseline value (maximum AVAL per subject):
+advs_worst <- advs |>
+  filter(AVISITN > 0) |>
+  group_by(USUBJID, PARAMCD, TRTA) |>
+  slice_max(AVAL, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+vs_worst_ard <- ard_stack(
+  advs_worst,
+  ard_continuous(
+    variables = AVAL,
+    statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "min", "max"))
+  ),
+  .by = c(PARAMCD, TRTA)
+)
+```
+
+---
+
+## 6. Disposition ARD
+
+Subject disposition (enrolled, treated, completed, discontinued):
+
+```r
+# Flag enrolled (all), treated (at least one dose), completed, discontinued
+adsl_disp <- adsl |>
+  mutate(
+    ENROLLED = "Y",
+    DCREASFL = if_else(!is.na(DCREASCD), "Y", "N"),
+    DCREASCD = factor(
+      DCREASCD,
+      levels = c("ADVERSE EVENT", "LACK OF EFFICACY", "WITHDREW CONSENT",
+                  "LOST TO FOLLOW-UP", "PHYSICIAN DECISION", "OTHER")
+    )
+  )
+
+# Disposition counts
+disp_ard <- ard_stack(
+  adsl_disp,
+  # Overall: treated / completed / discontinued
+  ard_categorical(
+    variables = c(SAFFL, EFFFL, DCREASFL),
+    statistic = ~ list(n = \(x, ...) sum(x == "Y", na.rm = TRUE),
+                       p = \(x, ...) mean(x == "Y", na.rm = TRUE))
+  ),
+  # Discontinuation reasons
+  ard_categorical(
+    variables = DCREASCD
+  ),
+  .by      = TRT01A,
   .total_n = TRUE
 )
 ```
 
-For "categorical exposure durations" (the typical "Duration of Treatment by Category" table — < 1 month, 1-3 months, etc.), you'd add a derived `TRTDURD_CAT` in ADSL using admiral or simple `mutate()`, then summarize it categorically.
+---
 
-## 8. Combining ARDs with `bind_ard()`
-
-When you have several pre-built ARDs that go into one display, `bind_ard()` combines them while preserving structure:
+## 7. Concomitant medications ARD
 
 ```r
-final_ard <- bind_ard(demog_ard, ae_incidence_ard, expo_ard)
-# Single ARD with all three sets of statistics stacked
+# ADCM if available, or similar
+# Using a simulated structure as example:
+# adcm has CMTRT (medication name), CMCLAS (class), CMSTDY, CMENDY, TRT01A, SAFFL
+
+# adcm <- pharmaverseadam::adcm  # (if available in your version)
+
+# Standard concomitant meds table pattern:
+cm_ard <- adcm |>
+  filter(SAFFL == "Y" & CMCAT == "CONCOMITANT") |>
+  distinct(USUBJID, TRT01A, CMCLAS, CMTRT) |>
+  ard_hierarchical(
+    by          = "TRT01A",
+    variables   = c("CMCLAS", "CMTRT"),
+    denominator = adsl_saf,
+    id          = "USUBJID"
+  )
 ```
 
-This is useful when ARDs are built in separate scripts, or when you want to construct a "study-wide ARD" for archival. The `context` column tells you which constructor produced each row, so you can filter as needed.
+---
 
-## 9. Pre-defined summary patterns
+## 8. Exposure ARD
 
-cards ships a few helpers to reduce boilerplate for canonical patterns:
+Treatment duration and dose intensity:
 
 ```r
-# continuous_summary_fns: helper returning a list of summary functions
-continuous_summary_fns(c("N", "mean", "sd"))
-# Returns a list of named functions
+adex <- pharmaverseadam::adex |> filter(SAFFL == "Y")
 
-# everything(): tidyselect helper for "all variables"
-ard_categorical(
-  adsl,
-  by = "TRT01A",
-  variables = everything()       # all categorical variables
+# Duration of treatment (from ADSL typically)
+expo_ard <- ard_stack(
+  adsl_saf,
+  ard_continuous(
+    variables = TRTDURD,
+    statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
+  ),
+  .by      = TRT01A,
+  .total_n = TRUE
+)
+
+# Cumulative dose
+adex_dose <- adex |> filter(PARAMCD == "DOSEINTNS")
+
+dose_ard <- ard_stack(
+  adex_dose,
+  ard_continuous(
+    variables = AVAL,
+    statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
+  ),
+  .by = TRTA
 )
 ```
 
-The `everything()` pattern is dangerous in practice — it computes statistics on every column, which usually generates noise. Prefer explicit variable lists.
+---
 
-## 10. Saving and loading ARDs
+## 9. Adding ARS traceability metadata
 
-ARDs are just tibbles. Standard R serialization works:
-
-```r
-saveRDS(demog_ard, "ards/demog_ard.rds")
-demog_ard <- readRDS("ards/demog_ard.rds")
-```
-
-For CDISC ARS submission, ARDs are typically serialized to JSON or as part of the broader submission package. CDISC publishes the ARS conceptual model; tools to serialize cards ARDs to ARS-JSON are emerging. Stay current with CDISC ARS releases (2025-2027 is when this is solidifying).
-
-## 11. `shuffle_ard()` — preparing for display
-
-cards' default ARD format is fully "long": every statistic is its own row, every group-by variable is in `group1`/`group2`/etc. For display, you typically want a more table-like shape with the group columns pivoted to columns.
-
-`shuffle_ard()` (or the alias `shuffle_card()`) does this pivot:
+For ARS-aligned submission, each ARD row should carry the Analysis ID, Method ID, and Output ID that produced it. The base `{cards}` package doesn't add these automatically, but they're easy to add post-hoc:
 
 ```r
-demog_ard |>
-  shuffle_ard()
+# Tag the demographics ARD with ARS metadata
+demog_ard_tagged <- demog_ard |>
+  mutate(
+    OutputId   = "T_DEMOG",
+    AnalysisId = case_when(
+      variable == "AGE"     ~ "AN_DEMOG_AGE",
+      variable == "BMIBL"   ~ "AN_DEMOG_BMI",
+      variable == "SEX"     ~ "AN_DEMOG_SEX",
+      variable == "AGEGR1"  ~ "AN_DEMOG_AGEGR",
+      variable == "RACE"    ~ "AN_DEMOG_RACE",
+      variable == "ETHNIC"  ~ "AN_DEMOG_ETHNIC",
+      .default = NA_character_
+    ),
+    MethodId = case_when(
+      context == "continuous"   ~ "MTH_SUMMARY_STATISTICS_CONTINUOUS",
+      context == "categorical"  ~ "MTH_COUNT_AND_PERCENTAGE",
+      context == "total_n"      ~ "MTH_SUBJECT_COUNT",
+      .default = NA_character_
+    )
+  )
 ```
 
-The result moves group columns to be actual columns (e.g., `TRT01A` becomes a column) and keeps statistics as rows. This is the shape `{tfrmt}` expects (Lesson 32).
+When using `{siera}`, this tagging is done automatically — siera reads the Analysis IDs from the ARS file and injects them as columns. When using `{arsbridge}`, the tagging is also automatic via `ars_to_ard()`.
 
-`{gtsummary}` doesn't typically need `shuffle_ard()` — its `tbl_ard_*()` functions consume the long format directly.
+---
 
-## 12. Putting it together: a real ARD pipeline
+## 10. Putting it together: the study-wide ARD pipeline
 
-A complete script that builds the demographics, AE, and lab ARDs and combines them:
+A complete script building all ARDs for a CSR:
 
 ```r
 library(cards)
 library(dplyr)
 library(pharmaverseadam)
+library(purrr)
 
-# Data
-adsl <- pharmaverseadam::adsl |> filter(SAFFL == "Y")
-adae <- pharmaverseadam::adae |> filter(SAFFL == "Y")
-adlb <- pharmaverseadam::adlb |> filter(SAFFL == "Y" & ANL01FL == "Y")
+# ─── 1. Load and filter data ──────────────────────────────────────────────────
+adsl   <- pharmaverseadam::adsl
+adae   <- pharmaverseadam::adae
+adlb   <- pharmaverseadam::adlb
 
-# Demographics
+adsl_saf <- adsl |> filter(SAFFL == "Y")
+adae_te  <- adae |> filter(SAFFL == "Y" & TRTEMFL == "Y")
+adlb_an  <- adlb |> filter(SAFFL == "Y" & ANL01FL == "Y")
+
+# ─── 2. Demographics ARD ──────────────────────────────────────────────────────
 demog_ard <- ard_stack(
-  adsl,
+  adsl_saf |>
+    mutate(
+      AGEGR1 = factor(AGEGR1, c("<65", "65-80", ">80")),
+      SEX    = factor(SEX,    c("F", "M")),
+      RACE   = factor(RACE,   sort(unique(RACE)))
+    ),
   ard_continuous(
-    variables = c(AGE, BMIBL),
+    variables = c(AGE, BMIBL, WEIGHTBL),
     statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
   ),
   ard_categorical(variables = c(AGEGR1, SEX, RACE)),
-  .by = TRT01A,
-  .overall = TRUE,
-  .total_n = TRUE
+  .by = TRT01A,  .overall = TRUE,  .total_n = TRUE
 )
 
-# AE incidence
-ae_ard <- adae |>
-  filter(TRTEMFL == "Y") |>
-  ard_hierarchical(
-    by = "ARM",
-    variables = c("AEBODSYS", "AEDECOD"),
-    denominator = adsl
-  )
+# ─── 3. AE incidence ARD ──────────────────────────────────────────────────────
+ae_ard <- bind_ard(
+  # Overall "any TEAE" row
+  adae_te |>
+    distinct(USUBJID, ARM) |>
+    mutate(any_teae = "Y") |>
+    ard_categorical(by = "ARM", variables = "any_teae",
+                    denominator = adsl_saf),
+  # SOC × PT hierarchy
+  adae_te |>
+    ard_hierarchical(by = "ARM", variables = c("AEBODSYS", "AEDECOD"),
+                     denominator = adsl_saf, id = "USUBJID")
+)
 
-# Lab change-from-baseline
-lab_ard <- adlb |>
-  filter(PARAMCD %in% c("HGB", "ALT")) |>
-  ard_stack(
-    ard_continuous(
-      variables = c(AVAL, CHG),
-      statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
-    ),
-    .by = c(PARAMCD, AVISIT, TRTA)
-  )
+# ─── 4. Lab change-from-baseline ARD ──────────────────────────────────────────
+lab_ard <- ard_stack(
+  adlb_an |> filter(PARAMCD %in% c("HGB", "ALT", "AST")),
+  ard_continuous(
+    variables = c(AVAL, CHG),
+    statistic = ~ continuous_summary_fns(c("N", "mean", "sd", "median", "min", "max"))
+  ),
+  .by = c(PARAMCD, AVISIT, TRTA)
+)
 
-# Combine for archival
-full_ard <- bind_ard(demog_ard, ae_ard, lab_ard)
+# ─── 5. Validate all ARDs ─────────────────────────────────────────────────────
+walk(
+  list(demog_ard = demog_ard, ae_ard = ae_ard, lab_ard = lab_ard),
+  function(ard) {
+    check_ard_structure(ard)
+    print_ard_conditions(ard)
+  }
+)
 
-# Validate
-check_ard_structure(full_ard)
-print_ard_conditions(full_ard)
+# ─── 6. Combine for study archive ─────────────────────────────────────────────
+study_ard <- bind_ard(demog_ard, ae_ard, lab_ard)
 
-# Save
-saveRDS(full_ard, "study_ard.rds")
+# ─── 7. Save ──────────────────────────────────────────────────────────────────
+saveRDS(demog_ard, "ards/demog_ard.rds")
+saveRDS(ae_ard,    "ards/ae_ard.rds")
+saveRDS(lab_ard,   "ards/lab_ard.rds")
+saveRDS(study_ard, "ards/study_ard.rds")
+
+message("Study ARD complete: ", nrow(study_ard), " rows")
 ```
 
-This single script generates the analysis results for an entire CSR's worth of tables. The display layer (gtsummary or tfrmt) takes this ARD and produces the actual tables — covered in the next lessons.
+---
 
-## 13. Validation strategy
+## 11. Preparing ARDs for display: `shuffle_ard()`
 
-For a study going to submission, ARD validation is the bedrock. Approach:
+`{tfrmt}` expects ARDs in a slightly wider format with the group columns pivoted. The `shuffle_ard()` function (also called `shuffle_card()`) does this pivot:
 
-1. **Dual programming of the ARD**: a second programmer independently writes the cards code
-2. **Compare ARDs**: use `{diffdf}` (Module 10) or simple `dplyr::anti_join()` to compare
-3. **Spot-check the displays**: pull individual values from your ARD and confirm they appear in the displayed table
+```r
+demog_ard_wide <- demog_ard |>
+  shuffle_ard()
+# Now: TRT01A is a regular column, not group1/group1_level
 
-The key shift from traditional validation: you validate the *numbers* (the ARD) and the *layout* (the display) separately. Most validation effort goes into the ARD, because that's where the analysis decisions live. The display layer is usually a thin transformation.
+# Compare shapes:
+# Before shuffle: group1 = "TRT01A", group1_level = "Placebo"
+# After shuffle:  TRT01A = "Placebo" (as a proper column)
+```
 
-## 14. Common pitfalls
+`{gtsummary}` consumes the standard long format directly — no `shuffle_ard()` needed. `{tfrmt}` requires `shuffle_ard()`. Be clear on which display layer you're targeting.
 
-A few patterns to avoid:
+---
 
-- **Forgetting `denominator`**: AE rates without an explicit ADSL denominator get the wrong N. Always specify when computing incidence.
-- **Mixing population filters**: applying `SAFFL == "Y"` to the source data but forgetting it in the denominator can give wrong proportions. Apply consistently.
-- **Not factor-typing categorical variables**: missing levels disappear from the ARD; tables show inconsistent rows across arms.
-- **Computing post-baseline only**: filtering to `AVISITN > 0` before summarizing change-from-baseline excludes baseline rows that some tables need.
+## 12. Dual-programming strategy for ARD validation
 
-These show up at code review. Build a checklist into your project's QC process.
+The key paradigm shift in validation: **you validate the ARD, not the display.**
 
-## 15. Comparing cards to old approaches
+**Traditional SAS approach**: Programmer 1 produces Table 14.1.1 in RTF. Programmer 2 independently produces the same table. QA compares the two RTFs cell by cell.
 
-If your team is migrating from Tplyr or rtables:
+**ARD-first approach**:
 
-| Old | New |
+```r
+# Programmer 1's ARD
+ard_p1 <- readRDS("validation/demog_ard_programmer1.rds")
+
+# Programmer 2's ARD
+ard_p2 <- readRDS("validation/demog_ard_programmer2.rds")
+
+# Compare: any rows in P1 not in P2 (after rounding floats)?
+ard_p1_flat <- ard_p1 |>
+  filter(!is.na(stat)) |>
+  mutate(stat_value = map_dbl(stat, ~ round(.x[[1]], 4))) |>
+  select(group1_level, variable, variable_level, stat_name, stat_value)
+
+ard_p2_flat <- ard_p2 |>
+  filter(!is.na(stat)) |>
+  mutate(stat_value = map_dbl(stat, ~ round(.x[[1]], 4))) |>
+  select(group1_level, variable, variable_level, stat_name, stat_value)
+
+# Find discrepancies:
+anti_join(ard_p1_flat, ard_p2_flat)  # rows in P1 but not P2
+anti_join(ard_p2_flat, ard_p1_flat)  # rows in P2 but not P1
+
+# Check specific values:
+full_join(ard_p1_flat, ard_p2_flat,
+          by = c("group1_level", "variable", "variable_level", "stat_name"),
+          suffix = c("_p1", "_p2")) |>
+  filter(abs(stat_value_p1 - stat_value_p2) > 0.001)
+```
+
+The display (the table layout) can then be validated separately, with much less effort: confirm that the values in the table match the ARD values by filtering and comparing.
+
+---
+
+## 13. Common pitfalls — production checklist
+
+Use this as a code review checklist:
+
+| Pitfall | Detection | Fix |
+|---|---|---|
+| Missing `denominator` on AE ARD | AE percentages > 100% or implausibly high | `denominator = adsl_saf` in every `ard_*()` for AEs |
+| Inconsistent population filters | Percentages computed on different N | Apply SAFFL/ITTFL filter consistently in both data and denominator |
+| Missing categorical levels | Some arms lack rows for a level | Factor-type all categorical variables before `ard_*()` calls |
+| Computing on post-baseline only | Baseline N ≠ post-baseline N | Review `AVISITN > 0` filters; include baseline rows where needed |
+| Using `bind_rows()` instead of `bind_ard()` | Silent column misalignment | Always use `bind_ard()` for ARD combination |
+| Not checking conditions | Silent errors in specific statistics | Always call `print_ard_conditions(ard)` after building |
+| Wrong `id` variable | Event counts instead of subject counts | Set `id = "USUBJID"` in `ard_hierarchical()` |
+| Forgetting `.total_n = TRUE` | gtsummary can't build column headers | Include `.total_n = TRUE` in `ard_stack()` for tables that need Big-N headers |
+
+---
+
+## 14. Migration from Tplyr and rtables
+
+If your team is migrating:
+
+| Old approach | New approach |
 |---|---|
-| `Tplyr::tplyr_table()` + layers + `build()` → wide table | `ard_stack()` → long ARD + gtsummary/tfrmt |
-| `rtables::basic_table() %>% analyze(...)` → table object | `ard_*()` → ARD + gtsummary/tfrmt |
-| Functions for each table | One ARD per analysis topic, multiple displays per ARD |
-| Layout intertwined with computation | Computation and layout separated |
+| `Tplyr::tplyr_table() |> build()` → wide table | `ard_stack()` → long ARD + gtsummary/tfrmt |
+| `rtables::basic_table() |> build_table()` → table object | `ard_*()` → ARD + gtsummary/tfrmt |
+| Recompute for each display | One ARD, multiple displays |
+| Dual prog = compare RTF files | Dual prog = compare ARD flat files |
+| Study-level archive = pile of RTFs | Study-level archive = one RDS per topic |
 
-The cards approach has more steps for a single table but pays off when you have many tables sharing data — which is most CSRs.
+The cards approach has more steps for a single table but pays dividends when you have 150 tables sharing overlapping analyses — which is every CSR.
 
-## 16. Key takeaways
+---
 
-- A complete clinical ARD pipeline produces tidy datasets for demographics, AE incidence, lab change-from-baseline, and exposure — each from a single `ard_stack()` or `ard_*()` call
-- `ard_hierarchical()` handles nested categorical tabulations (AE by SOC × PT)
-- `denominator` controls the N used for proportion calculations — critical for AE incidence
-- Factor-typing categorical variables ensures missing levels appear with zero counts
-- `bind_ard()` combines pre-built ARDs; `shuffle_ard()` reshapes for display
-- A study-wide ARD becomes the durable artifact; displays derive from it
+## 15. Key takeaways
 
-## 17. What's next
+- A complete clinical ARD pipeline covers: demographics, AE incidence (hierarchical + any-AE overall), lab change-from-baseline, vital signs, disposition, exposure, concomitant medications
+- Always specify `denominator = adsl_saf` for AE and any analysis where N = subjects not events
+- Always `factor()` categorical variables with all expected levels to prevent missing zero-count rows
+- For ARS traceability, add `OutputId`, `AnalysisId`, `MethodId` columns post-hoc (or let siera/arsbridge do it automatically)
+- `shuffle_ard()` reshapes for tfrmt; gtsummary uses the standard long format directly
+- Validation: compare ARD rows between dual programmers; the display validation is then trivial
+- Use `bind_ard()`, not `bind_rows()`, to combine ARDs
 
-Lesson 27 covers **`{cardx}`** — the cards extension for **regression and survival** ARDs. Where cards covers descriptive statistics (means, counts), cardx handles inferential outputs: t-tests, ANOVA, regression coefficients, hazard ratios from Cox models, Kaplan-Meier estimates. The same ARD structure, but the statistics are model outputs.
+---
+
+## 16. What's next
+
+Lesson 27 covers **`{cardx}`** — extending the ARD model to inferential statistics: t-tests, chi-squared, regression, survival analyses, and mixed models. Same ARD structure; the statistics come from model objects rather than simple summaries.
+
+We also introduce **`{siera}`** in detail: how to read an ARS JSON file and auto-generate ARD programs, and **`{arsbridge}`**: the end-to-end pipeline from annotated TLF shells to formatted tables.
 
 ---
 
 ## Self-check questions
 
-1. What's the difference between `ard_categorical(adae, by = "ARM", variables = "AEDECOD")` and `ard_hierarchical(adae, by = "ARM", variables = c("AESOC", "AEDECOD"))`?
-2. Why does `denominator = adsl` matter for AE incidence?
-3. Translate to cards: "Compute N, mean, SD, median, min, max of CHG by PARAMCD × AVISIT × TRTA."
-4. Why factor-type categorical variables before passing to cards?
-5. Given a demographics ARD with `.overall = TRUE`, what does `group1_level == "Overall"` represent?
-6. How would you save an ARD for archival, and why is this useful?
+1. A TEAE incidence ARD shows percentages above 100% for some preferred terms. What caused this and how do you fix it?
+2. Write the complete `ard_hierarchical()` call for serious TEAEs by SOC and PT, using the safety population denominator.
+3. Your demographics ARD is missing ">80" rows for the High Dose arm (because no subjects were in that age group). What's the fix?
+4. How would you compare two programmers' demographics ARDs to identify discrepancies?
+5. Translate to cards: "Compute N, Mean, SD, Median, Min, Max of AVAL and CHG by PARAMCD × AVISIT × TRTA for subjects with SAFFL=Y and ANL01FL=Y."
+6. What column and value would you filter on to find the Big-N rows added by `.total_n = TRUE`?
+
+---
 
 ## Glossary
 
-- **`ard_stack()`** — Run multiple `ard_*()` constructors in one call
-- **`.by`** — The grouping variable(s) for split-by-group statistics
-- **`.overall = TRUE`** — Add a column-level for all subjects combined
-- **`.total_n = TRUE`** — Add Big-N rows used for column header subtitles
-- **`denominator`** — Override the default N for proportion calculations
-- **`group1` / `group1_level`** — Standard ARD columns for the first grouping variable
-- **`stat_name` / `stat_label`** — Machine and human-readable statistic identifiers
-- **`shuffle_ard()` / `shuffle_card()`** — Pivot group columns to wide-table shape for display
-- **`bind_ard()`** — Concatenate multiple ARDs
-- **`check_ard_structure()`** — Validate that a tibble conforms to ARD structure
-- **Big-N** — The total subject count per arm (denominator in proportions)
-- **TRTEMFL** — Treatment-Emergent Flag (Lesson 17)
-- **PARAMCD** — Parameter Code in BDS ADaMs
+- **`ard_hierarchical()`** — Nested categorical tabulation; computes distinct-subject counts at each nesting level
+- **`id = "USUBJID"`** — Ensures distinct-subject counting in hierarchical/categorical ARDs
+- **`denominator = adsl_saf`** — Pass ADSL safety pop as denominator for correct AE N
+- **`shuffle_ard()`** — Pivot group columns from `group1_level` to actual wide columns (for tfrmt)
+- **`.overall = TRUE`** — Add "All subjects combined" rows to `ard_stack()` output
+- **`.total_n = TRUE`** — Add Big-N per group to `ard_stack()` output
+- **`context = "total_n"`** — Context value identifying Big-N rows
+- **`OutputId`** — ARS traceability column linking ARD rows to the output they belong to
+- **`AnalysisId`** — ARS traceability column linking rows to specific analyses in the ARS spec
+- **`MethodId`** — ARS traceability column linking rows to the statistical method used
+- **TRTEMFL** — Treatment-Emergent Flag in ADAE (`"Y"` = treatment-emergent AE)
+- **ANL01FL** — Analysis Flag 01 in BDS ADaMs; marks the observation for primary analysis
+- **PARAMCD** — Parameter Code in BDS ADaMs (e.g., `"ALT"`, `"HGB"`)
+- **AVISIT** — Analysis Visit label in BDS ADaMs
+- **CHG** — Change from Baseline in BDS ADaMs
+- **BNRIND** — Baseline Normal Range Indicator (e.g., "L", "N", "H")
+- **ANRIND** — Analysis Normal Range Indicator (post-baseline)

@@ -1,0 +1,1767 @@
+---
+title: "Lesson 25 — cards Part 1: ARD Structure, Column Anatomy & Core Constructors"
+author: "Hamid Tavakoli, MD, MSc"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    css: www/custom.css
+runtime: shiny_prerendered
+description: >
+  A deep dive into the cards Analysis Results Dataset (ARD): every column of the
+  ARD tibble and its type, why stat is a list column and four ways to extract
+  values, and the core constructors ard_continuous(), ard_categorical() (with the
+  denominator argument for AE incidence), ard_hierarchical() for nested SOC x PT
+  counts, and ard_complex() for arbitrary functions. Covers ard_stack() with
+  .by/.overall/.total_n, bind_ard(), ard_missing(), ard_dichotomous(),
+  ard_total_n(), continuous_summary_fns(), and validation/inspection helpers
+  get_ard_statistics(), check_ard_structure() and print_ard_conditions(), with
+  SAS-to-cards mental-model translations throughout.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 25_cards_part1_ard_concepts.Rmd
+# PURPOSE       : cards Part 1 — ARD structure & core constructors. The full
+#                 ARD column anatomy (group/variable/stat_name/stat list column/
+#                 fmt_fn/context/warning/error); why stat is a list column and
+#                 how to extract from it; ard_continuous(), ard_categorical()
+#                 (incl. the denominator argument), ard_hierarchical() (nested
+#                 SOC x PT distinct-subject counts), ard_complex(); ard_stack()
+#                 with .by/.overall/.total_n; bind_ard(); ard_missing();
+#                 ard_dichotomous(); ard_total_n(); continuous_summary_fns();
+#                 validation with check_ard_structure() / print_ard_conditions()
+#                 and extraction with get_ard_statistics(); custom statistics
+#                 patterns and SAS-to-cards mental-model translations.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-06-22
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo","Xanomeline Low Dose","Xanomeline High Dose"))
+  ) |>
+  filter(SAFFL == "Y")
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARDS FUNCTION MOCKS
+# These replicate the real {cards} APIs closely enough that exercises run inside
+# learnr WITHOUT the cards package installed. The output structure follows the
+# CDISC ARD spec exactly: group1/group1_level, variable, variable_level,
+# stat_name, stat_label, stat (LIST column), fmt_fn (LIST column), context,
+# warning (LIST column), error (LIST column).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Helper: build one fully-shaped ARD row with all standard columns -------------
+.ard_row <- function(variable, stat_name, stat, stat_label, context,
+                     group1 = NA_character_, group1_level = NA_character_,
+                     group2 = NA_character_, group2_level = NA_character_,
+                     variable_level = NA_character_,
+                     fmt_fn = NULL, warning = NULL, error = NULL) {
+  tibble(
+    group1         = group1,
+    group1_level   = group1_level,
+    group2         = group2,
+    group2_level   = group2_level,
+    variable       = variable,
+    variable_level = variable_level,
+    context        = context,
+    stat_name      = stat_name,
+    stat_label     = stat_label,
+    stat           = list(stat),
+    fmt_fn         = list(fmt_fn),
+    warning        = list(warning),
+    error          = list(error)
+  )
+}
+
+.as_card <- function(x) structure(x, class = c("card","tbl_df","tbl","data.frame"))
+
+# Default formatting functions (advisory; used by gtsummary in the real package)
+.fmt_int  <- function(x) format(round(x), big.mark = "")
+.fmt_dec1 <- function(x) formatC(x, digits = 1, format = "f")
+.fmt_pct  <- function(x) formatC(x, digits = 1, format = "f")
+
+#' continuous_summary_fns() — named list of summary functions by name
+#'
+#' Returns a named list of statistic functions. With no argument, returns the
+#' full default catalogue; pass a character vector to select a subset.
+continuous_summary_fns <- function(summaries = NULL) {
+  all_fns <- list(
+    N      = function(x) sum(!is.na(x)),
+    N_obs  = function(x) length(x),
+    N_miss = function(x) sum(is.na(x)),
+    p_miss = function(x) round(100 * mean(is.na(x)), 1),
+    mean   = function(x) mean(x, na.rm = TRUE),
+    sd     = function(x) sd(x, na.rm = TRUE),
+    var    = function(x) var(x, na.rm = TRUE),
+    median = function(x) median(x, na.rm = TRUE),
+    p25    = function(x) unname(quantile(x, 0.25, na.rm = TRUE)),
+    p75    = function(x) unname(quantile(x, 0.75, na.rm = TRUE)),
+    min    = function(x) min(x, na.rm = TRUE),
+    max    = function(x) max(x, na.rm = TRUE),
+    iqr    = function(x) unname(diff(quantile(x, c(0.25, 0.75), na.rm = TRUE))),
+    sum    = function(x) sum(x, na.rm = TRUE)
+  )
+  if (is.null(summaries)) all_fns else all_fns[summaries]
+}
+
+.cont_labels <- c(
+  N = "N", N_obs = "N Obs.", N_miss = "N Missing", p_miss = "% Missing",
+  mean = "Mean", sd = "SD", var = "Var.", median = "Median",
+  p25 = "Q1", p75 = "Q3", min = "Min", max = "Max", iqr = "IQR", sum = "Sum"
+)
+
+#' ard_continuous() — summary statistics for numeric variables (PROC MEANS)
+#'
+#' Returns one row per (variable x by-level x statistic). The stat cell is a
+#' list element so it can hold any object. Errors in a single statistic are
+#' captured in the error column rather than aborting the run.
+#'
+#' @param data       A data frame
+#' @param variables  Character vector of numeric column names
+#' @param by         Optional character: grouping column name
+#' @param statistic  Named list of stat_name -> function (defaults provided)
+#' @param fmt_fn     Optional named list of formatting functions
+ard_continuous <- function(data, variables, by = NULL,
+                           statistic = continuous_summary_fns(
+                             c("N","mean","sd","median","p25","p75","min","max")),
+                           fmt_fn = NULL) {
+  groups <- if (!is.null(by)) as.character(unique(data[[by]])) else NA_character_
+  default_fmt <- list(N = .fmt_int, min = .fmt_int, max = .fmt_int,
+                      mean = .fmt_dec1, sd = .fmt_dec1, median = .fmt_dec1,
+                      p25 = .fmt_dec1, p75 = .fmt_dec1, p_miss = .fmt_pct)
+
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      x   <- sub[[vv]]
+      lapply(names(statistic), function(sn) {
+        err <- NULL
+        val <- tryCatch(statistic[[sn]](x),
+                        error = function(e) { err <<- conditionMessage(e); NULL })
+        .ard_row(
+          variable     = vv,
+          stat_name    = sn,
+          stat         = val,
+          stat_label   = if (sn %in% names(.cont_labels)) unname(.cont_labels[sn]) else sn,
+          context      = "continuous",
+          group1       = if (!is.null(by)) by else NA_character_,
+          group1_level = if (!is.null(by)) gl else NA_character_,
+          fmt_fn       = default_fmt[[sn]],
+          error        = err
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  .as_card(rows)
+}
+
+#' ard_categorical() — counts and proportions for categorical variables (PROC FREQ)
+#'
+#' Returns rows for n (count per level), N (group denominator), and p (percent).
+#' The denominator argument controls N:
+#'   - "row" (default): N = non-missing rows in the grouped data
+#'   - a data frame    : N = number of rows of that data frame per group
+#'   - a named numeric : one N per group, looked up by group level
+#'
+#' @param data        A data frame
+#' @param variables   Character vector of column names
+#' @param by          Optional grouping column name
+#' @param denominator "row", a data frame, or a named numeric vector
+ard_categorical <- function(data, variables, by = NULL, denominator = "row") {
+  groups <- if (!is.null(by)) {
+    if (is.factor(data[[by]])) levels(data[[by]]) else sort(unique(as.character(data[[by]])))
+  } else NA_character_
+
+  # Resolve the denominator N for a given group level
+  get_N <- function(sub, gl) {
+    if (is.data.frame(denominator)) {
+      if (!is.na(gl) && !is.null(by) && by %in% names(denominator)) {
+        sum(as.character(denominator[[by]]) == gl)
+      } else {
+        nrow(denominator)
+      }
+    } else if (is.numeric(denominator)) {
+      if (!is.na(gl) && gl %in% names(denominator)) unname(denominator[gl]) else sum(denominator)
+    } else {
+      sum(!is.na(sub[[variables[1]]]))  # "row"
+    }
+  }
+
+  rows <- lapply(variables, function(vv) {
+    levs <- if (is.factor(data[[vv]])) levels(data[[vv]])
+            else sort(unique(as.character(data[[vv]])))
+    levs <- levs[!is.na(levs)]
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      total <- get_N(sub, gl)
+      lapply(levs, function(lv) {
+        cnt <- sum(as.character(sub[[vv]]) == lv, na.rm = TRUE)
+        pct <- if (total > 0) round(100 * cnt / total, 1) else NA_real_
+        bind_rows(
+          .ard_row(variable = vv, variable_level = lv, stat_name = "n",
+                   stat = cnt, stat_label = "n", context = "categorical",
+                   group1 = if (!is.null(by)) by else NA_character_,
+                   group1_level = if (!is.null(by)) gl else NA_character_,
+                   fmt_fn = .fmt_int),
+          .ard_row(variable = vv, variable_level = lv, stat_name = "N",
+                   stat = total, stat_label = "N", context = "categorical",
+                   group1 = if (!is.null(by)) by else NA_character_,
+                   group1_level = if (!is.null(by)) gl else NA_character_,
+                   fmt_fn = .fmt_int),
+          .ard_row(variable = vv, variable_level = lv, stat_name = "p",
+                   stat = pct, stat_label = "%", context = "categorical",
+                   group1 = if (!is.null(by)) by else NA_character_,
+                   group1_level = if (!is.null(by)) gl else NA_character_,
+                   fmt_fn = .fmt_pct)
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  .as_card(rows)
+}
+
+#' ard_dichotomous() — counts/proportions for a single TRUE level (PROC FREQ one-level)
+#'
+#' Summarises only the "event" level of a binary variable (default "Y").
+#' Returns n / N / p for that one level per group.
+#'
+#' @param data        A data frame
+#' @param variables   Character vector of binary column names
+#' @param by          Optional grouping column
+#' @param value       The level treated as the event (default "Y")
+#' @param denominator "row" or a data frame (subject denominator)
+ard_dichotomous <- function(data, variables, by = NULL, value = "Y",
+                            denominator = "row") {
+  full <- ard_categorical(data, variables, by = by, denominator = denominator)
+  out  <- full |> filter(variable_level == value) |> mutate(context = "dichotomous")
+  .as_card(out)
+}
+
+#' ard_hierarchical() — nested categorical counts (nested PROC FREQ; SOC x PT)
+#'
+#' Computes distinct-subject counts at each level of the hierarchy. With
+#' variables = c("AEBODSYS","AEDECOD"), produces:
+#'   - variable == "AEBODSYS": distinct subjects per (group x SOC)
+#'   - variable == "AEDECOD" : distinct subjects per (group x SOC x PT), with the
+#'                             SOC carried in group2 / group2_level
+#' Denominator N comes from the supplied subject-level data frame.
+#'
+#' @param data        Event-level data (one row per event)
+#' @param by          Grouping column (e.g. treatment arm)
+#' @param variables   Hierarchy outermost-first, e.g. c("AEBODSYS","AEDECOD")
+#' @param denominator Subject-level data frame for the N denominator
+#' @param id          Subject identifier for distinct-subject counting
+ard_hierarchical <- function(data, by, variables, denominator = NULL,
+                             id = "USUBJID") {
+  soc_var <- variables[1]
+  pt_var  <- if (length(variables) >= 2) variables[2] else NULL
+  groups  <- as.character(unique(data[[by]]))
+
+  N_for <- function(gl) {
+    if (is.data.frame(denominator) && by %in% names(denominator))
+      sum(as.character(denominator[[by]]) == gl)
+    else if (is.data.frame(denominator)) nrow(denominator)
+    else length(unique(data[[id]][as.character(data[[by]]) == gl]))
+  }
+
+  rows <- lapply(groups, function(gl) {
+    sub <- data[as.character(data[[by]]) == gl, ]
+    Ng  <- N_for(gl)
+
+    # SOC-level distinct-subject counts
+    soc_rows <- lapply(sort(unique(as.character(sub[[soc_var]]))), function(soc) {
+      ss  <- sub[as.character(sub[[soc_var]]) == soc, ]
+      cnt <- length(unique(ss[[id]]))
+      bind_rows(
+        .ard_row(variable = soc_var, variable_level = soc, stat_name = "n",
+                 stat = cnt, stat_label = "n", context = "hierarchical",
+                 group1 = by, group1_level = gl, fmt_fn = .fmt_int),
+        .ard_row(variable = soc_var, variable_level = soc, stat_name = "N",
+                 stat = Ng, stat_label = "N", context = "hierarchical",
+                 group1 = by, group1_level = gl, fmt_fn = .fmt_int),
+        .ard_row(variable = soc_var, variable_level = soc, stat_name = "p",
+                 stat = if (Ng > 0) round(100 * cnt / Ng, 1) else NA_real_,
+                 stat_label = "%", context = "hierarchical",
+                 group1 = by, group1_level = gl, fmt_fn = .fmt_pct)
+      )
+    }) |> bind_rows()
+
+    # PT-level distinct-subject counts, nested within SOC (group2 = SOC)
+    pt_rows <- if (!is.null(pt_var)) {
+      lapply(seq_len(nrow(unique(sub[, c(soc_var, pt_var)]))), function(i) {
+        combo <- unique(sub[, c(soc_var, pt_var)])[i, ]
+        soc   <- as.character(combo[[soc_var]]); pt <- as.character(combo[[pt_var]])
+        ss    <- sub[as.character(sub[[soc_var]]) == soc &
+                     as.character(sub[[pt_var]]) == pt, ]
+        cnt   <- length(unique(ss[[id]]))
+        bind_rows(
+          .ard_row(variable = pt_var, variable_level = pt, stat_name = "n",
+                   stat = cnt, stat_label = "n", context = "hierarchical",
+                   group1 = by, group1_level = gl,
+                   group2 = soc_var, group2_level = soc, fmt_fn = .fmt_int),
+          .ard_row(variable = pt_var, variable_level = pt, stat_name = "N",
+                   stat = Ng, stat_label = "N", context = "hierarchical",
+                   group1 = by, group1_level = gl,
+                   group2 = soc_var, group2_level = soc, fmt_fn = .fmt_int),
+          .ard_row(variable = pt_var, variable_level = pt, stat_name = "p",
+                   stat = if (Ng > 0) round(100 * cnt / Ng, 1) else NA_real_,
+                   stat_label = "%", context = "hierarchical",
+                   group1 = by, group1_level = gl,
+                   group2 = soc_var, group2_level = soc, fmt_fn = .fmt_pct)
+        )
+      }) |> bind_rows()
+    } else NULL
+
+    bind_rows(soc_rows, pt_rows)
+  }) |> bind_rows()
+
+  .as_card(rows)
+}
+
+#' ard_complex() — arbitrary statistics with access to the full data subset
+#'
+#' Unlike ard_continuous() (whose functions receive a vector), ard_complex()
+#' functions receive the *data frame* subset for the group, giving access to
+#' every column. SAS equivalent: PROC SQL custom aggregates.
+#'
+#' @param data       A data frame
+#' @param variables  Character vector naming the focus variable(s)
+#' @param by         Optional grouping column
+#' @param statistic  Named list: variable -> list(stat_name -> function(data, ...))
+ard_complex <- function(data, variables, by = NULL, statistic = list()) {
+  groups <- if (!is.null(by)) as.character(unique(data[[by]])) else NA_character_
+
+  rows <- lapply(variables, function(vv) {
+    fns <- statistic[[vv]]
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      lapply(names(fns), function(sn) {
+        err <- NULL
+        val <- tryCatch(fns[[sn]](data = sub),
+                        error = function(e) { err <<- conditionMessage(e); NULL })
+        .ard_row(variable = vv, stat_name = sn, stat = val,
+                 stat_label = sn, context = "complex",
+                 group1 = if (!is.null(by)) by else NA_character_,
+                 group1_level = if (!is.null(by)) gl else NA_character_,
+                 error = err)
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  .as_card(rows)
+}
+
+#' ard_missing() — missingness statistics for variables (PROC FREQ w/ MISSING)
+#'
+#' Returns N_miss, p_miss, and N_not_miss per variable, optionally by group.
+#'
+#' @param data       A data frame
+#' @param variables  Character vector of column names
+#' @param by         Optional grouping column
+ard_missing <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) as.character(unique(data[[by]])) else NA_character_
+
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      x   <- sub[[vv]]
+      bind_rows(
+        .ard_row(variable = vv, stat_name = "N_miss", stat = sum(is.na(x)),
+                 stat_label = "N Missing", context = "missing",
+                 group1 = if (!is.null(by)) by else NA_character_,
+                 group1_level = if (!is.null(by)) gl else NA_character_, fmt_fn = .fmt_int),
+        .ard_row(variable = vv, stat_name = "p_miss",
+                 stat = round(100 * mean(is.na(x)), 1),
+                 stat_label = "% Missing", context = "missing",
+                 group1 = if (!is.null(by)) by else NA_character_,
+                 group1_level = if (!is.null(by)) gl else NA_character_, fmt_fn = .fmt_pct),
+        .ard_row(variable = vv, stat_name = "N_not_miss", stat = sum(!is.na(x)),
+                 stat_label = "N Non-missing", context = "missing",
+                 group1 = if (!is.null(by)) by else NA_character_,
+                 group1_level = if (!is.null(by)) gl else NA_character_, fmt_fn = .fmt_int)
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  .as_card(rows)
+}
+
+#' ard_total_n() — total subject count, optionally per group (PROC FREQ one-way)
+#'
+#' Produces context = "total_n", stat_name = "N" rows — the Big-N that becomes
+#' a column header subtitle ("Placebo (N=86)").
+#'
+#' @param data A data frame (one row per subject)
+#' @param by   Optional grouping column
+ard_total_n <- function(data, by = NULL) {
+  if (is.null(by)) {
+    rows <- .ard_row(variable = "..total_n..", stat_name = "N",
+                     stat = nrow(data), stat_label = "N", context = "total_n",
+                     fmt_fn = .fmt_int)
+  } else {
+    groups <- if (is.factor(data[[by]])) levels(data[[by]])
+              else as.character(unique(data[[by]]))
+    rows <- lapply(groups, function(gl) {
+      .ard_row(variable = "..total_n..", stat_name = "N",
+               stat = sum(as.character(data[[by]]) == gl), stat_label = "N",
+               context = "total_n", group1 = by, group1_level = gl,
+               fmt_fn = .fmt_int)
+    }) |> bind_rows()
+  }
+  .as_card(rows)
+}
+
+#' ard_stack() — run several constructors in one call and combine them
+#'
+#' First positional argument is the data; remaining arguments are *partial*
+#' constructor calls (quosure-free: built here with do.call). .by applies the
+#' grouping to every constructor; .overall adds an "Overall" set of rows;
+#' .total_n appends Big-N rows; .missing toggles ard_missing inclusion.
+#'
+#' In these mocks, pass constructor results directly OR pass the data plus
+#' pre-built ARDs. To keep exercises simple we accept already-built ARDs in ...
+#' and apply .overall/.total_n/.by post-hoc.
+#'
+#' @param data     The source data frame
+#' @param ...      One or more pre-built ARD tibbles (card objects)
+#' @param .by      Grouping column name used for .total_n / .overall
+#' @param .overall Logical: append an "Overall" (all-groups-combined) copy
+#' @param .total_n Logical: append ard_total_n() rows
+#' @param .missing Logical: (accepted for API parity; no-op in mock)
+ard_stack <- function(data, ..., .by = NULL, .overall = FALSE,
+                      .total_n = FALSE, .missing = FALSE) {
+  ards <- list(...)
+  out  <- bind_rows(ards)
+
+  if (isTRUE(.overall)) {
+    overall <- out |>
+      mutate(group1_level = if_else(!is.na(group1_level), "Overall", group1_level))
+    out <- bind_rows(out, overall)
+  }
+  if (isTRUE(.total_n)) {
+    out <- bind_rows(out, ard_total_n(data, by = .by))
+  }
+  .as_card(out)
+}
+
+#' bind_ard() — combine pre-built ARDs with structure enforcement
+#'
+#' Like dplyr::bind_rows() but missing columns are filled so all inputs share
+#' the canonical ARD structure, preventing silent row misalignment.
+#'
+#' @param ... Two or more ARD tibbles (card objects)
+bind_ard <- function(...) {
+  ards <- list(...)
+  cols <- c("group1","group1_level","group2","group2_level","variable",
+            "variable_level","context","stat_name","stat_label","stat",
+            "fmt_fn","warning","error")
+  ards <- lapply(ards, function(a) {
+    for (cc in setdiff(cols, names(a))) {
+      a[[cc]] <- if (cc %in% c("stat","fmt_fn","warning","error"))
+        vector("list", nrow(a)) else NA_character_
+    }
+    a[, cols]
+  })
+  .as_card(bind_rows(ards))
+}
+
+#' get_ard_statistics() — extract named statistic values by filter condition
+#'
+#' Returns a named list mapping stat_name -> unwrapped value, the proper way to
+#' pull specific numbers out of an ARD (instead of indexing the list column).
+#'
+#' @param ard    An ARD tibble
+#' @param filter An unquoted filter expression (as in dplyr::filter)
+#' @param .by    Optional column to split the result by
+get_ard_statistics <- function(ard, filter, .by = NULL) {
+  fexpr <- rlang::enquo(filter)
+  sel   <- dplyr::filter(ard, !!fexpr)
+  unwrap <- function(df) {
+    vals <- lapply(df$stat, function(s) if (length(s)) s[[1]] else NA)
+    stats::setNames(vals, df$stat_name)
+  }
+  if (is.null(.by)) {
+    unwrap(sel)
+  } else {
+    split(sel, sel[[.by]]) |> lapply(unwrap)
+  }
+}
+
+#' check_ard_structure() — validate ARD column presence and types
+#'
+#' Returns invisible(NULL) on success; stops with an informative message if a
+#' required column is missing or stat is not a list column. Use as a pipeline gate.
+#'
+#' @param ard An object to validate
+check_ard_structure <- function(ard) {
+  required <- c("variable","stat_name","stat_label","stat","context",
+                "warning","error")
+  missing_cols <- setdiff(required, names(ard))
+  if (length(missing_cols))
+    stop("ARD structure invalid: missing columns ",
+         paste(missing_cols, collapse = ", "))
+  if (!is.list(ard$stat))
+    stop("ARD structure invalid: 'stat' must be a list column")
+  message("ARD structure OK: ", nrow(ard), " rows, ", ncol(ard), " columns.")
+  invisible(NULL)
+}
+
+#' print_ard_conditions() — print captured warnings and errors
+#'
+#' Captured conditions are silent; this surfaces them. Prints one line per
+#' stat_name with a non-NULL warning or error, or a clean message if none.
+#'
+#' @param ard An ARD tibble
+print_ard_conditions <- function(ard) {
+  has_cond <- function(col) vapply(ard[[col]], function(x) !is.null(x) && length(x), logical(1))
+  flagged  <- which(has_cond("warning") | has_cond("error"))
+  if (!length(flagged)) {
+    message("No conditions found.")
+    return(invisible(NULL))
+  }
+  for (i in flagged) {
+    w <- ard$warning[[i]]; e <- ard$error[[i]]
+    cat(sprintf("variable=%s stat_name=%s | %s%s\n",
+                ard$variable[i], ard$stat_name[i],
+                if (!is.null(w)) paste0("WARNING: ", w, " ") else "",
+                if (!is.null(e)) paste0("ERROR: ", e) else ""))
+  }
+  invisible(ard[flagged, ])
+}
+
+# ── Pre-built ARDs for exercises ──────────────────────────────────────────────
+
+# Continuous summary of adsl by treatment
+ard_demog_cont <- ard_continuous(
+  data      = adsl,
+  variables = c("AGE","WEIGHTBL","HEIGHTBL","BMIBL"),
+  by        = "TRT01P",
+  statistic = continuous_summary_fns(c("N","mean","sd","median","p25","p75","min","max"))
+)
+
+# Categorical summary of adsl by treatment
+ard_demog_cat <- ard_categorical(
+  data      = adsl,
+  variables = c("SEX","RACE","AGEGR1"),
+  by        = "TRT01P"
+)
+```
+
+## Overview
+
+Back in Lesson 01 we established the **ARS/ARD** paradigm. The two-line recap:
+
+- **Old way** — `ADaM -> PROC MEANS -> formatted RTF` (analysis and display tangled)
+- **New way** — `ADaM -> ARD (just numbers) -> display layer (just layout)`
+
+The **ARD** (Analysis Results Dataset) is the durable artifact. Displays derive from it. Multiple displays can share one ARD. Regulators can receive the ARD alongside the TLGs for machine-readable review.
+
+`{cards}` is the R implementation that makes this practical. In a traditional SAS workflow, the same means and counts are computed *inside* the PROC that formats them, so they are hard to reuse, retemplate, or compare across studies. An ARD stores each result once, independently of formatting, so the same ARD can feed a CSR table, a DSMB slide deck, or an interactive Shiny dashboard without recomputing anything.
+
+```
+ADaM data
+   |
+   v
+{cards}     <- descriptive ARDs (you are here)
+{cardx}     <- inferential ARDs (Lesson 27)
+   |
+   v
+{gtsummary} <- display (Lessons 28-29)
+{tfrmt}     <- display metadata (Lesson 32)
+   |
+   v
+.docx / .rtf / .html
+```
+
+> **Note on this tutorial.** The exercises run against lightweight mocks of the `cards` functions so they work inside learnr without the package installed. The mocks return tibbles with the *real* ARD column structure — including the `stat`, `fmt_fn`, `warning`, and `error` **list columns** — so everything you learn about extracting values and capturing conditions is accurate. In your real project you would `install.packages("cards")` and `library(cards)`; the API shapes match.
+
+### Installing and loading cards (real project)
+
+```r
+# From CRAN (stable):
+install.packages("cards")
+
+# Development version:
+remotes::install_github("insightsengineering/cards")
+
+library(cards)
+library(dplyr)
+library(pharmaverseadam)
+
+adsl <- pharmaverseadam::adsl |> filter(SAFFL == "Y")
+packageVersion("cards")   # >= 0.3.0 for all features shown here
+```
+
+### Trial Dataset
+
+All exercises use the **CDISCPILOT01** Alzheimer's study from `pharmaverseadam` — the same data from Lessons 4-19. Three arms: `Placebo`, `Xanomeline Low Dose`, `Xanomeline High Dose` (n = 254 safety population). `adsl`, `adae`, and `adlb` are already prepared for you in the setup chunk.
+
+---
+
+## Section 1 — The ARD Column Anatomy
+
+Understanding the ARD structure completely is essential before writing any `{cards}` code. Let's build the simplest possible ARD and dissect every column.
+
+The simplest ARD is one continuous variable with no grouping:
+
+```{r anatomy-simple, echo=TRUE}
+simple_ard <- ard_continuous(adsl, variables = "AGE")
+simple_ard |> select(variable, stat_name, stat_label, stat, context)
+```
+
+That is one row per default statistic computed on AGE. Now add a grouping variable:
+
+```{r anatomy-grouped, echo=TRUE}
+grouped_ard <- ard_continuous(adsl, by = "TRT01P", variables = "AGE")
+grouped_ard |>
+  select(group1, group1_level, variable, stat_name, stat, context) |>
+  head(10)
+```
+
+Eight statistics x three treatment arms = 24 rows.
+
+### The full column inventory
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `group1` | chr | **Name** of the first grouping variable (e.g. `"TRT01P"`) |
+| `group1_level` | chr | **Value** of that variable for this row (e.g. `"Placebo"`) |
+| `group2` / `group2_level` | chr | Second grouping level — added for nested by-vars or hierarchies |
+| `variable` | chr | The ADaM variable being summarised (e.g. `"AGE"`) |
+| `variable_level` | chr | The level being counted — **categorical only** (e.g. `"F"`) |
+| `stat_name` | chr | Machine-readable statistic key (`"mean"`, `"n"`, `"p"`) |
+| `stat_label` | chr | Human-readable display label (`"Mean"`, `"n"`, `"%"`) |
+| `stat` | **list** | The computed value — a list element holding any R object |
+| `fmt_fn` | **list** | Advisory formatting function (used by gtsummary) |
+| `context` | chr | Which `ard_*()` family produced the row |
+| `warning` | **list** | `NULL` or captured warning text |
+| `error` | **list** | `NULL` or captured error text |
+
+#### `group1` and `group1_level`
+
+`group1` stores the grouping **variable name** (`"TRT01P"`); `group1_level` stores its **value** for each row (`"Placebo"`, `"Xanomeline Low Dose"`, ...). For multiple grouping variables (e.g. `by = c("PARAMCD","AVISIT")`), cards adds `group2`/`group2_level`, `group3`/`group3_level`, and so on. When there is no grouping, `group1` and `group1_level` are `NA`.
+
+#### `variable` and `variable_level`
+
+`variable` is the name of the ADaM variable being summarised. `variable_level` is **only meaningful for categorical analyses**: for `ard_categorical(variables = "SEX")` it is `"F"` for the female rows and `"M"` for the male rows. For continuous analyses there are no levels to enumerate, so it is `NA`.
+
+#### `stat_name` and `stat_label`
+
+The statistic identifier pair. `stat_name` is the machine-readable key used for filtering and programmatic extraction; `stat_label` is the human-readable label used by gtsummary and tfrmt for table headers.
+
+Standard `stat_name` values for `ard_continuous()`:
+
+| `stat_name` | `stat_label` | What it computes |
+|---|---|---|
+| `N` | `"N"` | Count of non-missing values |
+| `N_obs` | `"N Obs."` | Total observations (including missing) |
+| `N_miss` | `"N Missing"` | Count of missing values |
+| `p_miss` | `"% Missing"` | Proportion missing |
+| `mean` | `"Mean"` | Arithmetic mean |
+| `sd` | `"SD"` | Standard deviation |
+| `var` | `"Var."` | Variance |
+| `median` | `"Median"` | Median |
+| `p25` | `"Q1"` | 25th percentile |
+| `p75` | `"Q3"` | 75th percentile |
+| `min` | `"Min"` | Minimum |
+| `max` | `"Max"` | Maximum |
+| `iqr` | `"IQR"` | Interquartile range |
+| `sum` | `"Sum"` | Sum |
+
+Standard `stat_name` values for `ard_categorical()`:
+
+| `stat_name` | `stat_label` | What it computes |
+|---|---|---|
+| `n` | `"n"` | Count of subjects in this level |
+| `N` | `"N"` | Total count (denominator) |
+| `p` | `"%"` | Percentage = 100 * n/N |
+
+#### `context`
+
+A character string identifying which `ard_*()` family produced the row. This is essential downstream: after `bind_ard()` combines several ARDs, `context` tells display code where each row came from.
+
+| `context` value | Produced by |
+|---|---|
+| `"continuous"` | `ard_continuous()` |
+| `"categorical"` | `ard_categorical()` |
+| `"dichotomous"` | `ard_dichotomous()` |
+| `"hierarchical"` | `ard_hierarchical()` |
+| `"complex"` | `ard_complex()` |
+| `"missing"` | `ard_missing()` |
+| `"total_n"` | `ard_total_n()` / `.total_n = TRUE` |
+
+### Practice — Explore a pre-built ARD
+
+`ard_demog_cont` is a continuous summary of AGE, weight, height, and BMI stratified by `TRT01P`, built for you in setup.
+
+```{r ex-anatomy-explore, exercise=TRUE, exercise.lines=8}
+# How many rows does ard_demog_cont have, and what stat_name values appear?
+
+nrow(ard_demog_cont)
+ard_demog_cont |> distinct(___)   # all unique stat_name values
+```
+
+```{r ex-anatomy-explore-hint-1}
+# distinct(stat_name) lists every statistic key present in the ARD
+```
+
+```{r ex-anatomy-explore-solution}
+nrow(ard_demog_cont)
+ard_demog_cont |> distinct(stat_name)
+```
+
+### Quiz — ARD column anatomy
+
+```{r quiz-anatomy, echo=FALSE}
+quiz(caption = "ARD Structure",
+  question("What does `group1_level` contain when `ard_continuous()` is called WITHOUT a `by` argument?",
+    answer("The variable name"),
+    answer("NA", correct = TRUE,
+           message = "With no grouping, group1 and group1_level are both NA — the statistic is marginal (unstratified)."),
+    answer("The word 'Overall'"),
+    answer("An empty string"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("In which context column value does `variable_level` carry a meaningful value?",
+    answer("continuous"),
+    answer("categorical", correct = TRUE,
+           message = "variable_level enumerates the levels being counted, which only exist for categorical (and hierarchical/dichotomous) analyses. For continuous it is NA."),
+    answer("It is always NA"),
+    answer("Only when by is supplied"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — Why `stat` Is a List Column (and 4 Ways to Extract)
+
+`stat` is a **list column**. This is the single most misunderstood aspect of cards ARDs, and the most common source of errors.
+
+Every cell in `stat` holds a list of length 1 containing the computed value. This is intentional: a list column can hold *any R object* — a scalar, a vector, a matrix, a named list from a model. That makes the ARD format extensible to complex outputs (a t-test returning multiple values, a Kaplan-Meier curve returning a CI vector) without ever changing the column structure.
+
+> **SAS programmer note.** In SAS, `PROC MEANS` writes `MEAN = 75.2` as a plain numeric variable in an output dataset. In cards that same value lives *inside a list cell*. You cannot do arithmetic on the list column directly — you must unwrap it first.
+
+There are four idiomatic ways to extract values.
+
+```{r stat-extraction, echo=TRUE}
+ard <- ard_continuous(adsl, by = "TRT01P", variables = "AGE")
+
+# Method 1: index the list column directly
+ard$stat[[2]]                              # second row's value (mean for Placebo)
+
+# Method 2: filter + pull + getElement
+ard |>
+  filter(group1_level == "Placebo", stat_name == "mean") |>
+  pull(stat) |>
+  getElement(1)
+
+# Method 3: get_ard_statistics() — the proper helper (returns a named list)
+get_ard_statistics(ard, filter = group1_level == "Placebo" & stat_name == "mean")
+
+# Method 4: map_dbl() for a whole tidy column
+ard |>
+  filter(stat_name == "mean") |>
+  mutate(stat_value = map_dbl(stat, 1)) |>
+  select(group1_level, variable, stat_name, stat_value)
+```
+
+> **Gotcha.** `unlist(stat)` works for simple scalar ARDs and is a fine quick path, but it silently *drops* `NULL` cells (failed statistics) and *flattens* multi-element results. For production extraction prefer `map_dbl(stat, 1)` or `get_ard_statistics()`, which preserve row alignment.
+
+### The `fmt_fn` list column
+
+`fmt_fn` is also a list column. Each cell holds a function (or `NULL`) specifying how the statistic *should be displayed*. This is advisory — `{gtsummary}` picks it up automatically; you rarely touch it. `mean` carries a 1-decimal formatter; `N` carries an integer formatter.
+
+```{r fmt-fn, echo=TRUE}
+mean_fmt <- ard |>
+  filter(stat_name == "mean", group1_level == "Placebo") |>
+  pull(fmt_fn) |> getElement(1)
+mean_fmt(75.20945)    # apply the advisory formatter to a value
+```
+
+### The `warning` and `error` list columns
+
+Both are list columns holding `NULL` (no issue) or captured condition text. A single failing statistic **does not abort the pipeline** — its `stat` becomes `NULL`, the message lands in `error`, and every other statistic still computes.
+
+```{r error-capture, echo=TRUE}
+bad_fn <- function(x) stop("calculation failed deliberately")
+
+ard_with_error <- ard_continuous(
+  adsl, variables = "AGE",
+  statistic = list(mean = function(x) mean(x, na.rm = TRUE), bad_stat = bad_fn)
+)
+
+ard_with_error$error[[2]]   # captured message
+ard_with_error$stat[[2]]    # NULL — value is NULL when computation failed
+```
+
+This is fundamental to production robustness: you investigate captured errors at your leisure without losing an entire run. We will surface them with `print_ard_conditions()` in Section 7.
+
+### Practice — Extract mean AGE across arms
+
+```{r ex-extract, exercise=TRUE, exercise.lines=8}
+# Extract mean AGE for all three arms as a plain numeric vector using map_dbl().
+
+ard_demog_cont |>
+  filter(variable == "AGE", stat_name == "mean") |>
+  mutate(mean_age = map_dbl(___, 1)) |>      # unwrap the stat list-column
+  select(group1_level, mean_age) |>
+  mutate(mean_age = round(mean_age, 1))
+```
+
+```{r ex-extract-hint-1}
+# map_dbl(stat, 1) pulls the first element of each list cell into a numeric vector
+```
+
+```{r ex-extract-solution}
+ard_demog_cont |>
+  filter(variable == "AGE", stat_name == "mean") |>
+  mutate(mean_age = map_dbl(stat, 1)) |>
+  select(group1_level, mean_age) |>
+  mutate(mean_age = round(mean_age, 1))
+```
+
+### Practice — Use get_ard_statistics()
+
+```{r ex-getstats, exercise=TRUE, exercise.lines=8}
+# Pull every statistic for AGE in the Placebo arm as a named list,
+# then read the mean out of it.
+
+age_placebo <- get_ard_statistics(
+  ard_demog_cont,
+  filter = variable == ___ & group1_level == ___
+)
+age_placebo$mean
+```
+
+```{r ex-getstats-hint-1}
+# variable == "AGE" & group1_level == "Placebo"
+# get_ard_statistics returns list(N=.., mean=.., sd=.., ...)
+```
+
+```{r ex-getstats-solution}
+age_placebo <- get_ard_statistics(
+  ard_demog_cont,
+  filter = variable == "AGE" & group1_level == "Placebo"
+)
+age_placebo$mean
+```
+
+### Quiz — the stat list column
+
+```{r quiz-stat, echo=FALSE}
+quiz(caption = "The stat list column",
+  question("Why is `stat` a list column rather than a plain numeric column?",
+    answer("Because dplyr requires list columns for grouped summaries"),
+    answer("So a single ARD can hold heterogeneous statistic types — scalars, vectors, CI bounds, model objects — without changing the column structure",
+           correct = TRUE,
+           message = "A list cell can hold any R object. That is what lets an ARD store a p-value, a mean, a whole confidence-interval vector, or a model object in the same column."),
+    answer("To reduce memory usage"),
+    answer("Because ARDs are always nested tibbles"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("A single statistic function throws an error during `ard_continuous()`. What happens?",
+    answer("The whole call aborts and no ARD is returned"),
+    answer("That statistic's stat cell becomes NULL and the message is captured in the error list column; other statistics still compute",
+           correct = TRUE,
+           message = "Conditions are captured per row, not raised. Use print_ard_conditions() to surface them after the fact."),
+    answer("The statistic is silently set to 0"),
+    answer("R prints the error to the console and stops"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 3 — `ard_continuous()`: Numeric Summaries
+
+`ard_continuous()` is the workhorse for numeric summaries — the `PROC MEANS` of cards.
+
+**Limiting statistics** is a production habit: never compute statistics you do not need. `continuous_summary_fns()` returns a named list of pre-built functions; pass a character vector to select a subset.
+
+```{r cont-fns, echo=TRUE}
+names(continuous_summary_fns())                       # full catalogue
+continuous_summary_fns(c("N","mean","sd")) |> names() # a selected subset
+```
+
+```r
+# Apply the same statistic list to several variables:
+ard_continuous(
+  adsl,
+  by        = "TRT01P",
+  variables = c("AGE","BMIBL","WEIGHTBL","HEIGHTBL"),
+  statistic = continuous_summary_fns(c("N","mean","sd","median","p25","p75","min","max"))
+)
+```
+
+> **SAS equivalent.** `PROC MEANS DATA=adsl N MEAN STD MEDIAN P25 P75 MIN MAX; CLASS TRT01P; VAR AGE BMIBL WEIGHTBL HEIGHTBL; WHERE SAFFL='Y'; RUN;`
+
+**Custom statistics** — any function taking a vector and returning a scalar can be a statistic:
+
+```{r cont-custom, echo=TRUE}
+cv_fn <- function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE) * 100
+
+ard_cv <- ard_continuous(
+  adsl, by = "TRT01P", variables = "AGE",
+  statistic = list(
+    N    = function(x) sum(!is.na(x)),
+    mean = function(x) mean(x, na.rm = TRUE),
+    sd   = function(x) sd(x, na.rm = TRUE),
+    cv   = cv_fn
+  )
+)
+ard_cv |>
+  filter(stat_name == "cv") |>
+  mutate(cv = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, cv)
+```
+
+### Practice — Build a continuous ARD
+
+```{r ex-cont-build, exercise=TRUE, exercise.lines=12}
+# Mean, SD, and median for AGE and BMIBL, stratified by TRT01P.
+
+ard_age_bmi <- ard_continuous(
+  data      = ___,
+  variables = c(___, ___),
+  by        = ___,
+  statistic = continuous_summary_fns(c("mean","sd","median"))
+)
+
+# 3 stats x 2 variables x 3 arms = 18 rows
+nrow(ard_age_bmi)
+```
+
+```{r ex-cont-build-hint-1}
+# data = adsl, variables = c("AGE","BMIBL"), by = "TRT01P"
+```
+
+```{r ex-cont-build-solution}
+ard_age_bmi <- ard_continuous(
+  data      = adsl,
+  variables = c("AGE","BMIBL"),
+  by        = "TRT01P",
+  statistic = continuous_summary_fns(c("mean","sd","median"))
+)
+
+nrow(ard_age_bmi)
+```
+
+### Practice — Custom SE statistic
+
+```{r ex-cont-se, exercise=TRUE, exercise.lines=16}
+# Add a standard error (SE = SD / sqrt(N)) statistic for AGE, then extract it.
+
+ard_age_se <- ard_continuous(
+  data      = adsl,
+  variables = "AGE",
+  by        = "TRT01P",
+  statistic = list(
+    N    = function(x) sum(!is.na(x)),
+    mean = function(x) mean(x, na.rm = TRUE),
+    se   = function(x) sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x)))
+  )
+)
+
+ard_age_se |>
+  filter(stat_name == ___) |>            # extract SE rows
+  mutate(se_val = round(map_dbl(stat, 1), 3)) |>
+  select(group1_level, se_val)
+```
+
+```{r ex-cont-se-hint-1}
+# stat_name == "se"
+```
+
+```{r ex-cont-se-solution}
+ard_age_se <- ard_continuous(
+  data      = adsl,
+  variables = "AGE",
+  by        = "TRT01P",
+  statistic = list(
+    N    = function(x) sum(!is.na(x)),
+    mean = function(x) mean(x, na.rm = TRUE),
+    se   = function(x) sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x)))
+  )
+)
+
+ard_age_se |>
+  filter(stat_name == "se") |>
+  mutate(se_val = round(map_dbl(stat, 1), 3)) |>
+  select(group1_level, se_val)
+```
+
+---
+
+## Section 4 — `ard_categorical()` and the `denominator` Argument
+
+`ard_categorical()` counts levels of categorical variables and computes percentages — the `PROC FREQ` of cards. It returns three rows per (level x group): `n` (count), `N` (denominator), and `p` (percent).
+
+> **Gotcha.** `p` is a **percentage (0-100)**, not a proportion (0-1). The ARD stores `p = 52.3`, labelled `"%"`. Do not multiply by 100 again.
+
+> **Gotcha — missing levels.** If a variable has a level with zero subjects in a group, that level is *absent* from the ARD by default, producing inconsistent table rows. The fix is to make the variable a **factor** with all expected levels declared, so every group emits a row for every level even when n = 0.
+
+> **SAS equivalent.** `PROC FREQ DATA=adsl; TABLES TRT01P*(AGEGR1 SEX RACE); WHERE SAFFL='Y'; RUN;`
+
+### The `denominator` argument — critical for AE incidence
+
+By default `N` is the count of non-missing rows in the source data per group. That is **wrong** when the data has multiple rows per subject (ADAE has one row per event). For AE incidence, the denominator must be the *subjects in the safety population*, not the events.
+
+```{r denom-demo, echo=TRUE}
+# CORRECT: denominator = subjects in safety population (from ADSL)
+ae_inc <- ard_categorical(
+  adae |> filter(TRTEMFL == "Y") |> mutate(ARM = TRT01A),
+  by          = "ARM",
+  variables   = "AEDECOD",
+  denominator = adsl |> mutate(ARM = as.character(TRT01P))  # one row per subject
+)
+
+# The N rows now reflect ADSL subject counts, not ADAE event counts:
+ae_inc |>
+  filter(stat_name == "N") |>
+  distinct(group1_level, stat = map_dbl(stat, 1))
+```
+
+When `denominator` is a data frame, cards counts *its* rows per group to determine N. This single argument replaces the SAS pattern of computing Big-N per arm in a separate `PROC FREQ`/`PROC SQL`, outputting it, then merging it back to compute percentages.
+
+Other denominator forms: a named numeric vector (`c("Placebo" = 86, ...)`), or `"row"` (the default — rows in the grouped data).
+
+### Practice — Build a categorical ARD
+
+```{r ex-cat-build, exercise=TRUE, exercise.lines=16}
+# Categorical ARD for SEX and AGEGR1 stratified by TRT01P. Then show
+# SEX counts (stat_name == "n") for the Placebo arm.
+
+ard_sex_age <- ard_categorical(
+  data      = ___,
+  variables = c(___, ___),
+  by        = ___
+)
+
+ard_sex_age |>
+  filter(variable == "SEX", group1_level == "Placebo", stat_name == "n") |>
+  mutate(n_val = map_dbl(stat, 1)) |>
+  select(variable_level, n_val)
+```
+
+```{r ex-cat-build-hint-1}
+# data = adsl, variables = c("SEX","AGEGR1"), by = "TRT01P"
+```
+
+```{r ex-cat-build-solution}
+ard_sex_age <- ard_categorical(
+  data      = adsl,
+  variables = c("SEX","AGEGR1"),
+  by        = "TRT01P"
+)
+
+ard_sex_age |>
+  filter(variable == "SEX", group1_level == "Placebo", stat_name == "n") |>
+  mutate(n_val = map_dbl(stat, 1)) |>
+  select(variable_level, n_val)
+```
+
+### Practice — AE incidence with a subject denominator
+
+```{r ex-cat-denom, exercise=TRUE, exercise.lines=18}
+# Compute treatment-emergent AE incidence for the top preferred terms,
+# using the ADSL safety population as the denominator (NOT the AE row count).
+
+adae_te <- adae |> filter(TRTEMFL == "Y") |> mutate(ARM = TRT01A)
+adsl_pop <- adsl |> mutate(ARM = as.character(TRT01P))
+
+ae_ard <- ard_categorical(
+  data        = adae_te,
+  variables   = "AEDECOD",
+  by          = "ARM",
+  denominator = ___          # the per-subject safety population
+)
+
+# Show the N (denominator) per arm — should match subject counts, not event counts
+ae_ard |>
+  filter(stat_name == "N") |>
+  distinct(group1_level, N = map_dbl(stat, 1))
+```
+
+```{r ex-cat-denom-hint-1}
+# denominator = adsl_pop  (a one-row-per-subject data frame with the ARM column)
+```
+
+```{r ex-cat-denom-solution}
+adae_te <- adae |> filter(TRTEMFL == "Y") |> mutate(ARM = TRT01A)
+adsl_pop <- adsl |> mutate(ARM = as.character(TRT01P))
+
+ae_ard <- ard_categorical(
+  data        = adae_te,
+  variables   = "AEDECOD",
+  by          = "ARM",
+  denominator = adsl_pop
+)
+
+ae_ard |>
+  filter(stat_name == "N") |>
+  distinct(group1_level, N = map_dbl(stat, 1))
+```
+
+### Practice — `ard_dichotomous()` for a single event level
+
+```{r ex-dichot, exercise=TRUE, exercise.lines=12}
+# ard_dichotomous() summarises only the "event" level of a binary variable.
+# Summarise the proportion of subjects with a serious AE (AESER == "Y") by ARM,
+# using the safety population denominator.
+
+adae_ser <- adae |> mutate(ARM = TRT01A) |> distinct(USUBJID, ARM, AESER)
+adsl_pop <- adsl |> mutate(ARM = as.character(TRT01P))
+
+ser_ard <- ard_dichotomous(
+  data        = adae_ser,
+  variables   = ___,         # "AESER"
+  by          = "ARM",
+  value       = "Y",
+  denominator = adsl_pop
+)
+ser_ard |> filter(stat_name == "p") |>
+  mutate(pct = map_dbl(stat, 1)) |> select(group1_level, variable_level, pct)
+```
+
+```{r ex-dichot-hint-1}
+# variables = "AESER" ; value = "Y" keeps only the serious-AE level
+```
+
+```{r ex-dichot-solution}
+adae_ser <- adae |> mutate(ARM = TRT01A) |> distinct(USUBJID, ARM, AESER)
+adsl_pop <- adsl |> mutate(ARM = as.character(TRT01P))
+
+ser_ard <- ard_dichotomous(
+  data        = adae_ser,
+  variables   = "AESER",
+  by          = "ARM",
+  value       = "Y",
+  denominator = adsl_pop
+)
+ser_ard |> filter(stat_name == "p") |>
+  mutate(pct = map_dbl(stat, 1)) |> select(group1_level, variable_level, pct)
+```
+
+---
+
+## Section 5 — `ard_hierarchical()`: Nested SOC x PT Counts
+
+For AE tables you need *both* SOC-level and PT-level **distinct-subject** counts, with PT counts shown within their SOC context. `ard_hierarchical()` handles the nesting in one call.
+
+```{r hier-demo, echo=TRUE}
+ae_hier <- adae |>
+  filter(TRTEMFL == "Y") |>
+  mutate(ARM = TRT01A) |>
+  ard_hierarchical(
+    by          = "ARM",
+    variables   = c("AEBODSYS","AEDECOD"),   # outermost (SOC) first
+    denominator = adsl |> mutate(ARM = as.character(TRT01P)),
+    id          = "USUBJID"                  # distinct-subject counting
+  )
+
+# SOC-level distinct-subject counts:
+ae_hier |>
+  filter(variable == "AEBODSYS", stat_name == "n") |>
+  mutate(n = map_dbl(stat, 1)) |>
+  select(group1_level, variable_level, n) |>
+  arrange(group1_level, desc(n)) |>
+  head(6)
+```
+
+What you get:
+
+- Rows where `variable == "AEBODSYS"`: distinct-subject counts per (ARM x SOC)
+- Rows where `variable == "AEDECOD"`: distinct-subject counts per (ARM x SOC x PT), with the SOC carried in `group2`/`group2_level`
+
+The counts are *subject-level* (distinct USUBJID), not event-level — the correct metric for "incidence by preferred term."
+
+| | `ard_categorical()` | `ard_hierarchical()` |
+|---|---|---|
+| Hierarchy | Flat — one level | Nested — SOC and PT |
+| PT context | None | PT shown within its SOC (`group2`) |
+| Count type | Rows / subjects | Distinct subjects via `id` |
+
+> **SAS equivalent.** You cannot do this cleanly in one `PROC FREQ`. SAS needs a SOC-level FREQ, a separate PT-level `TABLES ARM*SOC*PT` FREQ, then a `DATA` step to stack and order the hierarchy. `ard_hierarchical()` does it all in one call.
+
+### Practice — PT-level counts within SOC
+
+```{r ex-ard-hierarchical, exercise=TRUE, exercise.lines=16}
+# Build the hierarchical AE ARD, then pull the PT-level (AEDECOD) counts.
+# Notice the SOC travels along in group2_level.
+
+ae_hier <- adae |>
+  filter(TRTEMFL == "Y") |>
+  mutate(ARM = TRT01A) |>
+  ard_hierarchical(
+    by          = "ARM",
+    variables   = c(___, ___),      # "AEBODSYS" then "AEDECOD"
+    denominator = adsl |> mutate(ARM = as.character(TRT01P)),
+    id          = "USUBJID"
+  )
+
+ae_hier |>
+  filter(variable == "AEDECOD", stat_name == "n") |>
+  mutate(n = map_dbl(stat, 1)) |>
+  select(group1_level, group2_level, variable_level, n) |>
+  arrange(desc(n)) |>
+  head(8)
+```
+
+```{r ex-ard-hierarchical-hint-1}
+# variables = c("AEBODSYS","AEDECOD") — outermost (SOC) first, PT second
+```
+
+```{r ex-ard-hierarchical-solution}
+ae_hier <- adae |>
+  filter(TRTEMFL == "Y") |>
+  mutate(ARM = TRT01A) |>
+  ard_hierarchical(
+    by          = "ARM",
+    variables   = c("AEBODSYS","AEDECOD"),
+    denominator = adsl |> mutate(ARM = as.character(TRT01P)),
+    id          = "USUBJID"
+  )
+
+ae_hier |>
+  filter(variable == "AEDECOD", stat_name == "n") |>
+  mutate(n = map_dbl(stat, 1)) |>
+  select(group1_level, group2_level, variable_level, n) |>
+  arrange(desc(n)) |>
+  head(8)
+```
+
+---
+
+## Section 6 — `ard_complex()`: Arbitrary Functions
+
+When the standard constructors do not cover your analysis, `ard_complex()` accepts arbitrary functions that receive the **full data subset** for the group — not just a single vector. This is the key difference from `ard_continuous()` custom statistics: you get access to *every column*, so your statistic can combine variables.
+
+```{r complex-demo, echo=TRUE}
+# Mode of a categorical variable (needs the column, accessed via the data subset)
+get_mode <- function(data, ...) {
+  tbl <- sort(table(data$AGEGR1), decreasing = TRUE)
+  names(tbl)[1]
+}
+
+ard_complex(
+  adsl, by = "TRT01P", variables = "AGEGR1",
+  statistic = list(AGEGR1 = list(mode = get_mode))
+) |>
+  mutate(mode = map_chr(stat, 1)) |>
+  select(group1_level, variable, stat_name, mode)
+```
+
+> **SAS equivalent.** Custom `PROC SQL` aggregates, or a `DATA` step computing a derived statistic across columns.
+
+### Practice — Ratio across two columns
+
+```{r ex-ard-complex, exercise=TRUE, exercise.lines=16}
+# Proportion of female subjects per arm, computed inside a complex function
+# that has access to the whole data subset (SEX column).
+
+female_prop <- function(data, ...) {
+  mean(data$SEX == "F", na.rm = TRUE) * 100
+}
+
+ard_fprop <- ard_complex(
+  data      = adsl,
+  by        = "TRT01P",
+  variables = "SEX",
+  statistic = list(SEX = list(pct_female = ___))   # use the function above
+)
+
+ard_fprop |>
+  mutate(pct_female = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, stat_name, pct_female)
+```
+
+```{r ex-ard-complex-hint-1}
+# statistic = list(SEX = list(pct_female = female_prop))
+```
+
+```{r ex-ard-complex-solution}
+female_prop <- function(data, ...) {
+  mean(data$SEX == "F", na.rm = TRUE) * 100
+}
+
+ard_fprop <- ard_complex(
+  data      = adsl,
+  by        = "TRT01P",
+  variables = "SEX",
+  statistic = list(SEX = list(pct_female = female_prop))
+)
+
+ard_fprop |>
+  mutate(pct_female = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, stat_name, pct_female)
+```
+
+---
+
+## Section 7 — Stacking & Combining: `ard_stack()`, `bind_ard()`, `ard_total_n()`
+
+A real demographics table needs continuous *and* categorical ARDs together, plus Big-N per arm for the column headers.
+
+### `bind_ard()` — combine pre-built ARDs
+
+When ARDs are built in separate calls, `bind_ard()` combines them and **enforces** the ARD structure: any column present in one input but not another is filled in, preventing silent row mis-alignment. Prefer it over `dplyr::bind_rows()`, which does no structure validation.
+
+```{r bind-demo, echo=TRUE}
+ard_age  <- ard_continuous(adsl, by = "TRT01P", variables = "AGE",
+                           statistic = continuous_summary_fns(c("N","mean","sd")))
+ard_sex  <- ard_categorical(adsl, by = "TRT01P", variables = "SEX")
+
+combined <- bind_ard(ard_age, ard_sex)
+combined |> count(context)
+```
+
+### `ard_stack()` with `.by`, `.overall`, `.total_n`
+
+`ard_stack()` runs several constructors against one dataset and combines them, with switches for the things every demographics table needs:
+
+- `.by` — the grouping variable applied across constructors
+- `.overall = TRUE` — adds a complete set of rows with `group1_level = "Overall"` (the "All Subjects" / "Total" column)
+- `.total_n = TRUE` — appends `context = "total_n"`, `stat_name = "N"` rows: the Big-N per arm that becomes the column header subtitle ("Placebo (N=86)")
+
+```{r stack-demo, echo=TRUE}
+demog_ard <- ard_stack(
+  adsl,
+  ard_continuous(adsl, by = "TRT01P", variables = "AGE",
+                 statistic = continuous_summary_fns(c("N","mean","sd"))),
+  ard_categorical(adsl, by = "TRT01P", variables = "SEX"),
+  .by      = "TRT01P",
+  .overall = TRUE,
+  .total_n = TRUE
+)
+
+# The Overall rows and the total_n rows are now present:
+demog_ard |> filter(group1_level == "Overall") |> distinct(context)
+demog_ard |> filter(context == "total_n") |>
+  mutate(N = map_dbl(stat, 1)) |> select(group1_level, N)
+```
+
+> **SAS analogy.** `.overall = TRUE` is like adding a `PROC MEANS` with no `CLASS` after the stratified run and combining the outputs. `.total_n = TRUE` is the Big-N dataset you would compute separately and merge into column headers.
+
+### `ard_total_n()` standalone
+
+`ard_total_n()` produces the Big-N rows on their own — useful when you assemble headers separately.
+
+```{r totaln-demo, echo=TRUE}
+ard_total_n(adsl, by = "TRT01P") |>
+  mutate(N = map_dbl(stat, 1)) |>
+  select(group1_level, stat_name, N)
+```
+
+### Practice — Stack continuous + categorical with Overall and Big-N
+
+```{r ex-stack, exercise=TRUE, exercise.lines=20}
+# Stack a continuous summary (AGE, BMIBL: N/mean/sd) and a categorical summary
+# (SEX, RACE) by TRT01P, adding an Overall column and Big-N rows.
+
+demog <- ard_stack(
+  adsl,
+  ard_continuous(adsl, by = "TRT01P", variables = c("AGE","BMIBL"),
+                 statistic = continuous_summary_fns(c("N","mean","sd"))),
+  ard_categorical(adsl, by = "TRT01P", variables = c("SEX","RACE")),
+  .by      = "TRT01P",
+  .overall = ___,        # add the Overall column
+  .total_n = ___         # add Big-N rows
+)
+
+# Confirm: which contexts and which group levels are present?
+demog |> distinct(context)
+demog |> distinct(group1_level)
+```
+
+```{r ex-stack-hint-1}
+# .overall = TRUE, .total_n = TRUE
+```
+
+```{r ex-stack-solution}
+demog <- ard_stack(
+  adsl,
+  ard_continuous(adsl, by = "TRT01P", variables = c("AGE","BMIBL"),
+                 statistic = continuous_summary_fns(c("N","mean","sd"))),
+  ard_categorical(adsl, by = "TRT01P", variables = c("SEX","RACE")),
+  .by      = "TRT01P",
+  .overall = TRUE,
+  .total_n = TRUE
+)
+
+demog |> distinct(context)
+demog |> distinct(group1_level)
+```
+
+### Practice — Add missingness with `bind_ard()`
+
+```{r ex-bind-miss, exercise=TRUE, exercise.lines=14}
+# Append missingness for AGE and BMIBL to a pre-built demographics ARD
+# using bind_ard(). Then count rows by context.
+
+base_ard <- bind_ard(
+  ard_continuous(adsl, by = "TRT01P", variables = "AGE",
+                 statistic = continuous_summary_fns(c("N","mean","sd"))),
+  ard_categorical(adsl, by = "TRT01P", variables = "SEX")
+)
+
+final_ard <- bind_ard(
+  base_ard,
+  ard_missing(adsl, by = "TRT01P", variables = c(___, ___))
+)
+
+final_ard |> count(context)
+```
+
+```{r ex-bind-miss-hint-1}
+# variables = c("AGE","BMIBL")
+```
+
+```{r ex-bind-miss-solution}
+base_ard <- bind_ard(
+  ard_continuous(adsl, by = "TRT01P", variables = "AGE",
+                 statistic = continuous_summary_fns(c("N","mean","sd"))),
+  ard_categorical(adsl, by = "TRT01P", variables = "SEX")
+)
+
+final_ard <- bind_ard(
+  base_ard,
+  ard_missing(adsl, by = "TRT01P", variables = c("AGE","BMIBL"))
+)
+
+final_ard |> count(context)
+```
+
+---
+
+## Section 8 — Validating & Inspecting ARDs
+
+Three helpers make ARDs production-safe.
+
+### `check_ard_structure()`
+
+Verifies the ARD has the required columns and that `stat` is a list column. Use it as a pipeline gate.
+
+```{r check-demo, echo=TRUE}
+check_ard_structure(ard_demog_cont)   # message on success; error if invalid
+```
+
+### `print_ard_conditions()`
+
+Surfaces every captured warning and error. Captured conditions are silent — they never print unless you ask. Always call this after building a production ARD.
+
+```{r conditions-demo, echo=TRUE}
+ard_with_error <- ard_continuous(
+  adsl, variables = "AGE",
+  statistic = list(mean = function(x) mean(x, na.rm = TRUE),
+                   boom = function(x) stop("deliberate failure"))
+)
+print_ard_conditions(ard_with_error)
+print_ard_conditions(ard_demog_cont)   # clean ARD -> "No conditions found."
+```
+
+### `get_ard_statistics()`
+
+The proper way to pull specific values by filter condition (revisited from Section 2), including grouped extraction with `.by`.
+
+```{r getstats-by, echo=TRUE}
+# Mean AGE per arm as a named list of named lists:
+get_ard_statistics(
+  ard_demog_cont,
+  filter = variable == "AGE" & stat_name == "mean",
+  .by    = "group1_level"
+)
+```
+
+### Practice — Gate a pipeline with `check_ard_structure()`
+
+```{r ex-validate, exercise=TRUE, exercise.lines=12}
+# Build any ARD, validate it, then surface conditions.
+# Use check_ard_structure() and print_ard_conditions().
+
+my_ard <- ard_categorical(adsl, by = "TRT01P", variables = "AGEGR1")
+
+___(my_ard)            # validate column structure (message on success)
+___(my_ard)            # print captured conditions ("No conditions found.")
+```
+
+```{r ex-validate-hint-1}
+# check_ard_structure(my_ard)
+# print_ard_conditions(my_ard)
+```
+
+```{r ex-validate-solution}
+my_ard <- ard_categorical(adsl, by = "TRT01P", variables = "AGEGR1")
+
+check_ard_structure(my_ard)
+print_ard_conditions(my_ard)
+```
+
+### Quiz — validation helpers
+
+```{r quiz-validate, echo=FALSE}
+quiz(caption = "Validating ARDs",
+  question("A colleague's `ard_continuous()` call throws no error but the resulting ARD has wrong statistics. Which TWO helpers should you call to investigate?",
+    answer("check_ard_structure() and print_ard_conditions()",
+           correct = TRUE,
+           message = "check_ard_structure() confirms the shape is valid; print_ard_conditions() surfaces silently-captured warnings/errors that explain NULL or NA stats."),
+    answer("nrow() and ncol()"),
+    answer("summary() and str()"),
+    answer("head() and tail()"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("Why must you call `print_ard_conditions()` explicitly rather than relying on the console?",
+    answer("Because warnings always crash the session"),
+    answer("Because conditions are captured per-row into the warning/error list columns and never auto-print",
+           correct = TRUE,
+           message = "cards captures conditions silently so a single bad statistic does not abort the run. You inspect them on demand."),
+    answer("Because dplyr suppresses all messages"),
+    answer("It is optional and changes nothing"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 9 — Custom Statistics, Deep Dive
+
+Custom statistics are where experienced programmers unlock the full ARD model. Four common patterns:
+
+**Pattern 1 — simple custom function** (vector in, scalar out):
+
+```r
+geometric_mean <- function(x) exp(mean(log(x[x > 0 & !is.na(x)])))
+ard_continuous(adsl, by = "TRT01P", variables = "AGE",
+               statistic = list(geo_mean = geometric_mean))
+```
+
+**Pattern 2 — mixed default + custom** (concatenate `continuous_summary_fns()` with your own):
+
+```r
+ard_continuous(adsl, by = "TRT01P", variables = "AGE",
+  statistic = c(
+    continuous_summary_fns(c("N","mean","sd")),
+    list(cv = function(x) sd(x, na.rm=TRUE) / mean(x, na.rm=TRUE) * 100)
+  ))
+```
+
+**Pattern 3 — functions returning a named list** (multiple values, one per element):
+
+```{r custom-namedlist, echo=TRUE}
+mean_with_ci <- function(x) {
+  m  <- mean(x, na.rm = TRUE)
+  se <- sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x)))
+  list(est = m, ci_low = m - 1.96 * se, ci_high = m + 1.96 * se)
+}
+
+# In the real package each list element becomes its own row; in the mock the
+# whole list lands in one stat cell, which still demonstrates the principle:
+ci_ard <- ard_continuous(adsl, by = "TRT01P", variables = "AGE",
+                         statistic = list(mean_ci = mean_with_ci))
+ci_ard |>
+  filter(group1_level == "Placebo") |>
+  pull(stat) |> getElement(1)
+```
+
+**Pattern 4 — the `continuous_summary_fns()` helper** to avoid hand-writing common functions (shown throughout this lesson).
+
+### Practice — Mixed default + custom statistics
+
+```{r ex-custom-mixed, exercise=TRUE, exercise.lines=14}
+# Combine N/mean/sd from continuous_summary_fns() with a custom CV statistic.
+
+ard_mix <- ard_continuous(
+  data      = adsl,
+  by        = "TRT01P",
+  variables = "BMIBL",
+  statistic = c(
+    continuous_summary_fns(c("N","mean","sd")),
+    list(cv = function(x) ___)        # sd / mean * 100, na.rm = TRUE
+  )
+)
+
+ard_mix |> distinct(stat_name)
+```
+
+```{r ex-custom-mixed-hint-1}
+# cv = function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE) * 100
+```
+
+```{r ex-custom-mixed-solution}
+ard_mix <- ard_continuous(
+  data      = adsl,
+  by        = "TRT01P",
+  variables = "BMIBL",
+  statistic = c(
+    continuous_summary_fns(c("N","mean","sd")),
+    list(cv = function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE) * 100)
+  )
+)
+
+ard_mix |> distinct(stat_name)
+```
+
+---
+
+## Section 10 — The Conceptual Shift for SAS Programmers
+
+If you have spent years writing `PROC FREQ` and `PROC MEANS` outputs flowing straight into RTF macros, the ARD approach feels indirect — you compute numbers into a tibble that does not look like a table yet. The indirection is the point.
+
+| SAS programmer's mental model | ARD-first mental model |
+|---|---|
+| My PROC MEANS **produces the table** | My `ard_continuous()` produces the **numbers**; the table is built separately |
+| I reformat by changing the PROC code | I reformat by changing the display layer; the numbers do not change |
+| Dual programming = run twice, compare RTF | Dual programming = build two ARDs, compare with `dplyr::anti_join()` |
+| My output dataset has columns `MEAN`, `STD` | My ARD has *rows* with `stat_name = "mean"`, `"sd"` |
+| Big-N computed separately and merged | Big-N is `stat_name = "N"` rows, or `.total_n = TRUE` |
+| Hard to re-use calculations | One ARD -> infinite displays |
+
+**The practical test.** Can you answer "what is the mean age in the Placebo arm?" from your analysis artifact without re-running code or reading a formatted table? With an ARD: yes — one filter, one `[[1]]` unwrap. With a traditional TLG: re-run PROC MEANS or OCR the PDF.
+
+### The full ARD-producing constructor catalog
+
+| Function | Input type | Statistic type | SAS equivalent |
+|---|---|---|---|
+| `ard_continuous()` | Numeric variable | N, mean, sd, median, quartiles, min, max | `PROC MEANS` |
+| `ard_categorical()` | Factor/character | n, N, p per level | `PROC FREQ` |
+| `ard_dichotomous()` | Binary variable | n/N/p for one event level | `PROC FREQ` one-level |
+| `ard_hierarchical()` | Nested factors | Nested n, N, p (SOC x PT) | Nested `PROC FREQ` |
+| `ard_complex()` | Any variable + full data | Custom functions | `PROC SQL` custom aggregates |
+| `ard_total_n()` | Any dataset | Total N per group | `PROC FREQ` one-way |
+| `ard_missing()` | Any variable | Missingness statistics | `PROC FREQ` with MISSING |
+| `ard_attributes()` | Variable metadata | Labels, types | `PROC CONTENTS` |
+
+And from `{cardx}` (Lesson 27): `ard_stats_t_test()` (`PROC TTEST`), `ard_stats_chisq_test()` / `ard_stats_fisher_test()` (`PROC FREQ` exact), `ard_regression()` (`PROC REG`/`LOGISTIC`/`PHREG`), `ard_survival_survfit()` (`PROC LIFETEST`), `ard_proportion_ci()`, `ard_continuous_ci()` (`PROC MEANS CLM`), `ard_smd()`.
+
+---
+
+## Key Takeaways
+
+- A `{cards}` ARD has a fixed column set: `group1`/`group1_level` (and `group2`...), `variable`, `variable_level` (categorical only), `stat_name`, `stat_label`, `stat`, `fmt_fn`, `context`, `warning`, `error`.
+- `stat` is a **list column** — unwrap with `[[1]]`, `getElement(1)`, `map_dbl(stat, 1)`, or `get_ard_statistics()`. Never do arithmetic on it directly.
+- `fmt_fn` is also a list column holding advisory display formatters; `warning`/`error` capture conditions per-row so one failure never aborts the run.
+- Four core constructors: `ard_continuous()` (numeric), `ard_categorical()` (factor), `ard_hierarchical()` (nested SOC x PT distinct subjects), `ard_complex()` (arbitrary functions with full-data access).
+- The `denominator` argument is critical for AE incidence — pass the ADSL safety population so N counts *subjects*, not events.
+- Factor-type categorical variables so zero-count levels still appear.
+- `ard_stack()` runs several constructors with `.by`/`.overall`/`.total_n`; `bind_ard()` combines pre-built ARDs with structure enforcement; `ard_total_n()` makes Big-N rows.
+- Validate with `check_ard_structure()`, inspect conditions with `print_ard_conditions()`, and extract values with `get_ard_statistics()`.
+- `continuous_summary_fns()` returns named function lists — limit statistics to only what your SAP requires.
+
+---
+
+## What's Next
+
+**Lesson 26 — `{cards}` Part 2** works through a complete clinical ARD pipeline end to end: demographics, AE incidence, lab change-from-baseline, vital signs, exposure, and concomitant medications. You will build the full set of study ARDs and see how they connect into the display layer that `{gtsummary}` and `{tfrmt}` consume.
+
+---
+
+## Self-Check Questions
+
+1. Why is `stat` a list column rather than a simple numeric column? Name two ways to extract the actual value.
+2. What does `.overall = TRUE` add to an `ard_stack()` result? Which column value identifies those rows?
+3. You need "N, mean, SD of AGE by TRT01P over the safety population." Write the complete `{cards}` call.
+4. Your AE incidence percentages look too high. What is the likely cause, and how does the `denominator` argument fix it?
+5. What is `context`, and why is it useful after `bind_ard()` combines several ARDs?
+6. Translate to cards: `PROC FREQ DATA=adae; TABLES ARM*AEBODSYS*AEDECOD; WHERE TRTEMFL='Y'; RUN;`
+7. A colleague's `ard_continuous()` call throws no error but returns wrong statistics. Which two utility functions investigate this?
+
+---
+
+## Glossary
+
+- **ARD** — Analysis Results Dataset; tidy tibble of computed statistics, one row per statistic.
+- **`stat`** — List column holding the computed value; must be unwrapped to use as a number.
+- **`fmt_fn`** — List column holding the advisory display-formatting function per statistic.
+- **`stat_name`** — Machine-readable statistic key (`"mean"`, `"n"`, `"p"`).
+- **`stat_label`** — Human-readable display label (`"Mean"`, `"n"`, `"%"`).
+- **`context`** — Which `ard_*()` family produced each row.
+- **`group1` / `group1_level`** — Grouping variable name and its value for each row (`group2`... for nesting).
+- **`variable_level`** — For categorical ARDs: the level being counted (e.g. `"F"`).
+- **`warning` / `error`** — List columns holding captured conditions (`NULL` when clean).
+- **`ard_continuous()`** — Summary stats for numeric variables (PROC MEANS).
+- **`ard_categorical()`** — Count/proportion stats for categorical variables (PROC FREQ).
+- **`ard_dichotomous()`** — Counts/proportions for a single event level of a binary variable.
+- **`ard_hierarchical()`** — Nested categorical counts (SOC x PT distinct subjects).
+- **`ard_complex()`** — Custom summaries with arbitrary functions that receive the full data subset.
+- **`ard_missing()`** — Missingness statistics (N_miss, p_miss, N_not_miss).
+- **`ard_total_n()`** — Big-N rows per group (column-header subtitles).
+- **`ard_stack()`** — Run multiple constructors in one call; supports `.by`, `.overall`, `.total_n`.
+- **`bind_ard()`** — Combine pre-built ARDs with structure enforcement.
+- **`denominator`** — Controls N for proportions; pass a data frame for population-based N.
+- **`.overall = TRUE`** — Add an "All Subjects" set of rows to `ard_stack()` output.
+- **`.total_n = TRUE`** — Add Big-N rows per group in `ard_stack()` output.
+- **`continuous_summary_fns()`** — Helper returning a named list of summary functions by name.
+- **`check_ard_structure()`** — Validate ARD column presence and the `stat` list-column type.
+- **`print_ard_conditions()`** — Print any captured warnings and errors.
+- **`get_ard_statistics()`** — Extract named statistic values from an ARD by filter condition.
+- **Big-N** — Total subject count per arm; denominator for all proportion calculations.

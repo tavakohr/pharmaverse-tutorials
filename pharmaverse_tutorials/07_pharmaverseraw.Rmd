@@ -52,19 +52,13 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 tutorial_options(exercise.timelimit = 60)
 
 # ── 1. Raw datasets ───────────────────────────────────────────────────────────
-# Try the real pharmaverseraw package first; fall back to realistic tribbles
-# if the package is not installed in this environment.
+# Curated teaching datasets. NOTE: the real {pharmaverseraw} package (v0.1.1)
+# ships EDC-native column names (STUDY, IT.AETERM, IT.AESEV, no SITEID, …) that
+# do NOT match this lesson's schema or exercises. We therefore always build the
+# curated tribbles below so every exercise (count(SITEID), USUBJID derivation,
+# referential-integrity joins) resolves regardless of installed packages.
 
-if (requireNamespace("pharmaverseraw", quietly = TRUE)) {
-
-  data("ae_raw", package = "pharmaverseraw")
-  data("dm_raw", package = "pharmaverseraw")
-  data("ds_raw", package = "pharmaverseraw")
-  message("pharmaverseraw loaded from package.")
-
-} else {
-
-  message("pharmaverseraw not installed — using built-in fallback datasets.")
+{
 
   # ae_raw: mirrors pharmaverseraw AE structure (PATNUM not USUBJID, no AESEQ,
   # no AEDECOD / AEBODSYS, dates as plain ISO 8601 strings without 'DTC' suffix)
@@ -825,7 +819,9 @@ dm_shell <- dm_raw |>
     BRTHDTC = BRTHDAT,
     RFSTDTC = RFSTDAT
   ) |>
-  select(STUDYID, DOMAIN, USUBJID, RFSTDTC, BRTHDTC, AGE = ?, AGEU, SEX, RACE, ETHNIC, ARM)
+  select(STUDYID, DOMAIN, USUBJID, RFSTDTC, BRTHDTC, AGEU, SEX, RACE, ETHNIC, ARM)
+  # Note: AGE is derived from BRTHDAT (see 6a); it is not a raw dm_raw column,
+  # so it is intentionally omitted here.
 
 # Columns in real SDTM DM not yet in our shell:
 setdiff(names(dm_sdtm_real), names(dm_shell))

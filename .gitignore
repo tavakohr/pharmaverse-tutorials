@@ -17,6 +17,12 @@ renv/staging/
 # Rmd in RStudio. They are not source files — exclude them from version control.
 pharmaverse_tutorials/*.html
 
+# ── Tooling / local agent config ─────────────────────────────────────────────
+# graphify knowledge-graph output and Claude Code workspace config are local
+# tooling artifacts, not tutorial source.
+graphify-out/
+.claude/
+
 # ── General R build artifacts ─────────────────────────────────────────────────
 *.Rout
 *.aux

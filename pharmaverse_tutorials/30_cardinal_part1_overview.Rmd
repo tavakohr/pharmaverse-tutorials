@@ -1,0 +1,978 @@
+---
+title: "Lesson 30 — cardinal Part 1: ARD-First TLG Templates Overview"
+author: "Hamid Tavakoli, MD, MSc"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    css: www/custom.css
+runtime: shiny_prerendered
+description: >
+  Meet cardinal (formerly falcon): the pharmaverse industry initiative that
+  ships a harmonized, openly maintained catalog of Tables, Listings, and Graphs
+  (TLG) templates for clinical reporting. Learn what cardinal is and is not, how
+  it sits on top of the cards / cardx / gtsummary / tfrmt stack, the ARD-first
+  template concept, how to browse and adapt catalog templates, how the catalog
+  relates to NEST and to the emerging CDISC ARS standard, and how to build a
+  basic ARD-backed summary table the cardinal way.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 30_cardinal_part1_overview.Rmd
+# PURPOSE       : cardinal Part 1 — the harmonized TLG catalog. What cardinal is
+#                 (an industry catalog of Quarto templates, not a function
+#                 library), how it sits on cards/cardx/gtsummary/tfrmt, the
+#                 ARD-first template concept, browsing and adapting templates,
+#                 cardinal vs NEST, ARS alignment, and basic ARD table building.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-06-22
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    DTHFL_N = if_else(!is.na(DTHFL) & DTHFL == "Y", 1L, 0L, missing = 0L),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo","Xanomeline Low Dose","Xanomeline High Dose"))
+  ) |>
+  filter(SAFFL == "Y")
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+if (!"TRT01P" %in% names(adae_raw))
+  adae_raw <- left_join(adae_raw, select(adsl, USUBJID, TRT01P), by = "USUBJID")
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARDS BASE MOCKS (replicated from lesson 25)
+#
+# cardinal templates are built on the cards/cardx/gtsummary stack. Those packages
+# may not be installed in this learnr container, so the functions a cardinal
+# template would call are mocked below. The mocks return a `card`-class tibble
+# in the same shape cards uses (group1 / variable / context / stat_name / stat /
+# stat_label). This lets the exercises run standalone and lets you SEE the ARD a
+# cardinal template produces before any display layer is applied.
+# ══════════════════════════════════════════════════════════════════════════════
+
+.ard_row <- function(group1=NA_character_, group1_level=NA_character_,
+                     variable, variable_level=NA_character_,
+                     context, stat_name, stat, stat_label) {
+  tibble(
+    group1         = group1,
+    group1_level   = group1_level,
+    variable       = variable,
+    variable_level = variable_level,
+    context        = context,
+    stat_name      = stat_name,
+    stat           = list(stat),
+    stat_label     = stat_label
+  )
+}
+
+ard_continuous <- function(data, variables, by = NULL,
+                           statistics = list(
+                             N      = function(x) sum(!is.na(x)),
+                             mean   = function(x) mean(x, na.rm=TRUE),
+                             sd     = function(x) sd(x, na.rm=TRUE),
+                             median = function(x) median(x, na.rm=TRUE),
+                             p25    = function(x) quantile(x, 0.25, na.rm=TRUE),
+                             p75    = function(x) quantile(x, 0.75, na.rm=TRUE),
+                             min    = function(x) min(x, na.rm=TRUE),
+                             max    = function(x) max(x, na.rm=TRUE),
+                             n_miss = function(x) sum(is.na(x)),
+                             p_miss = function(x) round(100*mean(is.na(x)),1)
+                           )) {
+  stat_labels <- c(N="N (non-missing)", mean="Mean", sd="SD", median="Median",
+                   p25="Q1 (25th pctile)", p75="Q3 (75th pctile)",
+                   min="Min", max="Max", n_miss="N missing", p_miss="% missing")
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      x   <- sub[[vv]]
+      lapply(names(statistics), function(sn) {
+        val <- tryCatch(statistics[[sn]](x), error=function(e) NA_real_)
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="continuous", stat_name=sn,
+                 stat=val, stat_label=stat_labels[sn])
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class=c("card","tbl_df","tbl","data.frame"))
+}
+
+ard_categorical <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    levs <- sort(unique(as.character(data[[vv]])))
+    levs <- levs[!is.na(levs)]
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      total <- sum(!is.na(sub[[vv]]))
+      lapply(levs, function(lv) {
+        cnt <- sum(sub[[vv]] == lv, na.rm=TRUE)
+        bind_rows(
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="n", stat=cnt, stat_label="n"),
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="p", stat=round(100*cnt/total,1), stat_label="%")
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class=c("card","tbl_df","tbl","data.frame"))
+}
+
+ard_missing <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      x   <- sub[[vv]]
+      bind_rows(
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="missing", stat_name="n_miss",
+                 stat=sum(is.na(x)), stat_label="N missing"),
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="missing", stat_name="p_miss",
+                 stat=round(100*mean(is.na(x)),1), stat_label="% missing"),
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="missing", stat_name="n_not_miss",
+                 stat=sum(!is.na(x)), stat_label="N non-missing")
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class=c("card","tbl_df","tbl","data.frame"))
+}
+
+ard_stack <- function(...) {
+  out <- bind_rows(...)
+  structure(out, class=c("card","tbl_df","tbl","data.frame"))
+}
+
+bind_ard <- function(...) ard_stack(...)
+
+ard_get_stat <- function(ard, stat_nm, var_nm=NULL) {
+  x <- if (!is.null(var_nm)) filter(ard, variable==var_nm) else ard
+  x |> filter(stat_name==stat_nm) |> pull(stat) |> unlist()
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DISPLAY-LAYER MOCK
+#
+# A cardinal template ends with a gtsummary display call such as
+# tbl_ard_summary(). We are not rendering a real gt/flextable here; this mock
+# just turns the ARD into a tidy, human-readable preview tibble so you can see
+# the "shape" of a finished table without installing gtsummary.
+# ══════════════════════════════════════════════════════════════════════════════
+
+tbl_ard_summary <- function(ard, by = NULL, label = NULL, ...) {
+  out <- ard |>
+    mutate(value = vapply(stat, function(s) {
+      if (length(s) == 0 || is.null(s)) NA_character_ else as.character(round_if_num(s))
+    }, character(1))) |>
+    select(any_of(c("group1_level", "variable", "variable_level",
+                    "context", "stat_name", "value")))
+  structure(out, class = c("tbl_ard_preview", "tbl_df", "tbl", "data.frame"))
+}
+
+round_if_num <- function(s) if (is.numeric(s)) round(s, 2) else s
+
+# ── Pre-built objects used in exercises ──────────────────────────────────────
+demo_ard <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","WEIGHTBL","BMIBL"), by = "TRT01P"),
+  ard_categorical(adsl, variables = c("SEX","RACE"),             by = "TRT01P")
+)
+```
+
+## Overview
+
+**cardinal** — formerly called **falcon** — is a pharmaverse **industry initiative**
+rather than a typical R package. Its headline goal is to build and open-source a
+**harmonized catalog** of Tables, Listings, and Graphs (**TLG**) for clinical
+reporting.
+
+The motivating problem is duplication. Every pharma company independently builds
+essentially the same tables. The demographic table at one sponsor looks like the
+demographic table at the next. Each company maintains its own templates, each
+ages slightly differently, each requires its own re-validation, and reviewers see
+slightly different output formats across submissions for what is conceptually the
+same table.
+
+cardinal proposes a different model: **one industry catalog** of TLG templates,
+openly maintained, validated against the FDA Standard Safety Tables and Figures
+guidance, that any sponsor can copy and adapt.
+
+> **Origin.** cardinal was founded in 2023 with Roche, Boehringer Ingelheim,
+> Moderna, and Sanofi. It was renamed from `{falcon}` to `{cardinal}` in 2024
+> with broader pharmaverse alignment. The maintainer pool keeps growing.
+
+### Lesson map
+
+| Section | Topic |
+|---------|-------|
+| 1 | What cardinal is — and is not |
+| 2 | The catalog model (Quarto, not `library(cardinal)`) |
+| 3 | The Cardinal-future stack: cards / cardx / gtsummary / tfrmt / crane |
+| 4 | The ARD-first template concept |
+| 5 | Anatomy of a catalog template |
+| 6 | Catalog categories and how to browse |
+| 7 | Building a basic ARD the cardinal way |
+| 8 | Customizing a template for your study |
+| 9 | Contributing a template back |
+| 10 | cardinal vs NEST, and CDISC ARS alignment |
+
+---
+
+## Section 1 — What cardinal is (and isn't)
+
+The single most important thing to understand about cardinal is what kind of
+thing it is.
+
+cardinal is **not** a function library you install and call. You do **not** write
+`library(cardinal)` and then call `cardinal::make_table()`. There is a small
+`{cardinal}` R package that hosts catalog *infrastructure*, but that is not the
+primary interaction model.
+
+Instead, cardinal is a **Quarto-based catalog** of TLG templates, browsable as a
+website:
+
+```
+https://pharmaverse.github.io/cardinal/
+```
+
+You **read** the catalog and **copy** templates into your study. The interaction
+model is: browse → copy → adapt → render.
+
+> **Mental model.** Think of cardinal less like a toolbox and more like a
+> recipe book. The recipes (templates) are written, validated, and curated by the
+> industry; you copy a recipe and cook it with your own ingredients (your study's
+> ADaM data).
+
+```{r quiz-s1, echo=FALSE}
+quiz(
+  question(
+    "Which statement best describes how you interact with cardinal?",
+    answer("Install it with install.packages() and call cardinal::make_table()"),
+    answer("Browse a Quarto catalog website, copy a template, and adapt it to your study", correct=TRUE),
+    answer("Add it as an admiral extension and derive variables with it"),
+    answer("Submit your data to a cardinal server which returns finished RTFs"),
+    allow_retry = TRUE
+  ),
+  question(
+    "cardinal was previously known as:",
+    answer("falcon", correct=TRUE),
+    answer("tern"),
+    answer("chevron"),
+    answer("rtables"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — The catalog model
+
+Each entry in the catalog is a Quarto document (`index.qmd`) showing:
+
+- The **target TLG** — the specific FDA Standard Safety Tables and Figures table
+  being implemented.
+- The **full R code** to produce it.
+- A **rendered preview** of the output.
+- The **packages used** (typically cards, gtsummary, dplyr, sometimes specific
+  therapeutic-area packages).
+- **Notes on customization**.
+
+Templates live under `pharmaverse/cardinal/quarto/catalog/` in the GitHub
+repository, organized by FDA table number and category. Each template is a
+self-contained Quarto document — you can render it on its own before integrating
+it into your study.
+
+### Exercise 2-a — Identify the catalog usage steps
+
+The standard "use the catalog" workflow has the steps below — but two are
+scrambled placeholders. Fix the `___` blanks so the ordered workflow reads
+correctly.
+
+```{r catalog-steps, exercise=TRUE, exercise.lines=10}
+catalog_workflow <- c(
+  "1. Navigate to the cardinal catalog website",
+  "2. Browse the Catalog section and open a relevant template",
+  "3. Read the methodology notes",
+  "4. ___ the .qmd file into your project",
+  "5. Replace test data references with your ___ data",
+  "6. Customize per your SAP, then re-render"
+)
+cat(catalog_workflow, sep = "\n")
+```
+
+```{r catalog-steps-hint-1}
+# Step 4 verb: you COPY the template file.
+# Step 5: you swap pharmaverseadam test data for your STUDY data.
+```
+
+```{r catalog-steps-solution}
+catalog_workflow <- c(
+  "1. Navigate to the cardinal catalog website",
+  "2. Browse the Catalog section and open a relevant template",
+  "3. Read the methodology notes",
+  "4. Copy the .qmd file into your project",
+  "5. Replace test data references with your study data",
+  "6. Customize per your SAP, then re-render"
+)
+cat(catalog_workflow, sep = "\n")
+```
+
+> **Why Quarto?** A Quarto template mixes prose, code, and rendered output in one
+> document. A reviewer reading a template understands both the **methodology**
+> (the *why*) and the **implementation** (the *what*) in a single place. cardinal
+> templates are deliberately documentation-heavy for this reason.
+
+---
+
+## Section 3 — The Cardinal-future stack
+
+cardinal templates are built on what the pharmaverse calls the **Cardinal-future
+TLG stack**. Knowing which layer does what tells you, on sight, what any template
+is doing.
+
+| Layer | Packages | Job |
+|-------|----------|-----|
+| ARD | `{cards}`, `{cardx}` | Compute the **Analysis Results Dataset** — every statistic, tidy and machine-readable |
+| Display | `{gtsummary}`, sometimes `{tfrmt}` | Turn the ARD into a formatted table |
+| Pharma helpers | `{crane}` | Roche-flavoured gtsummary conventions |
+| Test data | `{pharmaverseadam}`, `{pharmaversesdtm}` | CDISCPILOT01 data for examples |
+| Rendering | `{quarto}`, `{rmarkdown}` | Produce the rendered document / RTF |
+
+For graphs (the **G** in TLG), templates additionally use `{ggplot2}` (often with
+`{tern}`-style themes), `{survminer}`, and `{ggsurvfit}` for Kaplan–Meier plots.
+
+Every cardinal template uses **cards** for ARD construction; **most** use
+gtsummary for display; **some** use tfrmt for complex layouts.
+
+```{r quiz-s3, echo=FALSE}
+quiz(
+  question(
+    "In the Cardinal-future stack, which package(s) construct the ARD?",
+    answer("gtsummary"),
+    answer("cards and cardx", correct=TRUE),
+    answer("tfrmt"),
+    answer("crane"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which package is the Roche-flavoured gtsummary helper layer?",
+    answer("crane", correct=TRUE),
+    answer("cardx"),
+    answer("ggsurvfit"),
+    answer("survminer"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 4 — The ARD-first template concept
+
+The defining design choice of the Cardinal-future stack is that it is
+**ARD-first**. An **ARD** (Analysis Results Dataset) is a tidy, long, machine-
+readable table where **one row = one statistic**. Columns describe *which* group,
+*which* variable, *which* level, *what* statistic, and *its value*.
+
+A cardinal template never jumps straight to a formatted table. It always:
+
+1. **Builds an ARD** with cards/cardx (`ard_continuous()`, `ard_categorical()`,
+   `ard_stack()`, …).
+2. **Renders a display** from that ARD with gtsummary (`tbl_ard_summary()`).
+
+This two-step separation is the whole point. The ARD is the submission artifact;
+the display is a *derived rendering* of it. Save the ARD and you have the piece
+CDISC ARS wants (more on that in Section 10).
+
+Below is the structure of a cards-style ARD. The `stat` column is a **list-column**:
+each cell holds the value, which you extract with `unlist(stat)`.
+
+```{r ard-shape, exercise=TRUE, exercise.lines=8}
+# demo_ard is pre-built in setup: continuous + categorical, by TRT01P
+demo_ard |>
+  select(group1_level, variable, variable_level, context, stat_name, stat) |>
+  head(8)
+```
+
+```{r ard-shape-hint-1}
+# Just run it. Note: context is "continuous" or "categorical",
+# one row per statistic, and stat is a list-column.
+```
+
+```{r ard-shape-solution}
+demo_ard |>
+  select(group1_level, variable, variable_level, context, stat_name, stat) |>
+  head(8)
+```
+
+### Exercise 4-a — Build a demographics ARD with ard_stack()
+
+Reproduce the ARD-first first step of a cardinal demographics template: stack a
+continuous ARD (AGE, WEIGHTBL, BMIBL) on top of a categorical ARD (SEX, RACE),
+stratified by treatment arm.
+
+```{r build-ard, exercise=TRUE, exercise.lines=12}
+my_demo_ard <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","WEIGHTBL","BMIBL"), by = "___"),
+  ard_categorical(adsl, variables = c("SEX","RACE"),             by = "___")
+)
+
+# How many rows came from each context?
+my_demo_ard |>
+  count(___)
+```
+
+```{r build-ard-hint-1}
+# by = "TRT01P" in both calls
+# count(context) shows continuous vs categorical contributions
+```
+
+```{r build-ard-solution}
+my_demo_ard <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","WEIGHTBL","BMIBL"), by = "TRT01P"),
+  ard_categorical(adsl, variables = c("SEX","RACE"),             by = "TRT01P")
+)
+
+my_demo_ard |>
+  count(context)
+```
+
+### Exercise 4-b — Extract a single statistic from the ARD
+
+From the pre-built `demo_ard`, pull the mean AGE for the Placebo arm. Remember
+`stat` is a list-column.
+
+```{r extract-stat, exercise=TRUE, exercise.lines=8}
+demo_ard |>
+  filter(variable == "AGE", stat_name == "___", group1_level == "___") |>
+  pull(stat) |>
+  unlist()
+```
+
+```{r extract-stat-hint-1}
+# stat_name == "mean"; group1_level == "Placebo"
+```
+
+```{r extract-stat-solution}
+demo_ard |>
+  filter(variable == "AGE", stat_name == "mean", group1_level == "Placebo") |>
+  pull(stat) |>
+  unlist()
+```
+
+---
+
+## Section 5 — Anatomy of a catalog template
+
+A typical cardinal template `index.qmd` is documentation-heavy. Paraphrased, it
+looks like this:
+
+````
+---
+title: "FDA Table 14.2.1: Demographics and Baseline Characteristics"
+---
+
+## Description
+This template implements the FDA Standard Safety Tables and Figures
+demographics table...
+
+## Required Packages
+library(cards); library(cardx); library(gtsummary); library(dplyr)
+library(pharmaverseadam)
+
+## ADaM Inputs
+- adsl: Subject-Level Analysis Dataset filtered to the safety population
+
+## Code
+adsl <- pharmaverseadam::adsl |> filter(SAFFL == "Y")
+ard  <- ard_stack(adsl, ard_continuous(...), ard_categorical(...), .by = TRT01A)
+tbl  <- ard |> tbl_ard_summary(...) |> bold_labels()
+tbl
+
+## Output
+[rendered table preview]
+
+## Customization Notes
+- For studies with crossover, replace TRT01A with TRT01P or TRTSEQA
+- Adjust footnote for sponsor terminology...
+````
+
+The five recurring sections — **Description**, **Required Packages**, **ADaM
+Inputs**, **Code**, **Output**, **Customization Notes** — make every template
+self-explanatory. The *why* is treated as importantly as the *what*.
+
+```{r quiz-s5, echo=FALSE}
+quiz(
+  question(
+    "A cardinal template is documentation-heavy primarily because:",
+    answer("Quarto requires extensive YAML"),
+    answer("A reader must understand both the methodology and the implementation to adapt and validate it", correct=TRUE),
+    answer("FDA mandates a fixed prose length"),
+    answer("gtsummary cannot run without prose"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 6 — Catalog categories
+
+The catalog organizes templates by TLG category:
+
+- **fda-table_xx** — FDA Standard Safety Tables (the canonical baseline)
+- **demographics** — demographics-focused tables
+- **adverse-events** — AE summary tables
+- **exposure** — exposure summary tables
+- **laboratory** — lab tables
+- **vital-signs** — VS summaries
+- **survival** — survival analyses
+- **subgroup** — subgroup forest plots and similar
+- **listings** — subject-level listings
+
+Each category has multiple entries, and the catalog is still growing — always
+check the website for current coverage.
+
+> The **fda-table_xx** category is the one to anchor on. If your CSR's tables are
+> aligned to the FDA guide (most are, increasingly), those templates are a
+> drop-in starting point. Part 2 of this lesson walks the most-used FDA safety
+> table patterns in detail.
+
+---
+
+## Section 7 — Building a basic ARD-backed table
+
+Let's do the full ARD-first round trip the cardinal way: build the ARD, then send
+it to the display layer. In a real template the display step is `tbl_ard_summary()`
+from gtsummary; here the setup chunk mocks that function to return a tidy preview
+so the round trip runs standalone.
+
+```{r basic-table, exercise=TRUE, exercise.lines=14}
+# Step 1 — build the ARD (ARD-first)
+ard <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","BMIBL"), by = "TRT01P"),
+  ard_categorical(adsl, variables = "SEX",            by = "TRT01P")
+)
+
+# Step 2 — send the ARD to the display layer
+tbl <- tbl_ard_summary(ard, by = "TRT01P")
+
+# Preview just the continuous AGE rows
+tbl |>
+  filter(variable == "___", context == "continuous") |>
+  select(group1_level, stat_name, value)
+```
+
+```{r basic-table-hint-1}
+# variable == "AGE"
+# The display layer is fed the ARD; it never recomputes the statistics.
+```
+
+```{r basic-table-solution}
+ard <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","BMIBL"), by = "TRT01P"),
+  ard_categorical(adsl, variables = "SEX",            by = "TRT01P")
+)
+
+tbl <- tbl_ard_summary(ard, by = "TRT01P")
+
+tbl |>
+  filter(variable == "AGE", context == "continuous") |>
+  select(group1_level, stat_name, value)
+```
+
+### Exercise 7-a — Confirm the display did not recompute
+
+A core ARD-first guarantee: the display layer reads pre-computed statistics; it
+does not re-run the math. Verify that the mean SEX="F" percentage shown in the
+table preview equals the value already sitting in the ARD.
+
+```{r no-recompute, exercise=TRUE, exercise.lines=16}
+ard <- ard_categorical(adsl, variables = "SEX", by = "TRT01P")
+tbl <- tbl_ard_summary(ard, by = "TRT01P")
+
+from_ard <- ard |>
+  filter(variable == "SEX", variable_level == "F",
+         stat_name == "p", group1_level == "Placebo") |>
+  pull(stat) |>
+  unlist()
+
+from_tbl <- tbl |>
+  filter(variable == "SEX", variable_level == "F",
+         stat_name == "p", group1_level == "Placebo") |>
+  pull(___)
+
+c(from_ard = from_ard, from_tbl = as.numeric(from_tbl))
+```
+
+```{r no-recompute-hint-1}
+# The display preview stores the rendered statistic in the `value` column.
+```
+
+```{r no-recompute-solution}
+ard <- ard_categorical(adsl, variables = "SEX", by = "TRT01P")
+tbl <- tbl_ard_summary(ard, by = "TRT01P")
+
+from_ard <- ard |>
+  filter(variable == "SEX", variable_level == "F",
+         stat_name == "p", group1_level == "Placebo") |>
+  pull(stat) |>
+  unlist()
+
+from_tbl <- tbl |>
+  filter(variable == "SEX", variable_level == "F",
+         stat_name == "p", group1_level == "Placebo") |>
+  pull(value)
+
+c(from_ard = from_ard, from_tbl = as.numeric(from_tbl))
+```
+
+---
+
+## Section 8 — Customizing a template
+
+cardinal templates are **starting points**, not finished products. They need
+adaptation for your study. The four most common customizations:
+
+**Replace test data with study data**
+
+```r
+# cardinal template (test data)
+adsl <- pharmaverseadam::adsl
+
+# your version (study data)
+adsl <- haven::read_xpt("path/to/adsl.xpt")
+```
+
+**Adjust filtering for sponsor populations**
+
+```r
+# cardinal default
+adsl <- adsl |> filter(SAFFL == "Y")
+
+# sponsor with a custom analysis flag
+adsl <- adsl |> filter(SAFFL == "Y" & ANL01FL == "Y")
+```
+
+**Apply sponsor styling**
+
+```r
+theme_gtsummary_compact()    # cardinal default
+my_sponsor_theme()           # sponsor-internal theme function
+```
+
+**Adjust footnotes for sponsor terminology** — replace cardinal's generic
+footnotes with your sponsor's SOP-required text. Purely cosmetic, but important
+for SOP compliance.
+
+### Exercise 8-a — Re-point a template's population filter
+
+A copied template filters ADSL to the safety population. Your sponsor requires
+*both* `SAFFL == "Y"` and the diabetes sub-population flag `DIABFL == "Y"`.
+Adjust the filter, then count subjects per arm.
+
+```{r custom-filter, exercise=TRUE, exercise.lines=10}
+adsl_custom <- adsl |>
+  filter(SAFFL == "Y" & ___ == "Y")
+
+adsl_custom |>
+  count(TRT01P)
+```
+
+```{r custom-filter-hint-1}
+# The sponsor sub-population flag here is DIABFL.
+```
+
+```{r custom-filter-solution}
+adsl_custom <- adsl |>
+  filter(SAFFL == "Y" & DIABFL == "Y")
+
+adsl_custom |>
+  count(TRT01P)
+```
+
+> Notice the *pattern* did not change — only the filter. That is the cardinal
+> value proposition: the validated structure stays; you change the inputs.
+
+---
+
+## Section 9 — Contributing a template back
+
+The cardinal initiative explicitly invites contributions. To add a template:
+
+1. Fork the `pharmaverse/cardinal` GitHub repo.
+2. Create a new folder in `quarto/catalog/` with a unique name
+   (e.g., `lab-creatinine-shift_01`).
+3. Add `index.qmd` following the template structure (description, packages, code,
+   output, notes).
+4. Add a `result.png` snapshot of the rendered output.
+5. Open a pull request.
+
+The cardinal team reviews and merges. Reviewer feedback typically focuses on:
+
+- **Methodology correctness** — does it match the FDA guide or a referenced standard?
+- **Code quality** — does it use the Cardinal-future stack, is it readable, error-free?
+- **Documentation completeness** — can a new programmer understand and adapt it?
+
+> The contribution model encourages broad participation. If your sponsor has a
+> useful TLG template that aligns with the FDA guide, contributing it benefits
+> the whole industry — and your name appears as the contributor.
+
+```{r quiz-s9, echo=FALSE}
+quiz(
+  question(
+    "What does a cardinal contributor open to add a template to the catalog?",
+    answer("A CRAN submission"),
+    answer("A GitHub pull request against pharmaverse/cardinal", correct=TRUE),
+    answer("A CDISC change-control ticket"),
+    answer("An FDA pre-submission meeting request"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Reviewer feedback on a contributed template usually does NOT focus on:",
+    answer("Methodology correctness vs the FDA guide"),
+    answer("Code quality and readability"),
+    answer("Documentation completeness"),
+    answer("Whether the template is faster than the equivalent SAS macro", correct=TRUE),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 10 — cardinal vs NEST, and CDISC ARS alignment
+
+### cardinal vs NEST
+
+A natural question: how does cardinal relate to Roche's **NEST** initiative
+(rtables / tern / chevron, covered in a later module)?
+
+| | NEST (legacy stack) | cardinal (future stack) |
+|---|---|---|
+| Maturity | Mature, production-proven | New, growing |
+| Form | All-in-one packages | Templates, not monolithic packages |
+| Built on | rtables → tern → chevron (+ r2rtf) | cards + cardx + gtsummary + tfrmt + ggplot |
+| Best for | Highly customized / exotic layouts (esp. oncology) | Standard FDA-aligned tables; easy to adapt and validate |
+| Direction | Existing pipelines maintained | Preferred for new starts; ARS-aligned |
+
+Both stacks coexist. Many sponsors use rtables/tern for complex tables and
+gtsummary for everything else. Strategically, cardinal is positioned to take on
+NEST's role for new development, especially as CDISC ARS becomes more central.
+Existing rtables pipelines won't be rewritten overnight — but new starts will
+likely prefer Cardinal-future.
+
+### CDISC ARS alignment
+
+CDISC's **Analysis Results Standard (ARS)** is emerging as the regulatory
+direction. ARS expects:
+
+- A machine-readable **ARD** as part of every submission.
+- The ARD linked to metadata describing how each statistic was computed.
+- The ARD linked to the rendered table for verification.
+
+Because cardinal templates are **ARD-first**, they produce both an ARD (via cards)
+and a display (via gtsummary). If you save the intermediate ARD object, you
+already have the ARS-ready artifact — the display is just a derived rendering.
+
+When ARS becomes a formal submission requirement (anticipated 2026–2027),
+cardinal-built tables are positioned to be ARS-compliant out of the box. Legacy
+stack tables would need additional work to generate the corresponding ARDs.
+
+### Exercise 10-a — Save the ARS-ready artifact
+
+The ARD object — not the rendered table — is the ARS submission artifact. From a
+demographics ARD, confirm it is a tidy long table by reporting its row count and
+the distinct `context` values it contains.
+
+```{r ars-artifact, exercise=TRUE, exercise.lines=10}
+ars_artifact <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","BMIBL"), by = "TRT01P"),
+  ard_categorical(adsl, variables = c("SEX","RACE"),  by = "TRT01P")
+)
+
+list(
+  n_rows   = nrow(ars_artifact),
+  contexts = ___(ars_artifact$context)
+)
+```
+
+```{r ars-artifact-hint-1}
+# Use unique() on the context column to list the distinct contexts.
+```
+
+```{r ars-artifact-solution}
+ars_artifact <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","BMIBL"), by = "TRT01P"),
+  ard_categorical(adsl, variables = c("SEX","RACE"),  by = "TRT01P")
+)
+
+list(
+  n_rows   = nrow(ars_artifact),
+  contexts = unique(ars_artifact$context)
+)
+```
+
+```{r quiz-s10, echo=FALSE}
+quiz(
+  question(
+    "Why is cardinal well-positioned for the CDISC ARS standard?",
+    answer("It generates RTF faster than rtables"),
+    answer("Its ARD-first templates produce a machine-readable ARD as the primary artifact, with the display as a derived rendering", correct=TRUE),
+    answer("It is the only stack FDA accepts"),
+    answer("It avoids gtsummary entirely"),
+    allow_retry = TRUE
+  ),
+  question(
+    "cardinal and NEST relate how?",
+    answer("cardinal replaced NEST entirely in 2024"),
+    answer("They coexist; NEST suits exotic layouts, cardinal suits standard FDA-aligned tables and is the likely future direction for new work", correct=TRUE),
+    answer("NEST is a subset of cardinal"),
+    answer("They are competing closed-source products"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Lesson Summary
+
+| Concept | Takeaway |
+|---------|----------|
+| What cardinal is | An industry catalog of TLG templates, not a function library |
+| Interaction model | Browse → copy → adapt → render (Quarto `.qmd` files) |
+| Underlying stack | cards / cardx (ARD) + gtsummary / tfrmt (display) + crane |
+| ARD-first | Build the ARD, then render a display from it |
+| Primary source | FDA Standard Safety Tables and Figures Integrated Guide |
+| vs NEST | Coexist; cardinal is the future-leaning, ARS-aligned choice |
+| ARS | The saved ARD is the submission artifact |
+
+### Key takeaways
+
+- **cardinal** (formerly **falcon**) is a pharmaverse industry initiative
+  providing a harmonized, openly maintained catalog of TLG templates.
+- It is **not** an R package you call — it is a Quarto-based template repository
+  browsed on a website. You copy templates into your study.
+- Templates implement the FDA Standard Safety Tables and Figures Integrated Guide,
+  one table at a time, organized by FDA table number and category.
+- Templates are built on the **Cardinal-future stack**: cards + cardx for the ARD,
+  gtsummary (sometimes tfrmt) for display, crane for Roche helpers.
+- The design is **ARD-first**: always build the ARD, then render a display from
+  it. The ARD is the submission artifact.
+- Use pattern: browse → copy → adapt. Customizations are usually cosmetic
+  (population filter, footnotes, table numbering, styling).
+- Contribution is open: fork, add a template, open a PR.
+- cardinal coexists with NEST (the rtables/tern/chevron stack) and is aligned with
+  the emerging CDISC ARS standard.
+
+### What's next
+
+**Lesson 31 — cardinal Part 2: FDA Safety Table Templates** walks through the
+most heavily-used cardinal templates (Demographics, AE Overview, AE by SOC/PT,
+Lab Shift, Serious-AE listings, subgroup forest plots), showing the recurring
+ARD-first patterns you will see across the catalog and the customizations a
+sponsor typically applies. After Part 2 we move to **Lesson 32 — tfrmt**, the
+display metadata layer for complex multi-dimensional tables.
+
+---
+
+## Self-check questions
+
+1. Why is cardinal described as a *catalog* rather than an R package?
+2. Which industry guide is the primary source for cardinal's safety table templates?
+3. Name three packages in the Cardinal-future stack and what each does.
+4. What does "ARD-first" mean, and why does it matter for CDISC ARS?
+5. What is the difference between cardinal and Roche's NEST stack?
+6. How would you contribute a new template to the cardinal catalog?
+
+## Glossary
+
+- **cardinal** — Industry harmonized catalog of TLG templates (formerly `falcon`).
+- **TLG** — Tables, Listings, and Graphs.
+- **ARD** — Analysis Results Dataset; tidy long table where one row = one statistic.
+- **ARD-first** — Build the ARD first, then derive the display from it.
+- **FDA Standard Safety Tables and Figures** — FDA guide documenting canonical
+  safety table layouts; cardinal's primary source.
+- **Cardinal-future stack** — cards + cardx + gtsummary + tfrmt + crane + ggplot.
+- **cards / cardx** — Packages that compute ARDs.
+- **gtsummary** — Renders an ARD into a formatted table (`tbl_ard_summary()`).
+- **tfrmt** — Display metadata layer for complex/multi-dimensional tables (Lesson 32).
+- **crane** — Roche extension for pharma-specific gtsummary patterns.
+- **NEST** — Roche-led legacy TLG stack (rtables, tern, chevron).
+- **CDISC ARS** — Analysis Results Standard; emerging CDISC framework for ARD-based reporting.
+- **Quarto** — Documentation/publishing framework; cardinal templates are Quarto documents.
+- **Catalog** — The browsable collection of templates on the cardinal website.
+- **Template** — A single `.qmd` file implementing one TLG; copyable into your study.

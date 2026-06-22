@@ -1,0 +1,2624 @@
+---
+title: "Lesson 32 — tfrmt: Display Metadata & Table Formatting"
+author: "Hamid Tavakoli, MD, MSc"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    css: www/custom.css
+runtime: shiny_prerendered
+description: >
+  The complete tfrmt lesson: separate table-formatting metadata from ARD data
+  with frmt(), frmt_combine(), frmt_structure(), body_plan(), col_plan(),
+  row_grp_plan(), page_plan(), spanning_structure(), and tfrmt() spec objects.
+  Reshape ARDs with ard_to_tfrmt(), preview with mock_df(), render with
+  print_to_gt(), and polish the final display with the gt package
+  (cols_label, tab_header, tab_spanner, fmt_number, tab_style, gtsave).
+  Capstone ties ARD -> tfrmt -> gt -> RTF for a submission-style table.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 32_tfrmt.Rmd
+# PURPOSE       : tfrmt display metadata + table formatting (consolidated):
+#                 frmt(), frmt_combine(), frmt_structure(), body_plan(),
+#                 col_plan(), row_grp_plan(), page_plan(), spanning_structure(),
+#                 tfrmt() spec objects, ard_to_tfrmt() conversion, mock_df()
+#                 shell sign-off, print_to_gt() / as_rtf() rendering, and gt
+#                 display formatting (cols_label, tab_header, tab_spanner,
+#                 fmt_number, tab_style, gtsave) for regulatory TLF automation.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-06-22
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL", "WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX == "F", round(rnorm(n, 161, 7)), round(rnorm(n, 174, 8)))
+  wt <- ifelse(adsl_raw$SEX == "F", round(rnorm(n, 68, 12), 1), round(rnorm(n, 82, 14), 1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL = ht, WEIGHTBL = wt,
+                                  BMIBL = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL = round(WEIGHTBL / (HEIGHTBL / 100)^2, 1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo", "Xanomeline Low Dose", "Xanomeline High Dose"))
+  ) |>
+  filter(SAFFL == "Y")
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+advs <- pharmaverseadam::advs
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARDS MOCKS — ard_continuous, ard_categorical, ard_missing, ard_stack
+# (replicated so exercises run without the real cards package installed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+.ard_row <- function(group1 = NA_character_, group1_level = NA_character_,
+                     variable, variable_level = NA_character_,
+                     context, stat_name, stat, stat_label) {
+  tibble(
+    group1         = group1,
+    group1_level   = group1_level,
+    variable       = variable,
+    variable_level = variable_level,
+    context        = context,
+    stat_name      = stat_name,
+    stat           = list(stat),
+    stat_label     = stat_label
+  )
+}
+
+ard_continuous <- function(data, variables, by = NULL,
+                           statistics = list(
+                             N      = function(x) sum(!is.na(x)),
+                             mean   = function(x) mean(x, na.rm = TRUE),
+                             sd     = function(x) sd(x, na.rm = TRUE),
+                             median = function(x) median(x, na.rm = TRUE),
+                             min    = function(x) min(x, na.rm = TRUE),
+                             max    = function(x) max(x, na.rm = TRUE),
+                             n_miss = function(x) sum(is.na(x)),
+                             p_miss = function(x) round(100 * mean(is.na(x)), 1)
+                           )) {
+  stat_labels <- c(N = "N (non-missing)", mean = "Mean", sd = "SD",
+                   median = "Median", min = "Min", max = "Max",
+                   n_miss = "N missing", p_miss = "% missing")
+  groups <- if (!is.null(by)) unique(as.character(data[[by]])) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      x   <- sub[[vv]]
+      lapply(names(statistics), function(sn) {
+        val <- tryCatch(statistics[[sn]](x), error = function(e) NA_real_)
+        .ard_row(group1 = if (!is.null(by)) by else NA_character_,
+                 group1_level = gl, variable = vv, context = "continuous",
+                 stat_name = sn, stat = val, stat_label = stat_labels[sn])
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+ard_categorical <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) unique(as.character(data[[by]])) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    levs <- sort(unique(as.character(data[[vv]])))
+    levs <- levs[!is.na(levs)]
+    lapply(groups, function(gl) {
+      sub   <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      total <- sum(!is.na(sub[[vv]]))
+      lapply(levs, function(lv) {
+        cnt <- sum(sub[[vv]] == lv, na.rm = TRUE)
+        bind_rows(
+          .ard_row(group1 = if (!is.null(by)) by else NA_character_,
+                   group1_level = gl, variable = vv, variable_level = lv,
+                   context = "categorical", stat_name = "n", stat = cnt, stat_label = "n"),
+          .ard_row(group1 = if (!is.null(by)) by else NA_character_,
+                   group1_level = gl, variable = vv, variable_level = lv,
+                   context = "categorical", stat_name = "p",
+                   stat = round(100 * cnt / max(total, 1), 1), stat_label = "%")
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+ard_missing <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) unique(as.character(data[[by]])) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      x   <- sub[[vv]]
+      bind_rows(
+        .ard_row(group1 = if (!is.null(by)) by else NA_character_,
+                 group1_level = gl, variable = vv, context = "missing",
+                 stat_name = "n_miss", stat = sum(is.na(x)), stat_label = "N missing"),
+        .ard_row(group1 = if (!is.null(by)) by else NA_character_,
+                 group1_level = gl, variable = vv, context = "missing",
+                 stat_name = "p_miss", stat = round(100 * mean(is.na(x)), 1),
+                 stat_label = "% missing")
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+ard_stack <- function(...) {
+  out <- bind_rows(...)
+  structure(out, class = c("card", "tbl_df", "tbl", "data.frame"))
+}
+
+bind_ard <- function(...) ard_stack(...)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TFRMT FUNCTION MOCKS
+# (the real tfrmt package is not assumed installed; these mocks reproduce its
+#  API surface so all exercises run and print sensibly)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# frmt: defines how a single number is printed
+frmt <- function(expression = "xx", missing = "", ...) {
+  structure(list(expression = expression, missing = missing, extra = list(...)),
+            class = "frmt")
+}
+
+print.frmt <- function(x, ...) {
+  cat(sprintf("<frmt> expression=\"%s\"  missing=\"%s\"\n",
+              x$expression, x$missing))
+  invisible(x)
+}
+
+# frmt_combine: combines multiple frmts into a composite cell (e.g., "n (%)")
+frmt_combine <- function(expression, ..., missing = "") {
+  parts <- list(...)
+  structure(list(expression = expression, parts = parts, frmts = parts,
+                 missing = missing),
+            class = "frmt_combine")
+}
+
+print.frmt_combine <- function(x, ...) {
+  cat(sprintf("<frmt_combine> expression=\"%s\"\n", x$expression))
+  invisible(x)
+}
+
+# frmt_structure: pairs frmt/frmt_combine objects with group/label selectors
+frmt_structure <- function(group_val = NULL, label_val = NULL,
+                            frmt_combine = NULL, ...) {
+  frmts <- c(list(frmt_combine), list(...))
+  frmts <- frmts[!vapply(frmts, is.null, logical(1))]
+  structure(list(group_val = group_val, label_val = label_val, frmts = frmts),
+            class = "frmt_structure")
+}
+
+# body_plan: collects frmt_structures that govern row display
+body_plan <- function(...) {
+  structures <- list(...)
+  structure(list(structures = structures), class = "body_plan")
+}
+
+# Length / [[ for body_plan so length() and bp[[i]] still work as in lesson 29
+length.body_plan <- function(x) length(x$structures)
+`[[.body_plan`    <- function(x, i) x$structures[[i]]
+
+# col_plan: defines column ordering / renaming / spanners
+col_plan <- function(...) {
+  args <- list(...)
+  structure(list(columns = args), class = "col_plan")
+}
+
+# tfrmt: the master table spec object. substitute() is called directly here
+# (not via a helper) so bare unquoted column names work:
+#   tfrmt(param = param, ...)  or  tfrmt(param = "col", ...)
+tfrmt <- function(label = NULL, param = NULL, value = NULL,
+                  column = NULL, group = NULL,
+                  big_n = NULL, title = NULL,
+                  body_plan = NULL, col_plan = NULL,
+                  row_grp_plan = NULL, page_plan = NULL,
+                  footnote_plan = NULL, ...) {
+  .s2c <- function(s) {
+    if (is.null(s)) return(NULL)
+    if (is.character(s)) return(s)
+    deparse(s)
+  }
+  label_v  <- .s2c(substitute(label))
+  param_v  <- .s2c(substitute(param))
+  value_v  <- .s2c(substitute(value))
+  column_v <- .s2c(substitute(column))
+  group_v  <- .s2c(substitute(group))
+  structure(
+    list(
+      label         = label_v,
+      param         = param_v,
+      value         = value_v,
+      column        = column_v,
+      group         = group_v,
+      big_n         = big_n,
+      title         = title,
+      body_plan     = body_plan,
+      col_plan      = col_plan,
+      row_grp_plan  = row_grp_plan,
+      page_plan     = page_plan,
+      footnote_plan = footnote_plan,
+      extra         = list(...)
+    ),
+    class = "tfrmt"
+  )
+}
+
+print.tfrmt <- function(x, ...) {
+  cat("<tfrmt spec>\n")
+  cat(sprintf("  label  : %s\n", x$label  %||% "(not set)"))
+  cat(sprintf("  param  : %s\n", x$param  %||% "(not set)"))
+  cat(sprintf("  value  : %s\n", x$value  %||% "(not set)"))
+  cat(sprintf("  column : %s\n", x$column %||% "(not set)"))
+  cat(sprintf("  group  : %s\n", x$group  %||% "(not set)"))
+  if (!is.null(x$title))
+    cat(sprintf("  title  : %s\n", x$title))
+  if (!is.null(x$body_plan))
+    cat(sprintf("  body_plan   : %d frmt_structure(s)\n",
+                length(x$body_plan$structures)))
+  if (!is.null(x$col_plan))
+    cat(sprintf("  col_plan    : %d column(s)/spanner(s)\n",
+                length(x$col_plan$columns)))
+  if (!is.null(x$row_grp_plan))
+    cat(sprintf("  row_grp_plan: label_loc = %s\n", x$row_grp_plan$label_loc))
+  if (!is.null(x$page_plan))
+    cat(sprintf("  page_plan   : %d page_structure(s), note_loc = %s\n",
+                length(x$page_plan$page_structures), x$page_plan$note_loc))
+  invisible(x)
+}
+
+# big_n_structure: maps Big-N rows into column-header N counts
+big_n_structure <- function(param_val, n_frmt = frmt("N = xx"), ...) {
+  structure(list(param_val = param_val, n_frmt = n_frmt), class = "big_n_structure")
+}
+
+# page_plan: defines pagination for long tables (e.g., AE tables)
+page_plan <- function(..., note_loc = c("above", "below")) {
+  note_loc <- match.arg(note_loc)
+  structure(list(page_structures = list(...), note_loc = note_loc),
+            class = "page_plan")
+}
+
+print.page_plan <- function(x, ...) {
+  cat(sprintf("<page_plan> %d page_structure(s), note_loc = \"%s\"\n",
+              length(x$page_structures), x$note_loc))
+  invisible(x)
+}
+
+page_structure <- function(group_val = NULL, ...) {
+  structure(list(group_val = group_val, extra = list(...)),
+            class = "page_structure")
+}
+
+print.page_structure <- function(x, ...) {
+  cat(sprintf("<page_structure> group_val = %s\n",
+              x$group_val %||% "(all rows on one page)"))
+  invisible(x)
+}
+
+# row_grp_plan: grouping for row-level hierarchies (e.g., SOC > PT)
+row_grp_plan <- function(..., label_loc = c("indented", "column", "spanning")) {
+  label_loc <- match.arg(label_loc)
+  structure(list(structures = list(...), label_loc = label_loc),
+            class = "row_grp_plan")
+}
+
+print.row_grp_plan <- function(x, ...) {
+  cat(sprintf("<row_grp_plan> %d structure(s), label_loc = \"%s\"\n",
+              length(x$structures), x$label_loc))
+  invisible(x)
+}
+
+row_grp_structure <- function(group_val = NULL, label_val = NULL,
+                               indent = c("indented", "column"), ...) {
+  structure(list(group_val = group_val, label_val = label_val, indent = indent[1]),
+            class = "row_grp_structure")
+}
+
+print.row_grp_structure <- function(x, ...) {
+  cat(sprintf("<row_grp_structure> group_val = %s  label_val = %s  indent = %s\n",
+              x$group_val %||% "(none)", x$label_val %||% "(none)", x$indent))
+  invisible(x)
+}
+
+# spanning_structure: add a spanner header above columns
+spanning_structure <- function(...) {
+  structure(list(...), class = "spanning_structure")
+}
+
+print.spanning_structure <- function(x, ...) {
+  lbls <- names(x)
+  cat(sprintf("<spanning_structure> %d spanner(s): %s\n",
+              length(x), paste(lbls, collapse = ", ")))
+  invisible(x)
+}
+
+# footnote_plan / footnote_structure: attach footnotes to matching cells
+footnote_structure <- function(footnote, column_val = NULL, label_val = NULL, ...) {
+  structure(list(footnote = footnote, column_val = column_val,
+                 label_val = label_val), class = "footnote_structure")
+}
+
+footnote_plan <- function(...) {
+  structure(list(...), class = "footnote_plan")
+}
+
+# tfrmt_n_pct: shortcut frmt_combine for n (%)
+tfrmt_n_pct <- function(n_frmt   = frmt("xxx"),
+                         pct_frmt = frmt("xx.x"),
+                         missing  = "0 (---%)") {
+  frmt_combine("{n} ({p}%)", n = n_frmt, p = pct_frmt, missing = missing)
+}
+
+# .apply_frmt: apply a frmt object to a single value (used in Section 1)
+.apply_frmt <- function(val, frmt_obj) {
+  if (inherits(frmt_obj, "frmt")) {
+    if (is.na(val) || is.null(val)) return(frmt_obj$missing)
+    fmt <- frmt_obj$expression
+    if (grepl("\\.", fmt)) {
+      dec <- nchar(sub(".*\\.", "", fmt))
+      return(formatC(as.numeric(val), digits = dec, format = "f"))
+    }
+    return(formatC(as.numeric(val), format = "d"))
+  }
+  as.character(val)
+}
+
+# ard_to_tfrmt: coerces a cards ARD into tfrmt long format
+# (label / label_level / column / param / value)
+ard_to_tfrmt <- function(ard, label_col = "variable",
+                          label_level_col = "variable_level",
+                          column_col = "group1_level",
+                          param_col  = "stat_name",
+                          value_col  = "stat") {
+  ard |>
+    mutate(value = unlist(.data[[value_col]])) |>
+    rename(
+      label       = !!sym(label_col),
+      label_level = !!sym(label_level_col),
+      column      = !!sym(column_col),
+      param       = !!sym(param_col)
+    ) |>
+    select(label, label_level, column, param, value) |>
+    filter(!is.na(column))
+}
+
+# print_to_gt: renders tfrmt spec + data as a display table (returns tibble here)
+print_to_gt <- function(tfrmt_spec, .data, ...) {
+  if (!inherits(tfrmt_spec, "tfrmt"))
+    stop("tfrmt_spec must be a tfrmt object")
+  cat("[print_to_gt()] Rendering tfrmt spec against", nrow(.data), "ARD rows\n")
+  keep <- intersect(c("label", "label_level", "column", "param", "value"),
+                    names(.data))
+  out <- .data |>
+    select(all_of(keep)) |>
+    head(20)
+  cat("[Output preview - first 20 rows of display-ready data]\n")
+  print(out)
+  invisible(out)
+}
+
+# print_mock_gt: render the spec with placeholder cells (no real data)
+print_mock_gt <- function(tfrmt_spec, .data = NULL, ...) {
+  cat("[print_mock_gt()] Blank shell for tfrmt spec (placeholder cells)\n")
+  cat("  label :", tfrmt_spec$label %||% "(not set)",
+      " column:", tfrmt_spec$column %||% "(not set)", "\n")
+  if (!is.null(.data)) {
+    keep <- intersect(c("label", "label_level", "column"), names(.data))
+    shell <- .data |> select(all_of(keep)) |> distinct()
+    cat("  Shell rows:", nrow(shell), "\n")
+    print(head(shell, 10))
+  }
+  cat("[Each data cell would show its format expression, e.g. xx.x (xx.xx)]\n")
+  invisible(tfrmt_spec)
+}
+
+# mock_df: alias-style blank shell generator for biostatistician sign-off
+mock_df <- function(tfrmt_spec, .data = NULL, ...) {
+  cat("[mock_df()] Generating blank shell for tfrmt spec\n")
+  cat("  label     :", tfrmt_spec$label  %||% "(not set)", "\n")
+  cat("  param     :", tfrmt_spec$param  %||% "(not set)", "\n")
+  cat("  column    :", tfrmt_spec$column %||% "(not set)", "\n")
+  if (!is.null(tfrmt_spec$row_grp_plan))
+    cat("  row groups:", tfrmt_spec$row_grp_plan$label_loc, "\n")
+  if (!is.null(tfrmt_spec$page_plan))
+    cat("  pagination: breaks on each page_structure group\n")
+  if (!is.null(.data))
+    cat("  ARD rows  :", nrow(.data), "\n")
+  cat("[Shell would display here - all data cells show format expressions]\n")
+  invisible(tfrmt_spec)
+}
+
+# as_rtf (mock): export gt object to RTF file
+as_rtf <- function(x, filename, ...) {
+  cat(sprintf("[as_rtf()] Would write RTF to: %s\n", filename))
+  invisible(x)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GT MOCKS / STUBS — used if the real gt package is not installed
+# ══════════════════════════════════════════════════════════════════════════════
+
+.gt_available <- requireNamespace("gt", quietly = TRUE)
+
+if (!.gt_available) {
+
+  gt <- function(data, rowname_col = NULL, groupname_col = NULL, ...) {
+    structure(list(data = data, opts = list(...), rowname_col = rowname_col,
+                   groupname_col = groupname_col),
+              class = "gt_tbl")
+  }
+
+  print.gt_tbl <- function(x, ...) {
+    cat("[gt table - install the gt package to render fully]\n\n")
+    print(as.data.frame(x$data), row.names = FALSE)
+    invisible(x)
+  }
+
+  cols_label <- function(.data, ...) {
+    args <- list(...)
+    if (inherits(.data, "gt_tbl")) {
+      .data$opts$col_labels <- c(.data$opts$col_labels, args)
+      cat(sprintf("[cols_label()] Relabelling %d column(s): %s\n",
+                  length(args), paste(names(args), collapse = ", ")))
+    }
+    .data
+  }
+
+  cols_align <- function(.data, align = "left", columns = everything()) {
+    if (inherits(.data, "gt_tbl"))
+      cat(sprintf("[cols_align()] align = \"%s\"\n", align))
+    .data
+  }
+
+  tab_header <- function(.data, title = "", subtitle = NULL) {
+    if (inherits(.data, "gt_tbl")) {
+      .data$opts$title    <- title
+      .data$opts$subtitle <- subtitle
+      cat(sprintf("[tab_header()] title = \"%s\"", title))
+      if (!is.null(subtitle)) cat(sprintf("  subtitle = \"%s\"", subtitle))
+      cat("\n")
+    }
+    .data
+  }
+
+  tab_spanner <- function(.data, label = "", columns = NULL) {
+    if (inherits(.data, "gt_tbl"))
+      cat(sprintf("[tab_spanner()] label = \"%s\"\n", label))
+    .data
+  }
+
+  tab_footnote <- function(.data, footnote = "", locations = NULL) {
+    if (inherits(.data, "gt_tbl")) {
+      .data$opts$footnotes <- c(.data$opts$footnotes, footnote)
+      cat(sprintf("[tab_footnote()] \"%s\"\n", footnote))
+    }
+    .data
+  }
+
+  tab_source_note <- function(.data, source_note = "") {
+    if (inherits(.data, "gt_tbl")) {
+      .data$opts$source_notes <- c(.data$opts$source_notes, source_note)
+      cat(sprintf("[tab_source_note()] \"%s\"\n", source_note))
+    }
+    .data
+  }
+
+  fmt_number <- function(.data, columns = NULL, decimals = 2, ...) {
+    if (inherits(.data, "gt_tbl"))
+      cat(sprintf("[fmt_number()] decimals = %d\n", decimals))
+    .data
+  }
+
+  fmt_percent <- function(.data, columns = NULL, decimals = 1, ...) {
+    if (inherits(.data, "gt_tbl"))
+      cat(sprintf("[fmt_percent()] decimals = %d\n", decimals))
+    .data
+  }
+
+  tab_style <- function(.data, style = NULL, locations = NULL) {
+    if (inherits(.data, "gt_tbl"))
+      cat("[tab_style()] Style rule applied\n")
+    .data
+  }
+
+  tab_options <- function(.data, ...) {
+    args <- list(...)
+    if (inherits(.data, "gt_tbl") && length(args) > 0)
+      cat(sprintf("[tab_options()] %d option(s) set: %s\n",
+                  length(args), paste(names(args), collapse = ", ")))
+    .data
+  }
+
+  gtsave <- function(.data, filename, ...) {
+    cat(sprintf("[gtsave()] Would save to: %s\n", filename))
+    invisible(.data)
+  }
+
+  cells_body <- function(columns = NULL, rows = NULL) {
+    list(type = "cells_body", columns = columns, rows = rows)
+  }
+
+  cells_column_labels <- function(columns = NULL) {
+    list(type = "cells_column_labels", columns = columns)
+  }
+
+  cell_text <- function(weight = NULL, color = NULL, style = NULL, ...) {
+    args <- c(list(weight = weight, color = color, style = style), list(...))
+    args <- args[!vapply(args, is.null, logical(1))]
+    structure(args, class = "cell_text")
+  }
+
+  cell_fill <- function(color = NULL) {
+    structure(list(color = color), class = "cell_fill")
+  }
+
+  everything <- function() NULL
+
+  md <- function(text) text   # markdown passthrough
+
+} else {
+  library(gt)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRE-BUILT OBJECTS USED IN EXERCISES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --- Continuous + categorical demographics ARDs ---
+cont_ard <- ard_continuous(adsl, variables = c("AGE", "BMIBL"), by = "TRT01P")
+cat_ard  <- ard_categorical(adsl, variables = c("SEX", "RACE"), by = "TRT01P")
+demo_ard <- ard_stack(cont_ard, cat_ard)
+
+# tfrmt-ready versions (label / label_level / column / param / value)
+tfrmt_cont <- ard_to_tfrmt(cont_ard)
+tfrmt_demo <- ard_to_tfrmt(demo_ard)
+
+# A complete example tfrmt spec for a 3-arm demographics table
+demo_spec <- tfrmt(
+  param  = "param",
+  value  = "value",
+  label  = "label",
+  column = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = "AGE",   frmt("xx.x")),
+    frmt_structure(label_val = "BMIBL", frmt("xx.x")),
+    frmt_structure(label_val = "SEX",
+      frmt_combine("{n} ({p}%)", n = frmt("xxx"), p = frmt("xx.x"))),
+    frmt_structure(label_val = "RACE",
+      frmt_combine("{n} ({p}%)", n = frmt("xxx"), p = frmt("xx.x")))
+  )
+)
+
+# --- Subject-level AE ARDs (avoid double-counting subjects) ---
+adsl_trt <- adsl |> select(USUBJID, TRT01P)
+
+ae_soc_subj <- adae |>
+  distinct(USUBJID, AESOC) |>
+  left_join(adsl_trt, by = "USUBJID")
+
+ae_pt_subj <- adae |>
+  distinct(USUBJID, AESOC, AEDECOD) |>
+  left_join(adsl_trt, by = "USUBJID")
+
+# Combined SOC categorical + continuous demographics ARD
+ae_ard <- ard_stack(
+  ard_categorical(ae_soc_subj, variables = "AESOC", by = "TRT01P"),
+  ard_continuous(adsl, variables = c("AGE", "WEIGHTBL"), by = "TRT01P")
+)
+
+ae_tfrmt_ready <- ae_ard |>
+  mutate(value = unlist(stat)) |>
+  select(label = variable, label_level = variable_level,
+         column = group1_level, param = stat_name, value) |>
+  filter(!is.na(column))
+
+# PT-level ARD for the capstone
+ae_pt_ard <- ard_categorical(ae_pt_subj, variables = "AEDECOD", by = "TRT01P")
+
+ae_pt_tfrmt_ready <- ae_pt_ard |>
+  mutate(value = unlist(stat)) |>
+  select(label = variable, label_level = variable_level,
+         column = group1_level, param = stat_name, value) |>
+  filter(!is.na(column))
+
+# --- Display tibbles for the gt section ---
+demog_display <- adsl |>
+  group_by(TRT01P) |>
+  summarise(
+    N          = n(),
+    Age_Mean   = round(mean(AGE, na.rm = TRUE), 1),
+    Age_SD     = round(sd(AGE,   na.rm = TRUE), 1),
+    Pct_Female = round(100 * mean(SEX == "F", na.rm = TRUE), 1),
+    .groups    = "drop"
+  )
+
+demog_wide <- demog_display |>
+  mutate(TRT01P = as.character(TRT01P))
+
+ae_counts <- adae |>
+  select(-any_of("TRT01P")) |>
+  left_join(select(adsl, USUBJID, TRT01P), by = "USUBJID") |>
+  group_by(TRT01P, AESOC) |>
+  summarise(n_ae   = n(),
+            n_subj = n_distinct(USUBJID),
+            .groups = "drop") |>
+  pivot_wider(names_from  = TRT01P,
+              values_from = c(n_ae, n_subj),
+              values_fill = 0)
+```
+
+## Overview
+
+**tfrmt** (Table Framework, developed by GSK and contributed to pharmaverse in
+2022) solves a fundamental problem in regulatory reporting: how do you keep a
+table's *format* specification separate from the underlying *data*?
+
+### The core idea
+
+In SAS, a single PROC REPORT call bundles layout, column definitions, format
+statements, and data together. Changing one arm label or one decimal-place
+specification means touching every program. `tfrmt` splits these concerns
+cleanly: the table layout is described as **metadata**, and any ARD with a
+matching shape fills it in.
+
+```
+ ARD data (from cards / cardx)
+        +
+ tfrmt spec object (format metadata)
+        │
+        ▼
+  print_to_gt()    ──►  gt table (HTML / RTF / PDF)
+  print_mock_gt()  ──►  blank shell for sponsor sign-off
+```
+
+The same `tfrmt` spec applies to real study data, to synthetic mock data for
+pre-approval sign-off, and to updated data at database lock — all with **zero
+code changes**.
+
+### Why tfrmt exists (beyond gtsummary)
+
+`gtsummary` (Lesson 27) covers ~70% of standard tables — demographics, AE
+summaries, simple shift tables. tfrmt earns its place for the remaining ~30%:
+
+- **Multi-dimensional column structure** — Visit → Arm → Statistic, three deep
+- **Mock-then-build workflow** — design and review the shell before data exists
+- **Highly bespoke layouts** — sponsor templates that fit no preset
+- **Pure separation of layout from data** — metadata describes; data fills
+
+### tfrmt vs. SAS PROC REPORT
+
+| SAS PROC REPORT | tfrmt |
+|----------------|-------|
+| Column layout in `COLUMN` statement | `col_plan()` |
+| `DEFINE var / DISPLAY FORMAT=` | `frmt("xx.x")` inside `frmt_structure()` |
+| Combining stats in a COMPUTE block | `frmt_combine("{n} ({p}%)", ...)` |
+| Row grouping via `GROUP` / `ORDER` | `row_grp_plan()` |
+| Page breaks via `BREAK` | `page_plan()` |
+| Hard-coded data source | Separate ARD passed to `print_to_gt()` |
+
+### The conceptual pieces of a tfrmt
+
+| Component | What it specifies |
+|---|---|
+| `label` | The row-label column (leftmost column) |
+| `column` | Column variable(s) (e.g., treatment arm) |
+| `param` | The stat-name column in the ARD |
+| `value` | The stat-value column in the ARD |
+| `group` | Row grouping variable(s) |
+| `big_n` | The Big-N row for column headers |
+| `body_plan` | How statistics map to cell formats |
+| `row_grp_plan` | Row group ordering, indentation, spacing |
+| `col_plan` | Column ordering and spanning labels |
+| `page_plan` | Pagination for long tables |
+| `footnote_plan` | Footnotes with positioning |
+
+Most are optional with sensible defaults. The minimum spec sets a few core
+columns plus a `body_plan` and renders.
+
+### ARD structure required by tfrmt
+
+tfrmt expects a long-format data frame with these key columns:
+
+| Column | Maps from (cards ARD) | Meaning |
+|--------|-----------------------|---------|
+| `label` | `variable` | Row label (e.g. "AGE") |
+| `label_level` | `variable_level` | Category level (e.g. "F" for SEX) |
+| `column` | `group1_level` | Column header (e.g. treatment arm) |
+| `param` | `stat_name` | Which statistic (e.g. "mean", "n") |
+| `value` | `unlist(stat)` | The numeric value |
+
+The `ard_to_tfrmt()` helper performs this reshaping automatically.
+
+> All exercises use the **CDISCPILOT01** Alzheimer's / Xanomeline study from
+> `pharmaverseadam` (254 subjects, Safety Population, three treatment arms).
+> Pre-built objects available in the session: `cont_ard`, `cat_ard`, `demo_ard`,
+> `tfrmt_cont`, `tfrmt_demo`, `demo_spec`, `ae_tfrmt_ready`, `ae_pt_tfrmt_ready`,
+> `demog_display`, `demog_wide`, `ae_counts`.
+
+---
+
+## Section 1 — frmt(): Format Expressions
+
+**`frmt()`** defines how a single numeric value is displayed. The `expression`
+argument is a pattern string where `x` represents a digit:
+
+| Expression | Meaning | Example output |
+|------------|---------|----------------|
+| `"xx"` | Integer, 2 digits | `42` |
+| `"xx.x"` | 1 decimal place | `42.3` |
+| `"xx.xx"` | 2 decimal places | `42.31` |
+| `"xx.xxx"` | 3 decimal places | `42.314` |
+
+The `missing` argument controls what is displayed for `NA` values (default `""`).
+
+### Exercise 1-a — Create and inspect a frmt object
+
+```{r s1-frmt-create, exercise=TRUE, exercise.lines=10}
+# Create a frmt with one decimal place
+f1 <- frmt("xx.x")
+
+# Inspect the structure and class
+str(f1)
+class(f1)
+```
+
+```{r s1-frmt-create-hint-1}
+# frmt() returns a list with elements: expression and missing
+# class(f1) should be "frmt"
+```
+
+```{r s1-frmt-create-solution}
+f1 <- frmt("xx.x")
+str(f1)
+class(f1)
+```
+
+### Exercise 1-b — Apply .apply_frmt() and compare decimal places
+
+```{r s1-frmt-apply, exercise=TRUE, exercise.lines=14}
+pi_val <- 3.14159265
+
+# One decimal place
+result_1 <- .apply_frmt(pi_val, frmt("___"))
+
+# Two decimal places
+result_2 <- .apply_frmt(pi_val, frmt("___"))
+
+# Three decimal places
+result_3 <- .apply_frmt(pi_val, frmt("___"))
+
+cat(result_1, "\n", result_2, "\n", result_3, "\n")
+```
+
+```{r s1-frmt-apply-hint-1}
+# "xx.x"   -> one decimal place   -> "3.1"
+# "xx.xx"  -> two decimal places  -> "3.14"
+# "xx.xxx" -> three decimal places -> "3.142"
+```
+
+```{r s1-frmt-apply-solution}
+pi_val <- 3.14159265
+
+result_1 <- .apply_frmt(pi_val, frmt("xx.x"))
+result_2 <- .apply_frmt(pi_val, frmt("xx.xx"))
+result_3 <- .apply_frmt(pi_val, frmt("xx.xxx"))
+
+cat(result_1, "\n", result_2, "\n", result_3, "\n")
+```
+
+### Exercise 1-c — Handle missing values with the missing argument
+
+```{r s1-frmt-missing, exercise=TRUE, exercise.lines=10}
+# Default missing: empty string
+.apply_frmt(NA_real_, frmt("xx.x"))
+
+# Custom missing string
+.apply_frmt(NA_real_, frmt("xx.x", missing = "NC"))
+
+# Real values still format normally
+.apply_frmt(74.2, frmt("xx.x", missing = "NC"))
+```
+
+```{r s1-frmt-missing-hint-1}
+# missing = "NC" is common in regulatory tables (Not Calculable)
+# Real values are unaffected by the missing argument
+```
+
+```{r s1-frmt-missing-solution}
+.apply_frmt(NA_real_, frmt("xx.x"))
+.apply_frmt(NA_real_, frmt("xx.x", missing = "NC"))
+.apply_frmt(74.2, frmt("xx.x", missing = "NC"))
+```
+
+```{r s1-quiz, echo=FALSE}
+quiz(
+  question(
+    "In tfrmt, what does frmt('xx.x') control?",
+    answer("The column width in the output table"),
+    answer("The number of decimal places and display format for a single statistic",
+           correct = TRUE),
+    answer("The row grouping level of a variable"),
+    answer("The column header text"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — frmt_combine(): Multi-Stat Cells
+
+Most clinical table cells contain multiple statistics in one string:
+`"42 (16.7%)"`, `"72.3 (8.1)"`, `"0.034 (0.012, 0.098)"`. **`frmt_combine()`**
+assembles these from individual `frmt()` objects using a glue-style
+`expression` with named placeholders in curly braces.
+
+```
+frmt_combine(
+  expression,     # glue string: "{n} ({p}%)"
+  ...,            # named frmt objects matching placeholders
+  missing = ""
+)
+```
+
+The format-string mini-language is more verbose than a typical R format string
+but is unambiguous: a reviewer can read the body_plan and know exactly how each
+cell displays.
+
+### Exercise 2-a — Create a frmt_combine for n (p%)
+
+```{r s2-combine-np, exercise=TRUE, exercise.lines=10}
+# Standard clinical table cell: "42 (16.7%)"
+np_fmt <- frmt_combine(
+  "___",                  # expression with {n} and {p} placeholders
+  n = frmt("___"),        # integer count
+  p = frmt("___")         # one decimal percentage
+)
+
+str(np_fmt)
+```
+
+```{r s2-combine-np-hint-1}
+# expression = "{n} ({p}%)"
+# n = frmt("xxx")  -- integer count (up to 3 digits)
+# p = frmt("xx.x") -- one decimal place
+```
+
+```{r s2-combine-np-solution}
+np_fmt <- frmt_combine(
+  "{n} ({p}%)",
+  n = frmt("xxx"),
+  p = frmt("xx.x")
+)
+
+str(np_fmt)
+```
+
+### Exercise 2-b — Create a frmt_combine for mean (SD)
+
+```{r s2-combine-mean-sd, exercise=TRUE, exercise.lines=10}
+# Cell format: "72.3 (8.1)"
+mean_sd_fmt <- frmt_combine(
+  "___",
+  mean = frmt("___"),
+  sd   = frmt("___")
+)
+
+class(mean_sd_fmt)
+length(mean_sd_fmt$frmts)   # should be 2 (mean and sd)
+```
+
+```{r s2-combine-mean-sd-hint-1}
+# expression = "{mean} ({sd})"
+# mean = frmt("xx.x"), sd = frmt("xx.x")
+```
+
+```{r s2-combine-mean-sd-solution}
+mean_sd_fmt <- frmt_combine(
+  "{mean} ({sd})",
+  mean = frmt("xx.x"),
+  sd   = frmt("xx.x")
+)
+
+class(mean_sd_fmt)
+length(mean_sd_fmt$frmts)
+```
+
+```{r s2-quiz, echo=FALSE}
+quiz(
+  question(
+    "In frmt_combine('{n} ({p}%)', n=frmt('xxx'), p=frmt('xx.x')), what do the curly braces around n and p signify?",
+    answer("R environment variable lookup"),
+    answer("Named placeholder slots filled by the corresponding frmt objects",
+           correct = TRUE),
+    answer("Optional arguments that can be omitted"),
+    answer("Regular expression capture groups"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 3 — frmt_structure(): Row-Level Formatting Rules
+
+**`frmt_structure()`** attaches a formatting rule to specific rows, identified
+by `group_val` (row group) and/or `label_val` (row label). The special value
+`".default"` matches any group/label not matched by an earlier rule.
+
+```
+frmt_structure(
+  group_val = NULL,    # match on row group value (or ".default")
+  label_val = NULL,    # match on row label value (or ".default")
+  ...                  # one or more frmt / frmt_combine objects
+)
+```
+
+### Exercise 3-a — Attach frmt to the AGE row
+
+```{r s3-struct-age, exercise=TRUE, exercise.lines=10}
+# Format the AGE row to one decimal place
+age_fmt_struct <- frmt_structure(
+  label_val = "___",   # row label in the output table
+  ___                  # frmt object
+)
+
+class(age_fmt_struct)
+age_fmt_struct$label_val
+```
+
+```{r s3-struct-age-hint-1}
+# label_val = "AGE"
+# Pass frmt("xx.x") as the second argument
+```
+
+```{r s3-struct-age-solution}
+age_fmt_struct <- frmt_structure(
+  label_val = "AGE",
+  frmt("xx.x")
+)
+
+class(age_fmt_struct)
+age_fmt_struct$label_val
+```
+
+### Exercise 3-b — Attach frmt_combine to the SEX row
+
+```{r s3-struct-sex, exercise=TRUE, exercise.lines=12}
+# SEX row should display "n (p%)"
+sex_fmt_struct <- frmt_structure(
+  label_val = "___",
+  frmt_combine(
+    "___",
+    n = frmt("___"),
+    p = frmt("___")
+  )
+)
+
+str(sex_fmt_struct)
+```
+
+```{r s3-struct-sex-hint-1}
+# label_val = "SEX", expression = "{n} ({p}%)"
+# n = frmt("xxx"), p = frmt("xx.x")
+```
+
+```{r s3-struct-sex-solution}
+sex_fmt_struct <- frmt_structure(
+  label_val = "SEX",
+  frmt_combine(
+    "{n} ({p}%)",
+    n = frmt("xxx"),
+    p = frmt("xx.x")
+  )
+)
+
+str(sex_fmt_struct)
+```
+
+---
+
+## Section 4 — body_plan(): Assembling the Formatting Plan
+
+**`body_plan()`** collects multiple `frmt_structure()` calls into a single
+formatting plan. Rules are applied top-down; the first matching rule wins, so
+place specific `label_val` rules before any `".default"` catch-all.
+
+### Exercise 4-a — Build a body_plan for a demographics table
+
+```{r s4-body-build, exercise=TRUE, exercise.lines=20}
+demo_body <- body_plan(
+  # AGE: mean to 1 decimal place
+  frmt_structure(label_val = "AGE",   frmt("xx.x")),
+
+  # BMIBL: mean to 1 decimal place
+  frmt_structure(label_val = "BMIBL", frmt("xx.x")),
+
+  # WEIGHTBL: mean to 1 decimal place
+  frmt_structure(label_val = "WEIGHTBL", frmt("___")),
+
+  # SEX: n (p%)
+  frmt_structure(label_val = "SEX",
+    frmt_combine("___", n = frmt("___"), p = frmt("___"))),
+
+  # RACE: n (p%)
+  frmt_structure(label_val = "RACE",
+    frmt_combine("{n} ({p}%)", n = frmt("xxx"), p = frmt("xx.x")))
+)
+
+class(demo_body)
+length(demo_body)   # should be 5
+```
+
+```{r s4-body-build-hint-1}
+# WEIGHTBL: frmt("xx.x")
+# SEX: frmt_combine("{n} ({p}%)", n = frmt("xxx"), p = frmt("xx.x"))
+```
+
+```{r s4-body-build-solution}
+demo_body <- body_plan(
+  frmt_structure(label_val = "AGE",      frmt("xx.x")),
+  frmt_structure(label_val = "BMIBL",    frmt("xx.x")),
+  frmt_structure(label_val = "WEIGHTBL", frmt("xx.x")),
+  frmt_structure(label_val = "SEX",
+    frmt_combine("{n} ({p}%)", n = frmt("xxx"), p = frmt("xx.x"))),
+  frmt_structure(label_val = "RACE",
+    frmt_combine("{n} ({p}%)", n = frmt("xxx"), p = frmt("xx.x")))
+)
+
+class(demo_body)
+length(demo_body)
+```
+
+### Exercise 4-b — Inspect a frmt_structure within the body_plan
+
+```{r s4-body-inspect, exercise=TRUE, exercise.lines=10}
+bp <- body_plan(
+  frmt_structure(label_val = "AGE",   frmt("xx.x")),
+  frmt_structure(label_val = "BMIBL", frmt("xx.x"))
+)
+
+# Access the second frmt_structure and confirm its label_val
+bp[[___]]$label_val
+```
+
+```{r s4-body-inspect-hint-1}
+# body_plan behaves like a list; bp[[2]] gets the second frmt_structure
+```
+
+```{r s4-body-inspect-solution}
+bp <- body_plan(
+  frmt_structure(label_val = "AGE",   frmt("xx.x")),
+  frmt_structure(label_val = "BMIBL", frmt("xx.x"))
+)
+
+bp[[2]]$label_val
+```
+
+---
+
+## Section 5 — tfrmt(): The Spec Object
+
+The **`tfrmt()`** function assembles all pieces — column mapping, body plan,
+column ordering — into one spec object that can be saved, version-controlled,
+and reused. Pass bare unquoted ARD column names (or strings); both work.
+
+```
+tfrmt(
+  param    = param,         # ARD column holding stat_name
+  value    = value,         # ARD column holding numeric value
+  label    = label,         # ARD column holding row label
+  column   = column,        # ARD column holding treatment arm
+  body_plan = body_plan(...),
+  col_plan  = col_plan(...),
+  row_grp_plan = NULL,
+  page_plan    = NULL
+)
+```
+
+### Exercise 5-a — Build a minimal 3-arm demographics tfrmt spec
+
+```{r s5-tfrmt-build, exercise=TRUE, exercise.lines=24}
+my_spec <- tfrmt(
+  param  = ___,      # unquoted column name
+  value  = ___,
+  label  = ___,
+  column = ___,
+  body_plan = body_plan(
+    frmt_structure(label_val = "AGE",   frmt("xx.x")),
+    frmt_structure(label_val = "BMIBL", frmt("xx.x")),
+    frmt_structure(label_val = "SEX",
+                   frmt_combine("{n} ({p}%)",
+                                n = frmt("xxx"), p = frmt("xx.x"))),
+    frmt_structure(label_val = "RACE",
+                   frmt_combine("{n} ({p}%)",
+                                n = frmt("xxx"), p = frmt("xx.x")))
+  )
+)
+
+class(my_spec)
+print(my_spec)
+```
+
+```{r s5-tfrmt-build-hint-1}
+# param = param, value = value, label = label, column = column
+# These are the unquoted column names that ard_to_tfrmt() creates
+```
+
+```{r s5-tfrmt-build-solution}
+my_spec <- tfrmt(
+  param  = param,
+  value  = value,
+  label  = label,
+  column = column,
+  body_plan = body_plan(
+    frmt_structure(label_val = "AGE",   frmt("xx.x")),
+    frmt_structure(label_val = "BMIBL", frmt("xx.x")),
+    frmt_structure(label_val = "SEX",
+                   frmt_combine("{n} ({p}%)",
+                                n = frmt("xxx"), p = frmt("xx.x"))),
+    frmt_structure(label_val = "RACE",
+                   frmt_combine("{n} ({p}%)",
+                                n = frmt("xxx"), p = frmt("xx.x")))
+  )
+)
+
+class(my_spec)
+print(my_spec)
+```
+
+### Exercise 5-b — Add a col_plan to control column order
+
+```{r s5-tfrmt-colplan, exercise=TRUE, exercise.lines=16}
+ordered_spec <- tfrmt(
+  param    = param,
+  value    = value,
+  label    = label,
+  column   = column,
+  col_plan = col_plan(
+    "label",
+    "Placebo",
+    "Xanomeline Low Dose",
+    "Xanomeline High Dose"
+  ),
+  body_plan = body_plan(
+    frmt_structure(label_val = "AGE", frmt("xx.x"))
+  )
+)
+
+# Inspect the col_plan slot
+ordered_spec$col_plan
+```
+
+```{r s5-tfrmt-colplan-hint-1}
+# col_plan() takes column names in display order
+# "label" is the row-label column; arms follow in the preferred order
+```
+
+```{r s5-tfrmt-colplan-solution}
+ordered_spec <- tfrmt(
+  param    = param,
+  value    = value,
+  label    = label,
+  column   = column,
+  col_plan = col_plan(
+    "label",
+    "Placebo",
+    "Xanomeline Low Dose",
+    "Xanomeline High Dose"
+  ),
+  body_plan = body_plan(
+    frmt_structure(label_val = "AGE", frmt("xx.x"))
+  )
+)
+
+ordered_spec$col_plan
+```
+
+```{r s5-quiz, echo=FALSE}
+quiz(
+  question(
+    "What is the main advantage of assembling layout into a saved tfrmt spec object?",
+    answer("It runs faster than PROC REPORT"),
+    answer("The same spec renders mock and real tables identically; only the ARD changes between database cut and lock",
+           correct = TRUE),
+    answer("It validates the ARD against CDISC SDTM rules"),
+    answer("It removes the need for an ARD entirely"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 6 — ard_to_tfrmt(): Converting an ARD
+
+A cards ARD has a list-column `stat` and columns `variable`, `variable_level`,
+`group1_level`, `stat_name`. tfrmt needs a flat data frame with `label`,
+`label_level`, `column`, `param`, `value`. **`ard_to_tfrmt()`** performs this
+reshaping in one step.
+
+> **Important:** `ard_to_tfrmt()` drops rows where `column` (`group1_level`) is
+> `NA` — i.e., unstratified rows. Always pass a `by`-stratified ARD.
+
+### Exercise 6-a — Convert a continuous ARD to tfrmt format
+
+```{r s6-convert-cont, exercise=TRUE, exercise.lines=12}
+# Build the ARD stratified by treatment arm
+age_ard <- ard_continuous(
+  adsl,
+  variables = c("AGE", "BMIBL"),
+  by        = "___"
+)
+
+# Convert to tfrmt format
+age_tfrmt <- ard_to_tfrmt(age_ard)
+
+glimpse(age_tfrmt)
+```
+
+```{r s6-convert-cont-hint-1}
+# by = "TRT01P"
+# Result columns: label, label_level, column, param, value
+```
+
+```{r s6-convert-cont-solution}
+age_ard <- ard_continuous(
+  adsl,
+  variables = c("AGE", "BMIBL"),
+  by        = "TRT01P"
+)
+
+age_tfrmt <- ard_to_tfrmt(age_ard)
+
+glimpse(age_tfrmt)
+```
+
+### Exercise 6-b — Inspect the converted ARD
+
+Use the pre-built `tfrmt_cont`. Filter to `label == "AGE"` and `param == "mean"`
+to verify the three arm means appear as separate rows with different `column`
+values.
+
+```{r s6-convert-inspect, exercise=TRUE, exercise.lines=10}
+tfrmt_cont |>
+  filter(label == "___", param == "___") |>
+  select(label, column, param, value)
+```
+
+```{r s6-convert-inspect-hint-1}
+# label == "AGE", param == "mean"
+# You should see three rows, one per treatment arm
+```
+
+```{r s6-convert-inspect-solution}
+tfrmt_cont |>
+  filter(label == "AGE", param == "mean") |>
+  select(label, column, param, value)
+```
+
+> **The cards `prep_*` family:** The real tfrmt/cards stack also ships
+> `shuffle_card()` (pivots `group1`/`group1_level` into actual columns),
+> `prep_big_n()` (extracts the per-arm subject N for column headers),
+> `prep_combine_vars()` (consolidates several variable names into one column),
+> and `prep_label()` (builds the leftmost row-label column). Our
+> `ard_to_tfrmt()` mock collapses that pipeline into a single reshape so the
+> exercises stay focused on the tfrmt spec itself.
+
+---
+
+## Section 7 — print_to_gt(), print_mock_gt() and mock_df()
+
+**`print_to_gt(spec, .data)`** applies the spec to a tfrmt-ready data frame and
+renders a gt table (in a real session) or a console preview (in this tutorial).
+
+**`print_mock_gt(spec)`** / **`mock_df(spec, .data)`** produce a **blank shell**
+showing structure without values — the artifact circulated for sponsor sign-off
+before database lock. In SAS workflows this is the manually drawn Word table
+shell; tfrmt generates it directly from the spec, guaranteeing the mock and the
+final table share one layout.
+
+### Exercise 7-a — Render the continuous ARD with print_to_gt()
+
+```{r s7-print, exercise=TRUE, exercise.lines=12}
+# Use pre-built tfrmt_cont and demo_spec.
+# Filter to mean rows only for a clean render.
+mean_only <- tfrmt_cont |>
+  filter(param == "___")
+
+print_to_gt(demo_spec, .data = mean_only)
+```
+
+```{r s7-print-hint-1}
+# param == "mean" -- keep only the mean rows
+```
+
+```{r s7-print-solution}
+mean_only <- tfrmt_cont |>
+  filter(param == "mean")
+
+print_to_gt(demo_spec, .data = mean_only)
+```
+
+### Exercise 7-b — Preview the table shell
+
+```{r s7-mock, exercise=TRUE, exercise.lines=8}
+# Generate a blank sign-off shell from the same spec
+mock_df(demo_spec, .data = tfrmt_cont)
+```
+
+```{r s7-mock-hint-1}
+# mock_df() shows distinct label x column combinations without values
+```
+
+```{r s7-mock-solution}
+mock_df(demo_spec, .data = tfrmt_cont)
+```
+
+```{r s7-quiz, echo=FALSE}
+quiz(
+  question(
+    "What is the purpose of the mock (print_mock_gt() / mock_df()) in a TLF workflow?",
+    answer("It generates fake data to test the pipeline before real data arrives"),
+    answer("It produces a blank table shell showing row and column structure for sponsor sign-off before database lock",
+           correct = TRUE),
+    answer("It exports the tfrmt spec to a PDF document"),
+    answer("It checks whether the ARD conforms to CDISC standards"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 8 — row_grp_plan(): Row Group Hierarchies
+
+In an AE summary table the SOC (System Organ Class) is a **group header row**
+and the PT (Preferred Term) rows are **indented beneath it**.
+**`row_grp_plan()`** controls this hierarchy.
+
+```
+NERVOUS SYSTEM DISORDERS          ← SOC header (group row)
+  Headache         12  14  11     ← PT row, indented
+  Dizziness         7   9   6
+GASTROINTESTINAL DISORDERS
+  Nausea           10  12  15
+```
+
+Key arguments:
+
+- `row_grp_plan(row_grp_structure(...), ..., label_loc = "indented")` — outer
+  wrapper. `label_loc = "indented"` keeps group labels in the same column,
+  indented; `"column"` puts them in a separate first column; `"spanning"` makes
+  them a header row across the table.
+- `row_grp_structure(group_val, label_val, indent)` — one structure per level.
+  `group_val` names the ARD column holding the group identifier; `label_val`
+  names the column holding the display label.
+
+### Exercise 8-a — Build a SOC > PT row_grp_plan
+
+```{r s8-rgp-build, exercise=TRUE, exercise.lines=14}
+# group_val = "AESOC"  (system organ class — the group header)
+# label_val = "AEDECOD"  (preferred term — the indented row label)
+rgp <- row_grp_plan(
+  row_grp_structure(
+    group_val = ___,
+    label_val = ___,
+    indent    = "indented"
+  ),
+  label_loc = ___
+)
+
+print(rgp)
+```
+
+```{r s8-rgp-build-hint-1}
+# group_val = "AESOC", label_val = "AEDECOD", label_loc = "indented"
+```
+
+```{r s8-rgp-build-solution}
+rgp <- row_grp_plan(
+  row_grp_structure(
+    group_val = "AESOC",
+    label_val = "AEDECOD",
+    indent    = "indented"
+  ),
+  label_loc = "indented"
+)
+
+print(rgp)
+```
+
+### Exercise 8-b — Inspect the row_grp_plan structure
+
+```{r s8-rgp-inspect, exercise=TRUE, exercise.lines=10}
+rgp <- row_grp_plan(
+  row_grp_structure(group_val = "AESOC", label_val = "AEDECOD",
+                    indent = "indented"),
+  label_loc = "indented"
+)
+
+str(___)
+```
+
+```{r s8-rgp-inspect-hint-1}
+# str(rgp)
+```
+
+```{r s8-rgp-inspect-solution}
+rgp <- row_grp_plan(
+  row_grp_structure(group_val = "AESOC", label_val = "AEDECOD",
+                    indent = "indented"),
+  label_loc = "indented"
+)
+
+str(rgp)
+```
+
+```{r s8-quiz, echo=FALSE}
+quiz(
+  question(
+    "What does label_loc = \"indented\" do in row_grp_plan()?",
+    answer("Puts group labels in a separate leftmost column"),
+    answer("Indents group labels within the existing label column, keeping a single label column",
+           correct = TRUE),
+    answer("Applies bold formatting to group header rows"),
+    answer("Hides the group label entirely"),
+    allow_retry = TRUE
+  ),
+  question(
+    "In a SOC > PT hierarchy, which argument holds the display text for the indented PT rows?",
+    answer("group_val", message = "group_val identifies the grouping variable (SOC level)."),
+    answer("label_val", correct = TRUE,
+           message = "label_val specifies the column whose values become the indented row labels (here AEDECOD)."),
+    answer("indent"),
+    answer("label_loc"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 9 — page_plan(): Pagination for Long Tables
+
+AE tables can run to many pages. **`page_plan()`** tells tfrmt where to insert
+page breaks so each SOC section starts on a new page; `note_loc` controls
+whether footnotes appear above or below each page.
+
+```r
+page_plan(
+  page_structure(group_val = "AESOC"),
+  note_loc = "below"
+)
+```
+
+Each `page_structure()` identifies a grouping value; tfrmt inserts a page break
+whenever that group changes.
+
+### Exercise 9-a — Build a page_plan
+
+```{r s9-pp-build, exercise=TRUE, exercise.lines=12}
+# Break on AESOC, place notes below each page.
+pp <- page_plan(
+  page_structure(group_val = ___),
+  note_loc = ___
+)
+
+print(pp)
+```
+
+```{r s9-pp-build-hint-1}
+# group_val = "AESOC", note_loc = "below"
+```
+
+```{r s9-pp-build-solution}
+pp <- page_plan(
+  page_structure(group_val = "AESOC"),
+  note_loc = "below"
+)
+
+print(pp)
+```
+
+### Exercise 9-b — Combine page_plan with a tfrmt spec
+
+```{r s9-pp-tfrmt, exercise=TRUE, exercise.lines=22}
+# Use ae_tfrmt_ready as the data argument.
+pp <- page_plan(
+  page_structure(group_val = "AESOC"),
+  note_loc = "below"
+)
+
+spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default",
+                   frmt_combine("{n} ({p}%)",
+                                n = frmt("xxx"), p = frmt("xx.x")))
+  ),
+  page_plan = ___
+)
+
+mock_df(spec, ae_tfrmt_ready)
+```
+
+```{r s9-pp-tfrmt-hint-1}
+# page_plan = pp
+```
+
+```{r s9-pp-tfrmt-solution}
+pp <- page_plan(
+  page_structure(group_val = "AESOC"),
+  note_loc = "below"
+)
+
+spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default",
+                   frmt_combine("{n} ({p}%)",
+                                n = frmt("xxx"), p = frmt("xx.x")))
+  ),
+  page_plan = pp
+)
+
+mock_df(spec, ae_tfrmt_ready)
+```
+
+---
+
+## Section 10 — tfrmt_n_pct(): the n (%) Shortcut
+
+Nearly every count cell in a clinical table displays as **n (x.x%)**. Writing
+`frmt_combine("{n} ({p}%)", n = frmt("xxx"), p = frmt("xx.x"))` by hand is
+verbose. **`tfrmt_n_pct()`** is a convenience wrapper producing the same object
+with sensible defaults (including `missing = "0 (---%)"`).
+
+### Exercise 10-a — Compare tfrmt_n_pct() to manual frmt_combine
+
+```{r s10-npct-compare, exercise=TRUE, exercise.lines=16}
+manual <- frmt_combine(
+  "{n} ({p}%)",
+  n = frmt("xxx"),
+  p = frmt("xx.x"),
+  missing = "0 (---%)"
+)
+
+shortcut <- tfrmt_n_pct()
+
+print(manual)
+print(shortcut)
+identical(manual$expression, shortcut$expression)
+```
+
+```{r s10-npct-compare-hint-1}
+# Both print the same expression: "{n} ({p}%)"
+# identical() returns TRUE if the expressions match
+```
+
+```{r s10-npct-compare-solution}
+manual <- frmt_combine(
+  "{n} ({p}%)",
+  n = frmt("xxx"),
+  p = frmt("xx.x"),
+  missing = "0 (---%)"
+)
+
+shortcut <- tfrmt_n_pct()
+
+print(manual)
+print(shortcut)
+identical(manual$expression, shortcut$expression)
+```
+
+### Exercise 10-b — Customise the shortcut
+
+```{r s10-npct-custom, exercise=TRUE, exercise.lines=12}
+# Format n as 4-digit counts ("xxxx") and percentage to 2 decimals ("xx.xx").
+npct_wide <- tfrmt_n_pct(
+  n_frmt   = frmt(___),
+  pct_frmt = frmt(___)
+)
+
+print(npct_wide)
+```
+
+```{r s10-npct-custom-hint-1}
+# n_frmt = frmt("xxxx"), pct_frmt = frmt("xx.xx")
+```
+
+```{r s10-npct-custom-solution}
+npct_wide <- tfrmt_n_pct(
+  n_frmt   = frmt("xxxx"),
+  pct_frmt = frmt("xx.xx")
+)
+
+print(npct_wide)
+```
+
+```{r s10-quiz, echo=FALSE}
+quiz(
+  question(
+    "What does the missing argument in tfrmt_n_pct() control?",
+    answer("The label displayed when a row has no subjects (e.g. n = 0)",
+           correct = TRUE,
+           message = "missing = \"0 (---%)\" is the default, shown when n = 0 or the statistic is NA."),
+    answer("Whether to omit rows entirely when n = 0"),
+    answer("The placeholder text shown in the mock shell"),
+    answer("The number of decimal places for missing-data imputations"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 11 — spanning_structure(): Column Spanners
+
+A **column spanner** is a merged header cell above a group of columns. In a lab
+table with visits Week 2/4/8 under each treatment arm, you would span the visit
+columns under each arm label. **`spanning_structure()`** is passed inside the
+`col_plan()` of a `tfrmt()` spec: name the spanner label, give a vector of the
+columns beneath it.
+
+> In the real package, `col_plan()` also supports the `>` operator —
+> `"Week 24" > c("Placebo", "Active")` — to nest arms under visit spanners. The
+> mock here uses the equivalent `spanning_structure()` form.
+
+### Exercise 11-a — Build a single spanner
+
+```{r s11-span-build, exercise=TRUE, exercise.lines=20}
+# Three visit columns "W02","W04","W08" under one spanner "Treatment Visits".
+ss <- spanning_structure(
+  "Treatment Visits" = c("W02", "W04", "W08")
+)
+
+print(ss)
+
+spec_span <- tfrmt(
+  label     = "label",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  col_plan  = col_plan(___),
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", frmt("xx.x"))
+  )
+)
+
+print(spec_span)
+```
+
+```{r s11-span-build-hint-1}
+# col_plan(spanning_structure("Treatment Visits" = c("W02","W04","W08")))
+```
+
+```{r s11-span-build-solution}
+ss <- spanning_structure(
+  "Treatment Visits" = c("W02", "W04", "W08")
+)
+
+print(ss)
+
+spec_span <- tfrmt(
+  label     = "label",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  col_plan  = col_plan(spanning_structure("Treatment Visits" = c("W02", "W04", "W08"))),
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", frmt("xx.x"))
+  )
+)
+
+print(spec_span)
+```
+
+### Exercise 11-b — Two spanners (one per arm)
+
+```{r s11-span-multi, exercise=TRUE, exercise.lines=18}
+# Active visits: "XLD_W02","XLD_W04" ; Placebo visits: "PBO_W02","PBO_W04"
+spec_two_span <- tfrmt(
+  label     = "label",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  col_plan  = col_plan(
+    spanning_structure(___ = c("XLD_W02", "XLD_W04")),
+    spanning_structure(___ = c("PBO_W02", "PBO_W04"))
+  ),
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", frmt("xx.x"))
+  )
+)
+
+print(spec_two_span)
+```
+
+```{r s11-span-multi-hint-1}
+# spanning_structure("Xanomeline Low Dose" = c("XLD_W02","XLD_W04"))
+# spanning_structure("Placebo" = c("PBO_W02","PBO_W04"))
+```
+
+```{r s11-span-multi-solution}
+spec_two_span <- tfrmt(
+  label     = "label",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  col_plan  = col_plan(
+    spanning_structure("Xanomeline Low Dose" = c("XLD_W02", "XLD_W04")),
+    spanning_structure("Placebo" = c("PBO_W02", "PBO_W04"))
+  ),
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", frmt("xx.x"))
+  )
+)
+
+print(spec_two_span)
+```
+
+---
+
+## Section 12 — Clinical Table Templates
+
+Real submissions follow recurring patterns. Rather than building every spec from
+scratch, clinical programmers maintain **template specs** that are parameterised
+and reused across studies. Here you build three standard templates.
+
+### Exercise 12-a — Demographics template
+
+```{r s12-tmpl-demog, exercise=TRUE, exercise.lines=24}
+# Rows: AGE (mean (SD)), all others n (%).
+# label_val = "AGE"      -> frmt_combine("{m} ({s})", m=frmt("xx.x"), s=frmt("xx.xx"))
+# label_val = ".default" -> tfrmt_n_pct()
+demog_spec_tmpl <- tfrmt(
+  label     = "label",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(
+      label_val = ___,
+      frmt_combine("{m} ({s})", m = frmt("xx.x"), s = frmt("xx.xx"))
+    ),
+    frmt_structure(
+      label_val = ___,
+      ___
+    )
+  )
+)
+
+print(demog_spec_tmpl)
+```
+
+```{r s12-tmpl-demog-hint-1}
+# label_val = "AGE" for the mean (SD) format
+# label_val = ".default" with tfrmt_n_pct() for everything else
+```
+
+```{r s12-tmpl-demog-solution}
+demog_spec_tmpl <- tfrmt(
+  label     = "label",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(
+      label_val = "AGE",
+      frmt_combine("{m} ({s})", m = frmt("xx.x"), s = frmt("xx.xx"))
+    ),
+    frmt_structure(
+      label_val = ".default",
+      tfrmt_n_pct()
+    )
+  )
+)
+
+print(demog_spec_tmpl)
+```
+
+### Exercise 12-b — AE summary template
+
+```{r s12-tmpl-ae, exercise=TRUE, exercise.lines=24}
+# All cells tfrmt_n_pct(); SOC > PT row grouping; then render.
+ae_spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", tfrmt_n_pct())
+  ),
+  row_grp_plan = row_grp_plan(
+    row_grp_structure(
+      group_val = ___,
+      label_val = ___,
+      indent    = "indented"
+    ),
+    label_loc = "indented"
+  )
+)
+
+print_to_gt(ae_spec, ___)
+```
+
+```{r s12-tmpl-ae-hint-1}
+# group_val = "AESOC", label_val = "AEDECOD"
+# print_to_gt(ae_spec, ae_tfrmt_ready)
+```
+
+```{r s12-tmpl-ae-solution}
+ae_spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", tfrmt_n_pct())
+  ),
+  row_grp_plan = row_grp_plan(
+    row_grp_structure(
+      group_val = "AESOC",
+      label_val = "AEDECOD",
+      indent    = "indented"
+    ),
+    label_loc = "indented"
+  )
+)
+
+print_to_gt(ae_spec, ae_tfrmt_ready)
+```
+
+### Exercise 12-c — Lab shift template
+
+```{r s12-tmpl-lab, exercise=TRUE, exercise.lines=28}
+# Baseline (BTOXGR) x worst post-baseline (ATOXGR) ALT grade counts.
+shift_counts <- adlb |>
+  filter(!is.na(BTOXGR), !is.na(ATOXGR), PARAMCD == "ALT") |>
+  mutate(
+    BTOXGR_label = paste0("Baseline Grade ", BTOXGR),
+    ATOXGR_label = paste0("Post Grade ",     ATOXGR)
+  ) |>
+  group_by(BTOXGR_label, ATOXGR_label) |>
+  summarise(value = n_distinct(USUBJID), .groups = "drop") |>
+  mutate(param = "n", label = BTOXGR_label, column = ATOXGR_label) |>
+  select(label, column, param, value)
+
+shift_spec <- tfrmt(
+  label     = ___,
+  param     = ___,
+  value     = ___,
+  column    = ___,
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", frmt("xxx"))
+  )
+)
+
+print_to_gt(shift_spec, shift_counts)
+```
+
+```{r s12-tmpl-lab-hint-1}
+# label = "label", param = "param", value = "value", column = "column"
+```
+
+```{r s12-tmpl-lab-solution}
+shift_counts <- adlb |>
+  filter(!is.na(BTOXGR), !is.na(ATOXGR), PARAMCD == "ALT") |>
+  mutate(
+    BTOXGR_label = paste0("Baseline Grade ", BTOXGR),
+    ATOXGR_label = paste0("Post Grade ",     ATOXGR)
+  ) |>
+  group_by(BTOXGR_label, ATOXGR_label) |>
+  summarise(value = n_distinct(USUBJID), .groups = "drop") |>
+  mutate(param = "n", label = BTOXGR_label, column = ATOXGR_label) |>
+  select(label, column, param, value)
+
+shift_spec <- tfrmt(
+  label     = "label",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", frmt("xxx"))
+  )
+)
+
+print_to_gt(shift_spec, shift_counts)
+```
+
+---
+
+## Section 13 — The mock workflow & shell sign-off
+
+The "mock first" workflow is signature pharma:
+
+```
+1. Statistician designs the table structure (rows, columns, statistics)
+2. Programmer builds a tfrmt object encoding the design
+3. Programmer renders mock_df() / print_mock_gt() — an empty-shell version
+4. Sponsor reviews and approves the layout
+5. Programmer builds the ARD via cards/cardx
+6. Programmer renders print_to_gt(ard) — same tfrmt, now filled with real values
+```
+
+The tfrmt object is the single source of truth for layout. Layout review happens
+once; data changes don't break the layout; mock and real are guaranteed to match
+in structure. In a gtsummary workflow, layout is intermingled with the data, so
+producing a faithful mock without dummy data is awkward.
+
+### Exercise 13-a — Generate a full AE shell
+
+```{r s13-mock-shell, exercise=TRUE, exercise.lines=22}
+ae_tfrmt_spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", tfrmt_n_pct())
+  ),
+  row_grp_plan = row_grp_plan(
+    row_grp_structure(group_val = "AESOC", label_val = "AEDECOD",
+                      indent = "indented"),
+    label_loc = "indented"
+  ),
+  page_plan = page_plan(
+    page_structure(group_val = "AESOC"),
+    note_loc = "below"
+  )
+)
+
+mock_df(___, ___)
+```
+
+```{r s13-mock-shell-hint-1}
+# mock_df(ae_tfrmt_spec, ae_tfrmt_ready)
+```
+
+```{r s13-mock-shell-solution}
+ae_tfrmt_spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", tfrmt_n_pct())
+  ),
+  row_grp_plan = row_grp_plan(
+    row_grp_structure(group_val = "AESOC", label_val = "AEDECOD",
+                      indent = "indented"),
+    label_loc = "indented"
+  ),
+  page_plan = page_plan(
+    page_structure(group_val = "AESOC"),
+    note_loc = "below"
+  )
+)
+
+mock_df(ae_tfrmt_spec, ae_tfrmt_ready)
+```
+
+### Exercise 13-b — Review the shell row labels
+
+```{r s13-mock-review, exercise=TRUE, exercise.lines=8}
+# A reviewer checks: are all expected row labels present?
+# How many unique label_level values (row labels) exist in ae_tfrmt_ready?
+ae_tfrmt_ready |>
+  ___(label_level) |>
+  nrow()
+```
+
+```{r s13-mock-review-hint-1}
+# distinct(label_level) then nrow()
+```
+
+```{r s13-mock-review-solution}
+ae_tfrmt_ready |>
+  distinct(label_level) |>
+  nrow()
+```
+
+---
+
+## Section 14 — gt: Polishing the Final Display
+
+tfrmt renders **through** `gt` (the *grammar of tables*). Once `print_to_gt()`
+hands you a gt object — or whenever tfrmt's layout cannot express the exact
+cosmetic detail your SAP requires — you reach for gt directly to control titles,
+spanners, footnotes, number formatting, conditional styling, and file export.
+
+gt is also the engine under `gtsummary`, so the same verbs apply across the
+modern TLG stack. Every gt pipeline starts with a data frame and chains
+pipe-composable verbs:
+
+```
+data frame
+  |> gt()                   # create gt table object
+  |> cols_label()           # rename column headers
+  |> tab_header()           # add title and subtitle
+  |> tab_spanner()          # group columns under a shared header
+  |> tab_footnote()         # add footnotes
+  |> tab_source_note()      # add source reference
+  |> fmt_number()           # format numeric cells
+  |> tab_style()            # conditional cell/text formatting
+  |> tab_options()          # global style options
+  |> gtsave("output.rtf")   # export to file
+```
+
+Two pre-built display tibbles are available: `demog_display` and `demog_wide`
+(N, mean age, SD age, % female by arm) and `ae_counts` (AE counts by SOC).
+
+### Exercise 14-a — gt() and cols_label()
+
+```{r s14-gt-labels, exercise=TRUE, exercise.lines=16}
+# Create a gt table and rename columns to human-readable labels.
+demog_display |>
+  gt() |>
+  cols_label(
+    TRT01P     = ___,
+    N          = ___,
+    Age_Mean   = ___,
+    Age_SD     = ___,
+    Pct_Female = ___
+  )
+```
+
+```{r s14-gt-labels-hint-1}
+# cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+#            Age_SD = "SD", Pct_Female = "% Female")
+# Note: column name on the LEFT, new label string on the RIGHT.
+```
+
+```{r s14-gt-labels-solution}
+demog_display |>
+  gt() |>
+  cols_label(
+    TRT01P     = "Treatment",
+    N          = "N",
+    Age_Mean   = "Mean Age",
+    Age_SD     = "SD",
+    Pct_Female = "% Female"
+  )
+```
+
+### Exercise 14-b — Title, footnote, and source note
+
+```{r s14-gt-header, exercise=TRUE, exercise.lines=18}
+# Add a title/subtitle, a footnote for SD, and a source note.
+demog_display |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  tab_header(
+    title    = ___,
+    subtitle = "Summary of Demographics (Safety Population)"
+  ) |>
+  tab_footnote(footnote    = ___) |>
+  tab_source_note(source_note = ___)
+```
+
+```{r s14-gt-header-hint-1}
+# title = "Table 14.1.1"
+# tab_footnote(footnote = "SD = Standard Deviation")
+# tab_source_note(source_note = "Source: ADSL; Safety Population (SAFFL = Y)")
+```
+
+```{r s14-gt-header-solution}
+demog_display |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  tab_header(
+    title    = "Table 14.1.1",
+    subtitle = "Summary of Demographics (Safety Population)"
+  ) |>
+  tab_footnote(footnote    = "SD = Standard Deviation") |>
+  tab_source_note(source_note = "Source: ADSL; Safety Population (SAFFL = Y)")
+```
+
+### Exercise 14-c — tab_spanner(): grouping columns
+
+```{r s14-gt-spanner, exercise=TRUE, exercise.lines=18}
+# Add an "Age Statistics" spanner above Age_Mean and Age_SD.
+demog_wide |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  tab_spanner(
+    label   = ___,
+    columns = c(___, ___)
+  )
+```
+
+```{r s14-gt-spanner-hint-1}
+# label = "Age Statistics", columns = c(Age_Mean, Age_SD)
+```
+
+```{r s14-gt-spanner-solution}
+demog_wide |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  tab_spanner(
+    label   = "Age Statistics",
+    columns = c(Age_Mean, Age_SD)
+  )
+```
+
+### Exercise 14-d — fmt_number() vs fmt_percent()
+
+> **Clinical gotcha:** `Pct_Female` already holds values like `47.1` (a
+> percentage, not a proportion). Use `fmt_number()` on it. `fmt_percent()`
+> multiplies by 100 and is only for true proportions (0–1).
+
+```{r s14-gt-fmt, exercise=TRUE, exercise.lines=14}
+# Format Age_Mean and Age_SD to 1 decimal; Pct_Female to 1 decimal (already a %).
+demog_wide |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  fmt_number(columns = c(___, ___), decimals = ___) |>
+  fmt_number(columns = ___, decimals = ___)
+```
+
+```{r s14-gt-fmt-hint-1}
+# fmt_number(columns = c(Age_Mean, Age_SD), decimals = 1)
+# fmt_number(columns = Pct_Female, decimals = 1)
+```
+
+```{r s14-gt-fmt-solution}
+demog_wide |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  fmt_number(columns = c(Age_Mean, Age_SD), decimals = 1) |>
+  fmt_number(columns = Pct_Female, decimals = 1)
+```
+
+### Exercise 14-e — tab_style(): conditional formatting
+
+`tab_style()` takes a `style` (what: `cell_text(weight = "bold")`,
+`cell_fill(color = ...)`) and `locations` (where: `cells_column_labels()`,
+`cells_body(rows = ...)`).
+
+```{r s14-gt-style, exercise=TRUE, exercise.lines=20}
+# Bold all column headers, then highlight rows where Age_Mean > 75.
+demog_wide |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  tab_style(
+    style     = cell_text(weight = ___),
+    locations = ___()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#FFFACD"),
+    locations = cells_body(rows = ___)
+  )
+```
+
+```{r s14-gt-style-hint-1}
+# weight = "bold"; locations = cells_column_labels()
+# cells_body(rows = Age_Mean > 75)
+```
+
+```{r s14-gt-style-solution}
+demog_wide |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#FFFACD"),
+    locations = cells_body(rows = Age_Mean > 75)
+  )
+```
+
+### Exercise 14-f — tab_options() and gtsave()
+
+`tab_options()` sets table-wide defaults; `gtsave()` writes the file, inferring
+the format from the extension. For submissions, **RTF** is the standard because
+it imports cleanly into Word-based CSR publishing workflows.
+
+```{r s14-gt-save, exercise=TRUE, exercise.lines=18}
+# Set font size 10 and bold headers, then save as RTF.
+demog_wide |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  tab_options(
+    table.font.size           = ___,
+    column_labels.font.weight = ___
+  ) |>
+  gtsave(filename = ___)
+```
+
+```{r s14-gt-save-hint-1}
+# table.font.size = 10, column_labels.font.weight = "bold"
+# gtsave(filename = "Table_14_1_1.rtf")
+```
+
+```{r s14-gt-save-solution}
+demog_wide |>
+  gt() |>
+  cols_label(TRT01P = "Treatment", N = "N", Age_Mean = "Mean Age",
+             Age_SD = "SD", Pct_Female = "% Female") |>
+  tab_options(
+    table.font.size           = 10,
+    column_labels.font.weight = "bold"
+  ) |>
+  gtsave(filename = "Table_14_1_1.rtf")
+```
+
+```{r s14-quiz, echo=FALSE}
+quiz(
+  question(
+    "A column pct_resp holds values like 42.3 (already a percentage). Which formatter?",
+    answer("fmt_percent()", message = "fmt_percent() multiplies by 100, so 42.3 would show as 4230%."),
+    answer("fmt_number()", correct = TRUE,
+           message = "The value is already a percentage; fmt_number() controls decimals without rescaling."),
+    answer("fmt_integer()"),
+    answer("fmt_scientific()"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which gtsave() extension produces a Word-importable submission table?",
+    answer(".html"),
+    answer(".pdf"),
+    answer(".rtf", correct = TRUE,
+           message = "RTF imports directly into Word-based CSR publishing workflows."),
+    answer(".xlsx"),
+    allow_retry = TRUE
+  ),
+  question(
+    "How do tfrmt and gt divide labour in the modern TLG stack?",
+    answer("They are competitors; pick one and never mix them"),
+    answer("tfrmt describes layout metadata and renders via gt; gt provides the final display polish and file export",
+           correct = TRUE),
+    answer("gt builds the ARD; tfrmt formats it"),
+    answer("tfrmt is for HTML only; gt is for RTF only"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 15 — Capstone: ARD → tfrmt → gt → RTF
+
+Bring everything together. Build a **submission-style AE table** end-to-end: an
+ARD, a tfrmt spec with row grouping and pagination, a mock for sign-off, the
+rendered table, and an RTF export — then show how gt would add the final
+display polish.
+
+### Exercise 15-a — Inspect the PT-level ARD
+
+```{r s15-cap-ard, exercise=TRUE, exercise.lines=10}
+# ae_pt_tfrmt_ready was built in setup. Confirm its shape.
+ae_pt_tfrmt_ready |> distinct(label_level) |> nrow()   # unique PTs
+ae_pt_tfrmt_ready |> distinct(___) |> nrow()           # treatment arms
+ae_pt_tfrmt_ready |> distinct(param)                   # should be n and p
+```
+
+```{r s15-cap-ard-hint-1}
+# distinct(column) for the treatment arm count
+```
+
+```{r s15-cap-ard-solution}
+ae_pt_tfrmt_ready |> distinct(label_level) |> nrow()
+ae_pt_tfrmt_ready |> distinct(column) |> nrow()
+ae_pt_tfrmt_ready |> distinct(param)
+```
+
+### Exercise 15-b — Build the complete AE spec
+
+```{r s15-cap-spec, exercise=TRUE, exercise.lines=30}
+# body_plan: tfrmt_n_pct() for all rows
+# row_grp_plan: SOC (group_val) > PT (label_val), indented
+# page_plan: break on AESOC, notes below
+ae_full_spec <- tfrmt(
+  label     = "label_level",
+  param     = ___,
+  value     = ___,
+  column    = ___,
+  title     = "Table 14.3.1: Adverse Events by SOC and Preferred Term",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", ___)
+  ),
+  row_grp_plan = row_grp_plan(
+    row_grp_structure(group_val = ___, label_val = ___, indent = "indented"),
+    label_loc = "indented"
+  ),
+  page_plan = page_plan(
+    page_structure(group_val = ___),
+    note_loc = "below"
+  )
+)
+
+print(ae_full_spec)
+```
+
+```{r s15-cap-spec-hint-1}
+# param = "param", value = "value", column = "column"
+# tfrmt_n_pct() in the frmt_structure
+# group_val = "AESOC", label_val = "AEDECOD"; page_structure group_val = "AESOC"
+```
+
+```{r s15-cap-spec-solution}
+ae_full_spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  title     = "Table 14.3.1: Adverse Events by SOC and Preferred Term",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", tfrmt_n_pct())
+  ),
+  row_grp_plan = row_grp_plan(
+    row_grp_structure(group_val = "AESOC", label_val = "AEDECOD",
+                      indent = "indented"),
+    label_loc = "indented"
+  ),
+  page_plan = page_plan(
+    page_structure(group_val = "AESOC"),
+    note_loc = "below"
+  )
+)
+
+print(ae_full_spec)
+```
+
+### Exercise 15-c — Mock, render, and export
+
+```{r s15-cap-render, exercise=TRUE, exercise.lines=24}
+# Rebuild the spec, then: mock for sign-off -> render -> RTF export.
+ae_full_spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", tfrmt_n_pct())
+  ),
+  row_grp_plan = row_grp_plan(
+    row_grp_structure(group_val = "AESOC", label_val = "AEDECOD",
+                      indent = "indented"),
+    label_loc = "indented"
+  ),
+  page_plan = page_plan(
+    page_structure(group_val = "AESOC"),
+    note_loc = "below"
+  )
+)
+
+# 1. Mock for biostatistician sign-off
+mock_df(ae_full_spec, ae_pt_tfrmt_ready)
+
+# 2. Render and assign the gt object
+gt_out <- print_to_gt(___, ___)
+
+# 3. Export to RTF
+as_rtf(gt_out, ___)
+```
+
+```{r s15-cap-render-hint-1}
+# print_to_gt(ae_full_spec, ae_pt_tfrmt_ready)
+# as_rtf(gt_out, "Table_14_3_1.rtf")
+```
+
+```{r s15-cap-render-solution}
+ae_full_spec <- tfrmt(
+  label     = "label_level",
+  param     = "param",
+  value     = "value",
+  column    = "column",
+  body_plan = body_plan(
+    frmt_structure(label_val = ".default", tfrmt_n_pct())
+  ),
+  row_grp_plan = row_grp_plan(
+    row_grp_structure(group_val = "AESOC", label_val = "AEDECOD",
+                      indent = "indented"),
+    label_loc = "indented"
+  ),
+  page_plan = page_plan(
+    page_structure(group_val = "AESOC"),
+    note_loc = "below"
+  )
+)
+
+mock_df(ae_full_spec, ae_pt_tfrmt_ready)
+
+gt_out <- print_to_gt(ae_full_spec, ae_pt_tfrmt_ready)
+
+as_rtf(gt_out, "Table_14_3_1.rtf")
+```
+
+> **Where gt takes over:** In a real session `print_to_gt()` returns a live gt
+> object. You can then pipe it into `tab_footnote()`, `tab_source_note()`, or
+> `tab_options()` for any display polish the tfrmt spec did not encode, before
+> calling `gtsave("Table_14_3_1.rtf")`. tfrmt owns the *structure*; gt owns the
+> *final cosmetic layer*.
+
+---
+
+## Lesson Summary
+
+| Object | Purpose |
+|--------|---------|
+| `frmt("xx.x")` | Format a single statistic to specified decimals |
+| `frmt_combine("{n} ({p}%)", ...)` | Combine multiple stats into one cell string |
+| `frmt_structure(label_val="AGE", frmt("xx.x"))` | Attach a format rule to a row |
+| `body_plan(frmt_structure(...), ...)` | Collect all row format rules; first match wins |
+| `tfrmt_n_pct()` | Shortcut `frmt_combine` for the standard `n (x.x%)` cell |
+| `col_plan("label","Placebo",...)` | Column display order |
+| `spanning_structure("Arm" = c(...))` | Spanner header above grouped columns |
+| `row_grp_plan()` + `row_grp_structure()` | SOC header → indented PT rows |
+| `page_plan()` + `page_structure()` | Page breaks for long tables |
+| `tfrmt(label, param, value, column, ...)` | Assemble the complete table spec |
+| `ard_to_tfrmt(ard)` | Reshape a cards ARD to tfrmt-ready format |
+| `mock_df()` / `print_mock_gt()` | Blank shell for sponsor sign-off |
+| `print_to_gt(spec, .data)` | Apply spec to data; render a gt table |
+| `as_rtf(gt, "*.rtf")` | Export the rendered table to RTF |
+| `gt()` + `cols_label()` / `tab_header()` / `tab_spanner()` | gt display verbs |
+| `fmt_number()` / `fmt_percent()` | gt numeric formatting (decimals vs rescale) |
+| `tab_style()` + `cell_text()` / `cell_fill()` | gt conditional cell formatting |
+| `tab_options()` / `gtsave()` | gt global options and file export |
+
+### Key takeaways
+
+- `tfrmt` **separates display metadata from data** — the spec is saved and
+  version-controlled independently of the analysis results, so mock and final
+  tables share one layout and only the ARD changes between cut and lock.
+- The tfrmt-ready ARD has columns `label`, `label_level`, `column`, `param`,
+  `value`; `ard_to_tfrmt()` maps them from standard cards ARD names (the real
+  stack uses `shuffle_card()` + `prep_*` helpers).
+- `body_plan()` rules match top-down on `label_val` / `group_val`; place
+  specific rules before any `".default"` catch-all.
+- `row_grp_plan()`, `page_plan()`, and `spanning_structure()` add the row
+  hierarchies, pagination, and column spanners real submission tables need.
+- The **mock-then-render** workflow replaces the manually drawn Word shell SAS
+  programmers circulate; the shell is generated directly from the spec.
+- `gt` is the rendering engine beneath tfrmt and gtsummary — use it directly for
+  final display polish (titles, spanners, footnotes, conditional styling) and
+  for file export (`gtsave()`), with **RTF** as the submission standard.
+- Use `fmt_number()` for values already expressed as percentages (`47.1`) and
+  `fmt_percent()` only for true proportions (`0.471`).
+- tfrmt objects are serializable display metadata — a natural fit for emerging
+  **CDISC ARS** workflows, where machine-readable display specs travel alongside
+  the ARD. (Watch CDISC ARS releases through 2026–2027.)
+
+### When to reach for tfrmt vs gtsummary vs rtables
+
+| Tool | Layout abstraction | Strengths |
+|---|---|---|
+| gtsummary | Function composition (`add_*`, `modify_*`) | Quick, fluent, standard cases |
+| tfrmt | Declarative metadata object | Mock workflow, complex columns, full layout separation |
+| rtables (Module 7) | Imperative layout DSL (`analyze`, `split_*`) | Maximum flexibility, NEST-stack alignment |
+
+All three coexist. Cardinal-future templates favour gtsummary + tfrmt; the
+legacy stack favours rtables + tern.
+
+---
+
+## What's next
+
+Module 6 (the Cardinal-future TLG stack: cards/cardx → gtsummary → tfrmt) is
+complete. **Module 7** covers the **legacy TLG stack** — starting with **Lesson
+33: rtables** — followed by tern, r2rtf, Tplyr, and tidytlg. These packages
+dominate production today and remain essential for sponsors invested in NEST or
+similar workflows; understanding them lets you collaborate with and maintain
+existing code even when new work uses Cardinal-future.
+
+After Module 7: Module 8 (Shiny / teal), Module 9 (submission packaging —
+xportr, datasetjson), Module 10 (traceability — logrx, diffdf), and a capstone
+study in Module 11.
+
+---
+
+## Self-check questions
+
+1. What does tfrmt provide that gtsummary does not?
+2. What are the five columns a tfrmt-ready ARD must contain, and what cards ARD
+   columns do they map from?
+3. Explain the "mock first" workflow and why it is valuable in pharma.
+4. What does `frmt_combine("{n} ({p}%)", n = frmt("xxx"), p = frmt("xx.x"))`
+   produce, and how does `tfrmt_n_pct()` relate to it?
+5. In `row_grp_plan()`, what is the difference between `label_loc = "indented"`
+   and `label_loc = "column"`?
+6. A column already holds `47.1` (a percentage). Should you apply `fmt_number()`
+   or `fmt_percent()` in gt, and why?
+7. Translate to tfrmt-conceptual terms: "Render a table with rows grouped by
+   AESOC, indented PT labels, columns of Placebo and Active, cell format
+   `n (p%)`, new page per SOC, exported to RTF."
+8. How does tfrmt support CDISC ARS-aligned workflows?
+
+## Glossary
+
+- **tfrmt** — A metadata-driven display layer for ARDs, complementary to gtsummary.
+- **`frmt()` / `frmt_combine()`** — tfrmt's format-string mini-language; `"xx.x"` = one decimal, `"{n} ({p}%)"` = combined cell.
+- **`frmt_structure()`** — Pairs a frmt/frmt_combine with `group_val`/`label_val` selectors (`".default"` = catch-all).
+- **`body_plan()`** — Collects frmt_structures; first matching rule per cell wins.
+- **`tfrmt_n_pct()`** — Shortcut producing the standard `n (x.x%)` frmt_combine.
+- **`col_plan()`** — Defines column ordering and (via `spanning_structure()` / `>`) spanner labels.
+- **`spanning_structure()`** — A merged column header above a group of columns.
+- **`row_grp_plan()` / `row_grp_structure()`** — Control row group display: indentation, spacing, label location (e.g. SOC > PT).
+- **`page_plan()` / `page_structure()`** — Pagination rules for multi-page tables.
+- **`big_n_structure()`** — Maps Big-N rows to per-column header N counts.
+- **`ard_to_tfrmt()`** — Reshape a cards ARD into tfrmt long format (real stack: `shuffle_card()` + `prep_big_n()` / `prep_combine_vars()` / `prep_label()`).
+- **`print_to_gt()`** — Render a tfrmt spec + ARD as a gt table.
+- **`print_mock_gt()` / `mock_df()`** — Render the spec with placeholder cells (no real data) for sponsor review.
+- **`as_rtf()`** — Export the rendered table to an RTF file.
+- **gt** — The grammar-of-tables rendering engine under tfrmt and gtsummary.
+- **`cols_label()` / `tab_header()` / `tab_spanner()`** — gt verbs to rename columns, add titles, and span columns.
+- **`fmt_number()` / `fmt_percent()`** — gt numeric formatting; the former fixes decimals, the latter rescales proportions to percentages.
+- **`tab_style()` / `cell_text()` / `cell_fill()`** — gt conditional formatting (bold, colour, fill) targeted via `cells_body()` / `cells_column_labels()`.
+- **`tab_options()` / `gtsave()`** — gt global style options and multi-format export (`.rtf` is the submission standard).
+- **Mock workflow** — Design the layout shell first, get sign-off, then plug in data; the tfrmt object guarantees mock and final match.

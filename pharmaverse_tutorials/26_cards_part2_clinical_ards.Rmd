@@ -1,0 +1,1669 @@
+---
+title: "Lesson 26 — cards Part 2: Building Clinical ARDs End-to-End"
+author: "Hamid Tavakoli, MD, MSc"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    css: www/custom.css
+runtime: shiny_prerendered
+description: >
+  Build a complete study-wide Analysis Results Dataset (ARD) covering every
+  clinical domain: demographics, treatment-emergent AE incidence by SOC and PT
+  with an ADSL denominator, lab summary and change-from-baseline by visit,
+  vital signs, drug exposure, and concomitant medications. Learn the population
+  filter and denominator strategy for each table type, the factor-typing pattern
+  for zero-count levels, ard_hierarchical() for subject-level counting,
+  bind_ard() for combination, ARS traceability metadata, and the dual-program-
+  the-ARD validation paradigm.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 26_cards_part2_clinical_ards.Rmd
+# PURPOSE       : cards Part 2 — building a complete clinical ARD pipeline
+#                 end-to-end: demographics, TEAE incidence by SOC/PT with the
+#                 ADSL safety-population denominator, lab change-from-baseline
+#                 by visit, vital signs, drug exposure, and concomitant
+#                 medications; the factor-typing pattern for zero-count levels,
+#                 ard_hierarchical() subject counting, ARS traceability tags,
+#                 and the dual-program-the-ARD validation paradigm.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-06-22
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N")
+  ) |>
+  filter(SAFFL == "Y")
+
+# Safety-population ADSL — the canonical denominator for AE / exposure tables.
+adsl_saf <- adsl
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+advs <- pharmaverseadam::advs
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARDS FUNCTION MOCKS
+# These replicate the real {cards} package APIs so exercises run inside learnr
+# without the package installed. Output structure follows the CDISC ARD spec:
+#   group1, group1_level, group2, group2_level, variable, variable_level,
+#   stat_name, stat_label, stat (LIST column), fmt_fn (list col),
+#   context, warning, error.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Helper: build one ARD row with the full CDISC column set ----------------------
+.ard_row <- function(group1=NA_character_, group1_level=NA_character_,
+                     group2=NA_character_, group2_level=NA_character_,
+                     group3=NA_character_, group3_level=NA_character_,
+                     variable, variable_level=NA_character_,
+                     context, stat_name, stat, stat_label,
+                     fmt_fn=NULL, warning=NULL, error=NULL) {
+  tibble(
+    group1         = group1,
+    group1_level   = group1_level,
+    group2         = group2,
+    group2_level   = group2_level,
+    group3         = group3,
+    group3_level   = group3_level,
+    variable       = variable,
+    variable_level = variable_level,
+    context        = context,
+    stat_name      = stat_name,
+    stat_label     = stat_label,
+    stat           = list(stat),
+    fmt_fn         = list(fmt_fn),
+    warning        = list(warning),
+    error          = list(error)
+  )
+}
+
+.as_card <- function(x) structure(x, class = c("card","tbl_df","tbl","data.frame"))
+
+#' Default continuous statistic functions (mirrors cards::continuous_summary_fns)
+#'
+#' Returns a NAMED LIST of summary functions. Pass a character vector of
+#' statistic names to subset; default returns the full panel.
+continuous_summary_fns <- function(summaries = c("N","mean","sd","median",
+                                                  "p25","p75","min","max")) {
+  all_fns <- list(
+    N      = function(x) sum(!is.na(x)),
+    mean   = function(x) mean(x, na.rm=TRUE),
+    sd     = function(x) sd(x, na.rm=TRUE),
+    median = function(x) median(x, na.rm=TRUE),
+    p25    = function(x) unname(quantile(x, 0.25, na.rm=TRUE)),
+    p75    = function(x) unname(quantile(x, 0.75, na.rm=TRUE)),
+    min    = function(x) min(x, na.rm=TRUE),
+    max    = function(x) max(x, na.rm=TRUE)
+  )
+  all_fns[summaries]
+}
+
+.cont_labels <- c(N="N", mean="Mean", sd="SD", median="Median",
+                  p25="Q1", p75="Q3", min="Min", max="Max")
+
+#' Resolve `variables` supplied as bare names, character vector, or c(a, b)
+.resolve_vars <- function(vars_quo, data) {
+  v <- tryCatch(vars_quo, error = function(e) NULL)
+  if (is.character(v)) return(v)
+  # tidyselect-style bare names captured via substitute
+  as.character(v)
+}
+
+#' Summarise continuous variables into an ARD (mock of cards::ard_continuous)
+#'
+#' @param data       A data frame
+#' @param variables  Character vector of numeric column names
+#' @param by         Optional character: grouping column name(s)
+#' @param statistic  Named list of functions, e.g. continuous_summary_fns(...)
+ard_continuous <- function(data, variables, by = NULL,
+                           statistic = continuous_summary_fns()) {
+  if (is.list(statistic) && !is.null(names(statistic))) {
+    stat_fns <- statistic
+  } else {
+    stat_fns <- continuous_summary_fns()
+  }
+  group_levels <- if (!is.null(by)) {
+    unique(data[by]) |> as_tibble()
+  } else {
+    tibble(.dummy = NA_character_)
+  }
+
+  rows <- lapply(variables, function(vv) {
+    lapply(seq_len(nrow(group_levels)), function(i) {
+      sub <- data
+      g1 <- g1l <- g2 <- g2l <- NA_character_
+      if (!is.null(by)) {
+        for (b in by) sub <- sub[sub[[b]] == group_levels[[b]][i], , drop = FALSE]
+        g1  <- by[1]; g1l <- as.character(group_levels[[by[1]]][i])
+        if (length(by) >= 2) { g2 <- by[2]; g2l <- as.character(group_levels[[by[2]]][i]) }
+      }
+      x <- sub[[vv]]
+      lapply(names(stat_fns), function(sn) {
+        val <- tryCatch(stat_fns[[sn]](x), error=function(e) NA_real_)
+        .ard_row(group1=g1, group1_level=g1l, group2=g2, group2_level=g2l,
+                 variable=vv, context="continuous", stat_name=sn, stat=val,
+                 stat_label=ifelse(sn %in% names(.cont_labels), .cont_labels[[sn]], sn))
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  .as_card(rows)
+}
+
+#' Summarise categorical variables into an ARD (mock of cards::ard_categorical)
+#'
+#' @param data        A data frame
+#' @param variables   Character vector of column names
+#' @param by          Optional grouping column name
+#' @param denominator Optional data frame; when supplied, the per-group N is the
+#'                    number of rows in `denominator` for that `by` level (the
+#'                    subject denominator), NOT the row count in `data`.
+ard_categorical <- function(data, variables, by = NULL, denominator = NULL) {
+  groups <- if (!is.null(by)) sort(unique(as.character(data[[by]]))) else NA_character_
+
+  rows <- lapply(variables, function(vv) {
+    if (is.factor(data[[vv]])) {
+      levs <- levels(data[[vv]])
+    } else {
+      levs <- sort(unique(as.character(data[[vv]])))
+    }
+    levs <- levs[!is.na(levs)]
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      # Denominator: subject-pop count if provided, else non-missing rows
+      if (!is.null(denominator) && !is.null(by)) {
+        total <- sum(as.character(denominator[[by]]) == gl, na.rm = TRUE)
+      } else if (!is.null(denominator)) {
+        total <- nrow(denominator)
+      } else {
+        total <- sum(!is.na(sub[[vv]]))
+      }
+      lapply(levs, function(lv) {
+        cnt <- sum(as.character(sub[[vv]]) == lv, na.rm=TRUE)
+        bind_rows(
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="n", stat=cnt, stat_label="n"),
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="N", stat=total, stat_label="N"),
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="p", stat=ifelse(total>0, round(100*cnt/total,1), NA_real_),
+                   stat_label="%")
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+
+  .as_card(rows)
+}
+
+#' Dichotomous summary (mock of cards::ard_dichotomous)
+#'
+#' Counts the "yes" value of each variable (default "Y") as a single n/N/p row
+#' set, using the subject denominator when provided.
+ard_dichotomous <- function(data, variables, by = NULL, value = "Y",
+                            denominator = NULL) {
+  groups <- if (!is.null(by)) sort(unique(as.character(data[[by]]))) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      if (!is.null(denominator) && !is.null(by)) {
+        total <- sum(as.character(denominator[[by]]) == gl, na.rm = TRUE)
+      } else if (!is.null(denominator)) {
+        total <- nrow(denominator)
+      } else {
+        total <- sum(!is.na(sub[[vv]]))
+      }
+      cnt <- sum(as.character(sub[[vv]]) == value, na.rm = TRUE)
+      bind_rows(
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 variable_level=value, context="dichotomous",
+                 stat_name="n", stat=cnt, stat_label="n"),
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 variable_level=value, context="dichotomous",
+                 stat_name="N", stat=total, stat_label="N"),
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 variable_level=value, context="dichotomous",
+                 stat_name="p", stat=ifelse(total>0, round(100*cnt/total,1), NA_real_),
+                 stat_label="%")
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+  .as_card(rows)
+}
+
+#' Missing-data summary (mock of cards::ard_missing)
+ard_missing <- function(data, variables, by = NULL) {
+  groups <- if (!is.null(by)) sort(unique(as.character(data[[by]]))) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+      x <- sub[[vv]]
+      bind_rows(
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="missing", stat_name="N_miss",
+                 stat=sum(is.na(x)), stat_label="N missing"),
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="missing", stat_name="p_miss",
+                 stat=round(100*mean(is.na(x)),1), stat_label="% missing")
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+  .as_card(rows)
+}
+
+#' Hierarchical (nested) categorical tabulation (mock of cards::ard_hierarchical)
+#'
+#' Computes DISTINCT-SUBJECT counts at each nesting level of `variables`
+#' (e.g. AEBODSYS then AEDECOD). The denominator must be the subject population
+#' (e.g. adsl_saf), and `id` names the subject identifier so multiple events per
+#' subject are counted once.
+#'
+#' @param data        Event-level data (e.g. adae filtered to TEAEs)
+#' @param by          Grouping column (e.g. "TRT01A")
+#' @param variables   Ordered character vector of nesting variables
+#' @param denominator Subject-population data frame (e.g. adsl_saf)
+#' @param id          Subject identifier column (default "USUBJID")
+ard_hierarchical <- function(data, by, variables, denominator = NULL,
+                             id = "USUBJID") {
+  groups <- sort(unique(as.character(data[[by]])))
+  out <- list()
+  for (lvl in seq_along(variables)) {
+    nest_vars <- variables[seq_len(lvl)]
+    grp_cols  <- c(by, nest_vars)
+    distinct_df <- data |>
+      distinct(across(all_of(c(id, grp_cols))))
+    agg <- distinct_df |>
+      count(across(all_of(grp_cols)), name = "n")
+    for (i in seq_len(nrow(agg))) {
+      gl <- as.character(agg[[by]][i])
+      if (!is.null(denominator)) {
+        N <- sum(as.character(denominator[[by]]) == gl, na.rm = TRUE)
+      } else {
+        N <- length(unique(data[[id]][as.character(data[[by]]) == gl]))
+      }
+      cnt <- agg$n[i]
+      # group2 = outer nesting variable level (if depth >= 2)
+      g2  <- if (lvl >= 2) nest_vars[1] else NA_character_
+      g2l <- if (lvl >= 2) as.character(agg[[nest_vars[1]]][i]) else NA_character_
+      vlev <- as.character(agg[[nest_vars[lvl]]][i])
+      out[[length(out)+1]] <- bind_rows(
+        .ard_row(group1=by, group1_level=gl, group2=g2, group2_level=g2l,
+                 variable=nest_vars[lvl], variable_level=vlev,
+                 context="hierarchical", stat_name="n", stat=cnt, stat_label="n"),
+        .ard_row(group1=by, group1_level=gl, group2=g2, group2_level=g2l,
+                 variable=nest_vars[lvl], variable_level=vlev,
+                 context="hierarchical", stat_name="N", stat=N, stat_label="N"),
+        .ard_row(group1=by, group1_level=gl, group2=g2, group2_level=g2l,
+                 variable=nest_vars[lvl], variable_level=vlev,
+                 context="hierarchical", stat_name="p",
+                 stat=ifelse(N>0, round(100*cnt/N,1), NA_real_), stat_label="%")
+      )
+    }
+  }
+  .as_card(bind_rows(out))
+}
+
+#' Build a stacked ARD (mock of cards::ard_stack)
+#'
+#' Accepts a base `data` frame followed by one or more partially-applied
+#' ard_*() calls (the `data` argument omitted), plus the grouping controls
+#' `.by`, `.overall`, and `.total_n`. Each ard_*() call is re-invoked once per
+#' analysis; .overall adds an "Overall" pooled group; .total_n adds Big-N rows.
+ard_stack <- function(data, ..., .by = NULL, .overall = FALSE, .total_n = FALSE) {
+  calls <- list(...)
+  # Accept .by as a bare symbol (.by = TRT01A) OR a string (.by = "TRT01A").
+  .by_sub <- substitute(.by)
+  by_chr <- if (is.null(.by_sub)) {
+    NULL
+  } else if (is.symbol(.by_sub)) {
+    as.character(.by_sub)
+  } else if (is.character(.by_sub)) {
+    .by_sub
+  } else {
+    as.character(eval(.by_sub, parent.frame()))
+  }
+
+  run_one <- function(fn, dat) {
+    # fn is a function of (data) returning an ARD
+    fn(dat)
+  }
+
+  parts <- list()
+  for (fn in calls) parts[[length(parts)+1]] <- fn(data)
+  out <- bind_rows(parts)
+
+  if (isTRUE(.overall)) {
+    overall_data <- data
+    ov_parts <- list()
+    for (fn in calls) ov_parts[[length(ov_parts)+1]] <- fn(overall_data)
+    ov <- bind_rows(ov_parts) |>
+      mutate(group1 = if (!is.null(by_chr)) by_chr[1] else group1,
+             group1_level = "Overall")
+    out <- bind_rows(out, ov)
+  }
+
+  if (isTRUE(.total_n) && !is.null(by_chr)) {
+    bign <- data |>
+      count(across(all_of(by_chr[1])), name = "n")
+    tn_rows <- lapply(seq_len(nrow(bign)), function(i) {
+      .ard_row(group1=by_chr[1], group1_level=as.character(bign[[by_chr[1]]][i]),
+               variable=by_chr[1], context="total_n",
+               stat_name="N", stat=bign$n[i], stat_label="Total N")
+    }) |> bind_rows()
+    if (isTRUE(.overall)) {
+      tn_rows <- bind_rows(tn_rows,
+        .ard_row(group1=by_chr[1], group1_level="Overall", variable=by_chr[1],
+                 context="total_n", stat_name="N", stat=nrow(data),
+                 stat_label="Total N"))
+    }
+    out <- bind_rows(out, tn_rows)
+  }
+  .as_card(out)
+}
+
+#' Bind ARDs (mock of cards::bind_ard) — preserves the `card` class
+bind_ard <- function(...) .as_card(bind_rows(...))
+
+#' Pull statistics out of an ARD as a named list (mock of cards::get_ard_statistics)
+#'
+#' @param ard    An ARD tibble
+#' @param filter An unquoted expression to subset rows first
+get_ard_statistics <- function(ard, filter) {
+  fexpr <- substitute(filter)
+  sub <- ard[eval(fexpr, ard, parent.frame()), , drop = FALSE]
+  stats <- sub$stat
+  names(stats) <- sub$stat_name
+  stats
+}
+
+#' Validate ARD column structure (mock of cards::check_ard_structure)
+#'
+#' Confirms required columns exist and `stat` is a list column. Returns the ARD
+#' invisibly; messages on problems.
+check_ard_structure <- function(ard) {
+  required <- c("group1","variable","stat_name","stat","context")
+  missing  <- setdiff(required, names(ard))
+  if (length(missing)) {
+    message("MISSING required ARD columns: ", paste(missing, collapse=", "))
+  } else if (!is.list(ard$stat)) {
+    message("`stat` is not a list column — structure check FAILED.")
+  } else {
+    message("ARD structure OK: ", nrow(ard), " rows, ",
+            length(unique(ard$variable)), " variables.")
+  }
+  invisible(ard)
+}
+
+#' Report warnings / errors carried in an ARD (mock of cards::print_ard_conditions)
+print_ard_conditions <- function(ard) {
+  has_warn <- if ("warning" %in% names(ard)) sum(!vapply(ard$warning, is.null, logical(1))) else 0L
+  has_err  <- if ("error"   %in% names(ard)) sum(!vapply(ard$error,   is.null, logical(1))) else 0L
+  message("ARD conditions: ", has_warn, " warning(s), ", has_err, " error(s).")
+  invisible(ard)
+}
+
+# ── Pre-built ARDs available to every exercise ───────────────────────────────
+
+# Factor-typed safety ADSL for demographics work
+adsl_factored <- adsl_saf |>
+  mutate(
+    SEX    = factor(SEX, levels = c("F", "M")),
+    AGEGR1 = factor(AGEGR1, levels = sort(unique(AGEGR1)))
+  )
+
+# Treatment-emergent AEs
+adae_te <- adae |> filter(TRTEMFL == "Y")
+
+# Analysis-flagged labs with a visit
+adlb_an <- adlb |> filter(!is.na(AVISIT))
+
+# Pre-built demographics ARD (continuous + categorical, by arm, with Overall + Big-N)
+demog_ard <- ard_stack(
+  adsl_factored,
+  function(d) ard_continuous(d, variables = c("AGE","BMIBL","WEIGHTBL","HEIGHTBL"),
+                             by = "TRT01A",
+                             statistic = continuous_summary_fns(
+                               c("N","mean","sd","median","min","max"))),
+  function(d) ard_categorical(d, variables = c("AGEGR1","SEX"), by = "TRT01A"),
+  .by = TRT01A, .overall = TRUE, .total_n = TRUE
+)
+
+# Pre-built AE incidence ARD (SOC x PT, subject denominator)
+ae_incidence_ard <- ard_hierarchical(
+  adae_te, by = "TRT01A", variables = c("AEBODSYS","AEDECOD"),
+  denominator = adsl_saf, id = "USUBJID"
+)
+```
+
+## Overview
+
+In **Lesson 25** you learned the ARD building blocks: `ard_continuous()`,
+`ard_categorical()`, `ard_missing()`, and how to `bind_ard()` them together.
+This lesson puts those blocks to work on a **complete clinical study**. By the
+end you will have assembled the ARDs behind the major sections of a Clinical
+Study Report (CSR): demographics, treatment-emergent adverse events, laboratory
+change-from-baseline, vital signs, drug exposure, and concomitant medications.
+
+The mental model:
+
+```
+ADaM data  →  population filter  →  ard_*()  →  ARD per topic  →  bind_ard()  →  study ARD
+```
+
+> **The single most important idea in this lesson:** *you validate the ARD, not
+> the display.* In SAS, two programmers each build the RTF table and QA compares
+> the two files cell-by-cell. In the cards world, two programmers each build the
+> **ARD**, and you compare those flat numeric files. The display layer becomes a
+> trivial, formatting-only check on top.
+
+### Trial dataset
+
+All exercises use the **CDISCPILOT01** Alzheimer's study from `pharmaverseadam`.
+Three arms — `Placebo`, `Xanomeline Low Dose`, `Xanomeline High Dose` — with the
+safety population pre-filtered (`SAFFL == "Y"`) into `adsl_saf`. The setup chunk
+also provides:
+
+- `adae` — adverse events, with `TRTA` renamed to **`TRT01A`** and a numeric
+  `AESEVN` derived; `adae_te` is pre-filtered to treatment-emergent events
+  (`TRTEMFL == "Y"`).
+- `adlb` — labs, with `ATOXGR` coerced to integer and admiral summary rows
+  (`DTYPE` not `NA`) removed; `adlb_an` is pre-filtered to rows with a non-`NA`
+  `AVISIT`.
+- `advs` — vital signs (`PARAMCD` of `SBP`, `DBP`, `PULSE`, `WEIGHT`, `HEIGHT`).
+
+Two ARDs are pre-built for you: `demog_ard` (demographics) and
+`ae_incidence_ard` (TEAE SOC × PT incidence).
+
+> **Mock note:** the real `{cards}` package is not installed in this tutorial.
+> The setup chunk defines mocks for `ard_continuous()`, `ard_categorical()`,
+> `ard_hierarchical()`, `ard_dichotomous()`, `ard_missing()`, `ard_stack()`,
+> `bind_ard()`, `continuous_summary_fns()`, `get_ard_statistics()`,
+> `check_ard_structure()`, and `print_ard_conditions()`. They return tibbles
+> with the true ARD column set, so everything you write here transfers directly
+> to production code. One simplification: in these mocks the analyses passed to
+> `ard_stack()` are written as `function(d) ard_*(d, ...)` so the helper can
+> re-run them per group — the real package lets you write the `ard_*()` calls
+> inline.
+
+---
+
+## Section 1 — Demographics ARD: the canonical template
+
+The standard demographics ("Table 14.1.1") combines **continuous** variables
+(AGE, BMI, weight, height) and **categorical** variables (age group, sex) by
+treatment arm, with an Overall column and Big-N header counts.
+
+```r
+demog_ard <- ard_stack(
+  adsl_saf,
+  function(d) ard_continuous(
+    d, variables = c("AGE","BMIBL","WEIGHTBL","HEIGHTBL"), by = "TRT01A",
+    statistic = continuous_summary_fns(c("N","mean","sd","median","min","max"))),
+  function(d) ard_categorical(d, variables = c("AGEGR1","SEX"), by = "TRT01A"),
+  .by      = TRT01A,   # columns by treatment arm
+  .overall = TRUE,     # add an "Overall" pooled group
+  .total_n = TRUE      # add Big-N header rows (context = "total_n")
+)
+```
+
+`continuous_summary_fns()` returns a named list of summary functions; pass it a
+character vector to pick exactly the statistics you want.
+
+### Practice — explore the pre-built demographics ARD
+
+```{r ex-demog-explore, exercise=TRUE, exercise.lines=10}
+# demog_ard is pre-built. What contexts and statistics does it contain?
+demog_ard |> distinct(context)
+demog_ard |> distinct(___)        # all unique stat_name values
+```
+
+```{r ex-demog-explore-hint-1}
+# distinct(stat_name)
+```
+
+```{r ex-demog-explore-solution}
+demog_ard |> distinct(context)
+demog_ard |> distinct(stat_name)
+```
+
+### Practice — spot-check mean age by arm
+
+```{r ex-demog-meanage, exercise=TRUE, exercise.lines=10}
+# Pull the mean AGE for each arm (including Overall).
+# stat is a LIST column — use map_dbl(stat, 1) to extract the number.
+demog_ard |>
+  filter(variable == "AGE", stat_name == ___) |>
+  mutate(mean_age = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, mean_age)
+```
+
+```{r ex-demog-meanage-hint-1}
+# stat_name == "mean"
+```
+
+```{r ex-demog-meanage-solution}
+demog_ard |>
+  filter(variable == "AGE", stat_name == "mean") |>
+  mutate(mean_age = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, mean_age)
+```
+
+### Practice — use get_ard_statistics() for a targeted lookup
+
+```{r ex-demog-getstat, exercise=TRUE, exercise.lines=8}
+# get_ard_statistics() pulls a named list of stats matching a filter expression.
+# Get the n and p for Female subjects in the Placebo arm.
+get_ard_statistics(
+  demog_ard,
+  filter = variable == "SEX" & variable_level == "F" &
+           group1_level == "Placebo" & stat_name %in% c("n", "p")
+)
+```
+
+```{r ex-demog-getstat-solution}
+get_ard_statistics(
+  demog_ard,
+  filter = variable == "SEX" & variable_level == "F" &
+           group1_level == "Placebo" & stat_name %in% c("n", "p")
+)
+```
+
+### The factor-typing pattern for categorical variables
+
+If an arm has **zero** subjects in a category level, that level vanishes from the
+ARD for that arm — and your table loses a row. Factor-type *before* building the
+ARD so every arm carries every level, even at `n = 0`:
+
+```r
+adsl_factored <- adsl_saf |>
+  mutate(
+    AGEGR1 = factor(AGEGR1, levels = c("<65", "65-80", ">80")),
+    SEX    = factor(SEX,    levels = c("F", "M")),
+    RACE   = factor(RACE,   levels = c(
+      "WHITE", "BLACK OR AFRICAN AMERICAN", "ASIAN",
+      "AMERICAN INDIAN OR ALASKA NATIVE", "OTHER"))
+  )
+```
+
+The mock `ard_categorical()` respects factor levels exactly as the real package
+does.
+
+### Practice — build a demographics ARD from scratch
+
+```{r ex-demog-build, exercise=TRUE, exercise.lines=18}
+# Build a demographics ARD with:
+#   - continuous: AGE, BMIBL  (N, mean, sd, median)
+#   - categorical: SEX (factor-typed F, M)
+# by TRT01A, with an Overall group and Big-N rows.
+
+my_adsl <- adsl_saf |>
+  mutate(SEX = factor(SEX, levels = c("F", "M")))
+
+my_demog <- ard_stack(
+  my_adsl,
+  function(d) ard_continuous(d, variables = c(___, ___), by = "TRT01A",
+                             statistic = continuous_summary_fns(
+                               c("N","mean","sd","median"))),
+  function(d) ard_categorical(d, variables = ___, by = "TRT01A"),
+  .by = TRT01A, .overall = ___, .total_n = ___
+)
+
+my_demog |> count(context)
+```
+
+```{r ex-demog-build-hint-1}
+# variables = c("AGE","BMIBL"); ard_categorical variables = "SEX"
+# .overall = TRUE, .total_n = TRUE
+```
+
+```{r ex-demog-build-solution}
+my_adsl <- adsl_saf |>
+  mutate(SEX = factor(SEX, levels = c("F", "M")))
+
+my_demog <- ard_stack(
+  my_adsl,
+  function(d) ard_continuous(d, variables = c("AGE","BMIBL"), by = "TRT01A",
+                             statistic = continuous_summary_fns(
+                               c("N","mean","sd","median"))),
+  function(d) ard_categorical(d, variables = "SEX", by = "TRT01A"),
+  .by = TRT01A, .overall = TRUE, .total_n = TRUE
+)
+
+my_demog |> count(context)
+```
+
+### Practice — validate the ARD
+
+```{r ex-demog-validate, exercise=TRUE, exercise.lines=6}
+# Run the two validation helpers on demog_ard.
+check_ard_structure(___)
+print_ard_conditions(___)
+```
+
+```{r ex-demog-validate-hint-1}
+# Both take the ARD: check_ard_structure(demog_ard) etc.
+```
+
+```{r ex-demog-validate-solution}
+check_ard_structure(demog_ard)
+print_ard_conditions(demog_ard)
+```
+
+```{r quiz-demog, echo=FALSE}
+quiz(caption = "Demographics ARD",
+  question("An arm has no subjects in the '>80' age group, so that row is missing for that arm. What is the correct fix?",
+    answer("Add a row manually with bind_rows()"),
+    answer("Convert AGEGR1 to a factor with all expected levels BEFORE the ard_categorical() call",
+           correct = TRUE,
+           message = "Factor-typing fixes the level set so every group carries every level, producing n = 0 rows instead of dropping them."),
+    answer("Use .total_n = TRUE"),
+    answer("Use ard_hierarchical() instead"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("Which `context` value identifies the Big-N rows added by `.total_n = TRUE`?",
+    answer("\"big_n\""),
+    answer("\"total_n\"", correct = TRUE,
+           message = "Filter on context == \"total_n\" to find the per-group denominators that gtsummary uses to build column headers."),
+    answer("\"header\""),
+    answer("\"N\""),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — AE incidence ARD: the safety table
+
+The adverse-event table counts **subjects** (not events) with at least one TEAE,
+then by System Organ Class (`AEBODSYS`), then by Preferred Term (`AEDECOD`)
+within each SOC. Two cards features make this correct:
+
+1. **`ard_hierarchical()`** does the nested SOC → PT tabulation.
+2. **`denominator = adsl_saf`** sets `N` to the safety-population subject count
+   per arm — *not* the number of AE rows.
+3. **`id = "USUBJID"`** counts distinct subjects, so a subject with three events
+   in one PT contributes 1, not 3.
+
+```r
+adae_te <- adae |> filter(TRTEMFL == "Y")
+
+ae_incidence_ard <- adae_te |>
+  ard_hierarchical(
+    by          = "TRT01A",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = adsl_saf,    # N = safety-pop subjects per arm
+    id          = "USUBJID"    # distinct subjects, not events
+  )
+```
+
+### Why `denominator = adsl_saf` is non-negotiable
+
+Without it, `N` becomes the count of TEAE *rows* per arm. Subjects with multiple
+AEs inflate `N`, percentages come out wrong, and some PTs show > 100%.
+
+> **Code-review rule:** every AE/CM/exposure ARD must carry
+> `denominator = adsl_saf` (or the appropriate population). If a percentage
+> exceeds 100%, the missing denominator is almost always the cause.
+
+### Practice — explore the hierarchical AE ARD
+
+```{r ex-ae-explore, exercise=TRUE, exercise.lines=10}
+# ae_incidence_ard is pre-built. It has group2 columns for the SOC nesting.
+# Show the group columns and the contexts.
+names(ae_incidence_ard)[startsWith(names(ae_incidence_ard), "group")]
+ae_incidence_ard |> distinct(variable)   # which nesting levels are present?
+```
+
+```{r ex-ae-explore-solution}
+names(ae_incidence_ard)[startsWith(names(ae_incidence_ard), "group")]
+ae_incidence_ard |> distinct(variable)
+```
+
+### Practice — top preferred terms in the High Dose arm
+
+```{r ex-ae-top, exercise=TRUE, exercise.lines=12}
+# Find the 5 PTs with the highest incidence (p) in Xanomeline High Dose.
+ae_incidence_ard |>
+  filter(variable == "AEDECOD",
+         group1_level == ___,         # the High Dose arm label
+         stat_name == "p") |>
+  mutate(pct = map_dbl(stat, 1)) |>
+  slice_max(pct, n = 5) |>
+  select(group2_level, variable_level, pct)
+```
+
+```{r ex-ae-top-hint-1}
+# group1_level == "Xanomeline High Dose"; variable_level holds the PT
+```
+
+```{r ex-ae-top-solution}
+ae_incidence_ard |>
+  filter(variable == "AEDECOD",
+         group1_level == "Xanomeline High Dose",
+         stat_name == "p") |>
+  mutate(pct = map_dbl(stat, 1)) |>
+  slice_max(pct, n = 5) |>
+  select(group2_level, variable_level, pct)
+```
+
+### The "any TEAE" overall row
+
+The header row "Subjects with at least one TEAE" is a single dichotomous count
+per arm. Reduce to one row per subject, flag it, then count with the subject
+denominator:
+
+```{r ex-ae-any, exercise=TRUE, exercise.lines=14}
+# Build the "any TEAE" overall row: distinct subjects with any TEAE, by arm,
+# using adsl_saf as the denominator.
+adae_any_ard <- adae_te |>
+  distinct(USUBJID, TRT01A) |>
+  mutate(any_teae = "Y") |>
+  ard_categorical(
+    by          = "TRT01A",
+    variables   = "any_teae",
+    denominator = ___          # subject denominator
+  )
+
+adae_any_ard |>
+  filter(stat_name %in% c("n","N","p")) |>
+  mutate(val = map_dbl(stat, 1)) |>
+  select(group1_level, stat_name, val)
+```
+
+```{r ex-ae-any-hint-1}
+# denominator = adsl_saf
+```
+
+```{r ex-ae-any-solution}
+adae_any_ard <- adae_te |>
+  distinct(USUBJID, TRT01A) |>
+  mutate(any_teae = "Y") |>
+  ard_categorical(
+    by          = "TRT01A",
+    variables   = "any_teae",
+    denominator = adsl_saf
+  )
+
+adae_any_ard |>
+  filter(stat_name %in% c("n","N","p")) |>
+  mutate(val = map_dbl(stat, 1)) |>
+  select(group1_level, stat_name, val)
+```
+
+### Practice — combine the overall row with the hierarchy
+
+```{r ex-ae-combine, exercise=TRUE, exercise.lines=12}
+# Use bind_ard() (NOT bind_rows()) to combine the any-TEAE row with the
+# SOC x PT hierarchy into a single AE ARD.
+adae_any_ard <- adae_te |>
+  distinct(USUBJID, TRT01A) |>
+  mutate(any_teae = "Y") |>
+  ard_categorical(by = "TRT01A", variables = "any_teae", denominator = adsl_saf)
+
+ae_full_ard <- ___(adae_any_ard, ae_incidence_ard)
+
+ae_full_ard |> count(context)
+```
+
+```{r ex-ae-combine-hint-1}
+# bind_ard(adae_any_ard, ae_incidence_ard)
+```
+
+```{r ex-ae-combine-solution}
+adae_any_ard <- adae_te |>
+  distinct(USUBJID, TRT01A) |>
+  mutate(any_teae = "Y") |>
+  ard_categorical(by = "TRT01A", variables = "any_teae", denominator = adsl_saf)
+
+ae_full_ard <- bind_ard(adae_any_ard, ae_incidence_ard)
+
+ae_full_ard |> count(context)
+```
+
+### Practice — serious TEAEs
+
+```{r ex-ae-serious, exercise=TRUE, exercise.lines=12}
+# Build the SOC x PT incidence ARD for SERIOUS TEAEs (AESER == "Y").
+# Same denominator and id as the all-TEAE version.
+ae_serious_ard <- adae |>
+  filter(TRTEMFL == "Y" & AESER == ___) |>
+  ard_hierarchical(
+    by          = "TRT01A",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = ___,
+    id          = "USUBJID"
+  )
+
+ae_serious_ard |> filter(variable == "AEDECOD", stat_name == "n") |> nrow()
+```
+
+```{r ex-ae-serious-hint-1}
+# AESER == "Y"; denominator = adsl_saf
+```
+
+```{r ex-ae-serious-solution}
+ae_serious_ard <- adae |>
+  filter(TRTEMFL == "Y" & AESER == "Y") |>
+  ard_hierarchical(
+    by          = "TRT01A",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = adsl_saf,
+    id          = "USUBJID"
+  )
+
+ae_serious_ard |> filter(variable == "AEDECOD", stat_name == "n") |> nrow()
+```
+
+```{r quiz-ae, echo=FALSE}
+quiz(caption = "AE incidence ARD",
+  question("A TEAE incidence ARD shows preferred-term percentages above 100%. What is the cause?",
+    answer("The wrong AVISIT filter"),
+    answer("Missing `denominator` — N defaulted to the AE row count, which exceeds the subject count",
+           correct = TRUE,
+           message = "Pass denominator = adsl_saf so N is the safety-population subject count, and id = \"USUBJID\" so events are collapsed to subjects."),
+    answer("AESEVN was not derived"),
+    answer("The arms were not factor-typed"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("What does `id = \"USUBJID\"` accomplish in `ard_hierarchical()`?",
+    answer("It sorts the output by subject"),
+    answer("It counts distinct subjects rather than events, so multiple AEs per subject count once",
+           correct = TRUE,
+           message = "AE incidence tables report subject counts, not event counts. id collapses repeated events per subject."),
+    answer("It adds a USUBJID column to the ARD"),
+    answer("It is the denominator"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 3 — Lab summary & change-from-baseline ARD
+
+A "Laboratory Values by Visit" table reports N, mean, SD, median, min, and max
+of `AVAL` *and* `CHG` (change from baseline) per `PARAMCD` × `AVISIT` × treatment
+arm. This is a **three-level grouping** (`group1`/`group2` plus the parameter),
+handled with `.by = c(PARAMCD, AVISIT, TRTA)` in the real package; our mock
+demonstrates the two-group case so the structure is clear.
+
+```r
+adlb_analysis <- adlb_an |>
+  filter(PARAMCD %in% c("ALT", "AST", "BILI", "CREAT"))
+
+lab_ard <- ard_stack(
+  adlb_analysis,
+  function(d) ard_continuous(
+    d, variables = c("AVAL", "CHG"), by = "TRT01A",
+    statistic = continuous_summary_fns(c("N","mean","sd","median","min","max")))
+)
+```
+
+> **Population reminder:** apply the same population filter to data *and*
+> denominator. For BDS labs, also keep baseline rows when the table needs a
+> baseline N — filtering on `AVISITN > 0` silently drops baseline.
+
+### Practice — lab AVAL/CHG summary for one parameter
+
+```{r ex-lab-summary, exercise=TRUE, exercise.lines=16}
+# Build an ARD of N, mean, sd, median of AVAL and CHG for ALT, by arm.
+alt <- adlb_an |> filter(PARAMCD == "ALT")
+
+lab_alt_ard <- ard_continuous(
+  data      = alt,
+  variables = c(___, ___),          # AVAL and CHG
+  by        = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd","median"))
+)
+
+# Mean CHG of ALT by arm
+lab_alt_ard |>
+  filter(variable == "CHG", stat_name == ___) |>
+  mutate(mean_chg = round(map_dbl(stat, 1), 2)) |>
+  select(group1_level, mean_chg)
+```
+
+```{r ex-lab-summary-hint-1}
+# variables = c("AVAL","CHG"); stat_name == "mean"
+```
+
+```{r ex-lab-summary-solution}
+alt <- adlb_an |> filter(PARAMCD == "ALT")
+
+lab_alt_ard <- ard_continuous(
+  data      = alt,
+  variables = c("AVAL", "CHG"),
+  by        = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd","median"))
+)
+
+lab_alt_ard |>
+  filter(variable == "CHG", stat_name == "mean") |>
+  mutate(mean_chg = round(map_dbl(stat, 1), 2)) |>
+  select(group1_level, mean_chg)
+```
+
+### Practice — change-from-baseline at a specific visit
+
+```{r ex-lab-visit, exercise=TRUE, exercise.lines=14}
+# Mean CHG of CREAT at "Week 24" by arm. Filter to PARAMCD and AVISIT first.
+creat_w24 <- adlb_an |>
+  filter(PARAMCD == ___, AVISIT == ___)
+
+ard_continuous(
+  data = creat_w24, variables = "CHG", by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd"))
+) |>
+  filter(stat_name == "mean") |>
+  mutate(mean_chg = round(map_dbl(stat, 1), 3)) |>
+  select(group1_level, mean_chg)
+```
+
+```{r ex-lab-visit-hint-1}
+# PARAMCD == "CREAT", AVISIT == "Week 24"
+```
+
+```{r ex-lab-visit-solution}
+creat_w24 <- adlb_an |>
+  filter(PARAMCD == "CREAT", AVISIT == "Week 24")
+
+ard_continuous(
+  data = creat_w24, variables = "CHG", by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd"))
+) |>
+  filter(stat_name == "mean") |>
+  mutate(mean_chg = round(map_dbl(stat, 1), 3)) |>
+  select(group1_level, mean_chg)
+```
+
+### Lab toxicity-grade shift
+
+For a shift table you need a baseline category and a post-baseline category.
+`ATOXGR` is an integer toxicity grade after the setup conversion. Here we tabulate
+the post-baseline grade distribution at a visit, factor-typed so all grades show:
+
+```{r ex-lab-shift, exercise=TRUE, exercise.lines=16}
+# Distribution of post-baseline ATOXGR for ALT at "Week 24", by arm.
+# Factor-type the grade so every level appears even at n = 0.
+alt_tox <- adlb_an |>
+  filter(PARAMCD == "ALT", AVISIT == "Week 24", !is.na(ATOXGR)) |>
+  mutate(ATOXGR = factor(ATOXGR, levels = c(0L, 1L, 2L, 3L, 4L)))
+
+ard_categorical(
+  data      = alt_tox,
+  variables = ___,            # the toxicity grade variable
+  by        = "TRT01A"
+) |>
+  filter(stat_name == "n") |>
+  mutate(n = map_dbl(stat, 1)) |>
+  select(group1_level, variable_level, n)
+```
+
+```{r ex-lab-shift-hint-1}
+# variables = "ATOXGR"
+```
+
+```{r ex-lab-shift-solution}
+alt_tox <- adlb_an |>
+  filter(PARAMCD == "ALT", AVISIT == "Week 24", !is.na(ATOXGR)) |>
+  mutate(ATOXGR = factor(ATOXGR, levels = c(0L, 1L, 2L, 3L, 4L)))
+
+ard_categorical(
+  data      = alt_tox,
+  variables = "ATOXGR",
+  by        = "TRT01A"
+) |>
+  filter(stat_name == "n") |>
+  mutate(n = map_dbl(stat, 1)) |>
+  select(group1_level, variable_level, n)
+```
+
+---
+
+## Section 4 — Vital signs ARD
+
+Vital signs follow the same continuous pattern as labs, on `advs`. Parameters are
+`SBP`, `DBP`, `PULSE`, `WEIGHT`, `HEIGHT`. A common variant is the **worst
+post-baseline value** per subject.
+
+```r
+vs <- advs |> filter(SAFFL == "Y", !is.na(AVISIT))
+
+vs_ard <- ard_continuous(
+  vs |> filter(PARAMCD == "SBP"),
+  variables = c("AVAL", "CHG"), by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd","median","min","max")))
+```
+
+### Practice — systolic BP summary
+
+```{r ex-vs-sbp, exercise=TRUE, exercise.lines=14}
+# Summarise AVAL of SBP (systolic BP) by arm: N, mean, sd, min, max.
+vs <- advs |> filter(SAFFL == "Y", !is.na(AVISIT))
+
+sbp <- vs |> filter(PARAMCD == ___)
+
+ard_continuous(
+  data = sbp, variables = "AVAL", by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd","min","max"))
+) |>
+  filter(stat_name == "mean") |>
+  mutate(mean_sbp = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, mean_sbp)
+```
+
+```{r ex-vs-sbp-hint-1}
+# PARAMCD == "SBP"
+```
+
+```{r ex-vs-sbp-solution}
+vs <- advs |> filter(SAFFL == "Y", !is.na(AVISIT))
+
+sbp <- vs |> filter(PARAMCD == "SBP")
+
+ard_continuous(
+  data = sbp, variables = "AVAL", by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd","min","max"))
+) |>
+  filter(stat_name == "mean") |>
+  mutate(mean_sbp = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, mean_sbp)
+```
+
+### Practice — worst (maximum) post-baseline value
+
+```{r ex-vs-worst, exercise=TRUE, exercise.lines=18}
+# For PULSE, take the maximum AVAL per subject post-baseline (AVISITN > 0),
+# then summarise across arms.
+vs <- advs |> filter(SAFFL == "Y", !is.na(AVISIT))
+
+pulse_worst <- vs |>
+  filter(PARAMCD == "PULSE", AVISITN > 0) |>
+  group_by(USUBJID, TRT01A) |>
+  slice_max(AVAL, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+ard_continuous(
+  data = pulse_worst, variables = ___, by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","max"))
+) |>
+  filter(stat_name == "max") |>
+  mutate(max_pulse = map_dbl(stat, 1)) |>
+  select(group1_level, max_pulse)
+```
+
+```{r ex-vs-worst-hint-1}
+# variables = "AVAL"
+```
+
+```{r ex-vs-worst-solution}
+vs <- advs |> filter(SAFFL == "Y", !is.na(AVISIT))
+
+pulse_worst <- vs |>
+  filter(PARAMCD == "PULSE", AVISITN > 0) |>
+  group_by(USUBJID, TRT01A) |>
+  slice_max(AVAL, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+ard_continuous(
+  data = pulse_worst, variables = "AVAL", by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","max"))
+) |>
+  filter(stat_name == "max") |>
+  mutate(max_pulse = map_dbl(stat, 1)) |>
+  select(group1_level, max_pulse)
+```
+
+---
+
+## Section 5 — Drug exposure ARD
+
+Treatment duration usually lives in ADSL as `TRTDURD` (treatment duration in
+days). A simple continuous summary by arm gives the exposure table.
+
+```r
+expo_ard <- ard_stack(
+  adsl_saf,
+  function(d) ard_continuous(
+    d, variables = "TRTDURD", by = "TRT01A",
+    statistic = continuous_summary_fns(c("N","mean","sd","median","min","max"))),
+  .by = TRT01A, .total_n = TRUE
+)
+```
+
+### Practice — exposure (treatment duration) summary
+
+```{r ex-expo, exercise=TRUE, exercise.lines=16}
+# Build an exposure ARD: summarise TRTDURD by arm with Big-N rows.
+# (If TRTDURD is absent in your build, derive it as TRTEDT - TRTSDT + 1.)
+adsl_exp <- adsl_saf
+if (!"TRTDURD" %in% names(adsl_exp))
+  adsl_exp <- adsl_exp |> mutate(TRTDURD = as.numeric(TRTEDT - TRTSDT) + 1)
+
+expo_ard <- ard_stack(
+  adsl_exp,
+  function(d) ard_continuous(d, variables = ___, by = "TRT01A",
+                             statistic = continuous_summary_fns(
+                               c("N","mean","sd","median","min","max"))),
+  .by = TRT01A, .total_n = ___
+)
+
+expo_ard |>
+  filter(variable == "TRTDURD", stat_name == "mean") |>
+  mutate(mean_days = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, mean_days)
+```
+
+```{r ex-expo-hint-1}
+# variables = "TRTDURD"; .total_n = TRUE
+```
+
+```{r ex-expo-solution}
+adsl_exp <- adsl_saf
+if (!"TRTDURD" %in% names(adsl_exp))
+  adsl_exp <- adsl_exp |> mutate(TRTDURD = as.numeric(TRTEDT - TRTSDT) + 1)
+
+expo_ard <- ard_stack(
+  adsl_exp,
+  function(d) ard_continuous(d, variables = "TRTDURD", by = "TRT01A",
+                             statistic = continuous_summary_fns(
+                               c("N","mean","sd","median","min","max"))),
+  .by = TRT01A, .total_n = TRUE
+)
+
+expo_ard |>
+  filter(variable == "TRTDURD", stat_name == "mean") |>
+  mutate(mean_days = round(map_dbl(stat, 1), 1)) |>
+  select(group1_level, mean_days)
+```
+
+---
+
+## Section 6 — Concomitant medications ARD
+
+A concomitant-medication table is hierarchical, just like AEs: medication **class**
+nesting medication **term**, counting distinct subjects with the safety-population
+denominator. ADCM is not always present in `pharmaverseadam`, so we demonstrate
+the identical pattern on the AE hierarchy and call out the CM mapping.
+
+The production CM call is:
+
+```r
+cm_ard <- adcm |>
+  filter(SAFFL == "Y") |>
+  distinct(USUBJID, TRT01A, CMCLAS, CMDECOD) |>
+  ard_hierarchical(
+    by          = "TRT01A",
+    variables   = c("CMCLAS", "CMDECOD"),   # class then preferred term
+    denominator = adsl_saf,
+    id          = "USUBJID"
+  )
+```
+
+The structure is identical to the AE incidence ARD: `group2` carries the class,
+`variable_level` carries the term, and `denominator + id` guarantee subject-level
+percentages.
+
+### Practice — a hierarchical subject-count ARD (CM pattern)
+
+```{r ex-cm, exercise=TRUE, exercise.lines=14}
+# Practise the CM/AE hierarchical pattern on adae: count distinct subjects by
+# AEBODSYS (outer) and AEDECOD (inner), with the subject denominator.
+cm_like_ard <- adae_te |>
+  distinct(USUBJID, TRT01A, AEBODSYS, AEDECOD) |>
+  ard_hierarchical(
+    by          = "TRT01A",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = ___,
+    id          = ___
+  )
+
+# Confirm percentages never exceed 100
+cm_like_ard |>
+  filter(stat_name == "p") |>
+  summarise(max_pct = max(map_dbl(stat, 1), na.rm = TRUE))
+```
+
+```{r ex-cm-hint-1}
+# denominator = adsl_saf, id = "USUBJID"
+```
+
+```{r ex-cm-solution}
+cm_like_ard <- adae_te |>
+  distinct(USUBJID, TRT01A, AEBODSYS, AEDECOD) |>
+  ard_hierarchical(
+    by          = "TRT01A",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = adsl_saf,
+    id          = "USUBJID"
+  )
+
+cm_like_ard |>
+  filter(stat_name == "p") |>
+  summarise(max_pct = max(map_dbl(stat, 1), na.rm = TRUE))
+```
+
+---
+
+## Section 7 — ARS traceability metadata
+
+For an ARS-aligned submission, each ARD row should carry the **Output ID**,
+**Analysis ID**, and **Method ID** that produced it. Base `{cards}` does not add
+these, but they are easy to attach post-hoc with `mutate()` + `case_when()`.
+When you use `{siera}` or `{arsbridge}` (Lesson 27), these tags are injected
+automatically from the ARS spec.
+
+```{r ex-ars-tag, exercise=TRUE, exercise.lines=22}
+# Tag demog_ard with ARS metadata: OutputId, AnalysisId, MethodId.
+demog_tagged <- demog_ard |>
+  mutate(
+    OutputId   = "T_DEMOG",
+    AnalysisId = case_when(
+      variable == "AGE"    ~ "AN_DEMOG_AGE",
+      variable == "BMIBL"  ~ "AN_DEMOG_BMI",
+      variable == "SEX"    ~ "AN_DEMOG_SEX",
+      variable == "AGEGR1" ~ "AN_DEMOG_AGEGR",
+      .default = NA_character_
+    ),
+    MethodId = case_when(
+      context == "continuous"  ~ "MTH_SUMMARY_CONTINUOUS",
+      context == "categorical" ~ "MTH_COUNT_PCT",
+      context == ___           ~ "MTH_SUBJECT_COUNT",   # the Big-N context
+      .default = NA_character_
+    )
+  )
+
+demog_tagged |> distinct(context, MethodId)
+```
+
+```{r ex-ars-tag-hint-1}
+# The Big-N context value is "total_n"
+```
+
+```{r ex-ars-tag-solution}
+demog_tagged <- demog_ard |>
+  mutate(
+    OutputId   = "T_DEMOG",
+    AnalysisId = case_when(
+      variable == "AGE"    ~ "AN_DEMOG_AGE",
+      variable == "BMIBL"  ~ "AN_DEMOG_BMI",
+      variable == "SEX"    ~ "AN_DEMOG_SEX",
+      variable == "AGEGR1" ~ "AN_DEMOG_AGEGR",
+      .default = NA_character_
+    ),
+    MethodId = case_when(
+      context == "continuous"  ~ "MTH_SUMMARY_CONTINUOUS",
+      context == "categorical" ~ "MTH_COUNT_PCT",
+      context == "total_n"     ~ "MTH_SUBJECT_COUNT",
+      .default = NA_character_
+    )
+  )
+
+demog_tagged |> distinct(context, MethodId)
+```
+
+---
+
+## Section 8 — Putting it together & validating
+
+A complete study ARD is just every topic ARD bound together with `bind_ard()`
+and validated as a group. Crucially, validation happens on the **ARD**, not on a
+rendered table.
+
+### Practice — assemble and validate a study ARD
+
+```{r ex-study, exercise=TRUE, exercise.lines=24}
+# Combine demographics + AE + a lab ARD into one study ARD, then validate.
+lab_ard <- ard_continuous(
+  adlb_an |> filter(PARAMCD %in% c("ALT","AST")),
+  variables = c("AVAL","CHG"), by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd")))
+
+study_ard <- ___(demog_ard, ae_incidence_ard, lab_ard)
+
+# Validate the whole package
+check_ard_structure(study_ard)
+print_ard_conditions(study_ard)
+
+study_ard |> count(context)
+```
+
+```{r ex-study-hint-1}
+# bind_ard(demog_ard, ae_incidence_ard, lab_ard)
+```
+
+```{r ex-study-solution}
+lab_ard <- ard_continuous(
+  adlb_an |> filter(PARAMCD %in% c("ALT","AST")),
+  variables = c("AVAL","CHG"), by = "TRT01A",
+  statistic = continuous_summary_fns(c("N","mean","sd")))
+
+study_ard <- bind_ard(demog_ard, ae_incidence_ard, lab_ard)
+
+check_ard_structure(study_ard)
+print_ard_conditions(study_ard)
+
+study_ard |> count(context)
+```
+
+### The dual-program-the-ARD validation paradigm
+
+Two programmers each build the demographics ARD independently. Instead of
+comparing rendered RTFs, flatten each ARD to numeric values and `anti_join`:
+
+```{r ex-dualprog, exercise=TRUE, exercise.lines=20}
+# Simulate two programmers' ARDs (here both come from demog_ard, with P2
+# rounded slightly differently). Flatten and find discrepancies.
+flatten_ard <- function(ard) {
+  ard |>
+    filter(!is.na(stat_name), map_lgl(stat, ~ is.numeric(.x[1]))) |>
+    mutate(stat_value = round(map_dbl(stat, 1), 4)) |>
+    select(group1_level, variable, variable_level, stat_name, stat_value)
+}
+
+ard_p1 <- flatten_ard(demog_ard)
+ard_p2 <- flatten_ard(demog_ard)
+
+# Rows in P1 not matched in P2 (should be empty when ARDs agree)
+___(ard_p1, ard_p2)
+```
+
+```{r ex-dualprog-hint-1}
+# anti_join(ard_p1, ard_p2) returns rows in P1 absent from P2
+```
+
+```{r ex-dualprog-solution}
+flatten_ard <- function(ard) {
+  ard |>
+    filter(!is.na(stat_name), map_lgl(stat, ~ is.numeric(.x[1]))) |>
+    mutate(stat_value = round(map_dbl(stat, 1), 4)) |>
+    select(group1_level, variable, variable_level, stat_name, stat_value)
+}
+
+ard_p1 <- flatten_ard(demog_ard)
+ard_p2 <- flatten_ard(demog_ard)
+
+anti_join(ard_p1, ard_p2)
+```
+
+> **Why this is the paradigm shift:** the ARD is the source of truth. Compare the
+> numbers once; the display (RTF/PDF) then only needs a light formatting check
+> that its cells match the ARD it was built from.
+
+---
+
+## Section 9 — Production checklist & migration
+
+Use this as a code-review checklist for every clinical ARD.
+
+| Pitfall | Detection | Fix |
+|---|---|---|
+| Missing `denominator` on AE ARD | percentages > 100% | `denominator = adsl_saf` in every AE/CM/exposure `ard_*()` |
+| Inconsistent population filters | percentages computed on different N | apply SAFFL/ITTFL filter identically to data and denominator |
+| Missing categorical levels | some arms lack a level row | `factor()` all categoricals with the full level set first |
+| Post-baseline-only filter drops baseline | baseline N ≠ post-baseline N | review `AVISITN > 0`; keep baseline rows where needed |
+| `bind_rows()` instead of `bind_ard()` | silent column / class loss | always combine ARDs with `bind_ard()` |
+| Not checking conditions | silent per-stat errors | call `print_ard_conditions()` after building |
+| Wrong `id` | event counts, not subject counts | set `id = "USUBJID"` in `ard_hierarchical()` |
+| Forgetting `.total_n = TRUE` | no Big-N for column headers | include `.total_n = TRUE` in `ard_stack()` |
+
+Migration from the legacy stack:
+
+| Old approach | New approach |
+|---|---|
+| `Tplyr::tplyr_table() |> build()` → wide table | `ard_stack()` → long ARD + gtsummary/tfrmt |
+| `rtables::build_table()` → table object | `ard_*()` → ARD + display layer |
+| recompute for each display | one ARD, many displays |
+| dual program = compare RTF files | dual program = compare ARD flat files |
+| study archive = pile of RTFs | study archive = one RDS per topic |
+
+```{r quiz-pipeline, echo=FALSE}
+quiz(caption = "Pipeline & validation",
+  question("In the ARD-first workflow, what do two independent programmers compare during validation?",
+    answer("The rendered RTF tables, cell by cell"),
+    answer("Their flattened ARDs (numeric values), e.g. via anti_join / full_join",
+           correct = TRUE,
+           message = "You validate the ARD, not the display. Once the numbers agree, the display check is a light formatting confirmation."),
+    answer("The define.xml files"),
+    answer("The SAS logs"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("Why use `bind_ard()` rather than `bind_rows()` to combine ARDs?",
+    answer("bind_ard() is faster"),
+    answer("bind_ard() preserves the card class and aligns the full ARD column set",
+           correct = TRUE,
+           message = "bind_rows() can silently drop the card class and misalign columns across ARDs from different functions."),
+    answer("bind_rows() cannot handle list columns"),
+    answer("There is no difference"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Capstone — a complete safety-table ARD
+
+Assemble the full safety overview ARD: the "any TEAE" overall row, serious-TEAE
+overall row, and the SOC × PT hierarchy — all subject-counted against the safety
+population.
+
+```{r ex-capstone, exercise=TRUE, exercise.lines=34}
+# Step 1: any-TEAE overall row
+any_ard <- adae_te |>
+  distinct(USUBJID, TRT01A) |>
+  mutate(any_teae = "Y") |>
+  ard_categorical(by = "TRT01A", variables = "any_teae", denominator = adsl_saf)
+
+# Step 2: any-serious-TEAE overall row
+sae_ard <- adae_te |>
+  filter(AESER == "Y") |>
+  distinct(USUBJID, TRT01A) |>
+  mutate(any_sae = "Y") |>
+  ard_categorical(by = "TRT01A", variables = "any_sae", denominator = ___)
+
+# Step 3: SOC x PT hierarchy
+soc_pt_ard <- adae_te |>
+  ard_hierarchical(by = "TRT01A", variables = c("AEBODSYS","AEDECOD"),
+                   denominator = adsl_saf, id = "USUBJID")
+
+# Step 4: combine with bind_ard()
+safety_ard <- ___(any_ard, sae_ard, soc_pt_ard)
+
+# Step 5: validate and inspect the any-TEAE percentages
+print_ard_conditions(safety_ard)
+safety_ard |>
+  filter(variable == "any_teae", stat_name == "p") |>
+  mutate(pct = map_dbl(stat, 1)) |>
+  select(group1_level, pct)
+```
+
+```{r ex-capstone-hint-1}
+# Step 2 denominator = adsl_saf
+# Step 4 bind_ard(any_ard, sae_ard, soc_pt_ard)
+```
+
+```{r ex-capstone-solution}
+any_ard <- adae_te |>
+  distinct(USUBJID, TRT01A) |>
+  mutate(any_teae = "Y") |>
+  ard_categorical(by = "TRT01A", variables = "any_teae", denominator = adsl_saf)
+
+sae_ard <- adae_te |>
+  filter(AESER == "Y") |>
+  distinct(USUBJID, TRT01A) |>
+  mutate(any_sae = "Y") |>
+  ard_categorical(by = "TRT01A", variables = "any_sae", denominator = adsl_saf)
+
+soc_pt_ard <- adae_te |>
+  ard_hierarchical(by = "TRT01A", variables = c("AEBODSYS","AEDECOD"),
+                   denominator = adsl_saf, id = "USUBJID")
+
+safety_ard <- bind_ard(any_ard, sae_ard, soc_pt_ard)
+
+print_ard_conditions(safety_ard)
+safety_ard |>
+  filter(variable == "any_teae", stat_name == "p") |>
+  mutate(pct = map_dbl(stat, 1)) |>
+  select(group1_level, pct)
+```
+
+---
+
+## Key takeaways
+
+- A complete clinical ARD pipeline covers **demographics, TEAE incidence
+  (hierarchical + any-AE overall), lab change-from-baseline, vital signs,
+  exposure, and concomitant medications**.
+- Always pass `denominator = adsl_saf` (and `id = "USUBJID"`) for AE/CM/exposure
+  tables so `N` is the subject count, not the event count, and percentages stay
+  ≤ 100%.
+- Always `factor()` categorical variables with the full level set so zero-count
+  levels still appear as `n = 0` rows.
+- Use `ard_stack()` with `.by`, `.overall = TRUE`, and `.total_n = TRUE` to build
+  per-arm columns, an Overall column, and Big-N (`context == "total_n"`) header
+  rows in one call.
+- Combine ARDs with **`bind_ard()`**, never `bind_rows()`.
+- Validate with `check_ard_structure()` and `print_ard_conditions()`; pull values
+  with `get_ard_statistics()` and `map_dbl(stat, 1)`.
+- For ARS traceability, add `OutputId`, `AnalysisId`, `MethodId` post-hoc — or let
+  `siera`/`arsbridge` inject them automatically.
+- **Validate the ARD, not the display:** dual-program the ARD, flatten, and
+  `anti_join` to find discrepancies.
+
+## What's next
+
+**Lesson 27 — `{cardx}`: inferential ARDs.** You extend the same ARD structure
+to statistical tests and models: t-tests, chi-squared, Wilcoxon, regression,
+and survival. The statistics come from model objects rather than simple
+summaries, but the ARD columns — and everything you learned about combining and
+validating ARDs — stay identical. We also introduce `{siera}` (read an ARS JSON,
+auto-generate ARD programs) and `{arsbridge}` (annotated shells → formatted
+tables end-to-end).
+
+---
+
+## Self-check questions
+
+1. A TEAE incidence ARD shows percentages above 100% for some preferred terms.
+   What caused this, and what are the two arguments that fix it?
+2. Write the full `ard_hierarchical()` call for *serious* TEAEs by SOC and PT
+   against the safety-population denominator.
+3. Your demographics ARD is missing the ">80" age-group row for the High Dose
+   arm because no subjects fell in that group. What is the fix, and where in the
+   pipeline does it go?
+4. How would you compare two programmers' demographics ARDs to find
+   discrepancies without ever rendering a table?
+5. Translate to cards: "Compute N, Mean, SD, Median, Min, Max of AVAL and CHG by
+   PARAMCD × AVISIT × treatment arm for the analysis-flagged safety population."
+6. Which `context` value identifies the Big-N rows added by `.total_n = TRUE`,
+   and what consumes them downstream?
+
+---
+
+## Glossary
+
+- **`ard_hierarchical()`** — nested categorical tabulation; computes
+  distinct-subject counts at each nesting level (e.g. SOC then PT).
+- **`ard_dichotomous()`** — single yes/no count (n, N, p) for a flag variable,
+  honouring the subject denominator.
+- **`continuous_summary_fns()`** — returns the named list of default summary
+  functions; subset it with a character vector of statistic names.
+- **`get_ard_statistics()`** — extract a named list of `stat` values matching a
+  filter expression.
+- **`check_ard_structure()`** — confirm required ARD columns exist and `stat` is
+  a list column.
+- **`print_ard_conditions()`** — report any warnings/errors carried in the ARD.
+- **`denominator = adsl_saf`** — pass the ADSL safety population so `N` is the
+  subject count, giving correct AE/CM/exposure percentages.
+- **`id = "USUBJID"`** — count distinct subjects, not events, in hierarchical
+  ARDs.
+- **`.overall = TRUE`** — add an "Overall" pooled group to `ard_stack()`.
+- **`.total_n = TRUE`** — add Big-N per group; rows have `context == "total_n"`.
+- **`bind_ard()`** — combine ARDs while preserving the card class and columns.
+- **`shuffle_ard()`** — (production) pivot `group1_level` to true wide columns,
+  required by tfrmt; gtsummary consumes the long format directly.
+- **`OutputId` / `AnalysisId` / `MethodId`** — ARS traceability columns linking
+  ARD rows to their output, analysis, and statistical method.
+- **TRT01A** — actual treatment in ADAE (renamed from `TRTA` in setup).
+- **TRTEMFL** — treatment-emergent flag in ADAE (`"Y"` = treatment-emergent).
+- **AESER** — serious AE flag in ADAE.
+- **AEBODSYS / AEDECOD** — System Organ Class / Preferred Term in ADAE.
+- **PARAMCD / AVISIT / AVAL / CHG** — parameter code, analysis visit, analysis
+  value, and change-from-baseline in BDS ADaMs.
+- **ATOXGR** — analysis toxicity grade (integer after the setup conversion).
+- **TRTDURD** — treatment duration in days (ADSL), the exposure-table variable.

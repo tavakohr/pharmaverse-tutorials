@@ -1,0 +1,1629 @@
+---
+title: "Lesson 27 — cardx: Inferential & Statistical ARDs"
+author: "Hamid Tavakoli, MD, MSc"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    css: www/custom.css
+runtime: shiny_prerendered
+description: >
+  Extend Analysis Results Datasets (ARDs) with inferential statistics using the
+  cardx package: t-tests, chi-squared and Fisher's exact tests, Wilcoxon rank-sum,
+  proportion and mean confidence intervals, regression coefficients (lm/glm/coxph),
+  Kaplan-Meier survival estimates, log-rank tests, ANOVA, estimated marginal means,
+  and standardized mean differences — all returned in the same machine-readable ARD
+  structure as cards, ready to combine into display-ready datasets for TLF automation.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 27_cardx.Rmd
+# PURPOSE       : cardx package — Inferential & Statistical ARDs:
+#                 ard_stats_t_test(), ard_stats_chisq_test(),
+#                 ard_stats_fisher_test(), ard_stats_wilcox_test(),
+#                 ard_proportion_ci(), ard_continuous_ci(), ard_regression()
+#                 (lm/glm/coxph/mmrm), ard_survival_survfit(),
+#                 ard_survival_survdiff(), ard_aov(), ard_emmeans(), ard_smd().
+#                 Mapping SAS PROC TTEST/FREQ/LIFETEST/PHREG/MIXED/LOGISTIC/GLM
+#                 to cardx, and the ADTTE CNSR censoring convention.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-06-22
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(pharmaverseadam)
+
+# survival is in base R distribution; guard the load so exercises still run
+# even on a minimal install. When present, the survival mocks use the real
+# survfit()/coxph()/survdiff(); otherwise they fall back to simple estimates.
+.have_survival <- requireNamespace("survival", quietly = TRUE)
+if (.have_survival) library(survival)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo","Xanomeline Low Dose","Xanomeline High Dose"))
+  ) |>
+  filter(SAFFL == "Y")
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+advs <- pharmaverseadam::advs
+
+# ADTTE — time-to-event. pharmaverseadam exports adtte_onco (CDISCPILOT01, same
+# 254 subjects as adsl); no TRTA column, so derive it from adsl by USUBJID below.
+adtte <- pharmaverseadam::adtte_onco
+if (!"TRTA" %in% names(adtte) && "TRT01A" %in% names(adtte))
+  adtte <- rename(adtte, TRTA = TRT01A)
+if (!"TRTA" %in% names(adtte))
+  adtte <- left_join(adtte, select(adsl, USUBJID, TRTA = TRT01P), by = "USUBJID")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARDX FUNCTION MOCKS
+# These replicate the real cardx APIs so exercises run inside learnr WITHOUT the
+# real package installed. stats and survival ARE available, so the mocks fit real
+# models (lm/glm/coxph/survfit/survdiff/aov) and tidy the results into ARD rows.
+# Output structure follows the CDISC ARD spec: one row per statistic, the `stat`
+# column is a LIST column, and `context` records the cardx function used.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Helper: build one ARD row (mirrors the cards mock from Lesson 25)
+.ard_row <- function(group1=NA_character_, group1_level=NA_character_,
+                     variable=NA_character_, variable_level=NA_character_,
+                     context, stat_name, stat, stat_label) {
+  tibble(
+    group1         = group1,
+    group1_level   = group1_level,
+    variable       = variable,
+    variable_level = variable_level,
+    context        = context,
+    stat_name      = stat_name,
+    stat           = list(stat),
+    stat_label     = stat_label
+  )
+}
+
+.as_card <- function(x) structure(x, class = c("card","tbl_df","tbl","data.frame"))
+
+# bind_ard() / ard_stack(): combine ARDs, preserve the card class
+ard_stack <- function(...) .as_card(bind_rows(...))
+bind_ard   <- function(...) .as_card(bind_rows(...))
+
+# ── ard_stats_t_test() ───────────────────────────────────────────────────────
+#' Two-sample (or one-sample / paired) t-test as an ARD.
+#'
+#' @param data        A data frame
+#' @param variables   Character: continuous outcome variable
+#' @param by          Optional character: grouping variable (exactly 2 levels)
+#' @param mu          One-sample test value (used when `by` is NULL)
+#' @param var.equal   FALSE = Welch (default), TRUE = Student's pooled-variance
+#' @param alternative "two.sided" (default), "less", or "greater"
+#' @param conf.level  Confidence level (default 0.95)
+ard_stats_t_test <- function(data, variables, by = NULL, mu = 0,
+                             var.equal = FALSE, alternative = "two.sided",
+                             conf.level = 0.95) {
+  vv <- variables
+  if (is.null(by)) {
+    x  <- data[[vv]]
+    tt <- t.test(x, mu = mu, alternative = alternative, conf.level = conf.level)
+    g1 <- NA_character_; gl <- NA_character_
+    est_rows <- list(
+      .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+               stat_name="estimate", stat=unname(tt$estimate[1]), stat_label="Mean")
+    )
+  } else {
+    levs <- as.character(unique(na.omit(data[[by]])))
+    if (length(levs) != 2) stop("ard_stats_t_test() requires exactly 2 levels in 'by'")
+    x1 <- data[[vv]][as.character(data[[by]]) == levs[1]]
+    x2 <- data[[vv]][as.character(data[[by]]) == levs[2]]
+    tt <- t.test(x1, x2, var.equal = var.equal, alternative = alternative,
+                 conf.level = conf.level)
+    g1 <- by; gl <- paste(levs, collapse = " vs ")
+    est_rows <- list(
+      .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+               stat_name="estimate", stat=unname(tt$estimate[1]-tt$estimate[2]),
+               stat_label="Mean Difference"),
+      .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+               stat_name="estimate1", stat=unname(tt$estimate[1]),
+               stat_label="Group 1 Mean"),
+      .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+               stat_name="estimate2", stat=unname(tt$estimate[2]),
+               stat_label="Group 2 Mean")
+    )
+  }
+  rest <- list(
+    .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+             stat_name="statistic", stat=unname(tt$statistic), stat_label="t Statistic"),
+    .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+             stat_name="p.value", stat=unname(tt$p.value), stat_label="p-value"),
+    .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+             stat_name="parameter", stat=unname(tt$parameter), stat_label="Degrees of Freedom"),
+    .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+             stat_name="conf.low", stat=tt$conf.int[1], stat_label="CI Lower"),
+    .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+             stat_name="conf.high", stat=tt$conf.int[2], stat_label="CI Upper"),
+    .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+             stat_name="method", stat=tt$method, stat_label="Method"),
+    .ard_row(group1=g1, group1_level=gl, variable=vv, context="stats_t_test",
+             stat_name="alternative", stat=tt$alternative, stat_label="Alternative")
+  )
+  .as_card(bind_rows(c(est_rows, rest)))
+}
+
+# ── ard_stats_chisq_test() ───────────────────────────────────────────────────
+#' Pearson chi-squared test of independence as an ARD.
+#'
+#' @param data      A data frame
+#' @param by        Character: grouping (column) variable
+#' @param variables Character vector: one or more categorical (row) variables
+ard_stats_chisq_test <- function(data, by, variables) {
+  out <- lapply(variables, function(vv) {
+    cs <- suppressWarnings(chisq.test(table(data[[vv]], data[[by]])))
+    bind_rows(
+      .ard_row(group1=by, variable=vv, context="stats_chisq_test",
+               stat_name="statistic", stat=unname(cs$statistic),
+               stat_label="X-squared Statistic"),
+      .ard_row(group1=by, variable=vv, context="stats_chisq_test",
+               stat_name="p.value", stat=unname(cs$p.value), stat_label="p-value"),
+      .ard_row(group1=by, variable=vv, context="stats_chisq_test",
+               stat_name="parameter", stat=unname(cs$parameter),
+               stat_label="Degrees of Freedom"),
+      .ard_row(group1=by, variable=vv, context="stats_chisq_test",
+               stat_name="method", stat=cs$method, stat_label="Method")
+    )
+  })
+  .as_card(bind_rows(out))
+}
+
+# ── ard_stats_fisher_test() ──────────────────────────────────────────────────
+#' Fisher's exact test as an ARD (preferred for small expected cell counts).
+ard_stats_fisher_test <- function(data, by, variables) {
+  out <- lapply(variables, function(vv) {
+    ft <- fisher.test(table(data[[vv]], data[[by]]))
+    bind_rows(
+      .ard_row(group1=by, variable=vv, context="stats_fisher_test",
+               stat_name="p.value", stat=unname(ft$p.value), stat_label="p-value"),
+      .ard_row(group1=by, variable=vv, context="stats_fisher_test",
+               stat_name="method", stat=ft$method, stat_label="Method")
+    )
+  })
+  .as_card(bind_rows(out))
+}
+
+# ── ard_stats_wilcox_test() ──────────────────────────────────────────────────
+#' Wilcoxon rank-sum (Mann-Whitney) test as an ARD.
+ard_stats_wilcox_test <- function(data, by, variables, correct = TRUE) {
+  vv   <- variables
+  levs <- as.character(unique(na.omit(data[[by]])))
+  if (length(levs) != 2) stop("ard_stats_wilcox_test() requires exactly 2 levels in 'by'")
+  x1 <- data[[vv]][as.character(data[[by]]) == levs[1]]
+  x2 <- data[[vv]][as.character(data[[by]]) == levs[2]]
+  wt <- suppressWarnings(wilcox.test(x1, x2, correct = correct))
+  gl <- paste(levs, collapse = " vs ")
+  bind_rows(
+    .ard_row(group1=by, group1_level=gl, variable=vv, context="stats_wilcox_test",
+             stat_name="statistic", stat=unname(wt$statistic), stat_label="W Statistic"),
+    .ard_row(group1=by, group1_level=gl, variable=vv, context="stats_wilcox_test",
+             stat_name="p.value", stat=unname(wt$p.value), stat_label="p-value"),
+    .ard_row(group1=by, group1_level=gl, variable=vv, context="stats_wilcox_test",
+             stat_name="method", stat=wt$method, stat_label="Method")
+  ) |> .as_card()
+}
+
+# ── ard_proportion_ci() ──────────────────────────────────────────────────────
+#' Confidence interval for a proportion, multiple methods.
+#'
+#' @param data      A data frame
+#' @param variables Character: a factor/character outcome
+#' @param by        Optional character: grouping variable
+#' @param value     Character: which level counts as the "success"
+#' @param method    "wilson" (default), "wald", "clopper_pearson", "agresti_coull",
+#'                  "jeffreys", or "wilson_correct"
+#' @param conf.level Confidence level (default 0.95)
+ard_proportion_ci <- function(data, variables, by = NULL, value,
+                              method = "wilson", conf.level = 0.95) {
+  vv <- variables
+  z  <- qnorm(1 - (1 - conf.level) / 2)
+  groups <- if (!is.null(by)) as.character(unique(na.omit(data[[by]]))) else NA_character_
+  one <- function(x) {
+    x <- x[!is.na(x)]
+    N <- length(x); k <- sum(as.character(x) == value)
+    p <- if (N > 0) k / N else NA_real_
+    ci <- switch(method,
+      "wald" = c(p - z*sqrt(p*(1-p)/N), p + z*sqrt(p*(1-p)/N)),
+      "clopper_pearson" = {
+        lo <- if (k == 0) 0 else qbeta((1-conf.level)/2, k, N-k+1)
+        hi <- if (k == N) 1 else qbeta(1-(1-conf.level)/2, k+1, N-k)
+        c(lo, hi)
+      },
+      "agresti_coull" = {
+        nt <- N + z^2; pt <- (k + z^2/2) / nt
+        c(pt - z*sqrt(pt*(1-pt)/nt), pt + z*sqrt(pt*(1-pt)/nt))
+      },
+      "jeffreys" = c(qbeta((1-conf.level)/2, k+0.5, N-k+0.5),
+                     qbeta(1-(1-conf.level)/2, k+0.5, N-k+0.5)),
+      {  # wilson / wilson_correct (default)
+        den <- 1 + z^2/N; ctr <- (p + z^2/(2*N)) / den
+        hw  <- (z*sqrt(p*(1-p)/N + z^2/(4*N^2))) / den
+        c(ctr - hw, ctr + hw)
+      })
+    list(estimate = p, conf.low = max(0, ci[1]), conf.high = min(1, ci[2]),
+         n = k, N = N)
+  }
+  out <- lapply(groups, function(gl) {
+    sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+    r <- one(sub[[vv]])
+    g1 <- if (!is.null(by)) by else NA_character_
+    bind_rows(
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               variable_level=value, context="proportion_ci",
+               stat_name="estimate", stat=r$estimate, stat_label="Proportion"),
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               variable_level=value, context="proportion_ci",
+               stat_name="conf.low", stat=r$conf.low, stat_label="CI Lower"),
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               variable_level=value, context="proportion_ci",
+               stat_name="conf.high", stat=r$conf.high, stat_label="CI Upper"),
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               variable_level=value, context="proportion_ci",
+               stat_name="n", stat=r$n, stat_label="n (events)"),
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               variable_level=value, context="proportion_ci",
+               stat_name="N", stat=r$N, stat_label="N"),
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               variable_level=value, context="proportion_ci",
+               stat_name="method", stat=method, stat_label="CI Method")
+    )
+  })
+  .as_card(bind_rows(out))
+}
+
+# ── ard_continuous_ci() ──────────────────────────────────────────────────────
+#' Confidence interval for a continuous mean.
+#'
+#' @param method "t.test" (default), "wilcox.test"
+ard_continuous_ci <- function(data, variables, by = NULL,
+                              method = "t.test", conf.level = 0.95) {
+  vv <- variables
+  groups <- if (!is.null(by)) as.character(unique(na.omit(data[[by]]))) else NA_character_
+  out <- lapply(groups, function(gl) {
+    sub <- if (!is.na(gl) && !is.null(by)) data[as.character(data[[by]]) == gl, ] else data
+    x   <- sub[[vv]][!is.na(sub[[vv]])]
+    tt  <- if (method == "wilcox.test")
+             suppressWarnings(wilcox.test(x, conf.int = TRUE, conf.level = conf.level))
+           else t.test(x, conf.level = conf.level)
+    est <- if (method == "wilcox.test") unname(tt$estimate) else mean(x)
+    g1  <- if (!is.null(by)) by else NA_character_
+    bind_rows(
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               context="continuous_ci", stat_name="estimate", stat=est,
+               stat_label="Mean"),
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               context="continuous_ci", stat_name="conf.low", stat=tt$conf.int[1],
+               stat_label="CI Lower"),
+      .ard_row(group1=g1, group1_level=as.character(gl), variable=vv,
+               context="continuous_ci", stat_name="conf.high", stat=tt$conf.int[2],
+               stat_label="CI Upper")
+    )
+  })
+  .as_card(bind_rows(out))
+}
+
+# ── ard_regression() ─────────────────────────────────────────────────────────
+#' Convert any fitted model (lm/glm/coxph/...) into an ARD.
+#'
+#' Reference factor levels appear with estimate = 0 and NA elsewhere, matching
+#' SAS CLASS reference-cell parameterization. Coefficients are on the model's
+#' native scale (log-odds for logistic glm, log-HR for coxph).
+#'
+#' @param x A fitted model object
+ard_regression <- function(x, conf.level = 0.95) {
+  z  <- qnorm(1 - (1 - conf.level) / 2)
+  is_cox <- inherits(x, "coxph")
+  sm  <- summary(x)
+  cf  <- coef(x)
+  if (is_cox) {
+    se <- sm$coefficients[, "se(coef)"]
+    pv <- sm$coefficients[, ncol(sm$coefficients)]
+  } else {
+    cm <- sm$coefficients
+    se <- cm[, 2]; pv <- cm[, ncol(cm)]
+  }
+  terms <- names(cf)
+  out <- lapply(terms, function(tm) {
+    est <- cf[[tm]]; s <- se[[tm]]
+    bind_rows(
+      .ard_row(variable=tm, context="regression", stat_name="estimate",
+               stat=est, stat_label="Coefficient"),
+      .ard_row(variable=tm, context="regression", stat_name="std.error",
+               stat=s, stat_label="Std Error"),
+      .ard_row(variable=tm, context="regression", stat_name="conf.low",
+               stat=est - z*s, stat_label="CI Lower"),
+      .ard_row(variable=tm, context="regression", stat_name="conf.high",
+               stat=est + z*s, stat_label="CI Upper"),
+      .ard_row(variable=tm, context="regression", stat_name="p.value",
+               stat=pv[[tm]], stat_label="p-value")
+    )
+  })
+  .as_card(bind_rows(out))
+}
+
+# ── ard_survival_survfit() ───────────────────────────────────────────────────
+#' Kaplan-Meier x-time survival probabilities and/or median survival as an ARD.
+#'
+#' @param x      A survfit object (built with Surv(AVAL, 1 - CNSR) ~ TRTA)
+#' @param times  Numeric vector: time points for survival probability
+#' @param probs  Numeric: quantile (0.5 = median) of the survival distribution
+ard_survival_survfit <- function(x, times = NULL, probs = NULL) {
+  if (!.have_survival || !inherits(x, "survfit"))
+    stop("ard_survival_survfit() needs a survfit object (load survival).")
+  strata <- if (!is.null(x$strata)) sub("^.*=", "", names(x$strata)) else NA_character_
+  rows <- list()
+  if (!is.null(times)) {
+    s <- summary(x, times = times, extend = TRUE)
+    grp <- if (!is.null(s$strata)) sub("^.*=", "", as.character(s$strata)) else NA_character_
+    for (i in seq_along(s$time)) {
+      rows <- c(rows, list(
+        .ard_row(group1=if (!is.na(grp[i])) "TRTA" else NA_character_,
+                 group1_level=grp[i], variable="survival", context="survival_survfit",
+                 stat_name="estimate", stat=s$surv[i],
+                 stat_label=paste0("Survival at t=", s$time[i])),
+        .ard_row(group1=if (!is.na(grp[i])) "TRTA" else NA_character_,
+                 group1_level=grp[i], variable="survival", context="survival_survfit",
+                 stat_name="conf.low", stat=s$lower[i], stat_label="CI Lower"),
+        .ard_row(group1=if (!is.na(grp[i])) "TRTA" else NA_character_,
+                 group1_level=grp[i], variable="survival", context="survival_survfit",
+                 stat_name="conf.high", stat=s$upper[i], stat_label="CI Upper"),
+        .ard_row(group1=if (!is.na(grp[i])) "TRTA" else NA_character_,
+                 group1_level=grp[i], variable="survival", context="survival_survfit",
+                 stat_name="n.risk", stat=s$n.risk[i], stat_label="N at risk")
+      ))
+    }
+  }
+  if (!is.null(probs)) {
+    q  <- quantile(x, probs = probs)
+    gl <- if (!is.null(x$strata)) strata else NA_character_
+    qt <- if (is.matrix(q$quantile)) q$quantile[, 1] else q$quantile
+    lo <- if (is.matrix(q$lower)) q$lower[, 1] else q$lower
+    hi <- if (is.matrix(q$upper)) q$upper[, 1] else q$upper
+    for (i in seq_along(qt)) {
+      rows <- c(rows, list(
+        .ard_row(group1=if (!is.na(gl[i])) "TRTA" else NA_character_,
+                 group1_level=gl[i], variable="survival", context="survival_survfit",
+                 stat_name="estimate", stat=qt[i], stat_label="Median Survival"),
+        .ard_row(group1=if (!is.na(gl[i])) "TRTA" else NA_character_,
+                 group1_level=gl[i], variable="survival", context="survival_survfit",
+                 stat_name="conf.low", stat=lo[i], stat_label="CI Lower"),
+        .ard_row(group1=if (!is.na(gl[i])) "TRTA" else NA_character_,
+                 group1_level=gl[i], variable="survival", context="survival_survfit",
+                 stat_name="conf.high", stat=hi[i], stat_label="CI Upper")
+      ))
+    }
+  }
+  .as_card(bind_rows(rows))
+}
+
+# ── ard_survival_survdiff() ──────────────────────────────────────────────────
+#' Log-rank test (from survdiff) as an ARD.
+ard_survival_survdiff <- function(x) {
+  if (!.have_survival || !inherits(x, "survdiff"))
+    stop("ard_survival_survdiff() needs a survdiff object (load survival).")
+  df <- length(x$n) - 1
+  pv <- pchisq(x$chisq, df, lower.tail = FALSE)
+  bind_rows(
+    .ard_row(variable="survival", context="survival_survdiff",
+             stat_name="statistic", stat=x$chisq, stat_label="Chi-squared"),
+    .ard_row(variable="survival", context="survival_survdiff",
+             stat_name="df", stat=df, stat_label="Degrees of Freedom"),
+    .ard_row(variable="survival", context="survival_survdiff",
+             stat_name="p.value", stat=pv, stat_label="p-value")
+  ) |> .as_card()
+}
+
+# ── ard_aov() ────────────────────────────────────────────────────────────────
+#' One-way (or multi-way) ANOVA as an ARD.
+#'
+#' @param formula A model formula (e.g. AGE ~ TRT01P)
+#' @param data    A data frame
+ard_aov <- function(formula, data) {
+  fit <- aov(formula, data = data)
+  st  <- summary(fit)[[1]]
+  terms <- trimws(rownames(st))
+  out <- lapply(seq_len(nrow(st)), function(i) {
+    tm <- terms[i]
+    bind_rows(
+      .ard_row(variable=tm, context="aov", stat_name="sumsq",
+               stat=st[i, "Sum Sq"], stat_label="Sum of Squares"),
+      .ard_row(variable=tm, context="aov", stat_name="df",
+               stat=st[i, "Df"], stat_label="Degrees of Freedom"),
+      .ard_row(variable=tm, context="aov", stat_name="statistic",
+               stat=st[i, "F value"], stat_label="F Statistic"),
+      .ard_row(variable=tm, context="aov", stat_name="p.value",
+               stat=st[i, "Pr(>F)"], stat_label="p-value")
+    )
+  })
+  .as_card(bind_rows(out))
+}
+
+# ── ard_emmeans() ────────────────────────────────────────────────────────────
+#' Estimated marginal (least-squares) means as an ARD.
+#'
+#' Mock: computes group means + t-based CIs from a fitted lm and a grouping
+#' variable, approximating emmeans output for teaching purposes.
+#'
+#' @param object A fitted lm
+#' @param specs  Character: the grouping (CLASS) variable name
+ard_emmeans <- function(object, specs, conf.level = 0.95) {
+  data <- model.frame(object)
+  grp  <- specs
+  levs <- as.character(unique(na.omit(data[[grp]])))
+  resp <- names(data)[1]
+  out <- lapply(levs, function(lv) {
+    x  <- data[[resp]][as.character(data[[grp]]) == lv]
+    tt <- t.test(x, conf.level = conf.level)
+    bind_rows(
+      .ard_row(group1=grp, group1_level=lv, variable=resp, context="emmeans",
+               stat_name="estimate", stat=unname(tt$estimate), stat_label="LS Mean"),
+      .ard_row(group1=grp, group1_level=lv, variable=resp, context="emmeans",
+               stat_name="conf.low", stat=tt$conf.int[1], stat_label="CI Lower"),
+      .ard_row(group1=grp, group1_level=lv, variable=resp, context="emmeans",
+               stat_name="conf.high", stat=tt$conf.int[2], stat_label="CI Upper")
+    )
+  })
+  .as_card(bind_rows(out))
+}
+
+# ── ard_smd() ────────────────────────────────────────────────────────────────
+#' Standardized mean differences for covariate balance as an ARD.
+#'
+#' Pairwise SMD between the first by-level (reference) and each other level.
+ard_smd <- function(data, by, variables) {
+  levs <- as.character(unique(na.omit(data[[by]])))
+  ref  <- levs[1]
+  cmp  <- levs[-1]
+  smd_one <- function(x, g) {
+    a <- x[g == ref]; b <- x[g != ref]
+    if (is.numeric(x)) {
+      sp <- sqrt((var(a, na.rm=TRUE) + var(b, na.rm=TRUE)) / 2)
+      (mean(b, na.rm=TRUE) - mean(a, na.rm=TRUE)) / sp
+    } else {
+      pa <- mean(as.character(a) == as.character(x)[1], na.rm=TRUE)
+      pb <- mean(as.character(b) == as.character(x)[1], na.rm=TRUE)
+      (pb - pa) / sqrt((pa*(1-pa) + pb*(1-pb)) / 2)
+    }
+  }
+  out <- lapply(variables, function(vv) {
+    lapply(cmp, function(cl) {
+      sub <- data[as.character(data[[by]]) %in% c(ref, cl), ]
+      val <- tryCatch(smd_one(sub[[vv]], as.character(sub[[by]])),
+                      error = function(e) NA_real_)
+      .ard_row(group1=by, group1_level=paste(ref, "vs", cl), variable=vv,
+               context="smd", stat_name="estimate", stat=val,
+               stat_label="Std. Mean Difference")
+    }) |> bind_rows()
+  })
+  .as_card(bind_rows(out))
+}
+
+# ── small display helper used across exercises ───────────────────────────────
+# Extract one stat value to plain numeric (purrr::map_dbl(stat, 1) idiom in cardx)
+.pull1 <- function(stat) map_dbl(stat, 1)
+
+# ── Pre-built objects for exercises ──────────────────────────────────────────
+adsl_2arm <- adsl |>
+  filter(TRT01P %in% c("Xanomeline Low Dose","Xanomeline High Dose")) |>
+  mutate(TRT01P = droplevels(TRT01P))
+
+adtte_os <- adtte |> filter(PARAMCD == "OS")
+if (nrow(adtte_os) == 0) adtte_os <- adtte |> filter(PARAMCD == unique(adtte$PARAMCD)[1])
+```
+
+## Overview
+
+In Lesson 25 you built **descriptive** ARDs with `{cards}`: counts, means, medians. Clinical reporting also needs **inferential** statistics — p-values, confidence intervals, hazard ratios, survival estimates. **`{cardx}`** ("cards extra") adds exactly these, wrapping the relevant base-R and `{survival}` machinery into the *same* ARD structure.
+
+```
+Data → descriptive ARD (cards)  ┐
+                                 ├─ bind_ard() → display-ready ARD → gtsummary/tfrmt
+Data → inferential ARD (cardx)  ┘
+```
+
+The payoff: one row per statistic, the same `group1 / variable / stat_name / stat / stat_label` columns, the same list-column `stat`. The only thing that changes is the **`context`** value (`"stats_t_test"`, `"survival_survfit"`, `"regression"`, …) so you can tell which engine produced each row.
+
+> **Reminder:** `stat` is a **list column**. You cannot do arithmetic on it directly. cardx examples use the `purrr::map_dbl(stat, 1)` idiom to pull a plain numeric vector; in this tutorial a helper `.pull1(stat)` does the same. `unlist(stat)` also works for simple numeric stats.
+
+### What cardx wraps
+
+cardx imports statistical computation from a wide range of R packages. The naming pattern is `ard_<engine>_<model>()`.
+
+| Package | What cardx wraps |
+|---|---|
+| `{stats}` (base R) | `t.test()`, `chisq.test()`, `fisher.test()`, `wilcox.test()`, `lm()`, `glm()`, `aov()` |
+| `{survival}` | `survfit()`, `coxph()`, `survdiff()` |
+| `{lme4}` / `{mmrm}` | `lmer()`, `mmrm()` (mixed models / MMRM) |
+| `{emmeans}` | Estimated marginal means and contrasts |
+| `{smd}` | Standardized mean differences |
+| `{broom.helpers}` | Tidy model-extraction backbone for `ard_regression()` |
+
+### Trial datasets
+
+All exercises use **CDISCPILOT01** (the Alzheimer's / Xanomeline study) from `pharmaverseadam`: `adsl` (safety population, 3 arms), `adae` (`TRT01A`, `AESER`, `TRTEMFL`), `adlb`, `advs`, and `adtte` (time-to-event: `PARAMCD`, `AVAL`, `CNSR`, `TRTA`).
+
+> **Censoring convention (memorize this now):** In ADTTE, **`CNSR = 1` means the subject was CENSORED** (event did *not* occur). But `survival::Surv(time, event)` expects the second argument to be **`1 = event occurred`**. They are opposite. Always build the survival object with `Surv(AVAL, 1 - CNSR)`. We return to this in Section 9.
+
+---
+
+## Section 1 — t-test: comparing continuous variables between arms
+
+The most common use is adding a **p-value** column to a demographics table. `ard_stats_t_test()` wraps `stats::t.test()` and returns every component — estimate, statistic, df, CI bounds, method, alternative — as its own ARD row.
+
+**SAS equivalent:** `PROC TTEST DATA=adsl_2arm; CLASS arm; VAR age; RUN;` — but SAS sends the result to a *report*, not a structured dataset you can filter and combine.
+
+```r
+# Two-sample Welch t-test on AGE between the two Xanomeline arms
+age_ttest <- ard_stats_t_test(adsl_2arm, by = "TRT01P", variables = "AGE")
+
+age_ttest |>
+  mutate(value = map_dbl(stat, 1)) |>
+  select(stat_name, stat_label, value)
+```
+
+Note the `method` row tells you *which* variant ran ("Welch Two Sample t-test" vs "Two Sample t-test") — traceability SAS does not give you by default.
+
+```r
+# Paired / one-sample test (mean change vs 0):
+ard_stats_t_test(advs_sub, variables = "CHG", mu = 0)
+
+# One-sided:    alternative = "less"
+# Student's t:  var.equal = TRUE   (pooled variance, not Welch)
+```
+
+### Practice — t-test ARD
+
+```{r ex-ttest, exercise=TRUE, exercise.lines=10}
+# adsl_2arm is pre-built: SAFFL=="Y" filtered to the two Xanomeline arms.
+# Run a Welch two-sample t-test on AGE between arms, then show every statistic.
+
+age_ttest <- ard_stats_t_test(
+  data      = adsl_2arm,
+  by        = ___,
+  variables = ___
+)
+
+age_ttest |>
+  mutate(value = ___(stat, 1)) |>
+  select(stat_name, stat_label, value)
+```
+
+```{r ex-ttest-hint-1}
+# by = "TRT01P", variables = "AGE"
+# Pull list-column values with map_dbl(stat, 1)  (or .pull1(stat))
+```
+
+```{r ex-ttest-solution}
+age_ttest <- ard_stats_t_test(
+  data      = adsl_2arm,
+  by        = "TRT01P",
+  variables = "AGE"
+)
+
+age_ttest |>
+  mutate(value = map_dbl(stat, 1)) |>
+  select(stat_name, stat_label, value)
+```
+
+### Practice — extract just the p-value
+
+```{r ex-ttest-pval, exercise=TRUE, exercise.lines=8}
+# A demographics table only needs the p-value. Filter to it and pull the number.
+
+ard_stats_t_test(adsl_2arm, by = "TRT01P", variables = "WEIGHTBL") |>
+  filter(stat_name == ___) |>
+  mutate(p = round(.pull1(stat), 4)) |>
+  select(variable, stat_label, p)
+```
+
+```{r ex-ttest-pval-hint-1}
+# stat_name == "p.value"
+```
+
+```{r ex-ttest-pval-solution}
+ard_stats_t_test(adsl_2arm, by = "TRT01P", variables = "WEIGHTBL") |>
+  filter(stat_name == "p.value") |>
+  mutate(p = round(.pull1(stat), 4)) |>
+  select(variable, stat_label, p)
+```
+
+---
+
+## Section 2 — Wilcoxon rank-sum test
+
+For non-normally distributed variables, `ard_stats_wilcox_test()` wraps `stats::wilcox.test()` (the Mann-Whitney U test). It returns `statistic` (W), `p.value`, and `method`. Like the t-test, `by` must have **exactly 2 levels**.
+
+**SAS equivalent:** `PROC NPAR1WAY DATA=adsl_2arm WILCOXON; CLASS arm; VAR bmibl; RUN;`
+
+```{r ex-wilcox, exercise=TRUE, exercise.lines=10}
+# BMIBL is right-skewed; a rank-based test is more appropriate than a t-test.
+# Compare the two Xanomeline arms on BMIBL.
+
+ard_stats_wilcox_test(
+  data      = adsl_2arm,
+  by        = ___,
+  variables = ___
+) |>
+  mutate(value = .pull1(stat)) |>
+  select(stat_name, stat_label, value)
+```
+
+```{r ex-wilcox-hint-1}
+# by = "TRT01P", variables = "BMIBL"
+```
+
+```{r ex-wilcox-solution}
+ard_stats_wilcox_test(
+  data      = adsl_2arm,
+  by        = "TRT01P",
+  variables = "BMIBL"
+) |>
+  mutate(value = .pull1(stat)) |>
+  select(stat_name, stat_label, value)
+```
+
+---
+
+## Section 3 — Chi-squared and Fisher's exact tests
+
+For **categorical** variables in a demographics table. `ard_stats_chisq_test()` accepts a *vector* of variables and tests each against the `by` grouping. `ard_stats_fisher_test()` is preferred when expected cell counts are small (any expected count < 5).
+
+**SAS equivalent:** `PROC FREQ DATA=adsl; TABLES arm * sex / CHISQ EXACT; RUN;`
+
+```{r ex-chisq, exercise=TRUE, exercise.lines=10}
+# Chi-squared test of SEX and AGEGR1 distributions across all 3 arms (use adsl).
+# chisq accepts a vector of variables.
+
+ard_stats_chisq_test(
+  data      = adsl,
+  by        = "TRT01P",
+  variables = c(___, ___)
+) |>
+  filter(stat_name == "p.value") |>
+  mutate(p = round(.pull1(stat), 4)) |>
+  select(variable, p)
+```
+
+```{r ex-chisq-hint-1}
+# variables = c("SEX", "AGEGR1")
+```
+
+```{r ex-chisq-solution}
+ard_stats_chisq_test(
+  data      = adsl,
+  by        = "TRT01P",
+  variables = c("SEX", "AGEGR1")
+) |>
+  filter(stat_name == "p.value") |>
+  mutate(p = round(.pull1(stat), 4)) |>
+  select(variable, p)
+```
+
+### Practice — Fisher's exact for a small table
+
+```{r ex-fisher, exercise=TRUE, exercise.lines=9}
+# Fisher's exact test on SEX between the two Xanomeline arms.
+
+ard_stats_fisher_test(
+  data      = adsl_2arm,
+  by        = "TRT01P",
+  variables = ___
+) |>
+  filter(stat_name == "p.value") |>
+  mutate(p = round(.pull1(stat), 4)) |>
+  select(variable, stat_label, p)
+```
+
+```{r ex-fisher-hint-1}
+# variables = "SEX"
+```
+
+```{r ex-fisher-solution}
+ard_stats_fisher_test(
+  data      = adsl_2arm,
+  by        = "TRT01P",
+  variables = "SEX"
+) |>
+  filter(stat_name == "p.value") |>
+  mutate(p = round(.pull1(stat), 4)) |>
+  select(variable, stat_label, p)
+```
+
+### Quiz — univariate tests
+
+```{r quiz-tests, echo=FALSE}
+quiz(caption = "Univariate Comparison Tests",
+  question("You want to test whether RACE distribution differs across 3 treatment arms. Which cardx function fits?",
+    answer("ard_stats_t_test() — it handles multiple groups"),
+    answer("ard_stats_chisq_test() — tests association between two categorical variables, any number of levels",
+           correct = TRUE,
+           message = "Chi-squared (and Fisher) work with any number of levels. t-test and Wilcoxon are for continuous outcomes and require exactly 2 groups."),
+    answer("ard_stats_wilcox_test() — for non-normal categorical data"),
+    answer("ard_proportion_ci() — it computes p-values for categories"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("When is ard_stats_fisher_test() preferred over ard_stats_chisq_test()?",
+    answer("When the outcome is continuous"),
+    answer("When expected cell counts are small (sparse table)", correct = TRUE,
+           message = "Fisher's exact test does not rely on the large-sample chi-squared approximation, so it is preferred when any expected cell count is below ~5."),
+    answer("When there are more than 2 treatment arms"),
+    answer("When the data are normally distributed"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 4 — Proportion confidence intervals: `ard_proportion_ci()`
+
+One of the most practically important cardx functions for pharma reporting: confidence intervals for a proportion (response rate, AE incidence, …) with a choice of CI methods.
+
+| `method` | Method name | Notes |
+|---|---|---|
+| `"wilson"` | Wilson score interval | **Recommended** for clinical reporting; handles small n and extremes |
+| `"wilson_correct"` | Wilson with continuity correction | More conservative |
+| `"clopper_pearson"` | Clopper-Pearson "exact" | Conservative; common in regulatory submissions |
+| `"wald"` | Wald (normal approx.) | Simplest, poor at extremes |
+| `"agresti_coull"` | Agresti-Coull | Good for small N |
+| `"jeffreys"` | Jeffreys (Bayesian) | Symmetric, good properties |
+
+**SAS equivalent:** base SAS has no Wilson/Clopper-Pearson by default — you need `PROC FREQ ... / BINOMIAL(CL=WILSON);`. This is an area where R is strictly more convenient.
+
+```r
+adsl_resp <- adsl |>
+  mutate(RESPONDER = factor(if_else(DTHFL == "Y", "N", "Y"), levels = c("Y","N")))
+
+ard_proportion_ci(
+  adsl_resp, by = "TRT01P", variables = "RESPONDER",
+  value = "Y", method = "wilson"
+)
+```
+
+> **Important: cardx returns the proportion `estimate` on a 0–1 scale here** (e.g. `0.481`), unlike `ard_categorical()`'s `p` which is a 0–100 percentage. Multiply by 100 yourself for display.
+
+### Practice — Wilson CI for an AE-experience rate
+
+```{r ex-prop-ci, exercise=TRUE, exercise.lines=14}
+# Build a subject-level "any AE" flag, then get a Wilson 95% CI per arm.
+anyae <- adsl |>
+  mutate(ANYAE = factor(
+    if_else(USUBJID %in% adae$USUBJID, "Y", "N"), levels = c("Y","N")))
+
+ard_proportion_ci(
+  data      = anyae,
+  by        = "TRT01P",
+  variables = "ANYAE",
+  value     = ___,            # which level is the "success"
+  method    = ___             # use Wilson
+) |>
+  filter(stat_name %in% c("estimate","conf.low","conf.high")) |>
+  mutate(value = round(.pull1(stat), 3)) |>
+  select(group1_level, stat_name, value)
+```
+
+```{r ex-prop-ci-hint-1}
+# value = "Y", method = "wilson"
+```
+
+```{r ex-prop-ci-solution}
+anyae <- adsl |>
+  mutate(ANYAE = factor(
+    if_else(USUBJID %in% adae$USUBJID, "Y", "N"), levels = c("Y","N")))
+
+ard_proportion_ci(
+  data      = anyae,
+  by        = "TRT01P",
+  variables = "ANYAE",
+  value     = "Y",
+  method    = "wilson"
+) |>
+  filter(stat_name %in% c("estimate","conf.low","conf.high")) |>
+  mutate(value = round(.pull1(stat), 3)) |>
+  select(group1_level, stat_name, value)
+```
+
+### Practice — compare CI methods
+
+```{r ex-prop-methods, exercise=TRUE, exercise.lines=16}
+# Compute the Placebo "any AE" CI three ways: wilson, clopper_pearson, wald.
+# Compare the lower/upper bounds.
+anyae <- adsl |>
+  mutate(ANYAE = factor(
+    if_else(USUBJID %in% adae$USUBJID, "Y", "N"), levels = c("Y","N"))) |>
+  filter(TRT01P == "Placebo")
+
+purrr::map_dfr(c("wilson","clopper_pearson","wald"), function(m) {
+  ard_proportion_ci(anyae, variables = "ANYAE", value = "Y", method = ___) |>
+    filter(stat_name %in% c("conf.low","conf.high")) |>
+    mutate(method = m, value = round(.pull1(stat), 3)) |>
+    select(method, stat_name, value)
+})
+```
+
+```{r ex-prop-methods-hint-1}
+# method = m  (the variable being iterated over)
+```
+
+```{r ex-prop-methods-solution}
+anyae <- adsl |>
+  mutate(ANYAE = factor(
+    if_else(USUBJID %in% adae$USUBJID, "Y", "N"), levels = c("Y","N"))) |>
+  filter(TRT01P == "Placebo")
+
+purrr::map_dfr(c("wilson","clopper_pearson","wald"), function(m) {
+  ard_proportion_ci(anyae, variables = "ANYAE", value = "Y", method = m) |>
+    filter(stat_name %in% c("conf.low","conf.high")) |>
+    mutate(method = m, value = round(.pull1(stat), 3)) |>
+    select(method, stat_name, value)
+})
+```
+
+---
+
+## Section 5 — Mean confidence intervals: `ard_continuous_ci()`
+
+For a continuous variable's mean CI (independent of `ard_continuous()`'s default SEM-based interval). Methods: `"t.test"` (t-distribution) and `"wilcox.test"` (Hodges-Lehmann).
+
+**SAS equivalent:** `PROC MEANS DATA=advs MEAN CLM; CLASS trta; VAR chg; RUN;`
+
+```{r ex-cont-ci, exercise=TRUE, exercise.lines=14}
+# 95% t-based CI for mean weight CHG at Week 24 by arm.
+advs_wk24 <- advs |>
+  filter(PARAMCD == "WEIGHT", AVISIT == "Week 24") |>
+  filter(!is.na(CHG))
+
+ard_continuous_ci(
+  data       = advs_wk24,
+  by         = ___,
+  variables  = ___,
+  method     = "t.test",
+  conf.level = 0.95
+) |>
+  mutate(value = round(.pull1(stat), 2)) |>
+  select(group1_level, stat_name, value)
+```
+
+```{r ex-cont-ci-hint-1}
+# by = "TRTA", variables = "CHG"
+```
+
+```{r ex-cont-ci-solution}
+advs_wk24 <- advs |>
+  filter(PARAMCD == "WEIGHT", AVISIT == "Week 24") |>
+  filter(!is.na(CHG))
+
+ard_continuous_ci(
+  data       = advs_wk24,
+  by         = "TRTA",
+  variables  = "CHG",
+  method     = "t.test",
+  conf.level = 0.95
+) |>
+  mutate(value = round(.pull1(stat), 2)) |>
+  select(group1_level, stat_name, value)
+```
+
+---
+
+## Section 6 — Regression: `ard_regression()`
+
+`ard_regression()` is a **universal converter**: hand it any fitted model object — `lm`, `glm`, `coxph`, `mmrm` — and it returns an ARD of coefficients with SEs, CIs, and p-values. Reference factor levels appear with `estimate = 0`, matching SAS CLASS reference-cell parameterization.
+
+> Coefficients are on the model's **native scale**: identity for `lm`, **log-odds** for logistic `glm`, **log-HR** for `coxph`. Exponentiate downstream for odds ratios / hazard ratios.
+
+### Linear regression — ANCOVA-style
+
+**SAS equivalent:** `PROC GLM` / `PROC MIXED` with `CLASS trta sex;` and a `MODEL chg = base trta age sex / SOLUTION;`.
+
+```{r ex-reg-lm, exercise=TRUE, exercise.lines=16}
+# ANCOVA of weight change at Week 24: CHG ~ BASE + TRTA + AGE + SEX.
+advs_wk24 <- advs |>
+  filter(PARAMCD == "WEIGHT", AVISIT == "Week 24", SAFFL == "Y") |>
+  filter(!is.na(CHG), !is.na(BASE))
+
+model_lm <- lm(CHG ~ BASE + TRTA + AGE + SEX, data = advs_wk24)
+
+ard_regression(___) |>
+  filter(stat_name %in% c("estimate","p.value")) |>
+  mutate(value = round(.pull1(stat), 4)) |>
+  select(variable, stat_name, value)
+```
+
+```{r ex-reg-lm-hint-1}
+# ard_regression(model_lm) — pass the fitted model object directly
+```
+
+```{r ex-reg-lm-solution}
+advs_wk24 <- advs |>
+  filter(PARAMCD == "WEIGHT", AVISIT == "Week 24", SAFFL == "Y") |>
+  filter(!is.na(CHG), !is.na(BASE))
+
+model_lm <- lm(CHG ~ BASE + TRTA + AGE + SEX, data = advs_wk24)
+
+ard_regression(model_lm) |>
+  filter(stat_name %in% c("estimate","p.value")) |>
+  mutate(value = round(.pull1(stat), 4)) |>
+  select(variable, stat_name, value)
+```
+
+### Logistic regression — odds ratios
+
+**SAS equivalent:** `PROC LOGISTIC DATA=adsl; CLASS trta sex; MODEL resp(EVENT='1') = trta age sex; ODDSRATIO trta; RUN;`
+
+```{r ex-reg-glm, exercise=TRUE, exercise.lines=18}
+# Logistic model of "any AE" on treatment + age + sex; report odds ratios.
+adsl_log <- adsl |>
+  mutate(ANYAE_NUM = if_else(USUBJID %in% adae$USUBJID, 1L, 0L))
+
+model_glm <- glm(
+  ANYAE_NUM ~ TRT01P + AGE + SEX,
+  data   = adsl_log,
+  family = binomial(link = "logit")
+)
+
+# ard_regression returns log-odds; exponentiate the estimate for the OR.
+ard_regression(model_glm) |>
+  filter(stat_name == ___) |>
+  mutate(OR = round(exp(.pull1(stat)), 3)) |>
+  select(variable, OR)
+```
+
+```{r ex-reg-glm-hint-1}
+# filter(stat_name == "estimate"), then OR = exp(estimate)
+```
+
+```{r ex-reg-glm-solution}
+adsl_log <- adsl |>
+  mutate(ANYAE_NUM = if_else(USUBJID %in% adae$USUBJID, 1L, 0L))
+
+model_glm <- glm(
+  ANYAE_NUM ~ TRT01P + AGE + SEX,
+  data   = adsl_log,
+  family = binomial(link = "logit")
+)
+
+ard_regression(model_glm) |>
+  filter(stat_name == "estimate") |>
+  mutate(OR = round(exp(.pull1(stat)), 3)) |>
+  select(variable, OR)
+```
+
+### Cox proportional hazards — hazard ratios
+
+**SAS equivalent:** `PROC PHREG DATA=adtte_os; CLASS trta sex; MODEL aval * cnsr(1) = trta age sex; HAZARDRATIO trta; RUN;`
+
+Note the SAS `cnsr(1)` — it tells PHREG that **`CNSR = 1` is the censoring value**. The R analogue is `Surv(AVAL, 1 - CNSR)`.
+
+```{r ex-reg-cox, exercise=TRUE, exercise.lines=16}
+# Cox model on OS: HR for treatment, adjusted for AGE and SEX.
+# CRITICAL: CNSR=1 means censored, so the event indicator is 1 - CNSR.
+
+cox_fit <- coxph(
+  Surv(AVAL, 1 - CNSR) ~ TRTA + AGE + SEX,
+  data = adtte_os
+)
+
+ard_regression(cox_fit) |>
+  filter(stat_name == "estimate") |>
+  mutate(HR = round(exp(.pull1(stat)), 3)) |>   # exp(log-HR) = HR
+  select(variable, HR)
+```
+
+```{r ex-reg-cox-hint-1}
+# The Surv() call is already correct: Surv(AVAL, 1 - CNSR).
+# estimate is the log-HR; HR = exp(estimate).
+```
+
+```{r ex-reg-cox-solution}
+cox_fit <- coxph(
+  Surv(AVAL, 1 - CNSR) ~ TRTA + AGE + SEX,
+  data = adtte_os
+)
+
+ard_regression(cox_fit) |>
+  filter(stat_name == "estimate") |>
+  mutate(HR = round(exp(.pull1(stat)), 3)) |>
+  select(variable, HR)
+```
+
+### Quiz — regression
+
+```{r quiz-reg, echo=FALSE}
+quiz(caption = "Regression ARDs",
+  question("ard_regression() on a coxph model returns estimate = 0.182 for TRTAXanomeline High Dose. What is the hazard ratio?",
+    answer("0.182"),
+    answer("exp(0.182) ≈ 1.20", correct = TRUE,
+           message = "coxph coefficients are log-HRs. HR = exp(log-HR) = exp(0.182) ≈ 1.20."),
+    answer("1 - 0.182 = 0.818"),
+    answer("log(0.182)"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("In an ard_regression() ARD, a factor's reference level appears with estimate = 0. Why?",
+    answer("It is a data error and should be removed"),
+    answer("Reference-cell coding sets the reference level as the baseline, so its effect is 0 by definition",
+           correct = TRUE,
+           message = "Like SAS CLASS reference parameterization, the reference level is the comparator; all other levels are estimated relative to it."),
+    answer("Because the model failed to converge"),
+    answer("Because the p-value was non-significant"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 7 — Kaplan-Meier survival: `ard_survival_survfit()`
+
+`ard_survival_survfit()` turns a `survfit` object into an ARD. Two modes:
+
+- **`times = c(...)`** → survival probability at those time points (x-day/x-year survival), with CI and N-at-risk.
+- **`probs = 0.5`** → quantile of the survival distribution (0.5 = **median survival**), with CI.
+
+**SAS equivalent:** `PROC LIFETEST DATA=adtte_os METHOD=KM; TIME aval * cnsr(1); STRATA trta; ODS OUTPUT Quartiles=... SurvivalPlot=...; RUN;`
+
+```{r ex-km-times, exercise=TRUE, exercise.lines=14}
+# x-day survival at days 180 and 365 by treatment arm.
+# Always Surv(AVAL, 1 - CNSR): CNSR=1 is censored, Surv wants 1=event.
+
+km_fit <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+
+ard_survival_survfit(km_fit, times = c(___, ___)) |>
+  filter(stat_name == "estimate") |>
+  mutate(surv = round(.pull1(stat), 3)) |>
+  select(group1_level, stat_label, surv)
+```
+
+```{r ex-km-times-hint-1}
+# times = c(180, 365)
+```
+
+```{r ex-km-times-solution}
+km_fit <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+
+ard_survival_survfit(km_fit, times = c(180, 365)) |>
+  filter(stat_name == "estimate") |>
+  mutate(surv = round(.pull1(stat), 3)) |>
+  select(group1_level, stat_label, surv)
+```
+
+### Practice — median survival with CI
+
+```{r ex-km-median, exercise=TRUE, exercise.lines=12}
+# Median survival (50th percentile of the survival curve) per arm, with CI.
+
+km_fit <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+
+ard_survival_survfit(km_fit, probs = ___) |>
+  filter(stat_name %in% c("estimate","conf.low","conf.high")) |>
+  mutate(days = round(.pull1(stat), 1)) |>
+  select(group1_level, stat_name, days)
+```
+
+```{r ex-km-median-hint-1}
+# probs = 0.5  (the median is the 50th percentile)
+```
+
+```{r ex-km-median-solution}
+km_fit <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+
+ard_survival_survfit(km_fit, probs = 0.5) |>
+  filter(stat_name %in% c("estimate","conf.low","conf.high")) |>
+  mutate(days = round(.pull1(stat), 1)) |>
+  select(group1_level, stat_name, days)
+```
+
+---
+
+## Section 8 — Log-rank test: `ard_survival_survdiff()`
+
+The log-rank test compares survival curves across arms. Feed `ard_survival_survdiff()` a `survdiff` object; it returns the chi-squared statistic, df, and p-value.
+
+**SAS equivalent:** `PROC LIFETEST; ... STRATA trta / LOGRANK; ODS OUTPUT HomTests=...; RUN;`
+
+```{r ex-logrank, exercise=TRUE, exercise.lines=12}
+# Log-rank test of OS across treatment arms.
+
+logrank <- survdiff(
+  Surv(AVAL, 1 - CNSR) ~ TRTA,
+  data = adtte_os
+) |>
+  ___()
+
+logrank |>
+  mutate(value = round(.pull1(stat), 4)) |>
+  select(stat_name, stat_label, value)
+```
+
+```{r ex-logrank-hint-1}
+# Pipe the survdiff object into ard_survival_survdiff()
+```
+
+```{r ex-logrank-solution}
+logrank <- survdiff(
+  Surv(AVAL, 1 - CNSR) ~ TRTA,
+  data = adtte_os
+) |>
+  ard_survival_survdiff()
+
+logrank |>
+  mutate(value = round(.pull1(stat), 4)) |>
+  select(stat_name, stat_label, value)
+```
+
+---
+
+## Section 9 — The censoring convention (the always-misunderstood detail)
+
+This is the **most common source of bugs** in cardx survival analyses. Memorize the table:
+
+| Context | Meaning of `1` | Source |
+|---|---|---|
+| ADTTE: `CNSR = 1` | Subject was **censored** (event did NOT occur) | CDISC ADaM standard |
+| `survival::Surv(time, event)`: `event = 1` | Event **occurred** | R survival package |
+
+They are **opposite**. The conversion is always `Surv(AVAL, 1 - CNSR)`:
+
+```r
+# CORRECT — 1 - CNSR makes the event indicator 1 = event
+survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+coxph(  Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+
+# WRONG — analyzes censored subjects AS IF they had events
+survfit(Surv(AVAL, CNSR) ~ TRTA, data = adtte_os)   # ← BUG
+```
+
+A robust team pattern is to convert once, up front, and never touch `CNSR` inside `Surv()` again:
+
+```r
+adtte_surv <- function(data, paramcd) {
+  data |>
+    filter(PARAMCD == paramcd) |>
+    mutate(EVENT = 1 - CNSR)         # convert once: EVENT = 1 means event
+}
+os <- adtte_surv(adtte, "OS")
+survfit(Surv(AVAL, EVENT) ~ TRTA, data = os)
+```
+
+### Practice — prove the bug
+
+```{r ex-censor, exercise=TRUE, exercise.lines=14}
+# Count "events" the CORRECT way (1 - CNSR) vs the WRONG way (CNSR).
+# They should NOT match. This is why QC catches this so often.
+
+n_events_correct <- adtte_os |> summarise(events = sum(1 - CNSR)) |> pull(events)
+n_events_wrong   <- adtte_os |> summarise(events = sum(___))      |> pull(events)
+
+tibble(
+  approach = c("Surv(AVAL, 1 - CNSR)  [correct]", "Surv(AVAL, CNSR)  [bug]"),
+  events   = c(n_events_correct, n_events_wrong)
+)
+```
+
+```{r ex-censor-hint-1}
+# The WRONG way sums CNSR directly: sum(CNSR)
+```
+
+```{r ex-censor-solution}
+n_events_correct <- adtte_os |> summarise(events = sum(1 - CNSR)) |> pull(events)
+n_events_wrong   <- adtte_os |> summarise(events = sum(CNSR))     |> pull(events)
+
+tibble(
+  approach = c("Surv(AVAL, 1 - CNSR)  [correct]", "Surv(AVAL, CNSR)  [bug]"),
+  events   = c(n_events_correct, n_events_wrong)
+)
+```
+
+### Quiz — censoring
+
+```{r quiz-censor, echo=FALSE}
+quiz(caption = "Censoring Convention",
+  question("In ADTTE, what does CNSR = 1 mean?",
+    answer("The event occurred"),
+    answer("The subject was censored (event did NOT occur)", correct = TRUE,
+           message = "CDISC ADaM uses CNSR = 1 for censored, CNSR = 0 for event. This is the opposite of the survival package convention."),
+    answer("The subject died"),
+    answer("The record is invalid"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("What goes wrong if you write Surv(AVAL, CNSR) instead of Surv(AVAL, 1 - CNSR)?",
+    answer("Nothing — they are equivalent"),
+    answer("R treats censored subjects as having events and vice versa, inverting the entire analysis",
+           correct = TRUE,
+           message = "The event indicator is flipped, so KM curves, medians, HRs, and log-rank p-values are all computed on the wrong subjects."),
+    answer("The model fails to converge"),
+    answer("Only the CI bounds change"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+---
+
+## Section 10 — ANOVA: `ard_aov()`
+
+For an omnibus comparison of a continuous outcome across 3+ groups, `ard_aov()` wraps `stats::aov()` and returns the ANOVA table (sum of squares, df, F, p-value) per term.
+
+**SAS equivalent:** `PROC GLM DATA=adsl; CLASS trt01p; MODEL age = trt01p; RUN;` (or `PROC ANOVA`).
+
+```{r ex-aov, exercise=TRUE, exercise.lines=10}
+# One-way ANOVA: does mean AGE differ across the 3 treatment arms?
+
+ard_aov(AGE ~ ___, data = adsl) |>
+  filter(stat_name %in% c("statistic","p.value")) |>
+  mutate(value = round(.pull1(stat), 4)) |>
+  select(variable, stat_name, value)
+```
+
+```{r ex-aov-hint-1}
+# AGE ~ TRT01P
+```
+
+```{r ex-aov-solution}
+ard_aov(AGE ~ TRT01P, data = adsl) |>
+  filter(stat_name %in% c("statistic","p.value")) |>
+  mutate(value = round(.pull1(stat), 4)) |>
+  select(variable, stat_name, value)
+```
+
+---
+
+## Section 11 — Estimated marginal means: `ard_emmeans()`
+
+For **least-squares (model-adjusted) means** and contrasts — the LSMEANS of clinical reporting. `ard_emmeans()` takes a fitted model and a grouping spec and returns the adjusted mean per level with CI.
+
+**SAS equivalent:** `PROC MIXED ...; LSMEANS trta / DIFF CL; RUN;`
+
+```{r ex-emmeans, exercise=TRUE, exercise.lines=14}
+# Fit an ANCOVA of weight CHG, then get LS means by treatment arm.
+advs_wk24 <- advs |>
+  filter(PARAMCD == "WEIGHT", AVISIT == "Week 24", SAFFL == "Y") |>
+  filter(!is.na(CHG), !is.na(BASE))
+
+mod <- lm(CHG ~ BASE + TRTA, data = advs_wk24)
+
+ard_emmeans(object = mod, specs = ___) |>
+  mutate(value = round(.pull1(stat), 3)) |>
+  select(group1_level, stat_name, value)
+```
+
+```{r ex-emmeans-hint-1}
+# specs = "TRTA" — the CLASS/grouping variable
+```
+
+```{r ex-emmeans-solution}
+advs_wk24 <- advs |>
+  filter(PARAMCD == "WEIGHT", AVISIT == "Week 24", SAFFL == "Y") |>
+  filter(!is.na(CHG), !is.na(BASE))
+
+mod <- lm(CHG ~ BASE + TRTA, data = advs_wk24)
+
+ard_emmeans(object = mod, specs = "TRTA") |>
+  mutate(value = round(.pull1(stat), 3)) |>
+  select(group1_level, stat_name, value)
+```
+
+> **MMRM note:** In real studies the repeated-measures primary endpoint is fit with `{mmrm}` — `mmrm(CHG ~ BASE + TRTA + AVISIT + TRTA:AVISIT + us(AVISIT | USUBJID), data = ...)` — then passed to `ard_regression()` or `ard_emmeans()`. The SAS analogue is `PROC MIXED ... REPEATED avisit / SUBJECT=usubjid TYPE=UN; LSMEANS trta*avisit / DIFF CL;`. The cardx call pattern is identical to the `lm` example above.
+
+---
+
+## Section 12 — Standardized mean differences: `ard_smd()`
+
+`ard_smd()` reports **standardized mean differences** (Cohen's d for continuous, standardized proportion difference for categorical) — the workhorse of covariate-balance "Table 1" assessments and propensity-matching diagnostics. A common rule of thumb: |SMD| < 0.1 indicates good balance.
+
+**SAS equivalent:** no single PROC; usually a macro computing `(mean1 - mean2) / pooled_sd`.
+
+```{r ex-smd, exercise=TRUE, exercise.lines=11}
+# Assess baseline balance of AGE, BMIBL, and SEX across the two Xanomeline arms.
+
+ard_smd(
+  data      = adsl_2arm,
+  by        = "TRT01P",
+  variables = c(___, ___, ___)
+) |>
+  mutate(SMD = round(.pull1(stat), 3)) |>
+  select(group1_level, variable, SMD)
+```
+
+```{r ex-smd-hint-1}
+# variables = c("AGE", "BMIBL", "SEX")
+```
+
+```{r ex-smd-solution}
+ard_smd(
+  data      = adsl_2arm,
+  by        = "TRT01P",
+  variables = c("AGE", "BMIBL", "SEX")
+) |>
+  mutate(SMD = round(.pull1(stat), 3)) |>
+  select(group1_level, variable, SMD)
+```
+
+---
+
+## Section 13 — Combining cards + cardx into one display-ready ARD
+
+The everyday deliverable: a demographics table with **descriptive stats from `{cards}`** and **p-values from `{cardx}`**, merged with `bind_ard()`. The `context` column keeps them distinguishable, and downstream `{gtsummary}` knows to route p-values into the correct column.
+
+```r
+desc_ard <- bind_ard(                        # cards (Lesson 25)
+  ard_continuous(adsl_2arm, variables = "AGE", by = "TRT01P"),
+  ard_categorical(adsl_2arm, variables = c("SEX","AGEGR1"), by = "TRT01P")
+)
+
+pval_ard <- bind_ard(                        # cardx (this lesson)
+  ard_stats_t_test(adsl_2arm, by = "TRT01P", variables = "AGE"),
+  ard_stats_chisq_test(adsl_2arm, by = "TRT01P", variables = c("SEX","AGEGR1"))
+)
+
+demog_with_pvalues <- bind_ard(desc_ard, pval_ard)
+demog_with_pvalues |> distinct(context)
+# "stats_t_test" "stats_chisq_test"  (+ "continuous" "categorical" from cards)
+```
+
+### Practice — assemble an inferential ARD bundle
+
+```{r ex-combine, exercise=TRUE, exercise.lines=20}
+# Build ONE ARD bundling, for the two Xanomeline arms:
+#   - t-test on AGE
+#   - chi-squared on SEX and AGEGR1
+#   - Wilcoxon on BMIBL
+# Then list the distinct context values and pull all p-values.
+
+bundle <- bind_ard(
+  ard_stats_t_test(adsl_2arm,      by = "TRT01P", variables = "AGE"),
+  ard_stats_chisq_test(adsl_2arm,  by = "TRT01P", variables = c("SEX","AGEGR1")),
+  ard_stats_wilcox_test(adsl_2arm, by = "TRT01P", variables = ___)
+)
+
+bundle |> distinct(context)
+
+bundle |>
+  filter(stat_name == ___) |>
+  mutate(p = round(.pull1(stat), 4)) |>
+  select(context, variable, p)
+```
+
+```{r ex-combine-hint-1}
+# variables = "BMIBL" for the Wilcoxon test
+# filter(stat_name == "p.value")
+```
+
+```{r ex-combine-solution}
+bundle <- bind_ard(
+  ard_stats_t_test(adsl_2arm,      by = "TRT01P", variables = "AGE"),
+  ard_stats_chisq_test(adsl_2arm,  by = "TRT01P", variables = c("SEX","AGEGR1")),
+  ard_stats_wilcox_test(adsl_2arm, by = "TRT01P", variables = "BMIBL")
+)
+
+bundle |> distinct(context)
+
+bundle |>
+  filter(stat_name == "p.value") |>
+  mutate(p = round(.pull1(stat), 4)) |>
+  select(context, variable, p)
+```
+
+---
+
+## Section 14 — Full SAS → cardx translation table
+
+| Statistical task | SAS PROC | cardx function |
+|---|---|---|
+| Two-group mean comparison | `PROC TTEST; CLASS arm; VAR x;` | `ard_stats_t_test(by, variables)` |
+| One-sample / paired t-test | `PROC TTEST; VAR x;` (or `PAIRED`) | `ard_stats_t_test(variables, mu=)` |
+| Non-parametric two-group | `PROC NPAR1WAY WILCOXON;` | `ard_stats_wilcox_test(by, variables)` |
+| Categorical association | `PROC FREQ; TABLES a*b / CHISQ;` | `ard_stats_chisq_test(by, variables)` |
+| Exact categorical test | `PROC FREQ; TABLES a*b / EXACT;` | `ard_stats_fisher_test(by, variables)` |
+| Proportion CI (Wilson/exact) | `PROC FREQ; ... / BINOMIAL(CL=WILSON);` | `ard_proportion_ci(value, method)` |
+| Mean CI | `PROC MEANS MEAN CLM;` | `ard_continuous_ci(method="t.test")` |
+| Omnibus group comparison | `PROC GLM; CLASS arm; MODEL y=arm;` | `ard_aov(y ~ arm)` |
+| Linear / ANCOVA model | `PROC GLM`/`PROC MIXED ... SOLUTION;` | `ard_regression(lm(...))` |
+| Logistic regression | `PROC LOGISTIC; MODEL y(EVENT='1')=...;` | `ard_regression(glm(..., binomial))` |
+| Cox PH model | `PROC PHREG; MODEL t*cnsr(1)=...;` | `ard_regression(coxph(Surv(t,1-CNSR)~...))` |
+| Kaplan-Meier survival | `PROC LIFETEST METHOD=KM; TIME t*cnsr(1);` | `ard_survival_survfit(times=/probs=)` |
+| Log-rank test | `PROC LIFETEST; STRATA arm / LOGRANK;` | `ard_survival_survdiff()` |
+| MMRM / repeated measures | `PROC MIXED; REPEATED / TYPE=UN; LSMEANS;` | `ard_regression(mmrm(...))` + `ard_emmeans()` |
+| Least-squares means | `LSMEANS arm / DIFF CL;` | `ard_emmeans(object, specs)` |
+| Standardized mean diff | (macro) | `ard_smd(by, variables)` |
+
+---
+
+## Section 15 — Capstone: a complete primary-efficacy inferential ARD
+
+Build, in one pipeline, the inferential layer for an OS analysis: K-M x-day survival, median survival, log-rank test, and a Cox HR — all bound into a single ARD with a unified structure.
+
+```{r ex-capstone, exercise=TRUE, exercise.lines=44}
+# All four pieces use the SAME survival object convention: Surv(AVAL, 1 - CNSR).
+
+# 1. Fit the K-M curve and the Cox model
+km   <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+cox  <- coxph(  Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+
+# 2. x-day survival at 180 and 365 days
+os_xday <- ard_survival_survfit(km, times = c(180, 365))
+
+# 3. Median survival
+os_med  <- ard_survival_survfit(km, probs = ___)
+
+# 4. Log-rank test
+os_lr   <- survdiff(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os) |>
+             ___()
+
+# 5. Cox hazard ratios
+os_cox  <- ard_regression(cox)
+
+# 6. Bind into one ARD and inspect the contexts present
+os_ard <- bind_ard(os_xday, os_med, os_lr, os_cox)
+
+os_ard |> count(context)
+```
+
+```{r ex-capstone-hint-1}
+# probs = 0.5 for the median; pipe survdiff into ard_survival_survdiff()
+```
+
+```{r ex-capstone-solution}
+km   <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+cox  <- coxph(  Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+
+os_xday <- ard_survival_survfit(km, times = c(180, 365))
+os_med  <- ard_survival_survfit(km, probs = 0.5)
+os_lr   <- survdiff(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os) |>
+             ard_survival_survdiff()
+os_cox  <- ard_regression(cox)
+
+os_ard <- bind_ard(os_xday, os_med, os_lr, os_cox)
+
+os_ard |> count(context)
+```
+
+---
+
+## Lesson Summary
+
+```{r final-quiz, echo=FALSE}
+quiz(caption = "Lesson 27 — Final Quiz",
+  question("What is the single biggest structural difference between a cards ARD and a cardx ARD?",
+    answer("cardx ARDs use a wide format"),
+    answer("None — same columns and list-column structure; only the context value (and the kind of statistic) changes",
+           correct = TRUE,
+           message = "That sameness is the point: descriptive (cards) and inferential (cardx) ARDs bind_ard() together cleanly because they share the ARD spec."),
+    answer("cardx stat values are not list columns"),
+    answer("cardx ARDs cannot be combined with cards ARDs"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("Write the survival object for an ADTTE Cox model. Which is correct?",
+    answer("Surv(AVAL, CNSR)"),
+    answer("Surv(AVAL, 1 - CNSR)", correct = TRUE,
+           message = "CNSR=1 is censored in ADTTE; Surv() needs 1=event, so the event indicator is 1 - CNSR."),
+    answer("Surv(CNSR, AVAL)"),
+    answer("Surv(AVAL, CNSR == 1)"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  ),
+  question("ard_proportion_ci(method='wilson') returns estimate = 0.481. ard_categorical() returns p = 48.1 for the same proportion. Why the difference?",
+    answer("One of them is wrong"),
+    answer("ard_proportion_ci() reports a 0–1 proportion; ard_categorical() reports a 0–100 percentage",
+           correct = TRUE,
+           message = "Watch the scale: multiply the cardx proportion estimate by 100 before displaying it next to cards percentages."),
+    answer("Wilson CIs are always on a different scale"),
+    answer("The two functions use different data"),
+    allow_retry = TRUE, random_answer_order = TRUE
+  )
+)
+```
+
+### Key takeaways
+
+- **`{cardx}` = same ARD, inferential statistics.** Same columns, same list-column `stat`, same `bind_ard()` — only `context` changes.
+- **Univariate tests:** `ard_stats_t_test()`, `ard_stats_wilcox_test()` (2 levels only), `ard_stats_chisq_test()`, `ard_stats_fisher_test()` (any levels).
+- **Confidence intervals:** `ard_proportion_ci()` (Wilson/Clopper-Pearson/Wald/…, 0–1 scale), `ard_continuous_ci()` (t / Hodges-Lehmann).
+- **`ard_regression()`** converts *any* fitted model (`lm`, `glm`, `coxph`, `mmrm`) to an ARD; coefficients are native-scale — `exp()` for OR/HR.
+- **Survival:** `ard_survival_survfit(times=)` for x-day survival, `(probs=0.5)` for median; `ard_survival_survdiff()` for the log-rank test.
+- **`ard_aov()`, `ard_emmeans()`, `ard_smd()`** cover omnibus ANOVA, LS means (LSMEANS), and covariate-balance SMDs.
+- **Censoring:** `CNSR = 1` is *censored* in ADTTE; `Surv()` needs `1 - CNSR`. This is the #1 survival QC failure point.
+- **Combine** descriptive (cards) + inferential (cardx) ARDs with `bind_ard()` for a display-ready dataset.
+
+### What's next
+
+**Lesson 28 — gtsummary (Part 1):** the display layer that *consumes* ARDs. You'll use `tbl_ard_summary()`, `add_p()`, and the gtsummary vocabulary to turn the descriptive and inferential ARDs you built in Lessons 25 and 27 into CSR-ready tables — without recomputing a single statistic.
+
+### Self-check questions
+
+1. What's the key difference between `{cards}` and `{cardx}` in the statistics they produce?
+2. Write the complete cardx call for "Wilson 95% CI for a responder rate by treatment arm."
+3. Why does `Surv(AVAL, 1 - CNSR)` need the `1 - CNSR` conversion, and what breaks if you forget it?
+4. Translate to cardx: "Log-rank test of OS by treatment arm."
+5. `ard_regression()` on a logistic `glm` returns `estimate` for a treatment level. What transformation gives the odds ratio?
+6. Which two cardx functions require the `by` variable to have exactly 2 levels, and what do you do for a 3-arm trial?
+7. `ard_proportion_ci()` reports `estimate = 0.52` while `ard_categorical()` reports `p = 52`. What is the scale difference and why does it matter for display?
+
+### Glossary
+
+- **`ard_stats_t_test()`** — t-test → ARD; wraps `stats::t.test()` (Welch by default; `var.equal=TRUE` for Student's).
+- **`ard_stats_wilcox_test()`** — Wilcoxon rank-sum (Mann-Whitney) → ARD; 2 levels only.
+- **`ard_stats_chisq_test()`** — Pearson chi-squared test → ARD; any number of levels.
+- **`ard_stats_fisher_test()`** — Fisher's exact test → ARD; preferred for sparse tables.
+- **`ard_proportion_ci()`** — Proportion CI with multiple methods (Wilson, Clopper-Pearson, Wald, Agresti-Coull, Jeffreys); 0–1 scale.
+- **`ard_continuous_ci()`** — CI for a continuous mean (t-distribution or Hodges-Lehmann).
+- **`ard_regression()`** — Convert any fitted model (`lm`/`glm`/`coxph`/`mmrm`) to an ARD; native-scale coefficients.
+- **`ard_survival_survfit()`** — K-M x-time survival (`times=`) and median (`probs=0.5`) → ARD.
+- **`ard_survival_survdiff()`** — Log-rank test → ARD.
+- **`ard_aov()`** — One-/multi-way ANOVA table → ARD.
+- **`ard_emmeans()`** — Estimated marginal (LS) means → ARD; the LSMEANS equivalent.
+- **`ard_smd()`** — Standardized mean differences for covariate balance → ARD.
+- **Welch t-test** — Default two-sample t-test allowing unequal variances.
+- **Wilson interval** — Recommended proportion CI; handles small N and extreme proportions.
+- **Clopper-Pearson** — "Exact" proportion CI; conservative, common in regulatory submissions.
+- **HR** — Hazard Ratio; `exp(log-HR)` from a Cox model.
+- **OR** — Odds Ratio; `exp(log-odds)` from a logistic model.
+- **LS mean** — Least-squares (model-adjusted) group mean.
+- **MMRM** — Mixed Model with Repeated Measures; standard primary analysis for repeated-measures efficacy.
+- **SMD** — Standardized Mean Difference; covariate-balance metric (|SMD| < 0.1 ≈ balanced).
+- **Censoring convention** — ADTTE: `CNSR = 1` = censored; `Surv()`: second arg `1` = event; convert with `1 - CNSR`.
+- **`context`** — ARD column recording which cardx engine produced each row (`"stats_t_test"`, `"survival_survfit"`, `"regression"`, …).

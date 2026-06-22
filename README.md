@@ -270,14 +270,16 @@ Each `pharmaverseXX/` folder contains human-readable **narrative lesson plans**
 
 | # | File | Exercises | Quizzes | Topic |
 |---|------|:---------:|:-------:|-------|
-| 25 | [25_cards_cardx.Rmd](pharmaverse_tutorials/25_cards_cardx.Rmd) | 21 | 3 | ARD construction with cards/cardx, statistical test results |
-| 26 | [26_gtsummary_part1.Rmd](pharmaverse_tutorials/26_gtsummary_part1.Rmd) | 11 | 2 | tbl\_summary(), by-arm demographics, add\_n/add\_p |
-| 27 | [27_gtsummary_part2.Rmd](pharmaverse_tutorials/27_gtsummary_part2.Rmd) | 9 | 2 | tbl\_regression(), tbl\_merge(), custom themes |
-| 28 | [28_cardinal.Rmd](pharmaverse_tutorials/28_cardinal.Rmd) | 14 | 2 | cardinal frequency and continuous summary tables |
-| 29 | [29_tfrmt_part1.Rmd](pharmaverse_tutorials/29_tfrmt_part1.Rmd) | 19 | 3 | tfrmt body\_plan, frmt(), frmt\_combine(), frmt\_when() |
-| 30 | [30_tfrmt_part2.Rmd](pharmaverse_tutorials/30_tfrmt_part2.Rmd) | 16 | 2 | Spanning headers, row groups, footnotes, col\_plan() |
-| 31 | [31_gt.Rmd](pharmaverse_tutorials/31_gt.Rmd) | 20 | 3 | gt table styling, colours, cell annotations |
-| 32 | [32_tlf_capstone.Rmd](pharmaverse_tutorials/32_tlf_capstone.Rmd) | 14 | 4 | End-to-end ARD → formatted submission table capstone |
+| 25 | [25_cards_part1_ard_concepts.Rmd](pharmaverse_tutorials/25_cards_part1_ard_concepts.Rmd) | 14 | 3 | cards Part 1 — ARD column anatomy, list-column `stat`, ard\_continuous/categorical/hierarchical/complex |
+| 26 | [26_cards_part2_clinical_ards.Rmd](pharmaverse_tutorials/26_cards_part2_clinical_ards.Rmd) | 21 | 3 | cards Part 2 — full clinical ARD pipeline: demographics, TEAE incidence, labs, vitals, exposure |
+| 27 | [27_cardx.Rmd](pharmaverse_tutorials/27_cardx.Rmd) | 20 | 4 | cardx — inferential ARDs: t-test, chi-sq, Fisher, regression, Cox PH, K-M survival, MMRM |
+| 28 | [28_gtsummary_part1.Rmd](pharmaverse_tutorials/28_gtsummary_part1.Rmd) | 11 | 2 | tbl\_summary(), by-arm demographics, add\_n/add\_p, tbl\_ard\_summary() |
+| 29 | [29_gtsummary_part2.Rmd](pharmaverse_tutorials/29_gtsummary_part2.Rmd) | 9 | 2 | tbl\_regression(), tbl\_merge(), ARD-driven tables, custom themes |
+| 30 | [30_cardinal_part1_overview.Rmd](pharmaverse_tutorials/30_cardinal_part1_overview.Rmd) | 8 | 5 | cardinal Part 1 — ARD-first TLG template catalog, Cardinal-future stack, ARS alignment |
+| 31 | [31_cardinal_part2_fda_safety.Rmd](pharmaverse_tutorials/31_cardinal_part2_fda_safety.Rmd) | 11 | 6 | cardinal Part 2 — FDA safety table templates |
+| 32 | [32_tfrmt.Rmd](pharmaverse_tutorials/32_tfrmt.Rmd) | 37 | 7 | tfrmt display metadata + gt formatting: body\_plan, frmt\_combine, col\_plan, gt polish |
+
+> Module 6 was restructured to mirror the lesson plans: cards is now split into Part 1 (concepts) and Part 2 (clinical pipeline), cardx has its own lesson, and tfrmt consolidates the former two tfrmt parts plus the standalone gt material. The previous standalone TLF capstone (`32_tlf_capstone.Rmd`) was moved to `pharmaverse_tutorials/archive/`; the end-to-end capstone now lives in Lessons 47–48.
 
 ---
 

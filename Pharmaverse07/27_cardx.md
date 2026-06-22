@@ -1,7 +1,7 @@
-# Lesson 27 — `{cardx}`: Regression, Survival, and Statistical Test ARDs
+# Lesson 27 — `{cardx}` and `{siera}`: Inferential ARDs and ARS Automation
 
 **Module**: 6 — TLG: the Cardinal-future stack
-**Estimated length**: ~20 min spoken
+**Estimated length**: ~35 min spoken
 **Prerequisites**: Lessons 25–26 (cards)
 
 ---
@@ -10,482 +10,874 @@
 
 By the end of this lesson, you will be able to:
 
-1. Explain what `{cardx}` extends `{cards}` with — inferential statistics
-2. Use `ard_stats_t_test()`, `ard_stats_chisq_test()` and similar for univariate tests
-3. Use `ard_regression()` for regression model output as an ARD
-4. Use `ard_survival_survfit()` to derive Kaplan-Meier estimates and median survival ARDs
-5. Combine cards descriptive ARDs with cardx inferential ARDs into one display-ready dataset
-6. Recognize the broad coverage of statistical model types cardx supports
+1. Explain what `{cardx}` adds to `{cards}` — inferential statistics with the same ARD structure
+2. Use `ard_stats_t_test()`, `ard_stats_chisq_test()`, `ard_stats_fisher_test()` for univariate tests
+3. Use `ard_regression()` for linear, logistic, and Cox model output as ARDs
+4. Use `ard_survival_survfit()` for Kaplan-Meier estimates (x-year survival and median)
+5. Use `ard_survival_survdiff()` for log-rank tests
+6. Use `ard_proportion_ci()` for proportion confidence intervals with multiple CI methods
+7. Combine descriptive (cards) + inferential (cardx) ARDs into one display-ready dataset
+8. Explain the `{siera}` package: what it does, its main function `readARS()`, and how to use it
+9. Walk through a `{siera}` workflow from ARS metadata to auto-generated R scripts to ARD
 
 ---
 
-## 1. What cardx is for
+## 1. What `{cardx}` adds
 
-`{cards}` covers descriptive statistics — N, mean, counts, percentages, hierarchical tabulations. These are the bread-and-butter of demographics, AE summaries, exposure tables. But clinical reporting also needs **inferential** outputs:
+`{cards}` covers descriptive statistics: counts, means, medians. But clinical reporting also needs **inferential** statistics:
 
-- t-tests and chi-squared tests on demographics tables (testing for arm differences)
-- Regression coefficients with CIs and p-values
-- Kaplan-Meier median survival, x-year survival rates
+- p-values from t-tests on demographics differences between arms
+- Confidence intervals for proportions (Wilson, Clopper-Pearson, etc.)
+- Regression coefficients with SEs and CIs
 - Hazard ratios from Cox models
-- Mixed-model estimates (MMRM, mixed-effects)
+- Kaplan-Meier median survival and x-year survival rates
+- Mixed-model treatment estimates (MMRM)
 
-`{cardx}` extends `{cards}` to cover these. Same ARD structure (one row per statistic), but the statistics come from model objects rather than simple summaries.
+`{cardx}` wraps all of these into the same ARD structure. Same column layout (`group1`, `variable`, `stat_name`, `stat_label`, `stat`). Same list-column for `stat`. Same error/warning capture. The only difference is the `context` column value changes to reflect the inferential function used.
 
 ```r
 install.packages("cardx")
 library(cards)
 library(cardx)
+library(survival)
+library(pharmaverseadam)
+library(dplyr)
 ```
 
-cardx imports cards and depends on it. Loading cardx gives you both vocabularies.
+---
 
-## 2. The packages cardx wraps
+## 2. Packages cardx wraps
 
-cardx imports and wraps statistical computation from several R packages, producing ARDs from each:
+cardx imports statistical computation from a wide range of R packages:
 
 | Package | What cardx wraps |
 |---|---|
-| `{stats}` (base R) | t.test, chisq.test, wilcox.test, aov, lm, glm |
-| `{survival}` | survfit, coxph |
-| `{lme4}` | lmer, glmer mixed-effects models |
-| `{geepack}` | GEE models |
-| `{emmeans}` | estimated marginal means |
-| `{effectsize}` | effect-size estimates |
-| `{parameters}` | tidy parameter extraction |
-| `{smd}` | standardized mean differences |
-| `{survey}` | survey-weighted analyses |
-| `{car}` | analysis-of-variance helpers |
-| `{broom.helpers}` | tidy model extraction |
+| `{stats}` (base R) | `t.test()`, `chisq.test()`, `fisher.test()`, `wilcox.test()`, `lm()`, `glm()` |
+| `{survival}` | `survfit()`, `coxph()`, `survdiff()` |
+| `{lme4}` | `lmer()`, `glmer()` (mixed models) |
+| `{mmrm}` | `mmrm()` (MMRM for clinical trials) |
+| `{geepack}` | `geeglm()` (GEE models) |
+| `{emmeans}` | Estimated marginal means and contrasts |
+| `{effectsize}` | Cohen's d and other effect sizes |
+| `{smd}` | Standardized mean differences |
+| `{survey}` | Survey-weighted analyses |
+| `{car}` | Analysis-of-variance |
+| `{broom.helpers}` | Tidy model extraction backbone |
 
-The pattern: cardx provides an `ard_<pkg>_<thing>()` function that wraps the relevant statistical function and returns an ARD.
+The pattern: `ard_<package>_<model_type>()` wraps the relevant function and returns an ARD.
 
-## 3. Univariate tests: comparing arms on AGE
+---
 
-The classic demographics-table augmentation: report a t-test p-value for AGE between two arms.
+## 3. Univariate comparison tests
+
+### t-test: comparing continuous variables between arms
+
+The most common use: add a p-value column to a demographics table.
 
 ```r
-library(pharmaverseadam)
-library(dplyr)
+adsl_2arm <- pharmaverseadam::adsl |>
+  filter(SAFFL == "Y" &
+         ARM %in% c("Xanomeline High Dose", "Xanomeline Low Dose"))
 
-adsl <- pharmaverseadam::adsl |>
-  filter(SAFFL == "Y" & ARM %in% c("Xanomeline High Dose", "Xanomeline Low Dose"))
-
-age_ttest_ard <- ard_stats_t_test(
-  adsl,
-  by = ARM,
+# Two-sample t-test on AGE
+age_ttest <- ard_stats_t_test(
+  adsl_2arm,
+  by        = ARM,
   variables = AGE
 )
 
-age_ttest_ard
+age_ttest |>
+  select(variable, stat_name, stat_label, stat) |>
+  mutate(value = map(stat, 1))
 ```
 
-The output:
+```
+   variable  stat_name   stat_label      value
+1  AGE       estimate    Mean Diff       -1.286
+2  AGE       estimate1   Group 1 Mean    74.381
+3  AGE       estimate2   Group 2 Mean    75.667
+4  AGE       statistic   t Statistic     -1.043
+5  AGE       p.value     p-value         0.299
+6  AGE       parameter   Degrees of F    165.4
+7  AGE       conf.low    CI Lower        -3.722
+8  AGE       conf.high   CI Upper         1.151
+9  AGE       method      Method          Welch Two Sample t-test
+10 AGE       alternative Alternative     two.sided
+```
+
+Every piece of the t-test output is a separate row. This matters because you can filter to just `p.value` for a demographics table's p-value column, or include the CI bounds for a more detailed comparison table.
+
+The `method` row tells you which variant of the t-test was used ("Welch Two Sample t-test" vs "Two Sample t-test"). This is traceability you don't get with SAS `PROC TTEST` output by default.
+
+**SAS equivalent**: `PROC TTEST DATA=adsl_2arm; CLASS arm; VAR age; RUN;` — but the SAS output goes to a report, not a structured dataset you can filter.
+
+```r
+# Paired t-test (within-subject change from baseline against 0):
+ard_stats_t_test(
+  advs |> filter(TRTA == "Xanomeline High Dose" & PARAMCD == "WEIGHT"),
+  variables = CHG,
+  mu        = 0    # test: mean(CHG) = 0
+)
+
+# One-sided test:
+ard_stats_t_test(adsl_2arm, by = ARM, variables = AGE,
+                 alternative = "less")
+
+# Equal variance (Student's t-test, not Welch's):
+ard_stats_t_test(adsl_2arm, by = ARM, variables = AGE,
+                 var.equal = TRUE)
+```
+
+### Wilcoxon rank-sum test
+
+For non-normally distributed variables:
+
+```r
+ard_stats_wilcox_test(
+  adsl_2arm,
+  by        = ARM,
+  variables = AGE
+)
+```
+
+Returns `statistic` (W), `p.value`, `method` ("Wilcoxon rank sum test"), `alternative`.
+
+### Chi-squared and Fisher's exact tests
+
+For categorical variables in a demographics table:
+
+```r
+# Chi-squared
+sex_chisq <- ard_stats_chisq_test(
+  adsl_2arm,
+  by        = ARM,
+  variables = c(SEX, AGEGR1)
+)
+
+# Fisher's exact (better for small cell counts)
+sex_fisher <- ard_stats_fisher_test(
+  adsl_2arm,
+  by        = ARM,
+  variables = SEX
+)
+
+sex_fisher |>
+  filter(stat_name == "p.value") |>
+  mutate(p = map_dbl(stat, 1))
+# p = 0.847  (no significant sex difference between arms)
+```
+
+**SAS equivalent**: `PROC FREQ DATA=adsl_2arm; TABLES arm * sex / CHISQ EXACT; RUN;`
+
+---
+
+## 4. Proportion confidence intervals — `ard_proportion_ci()`
+
+One of the most practically important cardx functions for pharma reporting: confidence intervals for proportions, with multiple CI methods.
+
+```r
+# Response rate in the efficacy population
+adsl_eff <- adsl |> filter(EFFFL == "Y") |>
+  mutate(RESPONDER = factor(if_else(MMRMS_RESPONSE == "Y", "Y", "N"),
+                            levels = c("Y", "N")))
+
+# Wilson CI (preferred for clinical reporting — handles small n and proportions near 0/1)
+resp_ci_ard <- ard_proportion_ci(
+  adsl_eff,
+  by        = TRT01A,
+  variables = RESPONDER,
+  value     = "Y",        # which level is the "success"
+  method    = "wilson"    # Wilson score interval
+)
+
+resp_ci_ard |>
+  mutate(value = map(stat, 1)) |>
+  select(group1_level, stat_name, value)
+```
 
 ```
-group1  variable  context        stat_name   stat_label     stat
-ARM     AGE       stats_t_test   estimate    Mean Diff      -1.286
-ARM     AGE       stats_t_test   estimate1   Group 1 Mean   74.381
-ARM     AGE       stats_t_test   estimate2   Group 2 Mean   75.667
-ARM     AGE       stats_t_test   statistic   t-stat         -1.043
-ARM     AGE       stats_t_test   p.value     p-value        0.299
-ARM     AGE       stats_t_test   conf.low    CI Low         -3.722
-ARM     AGE       stats_t_test   conf.high   CI High        1.151
-ARM     AGE       stats_t_test   method      Method         Welch ...
+   group1_level           stat_name  value
+1  Placebo                estimate   0.481   (proportion responding)
+2  Placebo                conf.low   0.376   (Wilson CI lower)
+3  Placebo                conf.high  0.589   (Wilson CI upper)
+4  Placebo                n          41
+5  Placebo                N          86
 ...
 ```
 
-Each row is one piece of the t-test output: the mean difference, both group means, t-statistic, p-value, CIs, and metadata (method = "Welch Two Sample t-test" — captures whether equal-variance assumption was made). This is the standard "all the information needed" output for clinical reporting.
+**Available CI methods**:
 
-For categorical variables, the equivalent is `ard_stats_chisq_test()` or `ard_stats_fisher_test()`:
+| `method` argument | Method name | Notes |
+|---|---|---|
+| `"wilson"` | Wilson score interval | Recommended for proportions; handles extremes well |
+| `"wilson_correct"` | Wilson with continuity correction | More conservative |
+| `"clopper_pearson"` | Clopper-Pearson "exact" | Exact CI; common in regulatory submissions |
+| `"wald"` | Wald interval | Simplest but poor at extremes |
+| `"agresti_coull"` | Agresti-Coull | Good for small N |
+| `"jeffreys"` | Jeffreys Bayesian | Symmetric; good properties |
+
+**SAS equivalent**: SAS base does not provide Wilson or Clopper-Pearson CIs natively. You'd need `PROC FREQ` with `BINOMIAL(CL=WILSON)` or macro workarounds. This is an area where R is strictly superior.
+
+### Combining response rate with CI in one ARD
 
 ```r
-ard_stats_chisq_test(
-  adsl,
-  by = ARM,
-  variables = c(SEX, AGEGR1)
+# Proportion (count) from cards
+response_count_ard <- ard_categorical(
+  adsl_eff,
+  by        = TRT01A,
+  variables = RESPONDER
 )
+
+# CI from cardx
+response_ci_ard <- ard_proportion_ci(
+  adsl_eff,
+  by = TRT01A, variables = RESPONDER, value = "Y", method = "wilson"
+)
+
+# Combined: both in one ARD for display
+response_full_ard <- bind_ard(response_count_ard, response_ci_ard)
 ```
 
-p-values and other test stats for each categorical variable's distribution across arms.
+---
 
-## 4. Mean differences with confidence intervals
+## 5. Mean confidence intervals — `ard_continuous_ci()`
 
-For "mean change from baseline" comparisons:
-
-```r
-# Suppose we have ADVS with CHG already derived
-advs <- pharmaverseadam::advs |>
-  filter(PARAMCD == "WEIGHT" & AVISIT == "Week 24" & ANL01FL == "Y")
-
-chg_ttest <- ard_stats_t_test(
-  advs,
-  by = TRTA,
-  variables = CHG
-)
-```
-
-Or for a paired analysis (within-subject baseline vs post-baseline change):
+For continuous variable confidence intervals (independent of the `ard_continuous()` default SEM-based CI):
 
 ```r
-ard_stats_t_test(
-  advs |> filter(TRTA == "Xanomeline High Dose"),
+# 95% CI for mean CHG at Week 24
+ard_continuous_ci(
+  advs |> filter(PARAMCD == "WEIGHT" & AVISIT == "Week 24" & ANL01FL == "Y"),
+  by       = TRTA,
   variables = CHG,
-  paired = FALSE                    # one-sample test of CHG against 0
+  conf.level = 0.95,
+  method   = "t.test"    # t-distribution CI
 )
 ```
 
-The arguments mirror `t.test()`'s. The ARD captures everything you need for reporting.
+Available methods: `"t.test"`, `"wilcox.test"`, `"boot"` (bootstrap).
 
-## 5. Regression output: `ard_regression()`
+---
 
-For multi-variable models — linear regression, logistic regression, Poisson — cardx provides `ard_regression()` which converts a fitted model object into an ARD:
+## 6. Regression: `ard_regression()`
+
+`ard_regression()` is a universal converter: give it any fitted model object, get back an ARD.
+
+### Linear regression
 
 ```r
-library(survival)
+advs_wk24 <- pharmaverseadam::advs |>
+  filter(PARAMCD == "WEIGHT" & AVISIT == "Week 24" & ANL01FL == "Y" & SAFFL == "Y")
 
-# Linear regression: WEIGHT change ~ baseline + treatment + age
-model_lm <- lm(
-  CHG ~ BASE + TRTA + AGE,
-  data = advs
-)
+model_lm <- lm(CHG ~ BASE + TRTA + AGE + SEX, data = advs_wk24)
 
 reg_ard <- ard_regression(model_lm)
+
+reg_ard |>
+  filter(stat_name %in% c("estimate", "conf.low", "conf.high", "p.value")) |>
+  mutate(value = map_dbl(stat, 1)) |>
+  select(variable, variable_level, stat_name, value)
 ```
 
-The output has one row per (coefficient × statistic):
-
 ```
-variable       variable_level    stat_name   stat_label    stat
-(Intercept)    NA                estimate    Estimate      2.30
-(Intercept)    NA                std.error   SE            0.51
-(Intercept)    NA                conf.low    CI Low        1.30
-(Intercept)    NA                conf.high   CI High       3.30
-(Intercept)    NA                p.value     p-value       0.000
-BASE           NA                estimate    ...           ...
-TRTA           Placebo           estimate    ...           ...   (reference)
-TRTA           Xanomeline High   estimate    ...           ...
-AGE            NA                estimate    ...           ...
+   variable  variable_level           stat_name  value
+1  BASE      <NA>                     estimate   0.847
+2  BASE      <NA>                     conf.low   0.712
+3  BASE      <NA>                     conf.high  0.982
+4  BASE      <NA>                     p.value    0.000
+5  TRTA      Placebo                  estimate   0.000    (reference)
+6  TRTA      Xanomeline High Dose     estimate  -1.823
+7  TRTA      Xanomeline High Dose     conf.low  -3.241
+8  TRTA      Xanomeline High Dose     conf.high -0.405
+9  TRTA      Xanomeline High Dose     p.value    0.012
+...
 ```
 
-Every coefficient gets a complete set of statistics. For factor variables (like TRTA), each non-reference level gets its own row. Under the hood, cardx uses `broom.helpers` to tidy the model.
+The reference level for factor variables appears with `estimate = 0` (and other stats as NA). Non-reference levels show estimates relative to the reference. This is identical to what SAS `PROC REG` with `CLASS TRTA(REF=...)` would produce, but now in a structured dataset.
 
-Logistic regression (binary outcome):
+### Logistic regression
 
 ```r
-adsl_pop <- adsl |> mutate(RESPONDER = if_else(EFFFL == "Y" & ...some condition..., 1, 0))
+adsl_resp <- adsl |>
+  filter(EFFFL == "Y") |>
+  mutate(RESP_NUM = if_else(MMRMS_RESPONSE == "Y", 1L, 0L))
 
 model_glm <- glm(
-  RESPONDER ~ TRTA + AGE + SEX,
-  data = adsl_pop,
-  family = binomial
+  RESP_NUM ~ TRTA + AGE + SEX,
+  data   = adsl_resp,
+  family = binomial(link = "logit")
 )
 
-ard_regression(model_glm)
+logit_ard <- ard_regression(model_glm)
+
+# To show odds ratios (exp of log-odds):
+logit_ard |>
+  filter(stat_name == "estimate") |>
+  mutate(OR = exp(map_dbl(stat, 1))) |>
+  select(variable, variable_level, OR)
 ```
 
-The ARD includes log-odds estimates and CIs. To produce odds ratios with CIs, cardx provides exponentiation utilities; alternatively, `gtsummary` (Lesson 28) does the exponentiation at the display step.
+**SAS equivalent**: `PROC LOGISTIC DATA=adsl_resp; CLASS trta sex; MODEL resp_num(EVENT='1') = trta age sex; ODDSRATIO trta; RUN;`
 
-## 6. Survival: Kaplan-Meier ARDs
+The key difference: `ard_regression()` returns log-odds by default (like SAS coefficients). Exponentiation to odds ratios happens downstream — either manually with `exp()`, or automatically by `{gtsummary}` when building an `add_difference()` table.
 
-The cardx pattern for K-M analyses:
+### Cox proportional hazards
 
 ```r
-library(survival)
-
 adtte_os <- pharmaverseadam::adtte |>
-  filter(PARAMCD == "OS")
+  filter(PARAMCD == "OS" & SAFFL == "Y")
 
-# Build a survfit object
-km_fit <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
-
-# Convert to ARD: x-year survival rates
-km_xyear_ard <- ard_survival_survfit(km_fit, times = c(180, 365))
-```
-
-The result: for each arm, at each requested time point, you get:
-
-- `n.risk`: number at risk
-- `estimate`: survival probability
-- `std.error`: standard error
-- `conf.low` / `conf.high`: CI bounds
-
-These are the data you need for "% surviving at 6 months / 1 year" annotations on a K-M plot.
-
-For **median survival** with CI:
-
-```r
-km_median_ard <- ard_survival_survfit(
-  km_fit,
-  probs = c(0.5)                # 0.5 = median
-)
-```
-
-The result has the time at which survival = 0.5 for each arm, with CI. You can request other quantiles by passing different `probs`.
-
-Two patterns for the call:
-
-```r
-# Pattern A: pass survfit object
-survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os) |>
-  ard_survival_survfit(times = c(180, 365))
-
-# Pattern B: pass data frame with formula
-adtte_os |>
-  ard_survival_survfit(
-    y = Surv(AVAL, 1 - CNSR),
-    variables = "TRTA",
-    times = c(180, 365)
-  )
-```
-
-Pattern A is more common; Pattern B is handy when the formula isn't known at survfit-call time.
-
-## 7. Hazard ratios from Cox models
-
-For HR comparing arms:
-
-```r
 cox_fit <- coxph(
   Surv(AVAL, 1 - CNSR) ~ TRTA + AGE + SEX,
   data = adtte_os
 )
 
-ard_regression(cox_fit)
+cox_ard <- ard_regression(cox_fit)
+
+# Hazard ratios: exp(log-HR)
+cox_ard |>
+  filter(stat_name == "estimate") |>
+  mutate(HR = exp(map_dbl(stat, 1))) |>
+  select(variable, variable_level, HR)
 ```
 
-`ard_regression()` works for Cox models the same way as for `lm`/`glm` — coefficient ARDs with estimates, SEs, CIs, p-values. For Cox the coefficients are log-hazard-ratios; downstream display layers typically exponentiate.
+**SAS equivalent**: `PROC PHREG DATA=adtte_os; CLASS trta sex; MODEL aval * cnsr(1) = trta age sex; HAZARDRATIO trta; RUN;`
 
-For survival-specific helpers like log-rank tests:
+**Always remember**: `CNSR = 1` in ADTTE means *censored*. `Surv()` second argument means *event occurred*. Convert: `Surv(AVAL, 1 - CNSR)`.
+
+---
+
+## 7. Kaplan-Meier survival ARDs
+
+### x-year survival rates
 
 ```r
-survdiff(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os) |>
+km_fit <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+
+# x-day survival rates (e.g., 180-day and 365-day)
+km_xyear_ard <- ard_survival_survfit(km_fit, times = c(180, 365))
+
+km_xyear_ard |>
+  mutate(value = map_dbl(stat, 1)) |>
+  select(group1_level, stat_name, value)
+```
+
+```
+   group1_level           stat_name   value
+1  Placebo                estimate    0.721   (72.1% survival at day 180)
+2  Placebo                conf.low    0.632
+3  Placebo                conf.high   0.821
+4  Placebo                n.risk      52
+5  Placebo                n.event     24
+6  Xanomeline High Dose   estimate    0.788   (78.8% survival at day 180)
+...
+```
+
+### Median survival with CI
+
+```r
+km_median_ard <- ard_survival_survfit(km_fit, probs = 0.5)
+
+km_median_ard |>
+  filter(stat_name %in% c("estimate", "conf.low", "conf.high")) |>
+  mutate(days = map_dbl(stat, 1)) |>
+  select(group1_level, stat_name, days)
+# Shows: median survival time in days per arm, with CI
+```
+
+### Both together
+
+```r
+km_full_ard <- bind_ard(km_xyear_ard, km_median_ard)
+```
+
+**Confidence interval methods**: The default is Greenwood's formula on the log scale. To use other methods:
+
+```r
+km_fit_plain <- survfit(
+  Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os,
+  conf.type = "plain"    # linear CI
+)
+ard_survival_survfit(km_fit_plain, times = c(180, 365))
+```
+
+**Pattern B** (without pre-building survfit):
+
+```r
+km_ard_alt <- adtte_os |>
+  ard_survival_survfit(
+    y         = Surv(AVAL, 1 - CNSR),
+    variables = "TRTA",
+    times     = c(180, 365)
+  )
+```
+
+**SAS equivalent**: `PROC LIFETEST DATA=adtte_os METHOD=KM PLOTS=SURVIVAL; TIME aval * cnsr(1); STRATA trta; ODS OUTPUT QUARTILES=km_medians SURVIVALPLOT=km_data; RUN;`
+
+---
+
+## 8. Log-rank test: `ard_survival_survdiff()`
+
+```r
+logrank_ard <- survdiff(
+  Surv(AVAL, 1 - CNSR) ~ TRTA,
+  data = adtte_os
+) |>
   ard_survival_survdiff()
+
+logrank_ard |>
+  filter(stat_name == "p.value") |>
+  mutate(p = map_dbl(stat, 1))
+# p = 0.043
 ```
 
-Returns the log-rank statistic, p-value, and degrees of freedom.
+**SAS equivalent**: `PROC LIFETEST; ... STRATA trta / LOGRANK; RUN;` with `ODS OUTPUT HomTests=logrank;`
 
-## 8. Mixed models: lme4 wrapper
+---
 
-For MMRM-style analyses with `{lme4}`:
+## 9. Mixed models: MMRM for repeated measures
+
+For the primary efficacy endpoint in many trials — Mixed Model with Repeated Measures:
 
 ```r
-library(lme4)
+library(mmrm)
 
-# Mixed model: CHG over time
-mmrm_data <- advs |> filter(PARAMCD == "WEIGHT")
+advs_mmrm <- pharmaverseadam::advs |>
+  filter(SAFFL == "Y" & PARAMCD == "WEIGHT" & ANL01FL == "Y") |>
+  filter(!is.na(CHG) & !is.na(BASE) & !is.na(AVISIT))
 
-mixed_fit <- lmer(
-  CHG ~ TRTA * AVISITN + BASE + (1 | USUBJID),
-  data = mmrm_data
+# Fit MMRM with unstructured covariance
+mmrm_fit <- mmrm(
+  formula = CHG ~ BASE + TRTA + AVISIT + TRTA:AVISIT + us(AVISIT | USUBJID),
+  data    = advs_mmrm
 )
 
-ard_regression(mixed_fit)
+mmrm_ard <- ard_regression(mmrm_fit)
+
+# Extract treatment effect at last visit:
+mmrm_ard |>
+  filter(grepl("TRTA", variable) & stat_name == "estimate") |>
+  mutate(effect = map_dbl(stat, 1)) |>
+  select(variable, variable_level, effect)
 ```
 
-The ARD has rows for fixed effects, similar to `lm` output. Random-effects variance components require additional cardx functions (or the `parameters` package directly).
+For estimated marginal means (LS means) with contrasts:
 
-For dedicated MMRM analyses, the `{mmrm}` package (also pharmaverse-aligned) is increasingly preferred over lme4 for clinical reporting; cardx integration is improving.
+```r
+library(emmeans)
 
-## 9. Effect sizes and standardized mean differences
+emm_ard <- ard_emmeans(
+  object      = mmrm_fit,
+  spec        = ~ TRTA | AVISIT,
+  at          = list(AVISIT = "Week 24")
+)
 
-For "did treatment matter clinically, not just statistically":
+# Contains: estimate (LS mean per arm), SE, CI
+```
+
+**SAS equivalent**: `PROC MIXED DATA=advs_mmrm; CLASS trta avisit usubjid; MODEL chg = base trta avisit trta*avisit / SOLUTION DDFM=KR; REPEATED avisit / SUBJECT=usubjid TYPE=UN; LSMEANS trta / DIFF CL; RUN;`
+
+---
+
+## 10. Standardized mean differences: `ard_smd()`
+
+For assessing covariate balance (e.g., comparing randomized arms or propensity-matched groups):
 
 ```r
 library(smd)
 
-ard_stats_smd(
-  adsl,
-  by = "ARM",
-  variables = c("AGE", "BMIBL")
+ard_smd(
+  adsl_saf,
+  by        = TRT01A,
+  variables = c(AGE, BMIBL, SEX, RACE)
 )
 ```
 
-Returns Cohen's d or similar standardized mean differences with CIs. Useful for ITT vs PP comparisons, propensity-score balance checks, etc.
+Returns Cohen's d (for continuous) or standardized difference (for categorical) per variable per treatment comparison. Useful for "Table 1" in observational studies or to assess randomization balance.
 
-## 10. Combining cards + cardx in one display
+---
 
-For a demographics table with p-values, you'd typically build separate ARDs (cards for descriptive, cardx for inferential) and stack them:
+## 11. Combining cards + cardx into one display-ready ARD
+
+The typical demographics table with p-values: descriptive stats from cards, p-values from cardx, combined in one ARD:
 
 ```r
-descriptive_ard <- ard_stack(
-  adsl,
+adsl_2arm <- adsl_saf |>
+  filter(ARM %in% c("Xanomeline High Dose", "Xanomeline Low Dose"))
+
+# Descriptive: cards
+desc_ard <- ard_stack(
+  adsl_2arm,
   ard_continuous(variables = AGE),
-  ard_categorical(variables = c(SEX, AGEGR1)),
-  .by = ARM,
-  .overall = TRUE,
+  ard_categorical(variables = c(SEX, AGEGR1, RACE)),
+  .by      = ARM,
   .total_n = TRUE
 )
 
-pvalue_ard <- bind_ard(
-  ard_stats_t_test(adsl, by = ARM, variables = AGE),
-  ard_stats_chisq_test(adsl, by = ARM, variables = c(SEX, AGEGR1))
+# Inferential: cardx
+pval_ard <- bind_ard(
+  ard_stats_t_test(adsl_2arm,    by = ARM, variables = AGE),
+  ard_stats_chisq_test(adsl_2arm, by = ARM, variables = c(SEX, AGEGR1, RACE))
 )
 
-full_ard <- bind_ard(descriptive_ard, pvalue_ard)
+# Combined
+demog_with_pvalues_ard <- bind_ard(desc_ard, pval_ard)
+
+# The context column distinguishes them:
+demog_with_pvalues_ard |>
+  distinct(context)
+# "continuous", "categorical", "total_n", "stats_t_test", "stats_chisq_test"
 ```
 
-The combined ARD has descriptive rows (with `context = "continuous"` or `"categorical"`) and inferential rows (with `context = "stats_t_test"` or `"stats_chisq_test"`). Downstream display filters and arranges them.
+`{gtsummary}` can consume this combined ARD and automatically place p-values in the correct column. We cover this in Lessons 28–29.
 
-`gtsummary::tbl_ard_summary()` with `add_p()` does this automatically — it requests the right tests internally and stacks the results.
+---
 
-## 11. The pre-baked datasets shipped with cards/cardx
-
-For quick experimentation, `cards::ADSL` and `cards::ADTTE` are bundled test datasets:
+## 12. Complete inferential ARD pipeline: primary efficacy
 
 ```r
-cards::ADSL    # CDISC pilot demographics
-cards::ADTTE   # CDISC pilot time-to-event
+library(cards); library(cardx); library(survival); library(mmrm)
+library(dplyr); library(pharmaverseadam)
+
+adsl_eff  <- pharmaverseadam::adsl  |> filter(EFFFL == "Y")
+adtte_os  <- pharmaverseadam::adtte |> filter(PARAMCD == "OS"  & SAFFL == "Y")
+adtte_pfs <- pharmaverseadam::adtte |> filter(PARAMCD == "PFS" & SAFFL == "Y")
+
+# ─── K-M: Overall Survival ────────────────────────────────────────────────────
+km_os <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+os_xyr   <- ard_survival_survfit(km_os, times = c(180, 365))
+os_med   <- ard_survival_survfit(km_os, probs = 0.5)
+os_lr    <- survdiff(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os) |>
+              ard_survival_survdiff()
+cox_os   <- coxph(Surv(AVAL, 1 - CNSR) ~ TRTA + AGE + SEX, data = adtte_os) |>
+              ard_regression()
+
+os_ard <- bind_ard(os_xyr, os_med, os_lr, cox_os)
+
+# ─── K-M: PFS ────────────────────────────────────────────────────────────────
+km_pfs <- survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_pfs)
+pfs_xyr  <- ard_survival_survfit(km_pfs, times = c(90, 180))
+pfs_med  <- ard_survival_survfit(km_pfs, probs = 0.5)
+pfs_lr   <- survdiff(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_pfs) |>
+              ard_survival_survdiff()
+
+pfs_ard <- bind_ard(pfs_xyr, pfs_med, pfs_lr)
+
+# ─── Response rate (proportion CI) ───────────────────────────────────────────
+adsl_resp <- adsl_eff |>
+  mutate(RESP = factor(if_else(EFFFL == "Y", "Y", "N"), c("Y", "N")))
+
+resp_count  <- ard_categorical(adsl_resp, by = TRT01A, variables = RESP)
+resp_ci     <- ard_proportion_ci(adsl_resp, by = TRT01A, variables = RESP,
+                                 value = "Y", method = "wilson")
+resp_ard    <- bind_ard(resp_count, resp_ci)
+
+# ─── Validate ────────────────────────────────────────────────────────────────
+walk(
+  list(os_ard = os_ard, pfs_ard = pfs_ard, resp_ard = resp_ard),
+  ~ { check_ard_structure(.x); print_ard_conditions(.x) }
+)
+
+# ─── Save ────────────────────────────────────────────────────────────────────
+saveRDS(os_ard,   "ards/os_ard.rds")
+saveRDS(pfs_ard,  "ards/pfs_ard.rds")
+saveRDS(resp_ard, "ards/resp_ard.rds")
 ```
 
-These match `pharmaverseadam`'s test data structure; use whichever feels natural. The cards docs typically reference `cards::ADSL` for compactness.
+---
 
-## 12. Putting it together: an inferential ARD
+## 13. Introducing `{siera}`: ARS metadata → ARD programs
 
-A complete script that produces descriptive + inferential ARDs for a CSR's primary efficacy summary:
+So far in this module we've been writing `{cards}` and `{cardx}` calls manually. The ARS standard envisions a higher automation level: **start from a structured specification, auto-generate the calculation code, never write boilerplate from scratch.**
+
+`{siera}` is the R implementation of this vision.
+
+### What siera does
+
+`{siera}` takes an ARS file (JSON or XLSX) describing your reporting event — what analyses to run, on what populations, with what statistical methods — and generates one R script per output. Each script, when run against ADaM datasets, produces an ARD for that output.
+
+**Key insight**: The specification-to-code step is automated. The programmer's job shifts from "write `ard_continuous()` calls" to "review and validate generated scripts, then run them."
+
+### Installation
 
 ```r
+install.packages("siera")   # CRAN
+library(siera)
+```
+
+### The main function: `readARS()`
+
+```r
+readARS(
+  ARS_path      = "path/to/ars_metadata.xlsx",  # or .json
+  output_folder = "programs/ARDs/",              # where R scripts go
+  ADaM_folder   = "data/adam/"                   # where .csv or .xpt ADaMs live
+)
+```
+
+After running, you'll have one `.R` file per output in `output_folder`. Running any of these scripts produces an `ARD` object.
+
+### Example: using siera's bundled data
+
+```r
+library(siera)
+
+# View the bundled example files:
+ARS_example()
+# [1] "ADAE.csv"                           "ADEXSUM.csv"
+# [3] "ADSL.csv"                           "ADVS.csv"
+# [5] "Common_Safety_Displays_cards.xlsx"  "exampleARS_1.json"
+# ... (several ARS JSON and XLSX examples)
+
+# Use the CDISC Common Safety Displays ARS file (XLSX format):
+ARS_path    <- ARS_example("Common_Safety_Displays_cards.xlsx")
+output_dir  <- tempdir()
+ADaM_dir    <- dirname(ARS_example("ADSL.csv"))
+
+# Generate R scripts:
+readARS(ARS_path, output_dir, ADaM_dir)
+# Creates: ARD_Out14-1-1.R, ARD_Out14-3-1-1.R, ARD_Out14-3-2-1.R, etc.
+
+list.files(output_dir, pattern = "ARD_.*\\.R")
+# [1] "ARD_Out14-1-1.R"    "ARD_Out14-3-1-1.R"  "ARD_Out14-3-2-1.R"
+# [4] "ARD_Out14-3-3-1a.R" "ARD_Out14-3-3-1b.R"
+```
+
+### Running a generated script
+
+```r
+# Run the demographics table script:
+example_script <- ARD_script_example("ARD_Out14-1-1.R")
+source(example_script)
+
+# The ARD is named "ARD" by convention
+head(ARD)
+```
+
+```
+   group1  group1_level  group2  group2_level  variable  variable_level  stat_name  stat_label  stat
+1  <NA>                  <NA>                  TRT01A    Placebo         n          n           86
+2  <NA>                  <NA>                  TRT01A    Xanomeline...   n          n           84
+3  <NA>                  <NA>                  TRT01A    Xanomeline...   n          n           84
+4  TRT01A  Placebo       <NA>                  AGE       <NA>            N          N           86
+5  TRT01A  Placebo       <NA>                  AGE       <NA>            mean       Mean        75.209
+6  TRT01A  Placebo       <NA>                  AGE       <NA>            sd         SD          8.59
+```
+
+This is a standard `{cards}` ARD, generated from the ARS specification — not from manually written R code.
+
+### Anatomy of a siera-generated script
+
+Each generated script follows this structure:
+
+```r
+# === Section 1: Program header ===
+# Output: Out14-1-1  (Demographics Summary Table)
+# Generated by siera 0.5.5 from: Common_Safety_Displays_cards.xlsx
+# Date: 2025-06-22
+
+# === Section 2: Libraries ===
 library(cards)
 library(cardx)
-library(survival)
 library(dplyr)
-library(pharmaverseadam)
 
-adsl <- pharmaverseadam::adsl |> filter(EFFFL == "Y")
-adtte_os <- pharmaverseadam::adtte |> filter(PARAMCD == "OS")
-adtte_pfs <- pharmaverseadam::adtte |> filter(PARAMCD == "PFS")
+# === Section 3: Load ADaM datasets ===
+ADSL <- read.csv("data/adam/ADSL.csv")
 
-# K-M analysis: 6-month and 1-year survival per arm
-os_xyear <- adtte_os |>
-  ard_survival_survfit(
-    y = Surv(AVAL, 1 - CNSR),
-    variables = "TRTA",
-    times = c(180, 365)
+# === Section 4a: Big-N analysis (by convention, always first) ===
+# Analysis: An01_05_SAF_Summ_ByTrt (Safety Population N per arm)
+# Apply Analysis Set: SAFFL == "Y"
+df_pop <- dplyr::filter(ADSL, SAFFL == "Y")
+
+df3_An01_05 <- cards::ard_categorical(
+  data = df_pop |> dplyr::select(TRT01A) |> dplyr::mutate(dummy = "x"),
+  by   = "TRT01A",
+  variables = "dummy"
+) |>
+  dplyr::filter(stat_name == "n") |>
+  dplyr::mutate(
+    AnalysisId = "An01_05_SAF_Summ_ByTrt",
+    MethodId   = "Mth01",
+    OutputId   = "Out14-1-1"
   )
 
-# K-M median survival per arm
-os_median <- adtte_os |>
-  ard_survival_survfit(
-    y = Surv(AVAL, 1 - CNSR),
-    variables = "TRTA",
-    probs = c(0.5)
+# === Section 4b: AGE summary analysis ===
+# Analysis: An03_01_Age_Summ_ByTrt
+df2_An03_01 <- df_pop  # no additional data subset
+
+df3_An03_01 <- cards::ard_continuous(
+  data       = df2_An03_01,
+  by         = c(TRT01A),
+  variables  = AGE
+) |>
+  dplyr::mutate(
+    AnalysisId = "An03_01_Age_Summ_ByTrt",
+    MethodId   = "Mth02",
+    OutputId   = "Out14-1-1"
   )
 
-# Cox HR adjusting for age and sex
-cox_fit <- coxph(
-  Surv(AVAL, 1 - CNSR) ~ TRTA + AGE + SEX,
-  data = adtte_os
+# ... (one section per Analysis in the spec)
+
+# === Section 5: Combine analyses ===
+ARD <- dplyr::bind_rows(
+  df3_An01_05,
+  df3_An03_01,
+  df3_An03_02_AgeGrp,
+  df3_An03_03_Sex,
+  df3_An03_04_Ethnic,
+  df3_An03_05_Race
 )
-os_hr <- ard_regression(cox_fit)
-
-# Log-rank test
-os_logrank <- survdiff(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os) |>
-  ard_survival_survdiff()
-
-# Combine for the survival results section
-survival_ard <- bind_ard(os_xyear, os_median, os_hr, os_logrank)
-
-saveRDS(survival_ard, "ards/survival_ard.rds")
 ```
 
-This single block produces all the data behind a typical "Overall Survival Analysis" CSR table — median survival, x-year survival rates, HR, log-rank p-value. The display layer (gtsummary or tfrmt) formats this into the canonical layout.
+Notice the traceability columns (`AnalysisId`, `MethodId`, `OutputId`) are injected automatically by the generated script — something you'd otherwise have to add manually.
 
-## 13. Validation considerations
+### The `AnalysisMethodCodeTemplate` mechanism
 
-For regression-based ARDs:
+The most powerful siera feature: ARS metadata can contain dynamic R code templates, not just declarative specifications. The template uses placeholder variables that siera substitutes with actual metadata values:
 
-- **Compare to standard software output**: run the same model in SAS PROC MIXED, PROC PHREG, etc., and confirm cardx values match
-- **Spot-check coefficients**: print the model summary, manually verify a few rows in the ARD
-- **Check sample size**: ARDs include N statistics; confirm they match the analysis-set count
+```r
+# In the ARS XLSX: AnalysisMethodCodeTemplate column contains:
+Analysis_ARD <- ard_continuous(
+  data      = filtered_data,
+  by        = c(byvariables_here),
+  variables = analysisvariable_here
+)
 
-For survival ARDs:
-
-- **K-M at standard timepoints**: verify median, 6-month, 1-year values against `survminer::ggsurvplot()` annotations on the same data
-- **Censoring direction**: cardx convention is `Surv(time, event)` with `event = 1` for event, `0` for censor. ADTTE CDISC convention is the opposite (CNSR = 1 for censor). Always convert: `Surv(AVAL, 1 - CNSR)`
-
-The censoring convention mismatch is a common source of bugs. Always document and test.
-
-## 14. The broad coverage
-
-cardx is large and growing. Beyond what we've covered:
-
-- `ard_aov()` — ANOVA tables
-- `ard_emmeans()` — estimated marginal means and contrasts
-- `ard_smd()` — standardized mean differences
-- `ard_continuous_ci()` — CIs for means with various methods
-- `ard_proportion_ci()` — CIs for proportions (Wilson, Clopper-Pearson, etc.)
-- `ard_categorical_ci()` — CIs for categorical proportions
-- `ard_dichotomous()` — dichotomous endpoint statistics
-- `ard_anova()` — ANOVA tables from various model classes
-- `ard_geepack_geeglm()` — generalized estimating equations
-- `ard_survey_*()` — survey-weighted analyses
-
-For a complete listing: `ls("package:cardx")` or browse the package reference site. Most clinical reporting needs are covered.
-
-## 15. The maintainers and direction
-
-`{cardx}` is maintained alongside `{cards}` — same team across Roche, GSK, Novartis. The package is in active development (0.x); new wrappers appear with each release as users request them.
-
-Strategic direction: cardx + cards together aim to be the comprehensive ARD-producing layer of the Cardinal-future stack. As CDISC ARS becomes formalized, cardx's coverage will align with the ARS-mandated statistic types.
-
-## 16. Where cardx fits in the bigger picture
-
-Recap of the stack:
-
-```
-ADaM data
-   │
-   ▼
-{cards}     ← descriptive ARDs
-{cardx}     ← inferential ARDs (you are here)
-   │
-   ▼
-{gtsummary} ← display
-{tfrmt}     ← display metadata
-   │
-   ▼
-.docx / .rtf / .html
+# siera substitutes:
+# byvariables_here      → TRT01A         (from analysisGroupings)
+# analysisvariable_here → AGE            (from analyses[].variable)
+# filtered_data         → df2_<analysisId>   (from analysisSets + dataSubsets)
 ```
 
-By the time you've mastered cards and cardx, you can compute essentially any statistic appearing in a clinical report and produce it as a structured ARD. The display layer becomes a transformation problem — much simpler.
+This means the same method template is reused for every continuous variable in the demographics table — siera instantiates it once per analysis with the appropriate variable name.
 
-## 17. Key takeaways
+---
 
-- `{cardx}` extends `{cards}` with inferential statistics — tests, regression, survival
-- ARD structure stays the same: one row per statistic, with `stat_name`, `stat_label`, `stat`
-- `ard_stats_t_test()`, `ard_stats_chisq_test()`, `ard_stats_fisher_test()` for univariate tests
-- `ard_regression()` for lm, glm, coxph, and similar model output
-- `ard_survival_survfit()` for K-M x-year survival and median survival
-- `ard_survival_survdiff()` for log-rank tests
-- Censoring convention: `Surv(AVAL, 1 - CNSR)` for ADTTE → cardx
-- Combine descriptive (cards) and inferential (cardx) ARDs with `bind_ard()` for full-table data
+---
 
-## 18. What's next
+## 14. The full cardx coverage
 
-Lessons 28–29 cover **`{gtsummary}`** — the display layer that turns ARDs into publication-quality tables. We'll cover `tbl_ard_summary()` (consumes ARDs from cards/cardx), composable tables, clinical reporting patterns (demographics tables, AE tables), and output to RTF for CSR delivery.
+Beyond what we've covered in this lesson:
 
-After gtsummary: `{cardinal}` (Lessons 30–31) and `{tfrmt}` (Lesson 32). Then Module 6 is complete.
+```r
+# Complete function list from cardx:
+ls("package:cardx") |> grep("^ard_", x = ., value = TRUE)
+
+# Key functions not yet shown:
+# ard_aov()              — one-way or multi-way ANOVA table
+# ard_emmeans()          — estimated marginal means and contrasts (LSMEANS equivalent)
+# ard_geepack_geeglm()   — GEE model output
+# ard_survey_*()         — survey-weighted analyses
+# ard_dichotomous()      — dichotomous endpoint stats
+# ard_categorical_ci()   — proportion CI for any categorical level
+# ard_effectsize_*()     — various effect size measures
+```
+
+For a complete and always-current listing: browse the cardx reference at `https://insightsengineering.github.io/cardx/`
+
+---
+
+## 15. Censoring convention — the always-misunderstood detail
+
+This is the most common source of bugs in cardx survival analyses. Memorize this table:
+
+| Context | Meaning of `1` | Source |
+|---|---|---|
+| ADTTE: `CNSR = 1` | Subject was **censored** (event did NOT occur) | CDISC ADaM standard |
+| `survival::Surv(time, event)`: `event = 1` | Event **occurred** | R survival package |
+
+They are **opposite**. The conversion is always `Surv(AVAL, 1 - CNSR)`:
+
+```r
+# CORRECT:
+survfit(Surv(AVAL, 1 - CNSR) ~ TRTA, data = adtte_os)
+coxph(Surv(AVAL, 1 - CNSR) ~ TRTA + AGE, data = adtte_os)
+
+# WRONG (will analyze the wrong subjects as having events):
+survfit(Surv(AVAL, CNSR) ~ TRTA, data = adtte_os)  # ← BUG
+```
+
+This is a frequent QC failure point. Build a project-level wrapper if your team has trouble with it:
+
+```r
+# Helper to standardize the survival object construction:
+adtte_surv <- function(data, paramcd) {
+  data |>
+    filter(PARAMCD == paramcd) |>
+    mutate(EVENT = 1 - CNSR)  # Convert once; never use CNSR directly in Surv()
+}
+
+os_data <- adtte_surv(adtte, "OS")
+survfit(Surv(AVAL, EVENT) ~ TRTA, data = os_data)  # EVENT is now 1 = event
+```
+
+---
+
+## 16. Key takeaways
+
+**`{cardx}`**:
+- Same ARD structure as `{cards}` — one row per statistic, same columns
+- Adds inferential statistics: tests, regression coefficients, survival curves, effect sizes
+- `ard_stats_t_test()`, `ard_stats_chisq_test()`: univariate comparison tests
+- `ard_proportion_ci()`: proportion CIs with Wilson, Clopper-Pearson, and other methods
+- `ard_regression()`: any fitted model (lm, glm, coxph, mmrm) → ARD
+- `ard_survival_survfit()`: K-M x-year survival and median survival → ARD
+- `ard_survival_survdiff()`: log-rank test → ARD
+- Combine with cards descriptive ARDs using `bind_ard()`
+- Censoring: `CNSR = 1` means censored in ADTTE; `Surv()` needs `1 - CNSR` for event indicator
+
+**`{siera}`**:
+- Reads ARS JSON or XLSX; auto-generates R scripts using `{cards}` that produce ARDs
+- `readARS(ars_path, output_folder, adam_folder)` — the main function
+- Generated scripts: standard structure (header → load ADaMs → analyses → combine ARDs)
+- `ARD_script_example()` — access and run bundled example scripts
+- `ARS_example()` — access bundled ARS metadata files and ADaM CSVs
+
+
+---
+
+## 17. What's next
+
+Lessons 28–29 cover **`{gtsummary}`** — the display layer that consumes ARDs and produces publication-quality tables. We'll use `tbl_ard_summary()`, `add_p()`, and the full gtsummary vocabulary to turn the ARDs we've built into CSR-ready output.
 
 ---
 
 ## Self-check questions
 
-1. What's the distinction between cards and cardx in terms of what they compute?
-2. Why does the censoring direction in ADTTE differ from the `survival::Surv()` convention?
-3. Translate to cardx: "Compute median PFS per arm with 95% CI."
-4. Translate to cardx: "Fit a Cox model of OS on TRTA, AGE, SEX; return the coefficients as an ARD."
-5. Why are p-values from cardx typically a separate ARD from cards descriptive output?
-6. List three packages cardx wraps and one example function from each.
+1. What's the key difference between `{cards}` and `{cardx}` in terms of the statistics they produce?
+2. Write the complete cardx call for: "Wilson 95% CI for response rate in the efficacy population by treatment arm."
+3. Why does `Surv(AVAL, 1 - CNSR)` need the `1 - CNSR` conversion? What happens if you forget it?
+4. Translate to cardx: "Log-rank test of OS by treatment arm."
+5. What is `AnalysisMethodCodeTemplate` in siera's ARS metadata, and what makes it powerful?
+6. What is `AnalysisMethodCodeTemplate` in siera's ARS metadata, and what makes it powerful?
+7. After running `readARS()`, you have a script `ARD_Out14-1-1.R`. What does running it produce, and what is the resulting object named by convention?
+
+---
 
 ## Glossary
 
-- **`ard_stats_t_test()`** — t-test as an ARD
-- **`ard_stats_chisq_test()`** — chi-squared test as an ARD
-- **`ard_regression()`** — Convert a fitted regression model to an ARD
-- **`ard_survival_survfit()`** — Convert a survfit object to ARD with x-year or quantile survival
-- **`ard_survival_survdiff()`** — Log-rank test as an ARD
-- **Censoring convention** — ADTTE: CNSR = 1 means censored; `Surv()`: event = 1 means event
-- **MMRM** — Mixed Model with Repeated Measures
-- **HR** — Hazard Ratio
-- **CI** — Confidence Interval
-- **SMD** — Standardized Mean Difference
-- **`broom.helpers`** — Package providing tidy model extraction; cardx depends on this
+- **`ard_stats_t_test()`** — t-test → ARD; wraps `stats::t.test()`
+- **`ard_stats_chisq_test()`** — Chi-squared test → ARD
+- **`ard_stats_fisher_test()`** — Fisher's exact test → ARD
+- **`ard_stats_wilcox_test()`** — Wilcoxon rank-sum test → ARD
+- **`ard_proportion_ci()`** — Proportion CI with multiple methods (Wilson, Clopper-Pearson, etc.)
+- **`ard_continuous_ci()`** — CI for a continuous mean
+- **`ard_regression()`** — Convert any fitted model to ARD
+- **`ard_survival_survfit()`** — K-M x-year survival and median → ARD
+- **`ard_survival_survdiff()`** — Log-rank test → ARD
+- **`ard_smd()`** — Standardized mean differences → ARD
+- **`ard_emmeans()`** — Estimated marginal means (LSMEANS) → ARD
+- **`mmrm()`** — Mixed Model with Repeated Measures; preferred over `lme4` for clinical MMRM
+- **Censoring convention** — ADTTE: `CNSR = 1` = censored; `Surv()`: second arg `1` = event
+- **Wilson interval** — Recommended proportion CI method; handles small N and extreme proportions
+- **Clopper-Pearson** — "Exact" proportion CI; conservative but widely accepted in regulatory submissions
+- **MMRM** — Mixed Model with Repeated Measures; standard analysis for repeated measures efficacy endpoints
+- **HR** — Hazard Ratio; exp of log-HR from Cox model
+- **LS mean** — Least Squares Mean; model-adjusted group mean
+- **`{siera}`** — R package (Clymb Clinical) that reads ARS metadata and generates ARD R scripts
+- **`readARS()`** — Main siera function: ARS file → R scripts
+- **`ARS_example()`** — siera helper to access bundled ARS/ADaM example files
+- **`ARD_script_example()`** — siera helper to access and run bundled generated ARD scripts
+- **AnalysisMethodCodeTemplate** — ARS metadata component: dynamic R code template run by siera per analysis
+- **`AnalysisId`** — Traceability column linking ARD rows to their ARS analysis specification
+- **`OutputId`** — Traceability column linking ARD rows to their output (table) in the ARS spec

@@ -2167,5 +2167,5 @@ In this lesson you built ADaM derivations specific to **metabolic disease trials
 
 ---
 
-**Next lesson:** Lesson 25 — cards & cardx — ARD (Analysis Results Dataset) creation with the `cards` package: `ard_continuous()`, `ard_categorical()`, `ard_missing()`, stratified summaries, and linking ARDs to TLF shells via tfrmt.
+**Next lesson:** Lesson 25 — cards Part 1 — ARD (Analysis Results Dataset) structure and core constructors: the ARD column anatomy, why `stat` is a list column, and `ard_continuous()` / `ard_categorical()` / `ard_hierarchical()` / `ard_complex()`. Module 6 then continues with cards Part 2 (clinical ARDs), cardx (inferential ARDs), gtsummary, cardinal, and tfrmt.
 ```

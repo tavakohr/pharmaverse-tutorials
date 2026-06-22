@@ -1,5 +1,5 @@
 ---
-title: "Lesson 27 — gtsummary Part 2: Regression Tables, Merging, and ARD Integration"
+title: "Lesson 29 — gtsummary Part 2: Regression Tables, Merging, and ARD Integration"
 author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
@@ -25,7 +25,7 @@ description: >
 #                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
 #                 Built on real CDISC CDISCPILOT01 data.
 #
-# SCRIPT NAME   : 27_gtsummary_part2.Rmd
+# SCRIPT NAME   : 29_gtsummary_part2.Rmd
 # PURPOSE       : gtsummary Part 2 — tbl_regression(), tbl_uvregression(),
 #                 tbl_merge(), tbl_stack(), tbl_ard_summary(), inline_text(),
 #                 and a complete safety/regression capstone.
@@ -520,7 +520,7 @@ ard_get_stat <- function(ard, stat_nm, var_nm = NULL) {
 
 ## Overview
 
-Lesson 26 covered `tbl_summary()` for descriptive tables. This lesson extends gtsummary to **regression output**, **table composition**, and **ARD-driven tables** — the full production workflow for a clinical study report.
+Lesson 28 covered `tbl_summary()` for descriptive tables. This lesson extends gtsummary to **regression output**, **table composition**, and **ARD-driven tables** — the full production workflow for a clinical study report.
 
 **Topics covered:**
 
@@ -1092,4 +1092,4 @@ In this lesson you extended gtsummary from descriptive tables to a full clinical
 
 > `tbl_stack()` simply `bind_rows()` the table bodies. Make sure all tables include the same `include=` variables or the stat columns will not align.
 
-**Next lesson:** Lesson 28 — cardinal — clinical trial analysis results with pre-built ARD functions for standard regulatory tables.
+**Next lesson:** Lesson 30 — cardinal Part 1 — ARD-first TLG templates overview for standard regulatory tables.

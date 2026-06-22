@@ -1,5 +1,5 @@
 ---
-title: "Lesson 26 — gtsummary Part 1: tbl_summary() and Clinical Demographic Tables"
+title: "Lesson 28 — gtsummary Part 1: tbl_summary() and Clinical Demographic Tables"
 author: "Hamid Tavakoli, MD, MSc"
 output:
   learnr::tutorial:
@@ -25,7 +25,7 @@ description: >
 #                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
 #                 Built on real CDISC CDISCPILOT01 data.
 #
-# SCRIPT NAME   : 26_gtsummary_part1.Rmd
+# SCRIPT NAME   : 28_gtsummary_part1.Rmd
 # PURPOSE       : gtsummary Part 1 — tbl_summary(), add_p(), add_overall(),
 #                 add_n(), modify_header(), bold_labels(), italicize_levels(),
 #                 as_tibble(), inline_text(), and a full Table 14.1.1-style
@@ -862,4 +862,4 @@ In this lesson you built clinical demographic tables using gtsummary's `tbl_summ
 
 > `add_p()` silently returns the object unchanged (with a message) if `by=` was not set. Always stratify first.
 
-**Next lesson:** Lesson 27 — gtsummary Part 2 — Regression tables with `tbl_regression()`, univariable screening with `tbl_uvregression()`, table merging and stacking, and building gtsummary tables directly from a cards ARD with `tbl_ard_summary()`.
+**Next lesson:** Lesson 29 — gtsummary Part 2 — Regression tables with `tbl_regression()`, univariable screening with `tbl_uvregression()`, table merging and stacking, and building gtsummary tables directly from a cards ARD with `tbl_ard_summary()`.

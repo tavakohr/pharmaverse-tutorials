@@ -1,0 +1,1195 @@
+---
+title: "Lesson 31 — cardinal Part 2: FDA Safety Table Templates"
+author: "Hamid Tavakoli, MD, MSc"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+    css: www/custom.css
+runtime: shiny_prerendered
+description: >
+  Walk the most heavily-used cardinal catalog templates implementing the FDA
+  Standard Safety Tables and Figures Integrated Guide: demographics (Pattern A),
+  AE overview with subject-level flags (Pattern B), AE by SOC and PT via
+  ard_hierarchical() (Pattern C), lab reference-range shift tables (Pattern D),
+  serious-AE listings (Pattern E), and subgroup forest plots (Pattern F). See how
+  every template is the same ARD-first shape, what customizations a sponsor
+  applies, and how ~10 templates assemble a complete CSR safety section.
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# PROJECT       : pharmaverse learnr Tutorials
+# DESCRIPTION   : Interactive learnr tutorials for clinical R programmers
+#                 transitioning from SAS to the pharmaverse ecosystem
+#                 (dplyr, admiral, sdtm.oak, metacore, xportr, teal and more).
+#                 Built on real CDISC CDISCPILOT01 data.
+#
+# SCRIPT NAME   : 31_cardinal_part2_fda_safety.Rmd
+# PURPOSE       : cardinal Part 2 — FDA Standard Safety Tables and Figures
+#                 templates. The six recurring ARD-first patterns (demographics,
+#                 AE overview, AE by SOC/PT, lab shift, listings, forest plots),
+#                 sponsor customizations, and assembling a full CSR safety
+#                 section from ~10 templates.
+#
+# AUTHOR        : Hamid Tavakoli
+# DATE CREATED  : 2026-06-22
+# ==============================================================================
+# DISCLAIMER:
+# This program and its contents represent independent work product. They contain
+# absolutely no proprietary items, confidential materials, or intellectual
+# property belonging to any past, current, or specific organization or corporate
+# entity. All data mapping, standards, and logic used herein are derived
+# strictly from public documentation, open-source ecosystems, or simulated data.
+# ==============================================================================
+# LICENSE       : MIT License
+# ==============================================================================
+
+library(learnr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(pharmaverseadam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+tutorial_options(exercise.timelimit = 120, exercise.blanks = TRUE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL PHARMAVERSEADAM DATA (CDISCPILOT01)
+# ══════════════════════════════════════════════════════════════════════════════
+adsl_raw <- pharmaverseadam::adsl
+if (!all(c("HEIGHTBL","WEIGHTBL") %in% names(adsl_raw))) {
+  set.seed(2014); n <- nrow(adsl_raw)
+  ht <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,161,7)), round(rnorm(n,174,8)))
+  wt <- ifelse(adsl_raw$SEX=="F", round(rnorm(n,68,12),1), round(rnorm(n,82,14),1))
+  adsl_raw <- adsl_raw |> mutate(HEIGHTBL=ht, WEIGHTBL=wt,
+                                  BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+} else if (!"BMIBL" %in% names(adsl_raw)) {
+  adsl_raw <- mutate(adsl_raw, BMIBL=round(WEIGHTBL/(HEIGHTBL/100)^2,1))
+}
+
+adsl <- adsl_raw |>
+  mutate(
+    ITTFL  = SAFFL,
+    DIABFL = if_else(!is.na(BMIBL) & BMIBL >= 30, "Y", "N", missing = "N"),
+    DTHFL_N = if_else(!is.na(DTHFL) & DTHFL == "Y", 1L, 0L, missing = 0L),
+    TRT01P = factor(TRT01P,
+                    levels = c("Placebo","Xanomeline Low Dose","Xanomeline High Dose"))
+  ) |>
+  filter(SAFFL == "Y")
+
+adae_raw <- pharmaverseadam::adae
+if ("TRTA" %in% names(adae_raw) && !"TRT01A" %in% names(adae_raw))
+  adae_raw <- rename(adae_raw, TRT01A = TRTA)
+if (!"TRT01P" %in% names(adae_raw))
+  adae_raw <- left_join(adae_raw, select(adsl, USUBJID, TRT01P), by = "USUBJID")
+# Ensure TRTEMFL exists; pharmaverseadam adae carries it, but synthesise if absent.
+if (!"TRTEMFL" %in% names(adae_raw))
+  adae_raw <- mutate(adae_raw, TRTEMFL = "Y")
+adae <- adae_raw |>
+  mutate(AESEVN = case_when(
+    AESEV == "MILD"     ~ 1L,
+    AESEV == "MODERATE" ~ 2L,
+    AESEV == "SEVERE"   ~ 3L,
+    TRUE                ~ NA_integer_
+  ))
+
+adlb <- pharmaverseadam::adlb
+if (is.character(adlb$ATOXGR))
+  adlb <- mutate(adlb, ATOXGR = as.integer(ATOXGR), BTOXGR = as.integer(BTOXGR))
+if ("DTYPE" %in% names(adlb))
+  adlb <- filter(adlb, is.na(DTYPE))
+if (!"TRTSDT" %in% names(adlb))
+  adlb <- left_join(adlb, select(adsl, USUBJID, TRTSDT), by = "USUBJID")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARDS BASE MOCKS (replicated from lesson 25)
+#
+# cardinal templates call cards/cardx + gtsummary, which may not be installed in
+# this learnr container. The functions below mock the ones the FDA-table patterns
+# use, returning a `card`-class tibble in the cards shape (group1 / variable /
+# context / stat_name / stat / stat_label). This lets each pattern run standalone
+# and lets you inspect the ARD a template produces.
+# ══════════════════════════════════════════════════════════════════════════════
+
+.ard_row <- function(group1=NA_character_, group1_level=NA_character_,
+                     variable, variable_level=NA_character_,
+                     context, stat_name, stat, stat_label) {
+  tibble(
+    group1         = group1,
+    group1_level   = group1_level,
+    variable       = variable,
+    variable_level = variable_level,
+    context        = context,
+    stat_name      = stat_name,
+    stat           = list(stat),
+    stat_label     = stat_label
+  )
+}
+
+ard_continuous <- function(data, variables, by = NULL,
+                           statistics = list(
+                             N      = function(x) sum(!is.na(x)),
+                             mean   = function(x) mean(x, na.rm=TRUE),
+                             sd     = function(x) sd(x, na.rm=TRUE),
+                             median = function(x) median(x, na.rm=TRUE),
+                             p25    = function(x) quantile(x, 0.25, na.rm=TRUE),
+                             p75    = function(x) quantile(x, 0.75, na.rm=TRUE),
+                             min    = function(x) min(x, na.rm=TRUE),
+                             max    = function(x) max(x, na.rm=TRUE)
+                           )) {
+  stat_labels <- c(N="N (non-missing)", mean="Mean", sd="SD", median="Median",
+                   p25="Q1 (25th pctile)", p75="Q3 (75th pctile)",
+                   min="Min", max="Max")
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      x   <- sub[[vv]]
+      lapply(names(statistics), function(sn) {
+        val <- tryCatch(statistics[[sn]](x), error=function(e) NA_real_)
+        .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                 group1_level=as.character(gl), variable=vv,
+                 context="continuous", stat_name=sn,
+                 stat=val, stat_label=stat_labels[sn])
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class=c("card","tbl_df","tbl","data.frame"))
+}
+
+ard_categorical <- function(data, variables, by = NULL, denominator = NULL) {
+  groups <- if (!is.null(by)) unique(data[[by]]) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    levs <- sort(unique(as.character(data[[vv]])))
+    levs <- levs[!is.na(levs)]
+    lapply(groups, function(gl) {
+      sub <- if (!is.na(gl) && !is.null(by)) data[data[[by]] == gl, ] else data
+      # denominator: optional named vector / data frame providing N per group;
+      # otherwise the within-group non-missing count.
+      total <- if (!is.null(denominator) && !is.na(gl)) {
+        d <- denominator
+        if (is.data.frame(d)) sum(d[[by]] == gl, na.rm = TRUE) else as.numeric(d[[as.character(gl)]])
+      } else sum(!is.na(sub[[vv]]))
+      lapply(levs, function(lv) {
+        cnt <- sum(sub[[vv]] == lv, na.rm=TRUE)
+        bind_rows(
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="n", stat=cnt, stat_label="n"),
+          .ard_row(group1=if(!is.null(by)) by else NA_character_,
+                   group1_level=as.character(gl), variable=vv,
+                   variable_level=lv, context="categorical",
+                   stat_name="p", stat=round(100*cnt/total,1), stat_label="%")
+        )
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class=c("card","tbl_df","tbl","data.frame"))
+}
+
+ard_stack <- function(...) {
+  out <- bind_rows(...)
+  structure(out, class=c("card","tbl_df","tbl","data.frame"))
+}
+bind_ard <- function(...) ard_stack(...)
+
+# Wilson 95% CI for a proportion p_hat based on n observations
+.wilson_ci <- function(n, p_hat, conf=0.95) {
+  z      <- qnorm(1-(1-conf)/2)
+  centre <- (p_hat + z^2/(2*n)) / (1 + z^2/n)
+  half   <- (z * sqrt(p_hat*(1-p_hat)/n + z^2/(4*n^2))) / (1 + z^2/n)
+  c(lower=round(centre-half,4), upper=round(centre+half,4))
+}
+
+ard_proportion_ci <- function(data, variables, by=NULL,
+                               conf.level=0.95, method="wilson",
+                               value=list()) {
+  groups <- if (!is.null(by)) sort(unique(na.omit(data[[by]]))) else NA_character_
+  rows <- lapply(variables, function(vv) {
+    pos_val <- if (!is.null(value[[vv]])) value[[vv]] else "Y"
+    lapply(groups, function(gl) {
+      x <- if (!is.na(gl) && !is.null(by)) data[[vv]][data[[by]]==gl] else data[[vv]]
+      x <- x[!is.na(x)]
+      n  <- length(x); k <- sum(x==pos_val); p_hat <- k/n
+      ci <- .wilson_ci(n, p_hat, conf.level)
+      bind_rows(
+        tibble(group1=if(!is.null(by)) by else NA_character_,
+               group1_level=as.character(gl), variable=vv,
+               context="proportion_ci", stat_name="n",
+               stat=list(k), stat_label=paste0("N (",pos_val,")")),
+        tibble(group1=if(!is.null(by)) by else NA_character_,
+               group1_level=as.character(gl), variable=vv,
+               context="proportion_ci", stat_name="p",
+               stat=list(round(100*p_hat,1)), stat_label="%"),
+        tibble(group1=if(!is.null(by)) by else NA_character_,
+               group1_level=as.character(gl), variable=vv,
+               context="proportion_ci", stat_name="conf.low",
+               stat=list(round(100*ci["lower"],1)),
+               stat_label=paste0(conf.level*100,"% CI lower")),
+        tibble(group1=if(!is.null(by)) by else NA_character_,
+               group1_level=as.character(gl), variable=vv,
+               context="proportion_ci", stat_name="conf.high",
+               stat=list(round(100*ci["upper"],1)),
+               stat_label=paste0(conf.level*100,"% CI upper"))
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+  structure(rows, class=c("card","tbl_df","tbl","data.frame"))
+}
+
+# Mock ard_hierarchical(): SOC x PT subject-level incidence with a denominator.
+ard_hierarchical <- function(data, by, variables, denominator) {
+  soc_var <- variables[1]; pt_var <- variables[2]
+  groups  <- sort(unique(na.omit(data[[by]])))
+  # subject-level: one row per subject per SOC/PT
+  su <- distinct(data, USUBJID, !!rlang::sym(by),
+                 !!rlang::sym(soc_var), !!rlang::sym(pt_var))
+  rows <- lapply(groups, function(gl) {
+    n_denom <- sum(denominator[[by]] == gl, na.rm = TRUE)
+    sub <- su[su[[by]] == gl, ]
+    pts <- distinct(sub, !!rlang::sym(soc_var), !!rlang::sym(pt_var))
+    lapply(seq_len(nrow(pts)), function(i) {
+      soc <- pts[[soc_var]][i]; pt <- pts[[pt_var]][i]
+      k <- sum(sub[[soc_var]] == soc & sub[[pt_var]] == pt, na.rm = TRUE)
+      bind_rows(
+        tibble(group1 = by, group1_level = as.character(gl),
+               variable = soc_var, variable_level = soc,
+               context = "hierarchical", stat_name = "soc"),
+        tibble(group1 = by, group1_level = as.character(gl),
+               variable = pt_var, variable_level = pt,
+               context = "hierarchical", stat_name = "n",
+               stat = list(k), p = round(100 * k / n_denom, 1))
+      )
+    }) |> bind_rows() |>
+      mutate(soc = soc) -> dummy
+    sub_summary <- sub |>
+      group_by(.data[[soc_var]], .data[[pt_var]]) |>
+      summarise(n = n_distinct(USUBJID), .groups = "drop") |>
+      mutate(p = round(100 * n / n_denom, 1),
+             group1_level = as.character(gl),
+             SOC = .data[[soc_var]], PT = .data[[pt_var]]) |>
+      select(group1_level, SOC, PT, n, p)
+    sub_summary
+  })
+  out <- bind_rows(rows)
+  structure(out, class = c("card","tbl_df","tbl","data.frame"))
+}
+
+# Pre-built subject-level AE-flag dataset, used across exercises (Pattern B).
+adae_te <- adae |> filter(TRTEMFL == "Y")
+adsl_flags <- adsl |>
+  mutate(
+    ANY_TEAE     = if_else(USUBJID %in% adae_te$USUBJID, "Y", "N"),
+    SERIOUS_TEAE = if_else(
+      USUBJID %in% (adae_te |> filter(AESER == "Y") |> pull(USUBJID)), "Y", "N"),
+    SEVERE_TEAE  = if_else(
+      USUBJID %in% (adae_te |> filter(AESEV == "SEVERE") |> pull(USUBJID)), "Y", "N")
+  )
+```
+
+## Overview
+
+cardinal's primary source is the **FDA Standard Safety Tables and Figures
+Integrated Guide** — a public FDA document (on FDA.gov) describing the canonical
+safety tables reviewers expect to see in submissions, with mockups and methodology.
+
+Part 1 covered *what cardinal is* (a Quarto catalog of ARD-first templates). Part
+2 covers *what the templates actually do*. Rather than reproduce every template,
+we focus on the **six recurring patterns**. Once you can recognize the patterns,
+every table in the catalog is readable on sight.
+
+Key principles from the FDA guide:
+
+- Tables use **subject-level denominators** for incidence calculations.
+- Severity (e.g., NCI CTCAE grades) is preferred over qualitative descriptors when available.
+- **Treatment-emergent** definitions are explicit (`TRTEMFL == "Y"`).
+- Footnotes document methodology.
+- Multiple display formats are supported (RTF for the CSR, JSON/ARD for ARS).
+
+### The canonical safety table set
+
+| FDA Table # | Subject | Pattern |
+|---|---|---|
+| 14.1.x | Subject disposition (accountability) | — |
+| 14.2.x | Demographics and baseline characteristics | **A** |
+| 14.3.x | Exposure (treatment duration, total dose) | A-like |
+| 14.4.x | Treatment-emergent AE overview | **B** |
+| 14.5.x | AEs by SOC and PT | **C** |
+| 14.6.x | Serious AEs (often a listing) | **E** |
+| 14.7.x | AEs leading to discontinuation | B-like |
+| 14.8.x | Deaths | B-like |
+| 14.9.x | Laboratory abnormality / shift summaries | **D** |
+| Figures | Subgroup forest plots | **F** |
+
+A "complete" cardinal-driven safety section uses roughly nine templates; each is
+about 50–100 lines of R, and the whole section is around 600 lines that produce
+~15 RTF tables.
+
+### Lesson map
+
+| Section | Pattern | Template |
+|---------|---------|----------|
+| 1 | A | Demographics (Table 14.2.x) |
+| 2 | B | AE overview (Table 14.4.x) |
+| 3 | C | AE by SOC × PT (Table 14.5.x) |
+| 4 | D | Lab reference-range shift (Table 14.9.x) |
+| 5 | E | Serious-AE listing |
+| 6 | F | Subgroup forest plot |
+| 7 | — | Assembling a complete CSR safety section + customizations |
+
+---
+
+## Section 1 — Pattern A: Demographics (FDA Table 14.2.x)
+
+The demographics template, paraphrased from cardinal, in real cards/cardx/gtsummary:
+
+```r
+adsl <- pharmaverseadam::adsl |> filter(SAFFL == "Y")
+
+demog_ard <- ard_stack(
+  adsl,
+  ard_continuous(variables = c(AGE, BMIBL, WEIGHTBL, HEIGHTBL)),
+  ard_categorical(variables = c(AGEGR1, SEX, RACE, ETHNIC)),
+  .by = TRT01A, .overall = TRUE, .total_n = TRUE
+)
+
+pvalue_ard <- bind_ard(
+  ard_stats_anova_oneway(adsl, by = "TRT01A",
+                         variables = c(AGE, BMIBL, WEIGHTBL, HEIGHTBL)),
+  ard_stats_chisq_test(adsl, by = "TRT01A",
+                       variables = c(AGEGR1, SEX, RACE, ETHNIC))
+)
+
+demog_tbl <- bind_ard(demog_ard, pvalue_ard) |>
+  tbl_ard_summary(by = "TRT01A",
+                  type = c(AGE, BMIBL) ~ "continuous2", overall = TRUE) |>
+  add_p() |> bold_labels() |>
+  modify_caption("**Table 14.2.1: Demographic and Baseline Characteristics**")
+```
+
+**Pattern recognition:**
+
+- ADSL filtered to safety pop.
+- ARD built with `ard_stack()` combining continuous and categorical.
+- p-values come from `cardx::ard_stats_*()` functions.
+- Display via `tbl_ard_summary()` with `continuous2` type.
+- Export to RTF.
+
+Every demographics-style template follows this exact shape. The differences across
+templates are only *which* variables, *which* statistical test, and *how* the
+footnotes are worded.
+
+### Exercise 1-a — Build the demographics descriptive ARD
+
+Reproduce the descriptive half of Pattern A: a continuous ARD (AGE, BMIBL,
+WEIGHTBL) stacked on a categorical ARD (SEX, RACE), stratified by treatment arm.
+
+```{r demog-ard, exercise=TRUE, exercise.lines=12}
+demog_ard <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","BMIBL","WEIGHTBL"), by = "___"),
+  ard_categorical(adsl, variables = c("SEX","RACE"),            by = "___")
+)
+
+demog_ard |>
+  count(context, variable)
+```
+
+```{r demog-ard-hint-1}
+# by = "TRT01P" in both calls (this study uses planned treatment).
+```
+
+```{r demog-ard-solution}
+demog_ard <- ard_stack(
+  ard_continuous(adsl,  variables = c("AGE","BMIBL","WEIGHTBL"), by = "TRT01P"),
+  ard_categorical(adsl, variables = c("SEX","RACE"),            by = "TRT01P")
+)
+
+demog_ard |>
+  count(context, variable)
+```
+
+### Exercise 1-b — Format mean (SD) for AGE per arm
+
+The `continuous2` display style shows "mean (SD)". Pull mean and SD for AGE from
+the ARD and format them as `"mean (SD)"` per arm.
+
+```{r demog-meansd, exercise=TRUE, exercise.lines=12}
+ard_continuous(adsl, variables = "AGE", by = "TRT01P") |>
+  filter(stat_name %in% c("mean","sd")) |>
+  mutate(stat = round(unlist(stat), 1)) |>
+  select(group1_level, stat_name, stat) |>
+  pivot_wider(names_from = stat_name, values_from = stat) |>
+  mutate(display = sprintf("%.1f (%.1f)", ___, ___))
+```
+
+```{r demog-meansd-hint-1}
+# sprintf order: mean then sd.
+```
+
+```{r demog-meansd-solution}
+ard_continuous(adsl, variables = "AGE", by = "TRT01P") |>
+  filter(stat_name %in% c("mean","sd")) |>
+  mutate(stat = round(unlist(stat), 1)) |>
+  select(group1_level, stat_name, stat) |>
+  pivot_wider(names_from = stat_name, values_from = stat) |>
+  mutate(display = sprintf("%.1f (%.1f)", mean, sd))
+```
+
+```{r quiz-s1, echo=FALSE}
+quiz(
+  question(
+    "In Pattern A, where do the p-values come from?",
+    answer("Manual t.test() calls woven into mutate()"),
+    answer("cardx ard_stats_*() functions (e.g., ard_stats_anova_oneway, ard_stats_chisq_test) stacked into the ARD", correct=TRUE),
+    answer("gtsummary computes them during rendering with no ARD"),
+    answer("They are hard-coded in the template"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 2 — Pattern B: AE Overview (FDA Table 14.4.x)
+
+The AE *overview* table summarizes counts and rates of AE categories per arm: any
+TEAE, serious TEAE, severe TEAE, leading-to-discontinuation, leading-to-death.
+
+```r
+adae_te <- adae |> filter(TRTEMFL == "Y")
+
+adsl_with_flags <- adsl |>
+  mutate(
+    ANY_TEAE     = if_else(USUBJID %in% adae_te$USUBJID, "Y", "N"),
+    SERIOUS_TEAE = if_else(USUBJID %in%
+                   (adae_te |> filter(AESER == "Y") |> pull(USUBJID)), "Y", "N"),
+    SEVERE_TEAE  = if_else(USUBJID %in%
+                   (adae_te |> filter(AESEV == "SEVERE") |> pull(USUBJID)), "Y", "N")
+  )
+
+ae_overview_ard <- ard_categorical(
+  adsl_with_flags, by = "TRT01A",
+  variables = c(ANY_TEAE, SERIOUS_TEAE, SEVERE_TEAE),
+  denominator = adsl
+)
+
+ae_overview_tbl <- ae_overview_ard |>
+  tbl_ard_summary(by = "TRT01A", type = everything() ~ "dichotomous") |>
+  modify_caption("**Table 14.4.1: Adverse Event Overview**")
+```
+
+**Pattern recognition:**
+
+- Subject-level flags computed via `mutate()` — one per AE category.
+- A single `ard_categorical()` call (a `dichotomous` display shows one "Y" row per category).
+- Explicit `denominator = adsl` anchors the rate to the safety-population subject count.
+
+> **Why the explicit denominator matters.** A subject with *no* AEs has no row in
+> ADAE, so they can never appear in an ADAE-driven count. The denominator must be
+> the **ADSL** subject count so that subjects without AEs are correctly counted in
+> the proportion. This is the single most common AE-table bug for SAS programmers
+> new to the pattern.
+
+### Exercise 2-a — Build the AE overview ARD with a subject denominator
+
+`adsl_flags` is pre-built in setup (it already has `ANY_TEAE`, `SERIOUS_TEAE`,
+`SEVERE_TEAE`). Build the overview ARD for the three flags, anchoring the
+denominator to the full ADSL so AE-free subjects count.
+
+```{r ae-overview, exercise=TRUE, exercise.lines=12}
+ae_overview_ard <- ard_categorical(
+  adsl_flags,
+  by          = "TRT01P",
+  variables   = c("ANY_TEAE","SERIOUS_TEAE","SEVERE_TEAE"),
+  denominator = ___
+)
+
+ae_overview_ard |>
+  filter(variable == "ANY_TEAE", variable_level == "Y") |>
+  select(group1_level, stat_name, stat) |>
+  mutate(stat = unlist(stat))
+```
+
+```{r ae-overview-hint-1}
+# denominator = adsl  -> the safety-population subject count per arm.
+```
+
+```{r ae-overview-solution}
+ae_overview_ard <- ard_categorical(
+  adsl_flags,
+  by          = "TRT01P",
+  variables   = c("ANY_TEAE","SERIOUS_TEAE","SEVERE_TEAE"),
+  denominator = adsl
+)
+
+ae_overview_ard |>
+  filter(variable == "ANY_TEAE", variable_level == "Y") |>
+  select(group1_level, stat_name, stat) |>
+  mutate(stat = unlist(stat))
+```
+
+### Exercise 2-b — Add a Wilson CI to the AE rates
+
+cardinal AE-overview templates often add a confidence interval to the incidence.
+Use `ard_proportion_ci()` (Wilson) on the subject-level flags and pull the ANY_TEAE
+rate with its CI per arm.
+
+```{r ae-overview-ci, exercise=TRUE, exercise.lines=14}
+ae_ci <- ard_proportion_ci(
+  adsl_flags,
+  variables = c("ANY_TEAE","SERIOUS_TEAE","SEVERE_TEAE"),
+  by        = "TRT01P",
+  method    = "wilson",
+  value     = list(ANY_TEAE="Y", SERIOUS_TEAE="Y", SEVERE_TEAE="Y")
+)
+
+ae_ci |>
+  filter(variable == "___", stat_name %in% c("p","conf.low","conf.high")) |>
+  mutate(stat = unlist(stat)) |>
+  select(group1_level, stat_name, stat) |>
+  pivot_wider(names_from = stat_name, values_from = stat) |>
+  mutate(display = sprintf("%.1f%% (%.1f, %.1f)", p, conf.low, conf.high))
+```
+
+```{r ae-overview-ci-hint-1}
+# variable == "ANY_TEAE"
+# Wilson keeps the CI within [0, 100] even for extreme rates.
+```
+
+```{r ae-overview-ci-solution}
+ae_ci <- ard_proportion_ci(
+  adsl_flags,
+  variables = c("ANY_TEAE","SERIOUS_TEAE","SEVERE_TEAE"),
+  by        = "TRT01P",
+  method    = "wilson",
+  value     = list(ANY_TEAE="Y", SERIOUS_TEAE="Y", SEVERE_TEAE="Y")
+)
+
+ae_ci |>
+  filter(variable == "ANY_TEAE", stat_name %in% c("p","conf.low","conf.high")) |>
+  mutate(stat = unlist(stat)) |>
+  select(group1_level, stat_name, stat) |>
+  pivot_wider(names_from = stat_name, values_from = stat) |>
+  mutate(display = sprintf("%.1f%% (%.1f, %.1f)", p, conf.low, conf.high))
+```
+
+```{r quiz-s2, echo=FALSE}
+quiz(
+  question(
+    "Why must the AE overview pass denominator = adsl rather than letting the ADAE counts define their own base?",
+    answer("To make the table render faster"),
+    answer("So subjects with no AEs are still counted in the denominator, giving correct incidence", correct=TRUE),
+    answer("Because ADAE has no USUBJID"),
+    answer("To exclude screen failures"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Wilson CI is the regulatory default for binary AE rates because:",
+    answer("It is always wider than Wald"),
+    answer("It stays within [0, 100] even for proportions near 0 or 1", correct=TRUE),
+    answer("It requires fewer subjects"),
+    answer("It uses the t-distribution"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 3 — Pattern C: AE by SOC and PT (FDA Table 14.5.x)
+
+The detailed AE table with the **SOC × PT** hierarchy (System Organ Class →
+Preferred Term). This is the classic AE table.
+
+```r
+ae_ard <- adae |>
+  filter(TRTEMFL == "Y") |>
+  ard_hierarchical(
+    by          = "ARM",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = adsl
+  )
+
+ae_tbl <- ae_ard |>
+  tbl_ard_summary(by = "TRT01A", overall = FALSE) |>
+  modify_header(label ~ "**System Organ Class<br>&nbsp;&nbsp;Preferred Term**") |>
+  modify_caption("**Table 14.5.1: Adverse Events by SOC and Preferred Term**")
+```
+
+`ard_hierarchical()` does the heavy lifting; gtsummary renders the SOC/PT
+indentation automatically.
+
+**Common customizations:**
+
+- **Incidence threshold** — show only PTs occurring in ≥ 5% of any arm (apply at
+  the ARD level or post-hoc).
+- **Sort order** — alphabetical (default) vs. by total incidence.
+- **Severity breakdown** — a multi-column version split by Mild/Moderate/Severe
+  using grade as an additional grouping.
+
+### Exercise 3-a — Build the SOC × PT hierarchical ARD
+
+`ard_hierarchical()` (mocked here) takes the treatment-emergent ADAE and produces
+one subject-level incidence row per SOC/PT, anchored to the ADSL denominator.
+
+```{r soc-pt, exercise=TRUE, exercise.lines=12}
+ae_socpt <- adae |>
+  filter(TRTEMFL == "Y") |>
+  ard_hierarchical(
+    by          = "TRT01P",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = ___
+  )
+
+# Top preferred terms by incidence in any arm
+ae_socpt |>
+  arrange(desc(p)) |>
+  head(8)
+```
+
+```{r soc-pt-hint-1}
+# denominator = adsl
+# variables order is c(SOC, PT) -> AEBODSYS first, AEDECOD second.
+```
+
+```{r soc-pt-solution}
+ae_socpt <- adae |>
+  filter(TRTEMFL == "Y") |>
+  ard_hierarchical(
+    by          = "TRT01P",
+    variables   = c("AEBODSYS", "AEDECOD"),
+    denominator = adsl
+  )
+
+ae_socpt |>
+  arrange(desc(p)) |>
+  head(8)
+```
+
+### Exercise 3-b — Apply a 5% incidence threshold
+
+A near-universal customization: keep only PTs reaching ≥ 5% incidence in *any*
+arm. Filter the hierarchical ARD accordingly.
+
+```{r soc-pt-threshold, exercise=TRUE, exercise.lines=12}
+ae_socpt <- adae |>
+  filter(TRTEMFL == "Y") |>
+  ard_hierarchical(by = "TRT01P",
+                   variables = c("AEBODSYS","AEDECOD"),
+                   denominator = adsl)
+
+keep_pts <- ae_socpt |>
+  group_by(PT) |>
+  summarise(max_p = max(p), .groups = "drop") |>
+  filter(max_p >= ___) |>
+  pull(PT)
+
+ae_socpt |>
+  filter(PT %in% keep_pts) |>
+  arrange(SOC, desc(p))
+```
+
+```{r soc-pt-threshold-hint-1}
+# 5% threshold -> max_p >= 5
+```
+
+```{r soc-pt-threshold-solution}
+ae_socpt <- adae |>
+  filter(TRTEMFL == "Y") |>
+  ard_hierarchical(by = "TRT01P",
+                   variables = c("AEBODSYS","AEDECOD"),
+                   denominator = adsl)
+
+keep_pts <- ae_socpt |>
+  group_by(PT) |>
+  summarise(max_p = max(p), .groups = "drop") |>
+  filter(max_p >= 5) |>
+  pull(PT)
+
+ae_socpt |>
+  filter(PT %in% keep_pts) |>
+  arrange(SOC, desc(p))
+```
+
+---
+
+## Section 4 — Pattern D: Lab Shift Table (FDA Table 14.9.x)
+
+A lab **shift table** answers: "how many subjects shifted from NORMAL at baseline
+to HIGH on treatment?" The display is a 2D cross-tab: baseline reference-range
+category × worst on-treatment category, with cell counts.
+
+```r
+adlb <- pharmaverseadam::adlb |>
+  filter(SAFFL == "Y" & ANL01FL == "Y" & PARAMCD == "HGB")
+
+shift_data <- adlb |>
+  filter(!is.na(BNRIND) & ONTRTFL == "Y") |>
+  group_by(USUBJID, BNRIND) |>
+  summarise(
+    WORST_TRT_IND = case_when(
+      any(ANRIND == "HIGH")   ~ "HIGH",
+      any(ANRIND == "LOW")    ~ "LOW",
+      any(ANRIND == "NORMAL") ~ "NORMAL",
+      TRUE                    ~ NA_character_),
+    .groups = "drop")
+
+shift_ard <- ard_categorical(
+  shift_data, by = c(TRT01A, BNRIND),
+  variables = WORST_TRT_IND, denominator = adsl |> count(TRT01A))
+```
+
+Shift tables get visually complex — row groups (baseline categories) and column
+groups (treatment × on-treatment). For the most complex layouts, switch to
+**tfrmt** (Lesson 32), which handles multi-dimensional displays better than
+gtsummary.
+
+> **adlb in this tutorial.** pharmaverseadam's adlb may not carry `BNRIND` /
+> `ANRIND` reference-range indicators. Below we build an equivalent shift using
+> the NCI CTCAE toxicity grades that adlb *does* carry (`BTOXGR` baseline,
+> `ATOXGR` analysis), collapsed to NORMAL (grade 0) vs ABNORMAL (grade != 0).
+
+### Exercise 4-a — Build a baseline → worst-on-treatment shift
+
+Collapse `BTOXGR`/`ATOXGR` into NORMAL vs ABNORMAL, take the worst on-treatment
+status per subject, then cross-tabulate baseline vs worst-on-treatment for one
+parameter.
+
+```{r lab-shift, exercise=TRUE, exercise.lines=22}
+shift_data <- adlb |>
+  filter(PARAMCD == "ALT", !is.na(BTOXGR), !is.na(ATOXGR)) |>
+  mutate(
+    BASE_CAT = if_else(BTOXGR == 0L, "NORMAL", "ABNORMAL"),
+    TRT_CAT  = if_else(ATOXGR == 0L, "NORMAL", "ABNORMAL")
+  ) |>
+  group_by(USUBJID, BASE_CAT) |>
+  summarise(
+    WORST_TRT = if_else(any(TRT_CAT == "ABNORMAL"), "ABNORMAL", "NORMAL"),
+    .groups = "drop"
+  )
+
+shift_data |>
+  count(BASE_CAT, ___)
+```
+
+```{r lab-shift-hint-1}
+# Cross-tabulate baseline vs the worst on-treatment category:
+# count(BASE_CAT, WORST_TRT)
+```
+
+```{r lab-shift-solution}
+shift_data <- adlb |>
+  filter(PARAMCD == "ALT", !is.na(BTOXGR), !is.na(ATOXGR)) |>
+  mutate(
+    BASE_CAT = if_else(BTOXGR == 0L, "NORMAL", "ABNORMAL"),
+    TRT_CAT  = if_else(ATOXGR == 0L, "NORMAL", "ABNORMAL")
+  ) |>
+  group_by(USUBJID, BASE_CAT) |>
+  summarise(
+    WORST_TRT = if_else(any(TRT_CAT == "ABNORMAL"), "ABNORMAL", "NORMAL"),
+    .groups = "drop"
+  )
+
+shift_data |>
+  count(BASE_CAT, WORST_TRT)
+```
+
+### Exercise 4-b — The shift table as a 2D matrix
+
+Pivot the shift counts into the familiar 2D shift matrix (baseline rows ×
+on-treatment columns).
+
+```{r lab-shift-2d, exercise=TRUE, exercise.lines=18}
+shift_data <- adlb |>
+  filter(PARAMCD == "ALT", !is.na(BTOXGR), !is.na(ATOXGR)) |>
+  mutate(BASE_CAT = if_else(BTOXGR == 0L, "NORMAL", "ABNORMAL"),
+         TRT_CAT  = if_else(ATOXGR == 0L, "NORMAL", "ABNORMAL")) |>
+  group_by(USUBJID, BASE_CAT) |>
+  summarise(WORST_TRT = if_else(any(TRT_CAT == "ABNORMAL"),
+                                "ABNORMAL", "NORMAL"), .groups = "drop")
+
+shift_data |>
+  count(BASE_CAT, WORST_TRT) |>
+  pivot_wider(names_from = ___, values_from = n, values_fill = 0)
+```
+
+```{r lab-shift-2d-hint-1}
+# Columns are the worst on-treatment category: names_from = WORST_TRT
+```
+
+```{r lab-shift-2d-solution}
+shift_data <- adlb |>
+  filter(PARAMCD == "ALT", !is.na(BTOXGR), !is.na(ATOXGR)) |>
+  mutate(BASE_CAT = if_else(BTOXGR == 0L, "NORMAL", "ABNORMAL"),
+         TRT_CAT  = if_else(ATOXGR == 0L, "NORMAL", "ABNORMAL")) |>
+  group_by(USUBJID, BASE_CAT) |>
+  summarise(WORST_TRT = if_else(any(TRT_CAT == "ABNORMAL"),
+                                "ABNORMAL", "NORMAL"), .groups = "drop")
+
+shift_data |>
+  count(BASE_CAT, WORST_TRT) |>
+  pivot_wider(names_from = WORST_TRT, values_from = n, values_fill = 0)
+```
+
+```{r quiz-s4, echo=FALSE}
+quiz(
+  question(
+    "Why do complex lab shift tables sometimes warrant tfrmt instead of gtsummary?",
+    answer("tfrmt is faster"),
+    answer("Shift tables have both row groups (baseline) and column groups (treatment x on-treatment), and tfrmt handles multi-dimensional layouts better", correct=TRUE),
+    answer("gtsummary cannot read adlb"),
+    answer("tfrmt is required by the FDA guide"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 5 — Pattern E: Serious-AE Listing
+
+Listings (the **L** in TLG) differ from summary tables: **one row per AE event**,
+with subject identifiers and details — not aggregated.
+
+```r
+sae_listing <- adae |>
+  filter(SAFFL == "Y" & TRTEMFL == "Y" & AESER == "Y") |>
+  select(USUBJID, AGE, SEX, ARM, AESTDT, AEENDT, AEDECOD, AEBODSYS,
+         AESEV, AESER, AEACN, AEOUT) |>
+  arrange(USUBJID, AESTDT)
+
+library(flextable)
+sae_listing |>
+  flextable() |>
+  set_caption("Listing 14.6.1: Serious Adverse Events") |>
+  save_as_rtf("outputs/l_14_6_1.rtf")
+```
+
+Listings **don't need ARDs** — they are raw event-level data with formatting.
+`{flextable}` handles them directly; gtsummary is *not* the right tool. For longer
+/ more complex listings (multi-page with continuation headers), `{r2rtf}` is often
+preferred for its pagination control. cardinal ships both flextable- and
+r2rtf-based listing templates.
+
+### Exercise 5-a — Build a serious-AE listing
+
+Build the event-level SAE listing: treatment-emergent serious AEs, selected
+columns, sorted by subject then preferred term.
+
+```{r sae-listing, exercise=TRUE, exercise.lines=12}
+sae_listing <- adae |>
+  filter(TRTEMFL == "Y" & AESER == "___") |>
+  select(USUBJID, TRT01A, AEBODSYS, AEDECOD, AESEV) |>
+  arrange(USUBJID, AEDECOD)
+
+head(sae_listing, 10)
+```
+
+```{r sae-listing-hint-1}
+# Serious AEs are flagged AESER == "Y".
+```
+
+```{r sae-listing-solution}
+sae_listing <- adae |>
+  filter(TRTEMFL == "Y" & AESER == "Y") |>
+  select(USUBJID, TRT01A, AEBODSYS, AEDECOD, AESEV) |>
+  arrange(USUBJID, AEDECOD)
+
+head(sae_listing, 10)
+```
+
+```{r quiz-s5, echo=FALSE}
+quiz(
+  question(
+    "Why doesn't gtsummary handle listings well?",
+    answer("gtsummary cannot read ADAE"),
+    answer("Listings are un-aggregated, event-level rows; gtsummary is built for summarized ARDs, so flextable/r2rtf are the right tools", correct=TRUE),
+    answer("Listings require a Wilson CI"),
+    answer("gtsummary only supports demographics"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 6 — Pattern F: Subgroup Forest Plot (FDA Figure)
+
+cardinal includes graph (**G**) templates. The signature graph is a **subgroup
+forest plot** showing the treatment effect (e.g., hazard ratio) across subgroups,
+with a vertical reference line, CIs as horizontal error bars, and a log-scaled
+x-axis.
+
+```r
+subgroup_hrs <- adsl |>
+  group_split(SUBGROUP) |>
+  purrr::map_dfr(\(d) {
+    fit <- coxph(Surv(AVAL, 1 - CNSR) ~ TRTA, data = d)
+    ard_regression(fit) |> mutate(SUBGROUP = unique(d$SUBGROUP_LABEL))
+  })
+
+forest_data <- subgroup_hrs |>
+  filter(stat_name %in% c("estimate","conf.low","conf.high")) |>
+  pivot_wider(names_from = stat_name, values_from = stat)
+
+ggplot(forest_data, aes(x = exp(estimate), y = SUBGROUP)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = exp(conf.low), xmax = exp(conf.high)), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_x_log10() +
+  labs(x = "Hazard Ratio (95% CI)", y = "Subgroup")
+```
+
+Forest plots are conceptually simple but visually demanding. cardinal templates
+fix the standard layout; sponsor adaptations are mostly aesthetic.
+
+> The MD lesson plan's sketch uses `EFFFL` and `TRTA`. In real CDISCPILOT01 ADSL
+> there is **no** `EFFFL` — use `SAFFL` (or another genuine flag) and `TRT01A` /
+> `TRT01P`. The exercise below builds the forest-plot *input data* the cardinal
+> way using only real adsl variables and a descriptive effect measure
+> (mean AGE difference vs Placebo) so the pattern is concrete without survival
+> columns adlb/adsl don't carry here.
+
+### Exercise 6-a — Assemble forest-plot input data across subgroups
+
+Build a per-subgroup effect table (here: mean AGE per arm within SEX subgroups)
+in the long → wide shape a forest plot consumes.
+
+```{r forest-data, exercise=TRUE, exercise.lines=16}
+forest_input <- adsl |>
+  group_by(SUBGROUP = SEX, TRT01P) |>
+  summarise(est = mean(AGE, na.rm = TRUE),
+            lo  = est - 1.96 * sd(AGE, na.rm = TRUE) / sqrt(n()),
+            hi  = est + 1.96 * sd(AGE, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+forest_input |>
+  filter(TRT01P == "___") |>
+  select(SUBGROUP, est, lo, hi)
+```
+
+```{r forest-data-hint-1}
+# Pick a reference arm to view, e.g. TRT01P == "Placebo".
+```
+
+```{r forest-data-solution}
+forest_input <- adsl |>
+  group_by(SUBGROUP = SEX, TRT01P) |>
+  summarise(est = mean(AGE, na.rm = TRUE),
+            lo  = est - 1.96 * sd(AGE, na.rm = TRUE) / sqrt(n()),
+            hi  = est + 1.96 * sd(AGE, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+forest_input |>
+  filter(TRT01P == "Placebo") |>
+  select(SUBGROUP, est, lo, hi)
+```
+
+```{r quiz-s6, echo=FALSE}
+quiz(
+  question(
+    "A subgroup forest plot's standard layout includes:",
+    answer("A pie chart per subgroup"),
+    answer("A vertical reference line, point estimates, horizontal CI error bars, and a (often log-scaled) x-axis", correct=TRUE),
+    answer("A stacked bar per arm"),
+    answer("Only a single overall estimate"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Section 7 — Assembling a complete CSR safety section
+
+A complete CSR safety section is a folder of cardinal templates, each producing
+one table or figure:
+
+```
+t_14_1_1_disposition.qmd     - Subject disposition
+t_14_2_1_demographics.qmd    - Demographics (Pattern A)
+t_14_3_1_exposure.qmd        - Exposure summary
+t_14_4_1_ae_overview.qmd     - AE overview (Pattern B)
+t_14_5_1_ae_soc_pt.qmd       - AE by SOC x PT (Pattern C)
+t_14_6_1_sae_listing.qmd     - Serious AE listing (Pattern E)
+t_14_7_1_disc_due_to_ae.qmd  - Discontinuation due to AE
+t_14_8_1_deaths.qmd          - Deaths
+t_14_9_1_lab_shift_hgb.qmd   - HGB shift table (Pattern D)
+f_14_4_1_ae_forest.qmd       - AE incidence forest plot (Pattern F)
+```
+
+Render them all in one shot:
+
+```r
+library(quarto)
+templates <- list.files("csr/safety/templates", pattern = "\\.qmd$", full.names = TRUE)
+for (t in templates) quarto_render(t, quiet = TRUE)
+# all RTFs / PNGs land in outputs/
+```
+
+Ten templates → ten RTFs in a few minutes. For a phase III submission this might
+be 20–30 templates rendering ~50–80 RTF tables and figures.
+
+### Common sponsor adaptations
+
+| Adaptation | cardinal default | sponsor variant |
+|---|---|---|
+| Population | `filter(SAFFL == "Y")` | `filter(SAFFL == "Y" & ANLPOP == "Y")` |
+| MedDRA version | test-data default | pinned study version |
+| Table numbering | `Table 14.4.1: ...` | `T-14-04-01: ...` (SOP convention) |
+| Footnotes | generic | SOP-mandated text |
+| Column labels | `stat_1` | `**Treatment A**<br>n = {n}` |
+
+### When to start from cardinal vs from scratch
+
+**Start from cardinal** when the table is a standard FDA-aligned safety summary, a
+template exists, and your customizations are cosmetic.
+
+**Start from scratch** when the table is highly study-specific (exotic biomarker
+or efficacy endpoints), no template exists, or your SOP demands a fundamentally
+different layout. Even then, you usually borrow the cardinal *pattern* (the ARD
+structure, the gtsummary configuration).
+
+For most CSRs, ~60–70% of tables start from cardinal templates; the rest need
+custom work.
+
+### Exercise 7-a — Re-point one template to a sponsor population
+
+Take the AE overview from Section 2 and re-point its population to the sponsor's
+requirement of `SAFFL == "Y" & DIABFL == "Y"`, then recompute the ANY_TEAE rate.
+Keep the denominator consistent with the new population.
+
+```{r csr-adapt, exercise=TRUE, exercise.lines=18}
+adsl_sponsor <- adsl |>
+  filter(SAFFL == "Y" & ___ == "Y")
+
+flags_sponsor <- adsl_sponsor |>
+  mutate(ANY_TEAE = if_else(USUBJID %in% adae_te$USUBJID, "Y", "N"))
+
+ard_categorical(
+  flags_sponsor,
+  by          = "TRT01P",
+  variables   = "ANY_TEAE",
+  denominator = adsl_sponsor
+) |>
+  filter(variable_level == "Y") |>
+  select(group1_level, stat_name, stat) |>
+  mutate(stat = unlist(stat))
+```
+
+```{r csr-adapt-hint-1}
+# Sponsor sub-population flag is DIABFL.
+# The denominator must be the SAME re-pointed population (adsl_sponsor).
+```
+
+```{r csr-adapt-solution}
+adsl_sponsor <- adsl |>
+  filter(SAFFL == "Y" & DIABFL == "Y")
+
+flags_sponsor <- adsl_sponsor |>
+  mutate(ANY_TEAE = if_else(USUBJID %in% adae_te$USUBJID, "Y", "N"))
+
+ard_categorical(
+  flags_sponsor,
+  by          = "TRT01P",
+  variables   = "ANY_TEAE",
+  denominator = adsl_sponsor
+) |>
+  filter(variable_level == "Y") |>
+  select(group1_level, stat_name, stat) |>
+  mutate(stat = unlist(stat))
+```
+
+```{r quiz-s7, echo=FALSE}
+quiz(
+  question(
+    "Roughly what fraction of a typical CSR's tables can start from a cardinal template?",
+    answer("Under 10%"),
+    answer("About 60-70%", correct=TRUE),
+    answer("Essentially 100%"),
+    answer("None; cardinal is efficacy-only"),
+    allow_retry = TRUE
+  ),
+  question(
+    "Which is typically the FIRST customization a sponsor applies to a cardinal template?",
+    answer("Rewriting the statistical method"),
+    answer("Re-pointing the population / data source (test data to study data and the population filter)", correct=TRUE),
+    answer("Switching from gtsummary to rtables"),
+    answer("Translating the code to SAS"),
+    allow_retry = TRUE
+  )
+)
+```
+
+---
+
+## Lesson Summary
+
+| Pattern | Table | ARD shape |
+|---------|-------|-----------|
+| A — Demographics | 14.2.x | `ard_stack(continuous + categorical)` + `cardx` p-values |
+| B — AE overview | 14.4.x | subject-level flags → `ard_categorical(denominator = adsl)` |
+| C — AE by SOC/PT | 14.5.x | `ard_hierarchical(c(SOC, PT), denominator = adsl)` |
+| D — Lab shift | 14.9.x | worst-on-treatment per subject → cross-tab |
+| E — SAE listing | 14.6.x | no ARD; event-level rows via flextable / r2rtf |
+| F — Forest plot | Figure | per-subgroup effect ARD → ggplot |
+
+### Key takeaways
+
+- The **FDA Standard Safety Tables and Figures Integrated Guide** is cardinal's
+  primary reference; each template implements one FDA table number.
+- **Six recurring patterns** cover the bulk of a safety section: demographics, AE
+  overview, AE by SOC/PT, lab shift, listings, forest plots.
+- Every summary table is **ARD-first**: build the ARD (cards/cardx), then render
+  (gtsummary) — except listings, which are raw event-level data via flextable/r2rtf.
+- AE incidence tables must anchor the **denominator to ADSL** so AE-free subjects
+  are counted; **Wilson** CIs are the regulatory default for rates.
+- `ard_hierarchical()` builds the SOC × PT incidence table; a ≥ 5% threshold is a
+  near-universal customization.
+- Complex multi-dimensional shift tables may warrant **tfrmt** over gtsummary.
+- A complete safety section is ~10 templates rendering ~50 RTFs in minutes; ~60–70%
+  of CSR tables start from cardinal templates.
+- Common sponsor adaptations are mostly cosmetic: population filter, MedDRA
+  version, table numbering, footnotes, column labels.
+
+### What's next
+
+**Lesson 32 — tfrmt** is the final lesson in this module: the display-metadata
+layer for ARDs. For tables gtsummary can't render elegantly — multi-dimensional
+layouts, mock-table workflows, fully sponsor-templated displays — tfrmt provides a
+separate metadata-driven layer that consumes the same ARDs you built here. After
+tfrmt, the module is complete and the series moves to the legacy NEST TLG stack.
+
+---
+
+## Self-check questions
+
+1. Which FDA reference is cardinal primarily implementing?
+2. What is the structure of an AE-overview ARD, and why is `denominator = adsl` essential?
+3. Which function builds the SOC × PT hierarchical AE table?
+4. Why do complex lab shift tables sometimes warrant tfrmt instead of gtsummary?
+5. Why don't listings use an ARD, and what renders them instead?
+6. Name three FDA Table 14.x.x subjects and the cardinal pattern each uses.
+7. What is typically the first customization a sponsor applies to a cardinal template?
+
+## Glossary
+
+- **FDA Standard Safety Tables and Figures** — FDA guide of canonical safety
+  table layouts; cardinal's primary source.
+- **Subject-level denominator** — Use the safety-population subject count for AE
+  incidence; subjects with no AEs still count.
+- **TEAE** — Treatment-Emergent Adverse Event (`TRTEMFL == "Y"`).
+- **AE Overview** — One table summarizing major AE categories (any, serious, severe, …).
+- **SOC × PT** — System Organ Class (MedDRA top level) × Preferred Term (lower level).
+- **`ard_hierarchical()`** — Builds the nested SOC/PT subject-level incidence ARD.
+- **Shift table** — Cross-tab of baseline category × worst on-treatment category.
+- **Forest plot** — Subgroup-level effect-size plot with a reference line.
+- **Listing** — Subject/event-level data display, not aggregated.
+- **Wilson CI** — Default binary-proportion CI; stays within [0, 100].
+- **MedDRA** — Medical Dictionary for Regulatory Activities; AE coding standard.
+- **CSR safety section** — The standard ~10-table safety set of a CSR.
+- **tfrmt** — Display-metadata layer for complex tables (Lesson 32).
+- **flextable / r2rtf** — Render listings and paginated RTF output.
