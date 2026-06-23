@@ -270,7 +270,8 @@ Each `pharmaverseXX/` folder contains human-readable **narrative lesson plans**
 
 | # | File | Exercises | Quizzes | Topic |
 |---|------|:---------:|:-------:|-------|
-| 25 | [25_cards_part1_ard_concepts.Rmd](pharmaverse_tutorials/25_cards_part1_ard_concepts.Rmd) | 14 | 3 | cards Part 1 — ARD column anatomy, list-column `stat`, ard\_continuous/categorical/hierarchical/complex |
+| 25a | [25_cards_part1a_ard_anatomy.Rmd](pharmaverse_tutorials/25_cards_part1a_ard_anatomy.Rmd) | 8 | 3 | cards Part 1a — ARD column anatomy, list-column `stat`, ard\_continuous/categorical, denominator |
+| 25b | [25_cards_part1b_constructors.Rmd](pharmaverse_tutorials/25_cards_part1b_constructors.Rmd) | 6 | 1 | cards Part 1b — ard\_stack\_hierarchical/complex/stack/bind\_ard, validation, custom statistics |
 | 26 | [26_cards_part2_clinical_ards.Rmd](pharmaverse_tutorials/26_cards_part2_clinical_ards.Rmd) | 21 | 3 | cards Part 2 — full clinical ARD pipeline: demographics, TEAE incidence, labs, vitals, exposure |
 | 27 | [27_cardx.Rmd](pharmaverse_tutorials/27_cardx.Rmd) | 20 | 4 | cardx — inferential ARDs: t-test, chi-sq, Fisher, regression, Cox PH, K-M survival, MMRM |
 | 28 | [28_gtsummary_part1.Rmd](pharmaverse_tutorials/28_gtsummary_part1.Rmd) | 11 | 2 | tbl\_summary(), by-arm demographics, add\_n/add\_p, tbl\_ard\_summary() |
