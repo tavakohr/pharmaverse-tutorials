@@ -4,6 +4,10 @@
 **Estimated length**: ~40 min spoken
 **Prerequisites**: Lesson 01 (ARS/ARD paradigm); Lessons 14–19 (admiral)
 
+> **Companion animation**: [demog_to_ard_animation.html](../animations/demog_to_ard_animation.html)
+> (standalone — open in a browser) — animates a demographic table expanding
+> cell-by-cell into ARD rows.
+
 ---
 
 ## Learning objectives

@@ -282,6 +282,13 @@ Each `pharmaverseXX/` folder contains human-readable **narrative lesson plans**
 
 > Module 6 was restructured to mirror the lesson plans: cards is now split into Part 1 (concepts) and Part 2 (clinical pipeline), cardx has its own lesson, and tfrmt consolidates the former two tfrmt parts plus the standalone gt material. The previous standalone TLF capstone (`32_tlf_capstone.Rmd`) was moved to `pharmaverse_tutorials/archive/`; the end-to-end capstone now lives in Lessons 47–48.
 
+**Animations** (standalone interactive HTML — open in any browser)
+
+| Lesson | Animation | Shows |
+|--------|-----------|-------|
+| 25 | [demog_to_ard_animation.html](animations/demog_to_ard_animation.html) | A demographic table expanding cell-by-cell into ARD rows (cards column anatomy, 3 CDISCPILOT01 arms) |
+| 27 | [ars_builder_animation.html](animations/ars_builder_animation.html) | A mock shell being authored block-by-block into CDISC ARS JSON |
+
 ---
 
 ## Module 8 — Tables, Listings & Figures (Part 2)

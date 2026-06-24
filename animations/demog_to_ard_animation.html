@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+PROJECT     : pharmaverse learnr Tutorials
+FILE        : demog_to_ard_animation.html
+PURPOSE     : Companion animation for Lesson 25 (cards Part 1 - ARD anatomy).
+              Animates a demographic summary table being expanded, one source
+              cell at a time, into Analysis Results Dataset (ARD) rows -
+              showing the cards ARD column anatomy (group1, group1_level,
+              variable, variable_level, context, stat_name, stat_label, stat,
+              fmt_fun, warning, error). Arms match CDISC CDISCPILOT01.
+LINKED FROM : README.md (Module 7) + Pharmaverse07/25_cards_part1_ard_concepts.md
+              Standalone page - open directly in a browser.
+AUTHOR      : Hamid Tavakoli, MD, MSc
+LICENSE     : MIT License
+--------------------------------------------------------------------------------
+DISCLAIMER:
+This program and its contents represent independent work product. They contain
+absolutely no proprietary items, confidential materials, or intellectual
+property belonging to any past, current, or specific organization or corporate
+entity. All data mapping, standards, and logic used herein are derived strictly
+from public documentation, open-source ecosystems, or simulated data.
+================================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Demographic Table → ARD Format</title>
+<style>
+  :root {
+    --blue-dark: #1a3a5c;
+    --blue-mid: #2563a8;
+    --blue-light: #dbeafe;
+    --green: #16a34a;
+    --green-light: #dcfce7;
+    --amber: #d97706;
+    --amber-light: #fef3c7;
+    --purple: #7c3aed;
+    --purple-light: #ede9fe;
+    --red: #dc2626;
+    --red-light: #fee2e2;
+    --teal: #0d9488;
+    --teal-light: #ccfbf1;
+    --gray: #6b7280;
+    --gray-light: #f3f4f6;
+    --gray-border: #e5e7eb;
+    --white: #ffffff;
+    --text: #111827;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0f172a;
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+
+  h1 {
+    color: white;
+    font-size: 1.4rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    margin-bottom: 4px;
+    text-align: center;
+  }
+
+  .subtitle {
+    color: #94a3b8;
+    font-size: 0.82rem;
+    margin-bottom: 18px;
+    text-align: center;
+  }
+
+  /* ── Controls ── */
+  .controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 18px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  button {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  #btnPlay  { background: #2563a8; color: white; }
+  #btnPlay:hover  { background: #1d4ed8; }
+  #btnStep  { background: #374151; color: white; }
+  #btnStep:hover  { background: #4b5563; }
+  #btnReset { background: #1f2937; color: #94a3b8; border: 1px solid #374151; }
+  #btnReset:hover { background: #374151; }
+
+  .step-indicator {
+    color: #94a3b8;
+    font-size: 0.8rem;
+    min-width: 80px;
+    text-align: center;
+  }
+
+  /* ── Main canvas ── */
+  .canvas {
+    position: relative;
+    width: 100%;
+    max-width: 1240px;
+    display: grid;
+    grid-template-columns: 5fr 6fr;
+    gap: 18px;
+  }
+
+  /* ── Panel shared ── */
+  .panel {
+    background: white;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.35);
+  }
+
+  .panel-header {
+    padding: 10px 16px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .left-panel .panel-header  { background: var(--blue-dark); color: white; }
+  .right-panel .panel-header { background: #1e3a2f; color: #86efac; }
+
+  /* ── Demographic Table ── */
+  .demog-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+
+  .demog-table th {
+    background: #f8fafc;
+    padding: 7px 10px;
+    text-align: center;
+    font-weight: 700;
+    border-bottom: 2px solid var(--blue-dark);
+    color: var(--blue-dark);
+  }
+
+  .demog-table th:first-child { text-align: left; }
+
+  .demog-table td {
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--gray-border);
+    transition: background 0.3s;
+    position: relative;
+  }
+
+  .demog-table .var-header td {
+    background: #eff6ff;
+    font-weight: 700;
+    color: var(--blue-dark);
+    padding-top: 8px;
+  }
+
+  .demog-table .indent td:first-child {
+    padding-left: 24px;
+    color: #374151;
+  }
+
+  td.highlight-cell {
+    background: #fef9c3 !important;
+    outline: 2px solid #f59e0b;
+    outline-offset: -2px;
+    border-radius: 3px;
+    z-index: 2;
+  }
+
+  /* ── ARD Panel ── */
+  .ard-scroll {
+    overflow-x: auto;
+    max-height: 460px;
+    overflow-y: auto;
+  }
+
+  .ard-table {
+    border-collapse: collapse;
+    font-size: 0.72rem;
+    width: max-content;
+    min-width: 100%;
+  }
+
+  .ard-table th {
+    background: #1e3a2f;
+    color: #86efac;
+    padding: 6px 8px;
+    text-align: left;
+    font-family: 'Courier New', monospace;
+    font-size: 0.7rem;
+    white-space: nowrap;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+
+  .ard-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #e5e7eb;
+    font-family: 'Courier New', monospace;
+    font-size: 0.7rem;
+    white-space: nowrap;
+    background: white;
+    transition: background 0.4s;
+    min-width: 70px;
+  }
+
+  .ard-table tr.ard-row-new td {
+    background: #f0fdf4;
+    animation: rowAppear 0.5s ease-out;
+  }
+
+  @keyframes rowAppear {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .ard-table td.col-group1      { color: #7c3aed; }
+  .ard-table td.col-group1level { color: #2563a8; font-weight: 600; }
+  .ard-table td.col-variable    { color: #16a34a; font-weight: 600; }
+  .ard-table td.col-varlevel    { color: #0d9488; }
+  .ard-table td.col-context     { color: #6b7280; }
+  .ard-table td.col-statname    { color: #d97706; }
+  .ard-table td.col-statlabel   { color: #d97706; }
+  .ard-table td.col-stat        { color: #dc2626; font-weight: 600; }
+  .ard-table td.col-fmt         { color: #6b7280; }
+  .ard-table td.col-warn        { color: #9ca3af; }
+  .ard-table td.col-err         { color: #9ca3af; }
+
+  td.ard-flash {
+    background: #fef9c3 !important;
+    transition: background 0s !important;
+  }
+
+  /* ── Flying particle ── */
+  .flying-tag {
+    position: fixed;
+    background: #fef3c7;
+    border: 2px solid #f59e0b;
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 0.75rem;
+    font-family: 'Courier New', monospace;
+    font-weight: 700;
+    color: #92400e;
+    z-index: 9999;
+    pointer-events: none;
+    box-shadow: 0 4px 16px rgba(245,158,11,0.4);
+    transition: all 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
+    opacity: 1;
+  }
+
+  .flying-tag.fade-out {
+    opacity: 0;
+    transition: opacity 0.3s ease-in;
+  }
+
+  /* ── Legend ── */
+  .legend {
+    width: 100%;
+    max-width: 1100px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 14px;
+    justify-content: center;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.72rem;
+    color: #94a3b8;
+  }
+
+  .legend-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* ── Annotation box ── */
+  .annotation {
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-left: 4px solid #2563a8;
+    border-radius: 8px;
+    padding: 10px 18px;
+    color: #e2e8f0;
+    font-size: 0.8rem;
+    max-width: 580px;
+    text-align: center;
+    z-index: 1000;
+    opacity: 0;
+    transition: opacity 0.4s;
+    pointer-events: none;
+    line-height: 1.5;
+  }
+
+  .annotation.visible { opacity: 1; }
+  .annotation .hl { color: #fbbf24; font-family: 'Courier New', monospace; }
+
+  /* ── Progress bar ── */
+  .progress-bar-wrap {
+    width: 100%;
+    max-width: 1100px;
+    height: 4px;
+    background: #1e293b;
+    border-radius: 2px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+
+  .progress-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #2563a8, #7c3aed);
+    border-radius: 2px;
+    transition: width 0.4s ease;
+    width: 0%;
+  }
+</style>
+</head>
+<body>
+
+<h1>Demographic Table → ARD Format</h1>
+<p class="subtitle">CDISC CDISCPILOT01 · Placebo vs Xanomeline Low / High Dose · Animated cell → ARD mapping</p>
+
+<div class="progress-bar-wrap">
+  <div class="progress-bar-fill" id="progressFill"></div>
+</div>
+
+<div class="controls">
+  <button id="btnReset" onclick="reset()">↺ Reset</button>
+  <button id="btnStep"  onclick="stepForward()">Step →</button>
+  <button id="btnPlay"  onclick="togglePlay()">▶ Play All</button>
+  <div class="step-indicator" id="stepLabel">Step 0 / 0</div>
+</div>
+
+<div class="canvas" id="mainCanvas">
+
+  <!-- LEFT: Demographic Table -->
+  <div class="panel left-panel">
+    <div class="panel-header">📋 Demographic Summary Table</div>
+    <div style="padding: 6px 0;">
+      <table class="demog-table" id="demogTable">
+        <thead>
+          <tr>
+            <th style="width:34%">Characteristic</th>
+            <th>Placebo<br><span style="font-weight:400;font-size:0.75em">(N=86)</span></th>
+            <th>Xanomeline<br>Low Dose<br><span style="font-weight:400;font-size:0.75em">(N=84)</span></th>
+            <th>Xanomeline<br>High Dose<br><span style="font-weight:400;font-size:0.75em">(N=84)</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- AGE -->
+          <tr class="var-header"><td colspan="4">Age (years)</td></tr>
+          <tr class="indent" id="row-age-n">
+            <td>n</td>
+            <td id="cell-age-n-pbo">86</td>
+            <td id="cell-age-n-ld">84</td>
+            <td id="cell-age-n-hd">84</td>
+          </tr>
+          <tr class="indent" id="row-age-mean">
+            <td>Mean (SD)</td>
+            <td id="cell-age-mean-pbo">75.2 (8.6)</td>
+            <td id="cell-age-mean-ld">75.7 (8.3)</td>
+            <td id="cell-age-mean-hd">74.4 (7.9)</td>
+          </tr>
+          <tr class="indent" id="row-age-median">
+            <td>Median</td>
+            <td id="cell-age-median-pbo">76.0</td>
+            <td id="cell-age-median-ld">77.5</td>
+            <td id="cell-age-median-hd">76.0</td>
+          </tr>
+          <!-- SEX -->
+          <tr class="var-header"><td colspan="4">Sex, n (%)</td></tr>
+          <tr class="indent" id="row-sex-f">
+            <td>Female</td>
+            <td id="cell-sex-f-pbo">53 (61.6%)</td>
+            <td id="cell-sex-f-ld">50 (59.5%)</td>
+            <td id="cell-sex-f-hd">40 (47.6%)</td>
+          </tr>
+          <tr class="indent" id="row-sex-m">
+            <td>Male</td>
+            <td id="cell-sex-m-pbo">33 (38.4%)</td>
+            <td id="cell-sex-m-ld">34 (40.5%)</td>
+            <td id="cell-sex-m-hd">44 (52.4%)</td>
+          </tr>
+          <!-- RACE -->
+          <tr class="var-header"><td colspan="4">Race, n (%)</td></tr>
+          <tr class="indent" id="row-race-w">
+            <td>White</td>
+            <td id="cell-race-w-pbo">74 (86.0%)</td>
+            <td id="cell-race-w-ld">70 (83.3%)</td>
+            <td id="cell-race-w-hd">72 (85.7%)</td>
+          </tr>
+          <tr class="indent" id="row-race-b">
+            <td>Black or African American</td>
+            <td id="cell-race-b-pbo">8 (9.3%)</td>
+            <td id="cell-race-b-ld">9 (10.7%)</td>
+            <td id="cell-race-b-hd">8 (9.5%)</td>
+          </tr>
+          <tr class="indent" id="row-race-a">
+            <td>Asian</td>
+            <td id="cell-race-a-pbo">4 (4.7%)</td>
+            <td id="cell-race-a-ld">5 (6.0%)</td>
+            <td id="cell-race-a-hd">4 (4.8%)</td>
+          </tr>
+          <!-- ETHNICITY -->
+          <tr class="var-header"><td colspan="4">Ethnicity, n (%)</td></tr>
+          <tr class="indent" id="row-eth-h">
+            <td>Hispanic or Latino</td>
+            <td id="cell-eth-h-pbo">3 (3.5%)</td>
+            <td id="cell-eth-h-ld">2 (2.4%)</td>
+            <td id="cell-eth-h-hd">4 (4.8%)</td>
+          </tr>
+          <tr class="indent" id="row-eth-nh">
+            <td>Not Hispanic or Latino</td>
+            <td id="cell-eth-nh-pbo">83 (96.5%)</td>
+            <td id="cell-eth-nh-ld">82 (97.6%)</td>
+            <td id="cell-eth-nh-hd">80 (95.2%)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- RIGHT: ARD Table -->
+  <div class="panel right-panel">
+    <div class="panel-header">🗃 Analysis Results Dataset (ARD)</div>
+    <div class="ard-scroll">
+      <table class="ard-table">
+        <thead>
+          <tr>
+            <th>group1</th>
+            <th>group1_level</th>
+            <th>variable</th>
+            <th>variable_level</th>
+            <th>context</th>
+            <th>stat_name</th>
+            <th>stat_label</th>
+            <th>stat</th>
+            <th>fmt_fun</th>
+            <th>warning</th>
+            <th>error</th>
+          </tr>
+        </thead>
+        <tbody id="ardBody">
+          <!-- rows injected by JS -->
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- canvas -->
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#7c3aed"></div>group1 / group1_level</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#16a34a"></div>variable</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#0d9488"></div>variable_level</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#d97706"></div>stat_name / stat_label</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#dc2626"></div>stat value</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#6b7280"></div>context / fmt_fun</div>
+</div>
+
+<div class="annotation" id="annotation"></div>
+
+<script>
+// ── ARD row definitions ──────────────────────────────────────────────
+// Each step highlights source cells, animates a flying tag, then appends an ARD row.
+
+const steps = [
+  {
+    highlight: ['cell-age-n-pbo'],
+    sourceLabel: '"TRT01P" → "Placebo"',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Placebo',
+      variable: 'AGE', variable_level: '',
+      context: 'continuous', stat_name: 'n', stat_label: 'n',
+      stat: '86', fmt_fun: 'integer', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Column header <span class="hl">TRT01P</span> → <span class="hl">group1</span> · "Placebo" → <span class="hl">group1_level</span> · Row label "Age" → <span class="hl">variable</span> = "AGE" · Stat "n" → <span class="hl">stat_name</span> · Value 86 → <span class="hl">stat</span>'
+  },
+  {
+    highlight: ['cell-age-n-ld'],
+    sourceLabel: '"TRT01P" → "Xan Low"',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Xanomeline Low Dose',
+      variable: 'AGE', variable_level: '',
+      context: 'continuous', stat_name: 'n', stat_label: 'n',
+      stat: '84', fmt_fun: 'integer', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Same variable <span class="hl">AGE</span>, same stat <span class="hl">n</span> — now <span class="hl">group1_level</span> = "Xanomeline Low Dose"'
+  },
+  {
+    highlight: ['cell-age-n-hd'],
+    sourceLabel: '"TRT01P" → "Xan High"',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Xanomeline High Dose',
+      variable: 'AGE', variable_level: '',
+      context: 'continuous', stat_name: 'n', stat_label: 'n',
+      stat: '84', fmt_fun: 'integer', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Three arms → three ARD rows for one stat. Each level of <span class="hl">group1</span> (Placebo / Xan Low / Xan High) fans out into its own row.'
+  },
+  {
+    highlight: ['cell-age-mean-pbo'],
+    sourceLabel: 'Mean 75.2',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Placebo',
+      variable: 'AGE', variable_level: '',
+      context: 'continuous', stat_name: 'mean', stat_label: 'Mean',
+      stat: '75.2', fmt_fun: 'xx.x', warning: 'NULL', error: 'NULL'
+    },
+    annotation: '"Mean (SD)" cell → two ARD rows: one for <span class="hl">stat_name = "mean"</span>, one for <span class="hl">stat_name = "sd"</span>'
+  },
+  {
+    highlight: ['cell-age-mean-pbo'],
+    sourceLabel: 'SD 8.6',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Placebo',
+      variable: 'AGE', variable_level: '',
+      context: 'continuous', stat_name: 'sd', stat_label: 'SD',
+      stat: '8.6', fmt_fun: 'xx.x', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Each summary statistic gets its own ARD row — <span class="hl">mean</span> and <span class="hl">sd</span> are separate rows sharing the same group & variable'
+  },
+  {
+    highlight: ['cell-age-median-hd'],
+    sourceLabel: 'Median 76.0',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Xanomeline High Dose',
+      variable: 'AGE', variable_level: '',
+      context: 'continuous', stat_name: 'median', stat_label: 'Median',
+      stat: '76.0', fmt_fun: 'xx.x', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Median for the High Dose arm: <span class="hl">stat_name = "median"</span> · <span class="hl">variable_level</span> stays empty — AGE is continuous'
+  },
+  {
+    highlight: ['cell-sex-f-pbo'],
+    sourceLabel: 'Female n=53',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Placebo',
+      variable: 'SEX', variable_level: 'F',
+      context: 'categorical', stat_name: 'n', stat_label: 'n',
+      stat: '53', fmt_fun: 'integer', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Categorical variable! "Female" → <span class="hl">variable_level = "F"</span> · <span class="hl">context</span> changes to <span class="hl">categorical</span>'
+  },
+  {
+    highlight: ['cell-sex-f-pbo'],
+    sourceLabel: '61.6%',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Placebo',
+      variable: 'SEX', variable_level: 'F',
+      context: 'categorical', stat_name: 'p', stat_label: '%',
+      stat: '0.616', fmt_fun: 'xx.x%', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'The percentage from the cell → separate row with <span class="hl">stat_name = "p"</span>, stat stored as proportion <span class="hl">0.616</span>'
+  },
+  {
+    highlight: ['cell-sex-m-hd'],
+    sourceLabel: 'Male n=44',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Xanomeline High Dose',
+      variable: 'SEX', variable_level: 'M',
+      context: 'categorical', stat_name: 'n', stat_label: 'n',
+      stat: '44', fmt_fun: 'integer', warning: 'NULL', error: 'NULL'
+    },
+    annotation: '<span class="hl">variable_level = "M"</span> for Male, High Dose arm · each combination of group × level × stat = one row'
+  },
+  {
+    highlight: ['cell-race-w-ld'],
+    sourceLabel: 'White 83.3%',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Xanomeline Low Dose',
+      variable: 'RACE', variable_level: 'WHITE',
+      context: 'categorical', stat_name: 'p', stat_label: '%',
+      stat: '0.833', fmt_fun: 'xx.x%', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Race variable: <span class="hl">variable = "RACE"</span> · level "White" → <span class="hl">variable_level = "WHITE"</span> (CDISC coded value)'
+  },
+  {
+    highlight: ['cell-race-b-pbo'],
+    sourceLabel: 'Black 9.3%',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Placebo',
+      variable: 'RACE', variable_level: 'BLACK OR AFRICAN AMERICAN',
+      context: 'categorical', stat_name: 'p', stat_label: '%',
+      stat: '0.093', fmt_fun: 'xx.x%', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'CDISC controlled terminology: full text in <span class="hl">variable_level</span> — "BLACK OR AFRICAN AMERICAN"'
+  },
+  {
+    highlight: ['cell-eth-h-pbo'],
+    sourceLabel: 'Hispanic 3.5%',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Placebo',
+      variable: 'ETHNIC', variable_level: 'HISPANIC OR LATINO',
+      context: 'categorical', stat_name: 'p', stat_label: '%',
+      stat: '0.035', fmt_fun: 'xx.x%', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Ethnicity → <span class="hl">variable = "ETHNIC"</span> · <span class="hl">variable_level = "HISPANIC OR LATINO"</span> (SDTM CT)'
+  },
+  {
+    highlight: ['cell-eth-nh-hd'],
+    sourceLabel: 'Non-Hispanic 95.2%',
+    ardRow: {
+      group1: 'TRT01P', group1_level: 'Xanomeline High Dose',
+      variable: 'ETHNIC', variable_level: 'NOT HISPANIC OR LATINO',
+      context: 'categorical', stat_name: 'p', stat_label: '%',
+      stat: '0.952', fmt_fun: 'xx.x%', warning: 'NULL', error: 'NULL'
+    },
+    annotation: 'Final row: every cell in the table expands to multiple ARD rows — one per <span class="hl">stat_name</span> × group combination'
+  }
+];
+
+let currentStep = 0;
+let playing = false;
+let playTimer = null;
+
+const ardBody = document.getElementById('ardBody');
+const annotation = document.getElementById('annotation');
+const stepLabel = document.getElementById('stepLabel');
+const progressFill = document.getElementById('progressFill');
+
+function updateStepLabel() {
+  stepLabel.textContent = `Step ${currentStep} / ${steps.length}`;
+  progressFill.style.width = `${(currentStep / steps.length) * 100}%`;
+}
+
+function clearHighlights() {
+  document.querySelectorAll('.highlight-cell').forEach(el => el.classList.remove('highlight-cell'));
+}
+
+function showAnnotation(html) {
+  annotation.innerHTML = html;
+  annotation.classList.add('visible');
+}
+
+function hideAnnotation() {
+  annotation.classList.remove('visible');
+}
+
+// Get bounding rect of a cell in viewport coordinates
+function getRect(id) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  return el.getBoundingClientRect();
+}
+
+// Get rect of the last ARD row's stat cell
+function getArdTargetRect() {
+  const rows = ardBody.querySelectorAll('tr');
+  if (rows.length === 0) return null;
+  const lastRow = rows[rows.length - 1];
+  const cells = lastRow.querySelectorAll('td');
+  if (cells.length < 8) return null;
+  return cells[7].getBoundingClientRect(); // stat column index 7
+}
+
+function animateFly(sourceCellId, label, callback) {
+  const sourceEl = document.getElementById(sourceCellId);
+  if (!sourceEl) { callback && callback(); return; }
+
+  const srcRect = sourceEl.getBoundingClientRect();
+
+  // Create flying tag
+  const tag = document.createElement('div');
+  tag.className = 'flying-tag';
+  tag.textContent = label;
+  document.body.appendChild(tag);
+
+  // Position at source
+  tag.style.left = srcRect.left + 'px';
+  tag.style.top  = srcRect.top  + 'px';
+  tag.style.width = Math.max(srcRect.width, 80) + 'px';
+  tag.style.textAlign = 'center';
+
+  // Force reflow
+  tag.getBoundingClientRect();
+
+  // After tiny delay, fly to target (we compute target after ARD row is added)
+  setTimeout(() => {
+    const ardScroll = document.querySelector('.ard-scroll');
+    const ardRect = ardScroll.getBoundingClientRect();
+    const destX = ardRect.left + ardRect.width / 2 - 40;
+    const destY = ardRect.top  + ardRect.height / 2;
+
+    tag.style.left = destX + 'px';
+    tag.style.top  = destY + 'px';
+    tag.style.transform = 'scale(0.85)';
+
+    setTimeout(() => {
+      tag.classList.add('fade-out');
+      setTimeout(() => {
+        tag.remove();
+        callback && callback();
+      }, 350);
+    }, 500);
+  }, 60);
+}
+
+function appendArdRow(data, isNew) {
+  const tr = document.createElement('tr');
+  if (isNew) tr.className = 'ard-row-new';
+
+  const cols = [
+    { val: data.group1,        cls: 'col-group1' },
+    { val: data.group1_level,  cls: 'col-group1level' },
+    { val: data.variable,      cls: 'col-variable' },
+    { val: data.variable_level,cls: 'col-varlevel' },
+    { val: data.context,       cls: 'col-context' },
+    { val: data.stat_name,     cls: 'col-statname' },
+    { val: data.stat_label,    cls: 'col-statlabel' },
+    { val: data.stat,          cls: 'col-stat' },
+    { val: data.fmt_fun,       cls: 'col-fmt' },
+    { val: data.warning,       cls: 'col-warn' },
+    { val: data.error,         cls: 'col-err' }
+  ];
+
+  cols.forEach(c => {
+    const td = document.createElement('td');
+    td.className = c.cls;
+    td.textContent = c.val;
+    tr.appendChild(td);
+  });
+
+  ardBody.appendChild(tr);
+
+  // Scroll ARD panel to bottom
+  const scroll = document.querySelector('.ard-scroll');
+  scroll.scrollTop = scroll.scrollHeight;
+
+  return tr;
+}
+
+function runStep(idx) {
+  if (idx >= steps.length) {
+    stopPlay();
+    return;
+  }
+
+  const s = steps[idx];
+
+  // Highlight source cells
+  clearHighlights();
+  s.highlight.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.classList.add('highlight-cell');
+  });
+
+  showAnnotation(s.annotation);
+
+  // Animate flying tag from first highlight cell
+  animateFly(s.highlight[0], s.sourceLabel, () => {
+    // Add ARD row
+    appendArdRow(s.ardRow, true);
+
+    // Flash the new row briefly
+    const lastRow = ardBody.querySelector('tr:last-child');
+    if (lastRow) {
+      lastRow.querySelectorAll('td').forEach(td => {
+        td.classList.add('ard-flash');
+        setTimeout(() => td.classList.remove('ard-flash'), 600);
+      });
+    }
+  });
+}
+
+function stepForward() {
+  if (currentStep >= steps.length) return;
+  runStep(currentStep);
+  currentStep++;
+  updateStepLabel();
+}
+
+function togglePlay() {
+  if (playing) {
+    stopPlay();
+  } else {
+    startPlay();
+  }
+}
+
+function startPlay() {
+  playing = true;
+  document.getElementById('btnPlay').textContent = '⏸ Pause';
+
+  function tick() {
+    if (currentStep >= steps.length) {
+      stopPlay();
+      return;
+    }
+    stepForward();
+    playTimer = setTimeout(tick, 2000);
+  }
+  tick();
+}
+
+function stopPlay() {
+  playing = false;
+  document.getElementById('btnPlay').textContent = '▶ Play All';
+  if (playTimer) { clearTimeout(playTimer); playTimer = null; }
+}
+
+function reset() {
+  stopPlay();
+  currentStep = 0;
+  clearHighlights();
+  hideAnnotation();
+  ardBody.innerHTML = '';
+  updateStepLabel();
+}
+
+// Init
+updateStepLabel();
+</script>
+</body>
+</html>

@@ -4,6 +4,10 @@
 **Estimated length**: ~35 min spoken
 **Prerequisites**: Lessons 25–26 (cards)
 
+> **Companion animation**: [ars_builder_animation.html](../animations/ars_builder_animation.html)
+> (standalone — open in a browser) — animates a mock shell being authored
+> block-by-block into CDISC ARS JSON.
+
 ---
 
 ## Learning objectives

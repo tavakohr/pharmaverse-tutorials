@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+PROJECT     : pharmaverse learnr Tutorials
+FILE        : ars_builder_animation.html
+PURPOSE     : Companion animation for Lesson 27 (cardx / siera - ARS automation).
+              Animates a mock shell (Table 14.1.1, Demographics) being authored
+              block-by-block into CDISC Analysis Results Standard (ARS) JSON:
+              analysisSets, analysisGroupings, methods, analyses, outputs. Arms
+              match CDISC CDISCPILOT01 (Placebo / Xanomeline Low / High Dose).
+LINKED FROM : README.md (Module 7) + Pharmaverse07/27_cardx.md
+              Standalone page - open directly in a browser.
+AUTHOR      : Hamid Tavakoli, MD, MSc
+LICENSE     : MIT License
+--------------------------------------------------------------------------------
+DISCLAIMER:
+This program and its contents represent independent work product. They contain
+absolutely no proprietary items, confidential materials, or intellectual
+property belonging to any past, current, or specific organization or corporate
+entity. All data mapping, standards, and logic used herein are derived strictly
+from public documentation, open-source ecosystems, or simulated data.
+================================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shell → ARS JSON Builder</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117; --surface:#161b22; --border:#21262d;
+  --text:#e6edf3; --muted:#7d8590;
+  --blue:#79c0ff; --green:#a5d6a7; --amber:#d29922;
+  --purple:#bc8cff; --pink:#f778ba; --num:#ffa657;
+  --punc:#c9d1d9; --comment:#6e7681;
+  /* format pattern colors match shell placeholders */
+  --rn:#3fb950; --rc:#58a6ff; --rp:#f778ba;
+  --fn:#3fb950; --fc:#58a6ff; --fp:#f778ba; --fx:#bc8cff;
+}
+body{
+  font-family:-apple-system,'Segoe UI',sans-serif;
+  background:var(--bg); color:var(--text);
+  min-height:100vh; display:flex; flex-direction:column;
+  align-items:center; gap:9px; padding:13px 16px 80px;
+}
+.page-title{font-size:1.2rem;font-weight:700}
+.page-sub{color:var(--muted);font-size:0.76rem}
+/* workflow */
+.wf{display:flex;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden;font-size:0.7rem;font-weight:600}
+.wf-s{padding:5px 11px;color:var(--muted);border-right:1px solid var(--border);transition:background .3s,color .3s}
+.wf-s:last-child{border-right:none}
+.wf-s.on{background:#1f2d45;color:var(--blue)}
+/* progress */
+.prog-wrap{width:100%;max-width:1240px;height:3px;background:var(--border);border-radius:2px;overflow:hidden}
+.prog-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--purple));transition:width .4s ease;width:0%}
+/* controls */
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:center}
+button{padding:6px 16px;border:none;border-radius:6px;font-size:0.81rem;font-weight:600;cursor:pointer;transition:filter .15s}
+button:hover{filter:brightness(1.15)}
+#btnPlay{background:var(--blue);color:#0d1117}
+#btnStep{background:#30363d;color:var(--text)}
+#btnReset{background:var(--surface);color:var(--muted);border:1px solid var(--border)}
+.step-lbl{color:var(--muted);font-size:0.77rem;min-width:90px;text-align:center}
+.phase-lbl{font-size:0.71rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;padding:3px 10px;border-radius:20px;background:#1f2d45;color:var(--blue)}
+/* canvas */
+.canvas{width:100%;max-width:1240px;display:grid;grid-template-columns:5fr 7fr;gap:14px;align-items:start}
+/* panels */
+.panel{border-radius:10px;overflow:hidden;border:1px solid var(--border);background:var(--surface);box-shadow:0 4px 20px rgba(0,0,0,.5)}
+.panel-hdr{padding:8px 14px;font-size:0.7rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase}
+.left-panel  .panel-hdr{background:#1a1400;color:#d29922;border-bottom:1px solid #3d2e00}
+.right-panel .panel-hdr{background:#0d1f12;color:#3fb950;border-bottom:1px solid #1a3a22}
+/* shell */
+.shell-wrap{padding:8px 10px 10px}
+.sh-title{text-align:center;font-size:0.72rem;font-weight:700;color:#d29922;line-height:1.6;margin-bottom:6px;border-bottom:2px solid #3d2e00;padding-bottom:6px}
+.sh-pop{text-align:center;font-size:0.68rem;color:#92713c;font-style:italic;margin-bottom:5px}
+table.sh{width:100%;border-collapse:collapse;font-size:0.72rem}
+table.sh th{background:#1a1400;padding:5px 7px;border-bottom:2px solid #3d2e00;color:#d29922;font-weight:700}
+table.sh th:first-child{text-align:left}
+table.sh th:not(:first-child){text-align:center}
+table.sh td{padding:3px 7px;border-bottom:1px solid var(--border);color:var(--text);transition:background .25s}
+table.sh td:not(:first-child){text-align:center}
+table.sh .vh td{background:#1a1a2e;color:var(--blue);font-weight:700;padding-top:6px}
+table.sh .ind td:first-child{padding-left:18px;color:var(--muted)}
+.fn{color:var(--fn);font-family:'Courier New',mono;font-weight:700}
+.fc{color:var(--fc);font-family:'Courier New',mono;font-weight:700}
+.fp{color:var(--fp);font-family:'Courier New',mono;font-weight:700}
+.fx{color:var(--fx);font-family:'Courier New',mono;font-weight:700}
+tr.hl-row td{background:#1e1800!important;outline:1px solid var(--amber)}
+th.hl-cell{background:#1e1800!important;outline:2px solid var(--amber);outline-offset:-2px}
+.sh-fn{margin-top:6px;font-size:0.63rem;color:var(--muted);border-top:1px solid var(--border);padding-top:5px;line-height:1.5;transition:background .25s;border-radius:3px}
+.sh-fn.hl{background:#1e1800;padding:4px 6px}
+/* JSON viewer */
+.json-scroll{overflow-y:auto;max-height:560px;padding:10px 14px}
+.json-body{font-family:'Courier New',monospace;font-size:0.69rem;line-height:1.75;white-space:pre}
+/* JSON syntax */
+.jk{color:var(--blue)}
+.js{color:var(--green)}
+.jn{color:var(--num)}
+.jb2{color:var(--purple)}
+.jp{color:var(--punc)}
+.jc{color:var(--comment);font-style:italic}
+/* resultPattern colored same as shell placeholders */
+.rn{color:var(--rn);font-weight:700}
+.rc{color:var(--rc);font-weight:700}
+.rp2{color:var(--rp);font-weight:700}
+/* JSON sections */
+.jsec{transition:opacity .5s ease,background .5s ease;border-radius:3px}
+.jsec.dim{opacity:.08}
+.jsec.lit{opacity:1}
+.jsec.flash{animation:secFlash 2s ease-out;border-radius:5px}
+@keyframes secFlash{
+  0%  {background:rgba(210,153,34,0.38);box-shadow:inset 4px 0 0 #d29922,0 0 18px rgba(210,153,34,0.35)}
+  40% {background:rgba(210,153,34,0.18);box-shadow:inset 4px 0 0 #d29922,0 0 8px rgba(210,153,34,0.15)}
+  100%{background:transparent;box-shadow:none}
+}
+/* annotation */
+.ann{
+  position:fixed;bottom:12px;left:50%;transform:translateX(-50%);
+  background:#0d1117;border:1px solid #30363d;border-left:4px solid var(--blue);
+  border-radius:8px;padding:8px 18px;color:#e6edf3;font-size:0.76rem;
+  max-width:700px;text-align:center;z-index:1000;
+  opacity:0;transition:opacity .4s;pointer-events:none;line-height:1.6;
+  box-shadow:0 4px 20px rgba(0,0,0,.5)
+}
+.ann.vis{opacity:1}
+.ht{color:var(--amber);font-family:'Courier New',mono;font-weight:700}
+.hb{color:var(--blue);font-family:'Courier New',mono}
+.hg{color:var(--green);font-family:'Courier New',mono}
+.hp{color:var(--fp);font-family:'Courier New',mono}
+/* legend */
+.legend{width:100%;max-width:1240px;display:flex;flex-wrap:wrap;gap:12px;justify-content:center}
+.leg{display:flex;align-items:center;gap:5px;font-size:0.69rem;color:var(--muted)}
+.lc{font-family:'Courier New',mono;font-size:0.71rem;font-weight:700;padding:1px 6px;border-radius:3px}
+</style>
+</head>
+<body>
+
+<div class="page-title">Mock Shell → ARS JSON</div>
+<p class="page-sub">Programmer lead annotates the shell · builds the ARS block by block · one statistic at a time</p>
+
+<div class="wf">
+  <div class="wf-s on">1 · Receive mock shell</div>
+  <div class="wf-s on">2 · Annotate shell</div>
+  <div class="wf-s on">3 · Author ARS JSON ←</div>
+  <div class="wf-s" id="wf4">4 · Write SAS programs</div>
+  <div class="wf-s" id="wf5">5 · DB lock → populate results[ ]</div>
+</div>
+
+<div class="prog-wrap"><div class="prog-fill" id="progFill"></div></div>
+
+<div class="controls">
+  <button id="btnReset" onclick="reset()">↺ Reset</button>
+  <button id="btnStep"  onclick="stepFwd()">Step →</button>
+  <button id="btnPlay"  onclick="togglePlay()">▶ Play All</button>
+  <div class="step-lbl" id="stepLbl">Step 0 / 0</div>
+  <div class="phase-lbl" id="phaseLbl">Ready</div>
+</div>
+
+<div class="canvas">
+
+<!-- ── LEFT: Mock Shell ────────────────────────────────────── -->
+<div class="panel left-panel">
+  <div class="panel-hdr">📄 Mock Shell · Table 14.1.1</div>
+  <div class="shell-wrap">
+    <div class="sh-title">Table 14.1.1<br>Demographics and Baseline Characteristics</div>
+    <div class="sh-pop" id="sh-pop">Safety Analysis Set</div>
+    <table class="sh">
+      <thead>
+        <tr>
+          <th style="width:40%">Characteristic</th>
+          <th id="sh-pbo">Placebo<br><span class="fx">(N=xxx)</span></th>
+          <th id="sh-ld">Xan Low<br><span class="fx">(N=xxx)</span></th>
+          <th id="sh-hd">Xan High<br><span class="fx">(N=xxx)</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="vh" id="sh-age-hdr"><td colspan="4">Age (years)</td></tr>
+        <tr class="ind" id="sh-age-n">  <td>n</td>         <td><span class="fn">xx</span></td><td><span class="fn">xx</span></td><td><span class="fn">xx</span></td></tr>
+        <tr class="ind" id="sh-age-mean"><td>Mean (SD)</td><td><span class="fc">xx.x</span> (<span class="fc">xx.x</span>)</td><td><span class="fc">xx.x</span> (<span class="fc">xx.x</span>)</td><td><span class="fc">xx.x</span> (<span class="fc">xx.x</span>)</td></tr>
+        <tr class="ind" id="sh-age-med"> <td>Median</td>   <td><span class="fc">xx.x</span></td><td><span class="fc">xx.x</span></td><td><span class="fc">xx.x</span></td></tr>
+        <tr class="ind" id="sh-age-mm">  <td>Min, Max</td> <td><span class="fc">xx.x</span>, <span class="fc">xx.x</span></td><td><span class="fc">xx.x</span>, <span class="fc">xx.x</span></td><td><span class="fc">xx.x</span>, <span class="fc">xx.x</span></td></tr>
+        <tr class="vh" id="sh-sex-hdr"><td colspan="4">Sex, n (%)</td></tr>
+        <tr class="ind" id="sh-sex-f"><td>Female</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td></tr>
+        <tr class="ind" id="sh-sex-m"><td>Male</td>  <td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td></tr>
+        <tr class="vh" id="sh-race-hdr"><td colspan="4">Race, n (%)</td></tr>
+        <tr class="ind" id="sh-race-w"><td>White</td>                    <td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td></tr>
+        <tr class="ind" id="sh-race-b"><td>Black or African American</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td></tr>
+        <tr class="ind" id="sh-race-a"><td>Asian</td>                    <td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td></tr>
+        <tr class="vh" id="sh-eth-hdr"><td colspan="4">Ethnicity, n (%)</td></tr>
+        <tr class="ind" id="sh-eth-h" ><td>Hispanic or Latino</td>     <td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td></tr>
+        <tr class="ind" id="sh-eth-nh"><td>Not Hispanic or Latino</td>  <td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td><td><span class="fn">xx</span> (<span class="fp">xx.x%</span>)</td></tr>
+      </tbody>
+    </table>
+    <div class="sh-fn" id="sh-fn">
+Abbrev.: n = number of subjects; SD = standard deviation.
+Percentages based on n per treatment group in the Safety Analysis Set.</div>
+  </div>
+</div>
+
+<!-- ── RIGHT: ARS JSON ────────────────────────────────────── -->
+<div class="panel right-panel">
+  <div class="panel-hdr">🗂 ARS JSON · ars_demog_study001.json</div>
+  <div class="json-scroll" id="jsonScroll">
+    <div class="json-body" id="jsonBody">
+      <!-- Injected by JS on load -->
+    </div>
+  </div>
+</div>
+
+</div><!-- /canvas -->
+
+<div class="legend">
+  <span class="leg"><span class="lc" style="background:#052e16;color:var(--rn)">"xx"</span> count / integer</span>
+  <span class="leg"><span class="lc" style="background:#051528;color:var(--rc)">"xx.x"</span> continuous (1 d.p.)</span>
+  <span class="leg"><span class="lc" style="background:#2a0f1f;color:var(--rp)">"xx.x%"</span> percentage</span>
+  <span class="leg" style="margin-left:8px"><span style="color:var(--blue)">■</span> JSON key &nbsp; <span style="color:var(--green)">■</span> string value &nbsp; <span style="color:var(--num)">■</span> number &nbsp; <span style="color:var(--comment)">■</span> comment</span>
+</div>
+
+<div class="ann" id="ann"></div>
+
+<script>
+// ── JSON builder helpers ─────────────────────────────────────────
+
+const k  = s => `<span class="jk">"${s}"</span>`;
+const sv = s => `<span class="js">"${s}"</span>`;
+const nv = n => `<span class="jn">${n}</span>`;
+const bv = b => `<span class="jb2">${b}</span>`;
+const p  = s => `<span class="jp">${s}</span>`;
+const cm = s => `<span class="jc">  // ${s}</span>`;
+const rn = s => `<span class="rn">"${s}"</span>`;  // resultPattern xx
+const rc = s => `<span class="rc">"${s}"</span>`;  // resultPattern xx.x
+const rp = s => `<span class="rp2">"${s}"</span>`; // resultPattern xx.x%
+
+// indent helper — 2 spaces per level
+const I = (n, ...parts) => `<div>${'  '.repeat(n)}${parts.join('')}</div>`;
+
+// wrap lines into a reveal-able section
+function sec(id, ...lines) {
+  return `<div class="jsec dim" id="${id}">${lines.join('')}</div>`;
+}
+
+// ── Build the complete ARS JSON ──────────────────────────────────
+
+const JSON_HTML = [
+
+  // always-visible wrapper
+  `<div>${p('{')}</div>`,
+  `<div>${'  '}${k('reportingEvent')}${p(': {')}</div>`,
+  `<div></div>`,
+
+  // ── SECTION 1: analysisSets + analysisGroupings ────────────────
+  sec('jb-infra',
+    I(2, k('analysisSets'), p(': [')),
+    I(3, p('{')),
+    I(4, k('id'),         p(': '), sv('AS.SAFETY'),           p(',')),
+    I(4, k('label'),      p(': '), sv('Safety Analysis Set'), p(',')),
+    I(4, k('condition'),  p(': {')),
+    I(5, k('dataset'),    p(': '), sv('ADSL'),                p(',')),
+    I(5, k('variable'),   p(': '), sv('SAFFL'),               p(',')),
+    I(5, k('comparator'), p(': '), sv('EQ'),                  p(',')),
+    I(5, k('value'),      p(': ['), sv('Y'), p(']')),
+    I(4, p('},')),
+    I(4, k('order'), p(': '), nv('1')),
+    I(3, p('}'), p('],')),
+    `<div></div>`,
+    I(2, k('analysisGroupings'), p(': [')),
+    I(3, p('{')),
+    I(4, k('id'),               p(': '), sv('GRP.TRT01P'),          p(',')),
+    I(4, k('label'),            p(': '), sv('Planned Treatment'),    p(',')),
+    I(4, k('groupingVariable'), p(': '), sv('TRT01P'),              p(',')),
+    I(4, k('dataDriven'),       p(': '), bv('false'),               p(',')),
+    I(4, k('groups'), p(': [')),
+    I(5, p('{ '), k('id'), p(': '), sv('GRP.TRT01P.PLACEBO'), p(', '), k('label'), p(': '), sv('Placebo'),              p(', '), k('value'), p(': '), sv('Placebo'),              p(', '), k('order'), p(': '), nv('1'), p(' },')),
+    I(5, p('{ '), k('id'), p(': '), sv('GRP.TRT01P.XANLO'),   p(', '), k('label'), p(': '), sv('Xanomeline Low Dose'),  p(', '), k('value'), p(': '), sv('Xanomeline Low Dose'),  p(', '), k('order'), p(': '), nv('2'), p(' },')),
+    I(5, p('{ '), k('id'), p(': '), sv('GRP.TRT01P.XANHI'),   p(', '), k('label'), p(': '), sv('Xanomeline High Dose'), p(', '), k('value'), p(': '), sv('Xanomeline High Dose'), p(', '), k('order'), p(': '), nv('3'), p(' }')),
+    I(4, p(']')),
+    I(3, p('}'), p('],')),
+    `<div></div>`
+  ),
+
+  // ── SECTION 2a: methods[ open + MTH.CONT.SUMM header ──────────
+  sec('jb-mth-open',
+    I(2, k('methods'), p(': [')),
+    I(3, p('{')),
+    I(4, k('id'),          p(': '), sv('MTH.CONT.SUMM'),              p(',')),
+    I(4, k('name'),        p(': '), sv('Continuous Variable Summary'), p(',')),
+    I(4, k('description'), p(': '), sv('n, Mean, SD, Median, Min, Max'), p(',')),
+    I(4, k('operations'),  p(': ['))
+  ),
+
+  // ── SECTION 3: OP.N ───────────────────────────────────────────
+  sec('jb-op-n',
+    I(5, p('{ '), k('id'), p(': '), sv('OP.N'),      p(', '), k('label'), p(': '), sv('n'),      p(', '), k('order'), p(': '), nv('1'), p(', '), k('resultPattern'), p(': '), rn('xx'),    p(' },')),
+  ),
+
+  // ── SECTION 4: OP.MEAN + OP.SD ────────────────────────────────
+  sec('jb-op-mean-sd',
+    I(5, p('{ '), k('id'), p(': '), sv('OP.MEAN'),   p(', '), k('label'), p(': '), sv('Mean'),   p(', '), k('order'), p(': '), nv('2'), p(', '), k('resultPattern'), p(': '), rc('xx.x'),  p(' },')),
+    I(5, p('{ '), k('id'), p(': '), sv('OP.SD'),     p(', '), k('label'), p(': '), sv('SD'),     p(', '), k('order'), p(': '), nv('3'), p(', '), k('resultPattern'), p(': '), rc('xx.x'),  p(' },')),
+  ),
+
+  // ── SECTION 5: OP.MEDIAN ──────────────────────────────────────
+  sec('jb-op-median',
+    I(5, p('{ '), k('id'), p(': '), sv('OP.MEDIAN'), p(', '), k('label'), p(': '), sv('Median'), p(', '), k('order'), p(': '), nv('4'), p(', '), k('resultPattern'), p(': '), rc('xx.x'),  p(' },')),
+  ),
+
+  // ── SECTION 6a: OP.MIN + OP.MAX + close MTH.CONT.SUMM ─────────
+  sec('jb-op-minmax',
+    I(5, p('{ '), k('id'), p(': '), sv('OP.MIN'),    p(', '), k('label'), p(': '), sv('Min'),    p(', '), k('order'), p(': '), nv('5'), p(', '), k('resultPattern'), p(': '), rc('xx.x'),  p(' },')),
+    I(5, p('{ '), k('id'), p(': '), sv('OP.MAX'),    p(', '), k('label'), p(': '), sv('Max'),    p(', '), k('order'), p(': '), nv('6'), p(', '), k('resultPattern'), p(': '), rc('xx.x'),  p(' }')),
+    I(4, p(']')),    // close operations
+    I(3, p('},')),   // close MTH.CONT.SUMM
+  ),
+
+  // ── SECTION 7a: MTH.CAT.FREQ + close methods[ ─────────────────
+  sec('jb-mth-cat',
+    I(3, p('{')),
+    I(4, k('id'),          p(': '), sv('MTH.CAT.FREQ'),              p(',')),
+    I(4, k('name'),        p(': '), sv('Categorical Frequency Count'), p(',')),
+    I(4, k('description'), p(': '), sv('n and column percentage'),    p(',')),
+    I(4, k('operations'),  p(': [')),
+    I(5, p('{ '), k('id'), p(': '), sv('OP.CAT.N'),  p(', '), k('label'), p(': '), sv('n'), p(', '), k('order'), p(': '), nv('1'), p(', '), k('resultPattern'), p(': '), rn('xx'),    p(' },')),
+    I(5, p('{ '), k('id'), p(': '), sv('OP.CAT.PCT'),p(', '), k('label'), p(': '), sv('%'), p(', '), k('order'), p(': '), nv('2'), p(', '), k('resultPattern'), p(': '), rp('xx.x%'), p(' }')),
+    I(4, p(']')),
+    I(3, p('}')),
+    I(2, p('],')),  // close methods
+    `<div></div>`
+  ),
+
+  // ── SECTION 2b: analyses[ open + AN.DM.AGE header ─────────────
+  sec('jb-age-hdr',
+    I(2, k('analyses'), p(': [')),
+    `<div></div>`,
+    I(3, p('{'), cm('── AGE ──────────────────────────────')),
+    I(4, k('id'),            p(': '), sv('AN.DM.AGE'),                p(',')),
+    I(4, k('name'),          p(': '), sv('Age – Summary Statistics'), p(',')),
+    I(4, k('reason'),        p(': '), sv('SPECIFIED IN SAP'),          p(',')),
+    I(4, k('purpose'),       p(': '), sv('PRIMARY OUTCOME MEASURE'),   p(',')),
+    I(4, k('analysisSetId'), p(': '), sv('AS.SAFETY'),                 p(',')),
+    I(4, k('dataset'),       p(': '), sv('ADSL'),                      p(',')),
+    I(4, k('variable'),      p(': '), sv('AGE'),                       p(',')),
+    I(4, k('methodId'),      p(': '), sv('MTH.CONT.SUMM'),             p(',')),
+    I(4, k('orderedGroupings'), p(': [{ '), k('order'), p(': '), nv('1'), p(', '), k('groupingId'), p(': '), sv('GRP.TRT01P'), p(', '), k('resultsByGroup'), p(': '), bv('true'), p(' }],')),
+  ),
+
+  // ── SECTION 6b: AN.DM.AGE results + close ─────────────────────
+  sec('jb-age-close',
+    I(4, k('results'), p(': []'), cm('populated after DB lock')),
+    I(3, p('},')),
+    `<div></div>`
+  ),
+
+  // ── SECTION 7b: AN.DM.SEX header ──────────────────────────────
+  sec('jb-sex-hdr',
+    I(3, p('{'), cm('── SEX ──────────────────────────────')),
+    I(4, k('id'),            p(': '), sv('AN.DM.SEX'),               p(',')),
+    I(4, k('name'),          p(': '), sv('Sex – Frequency Counts'), p(',')),
+    I(4, k('reason'),        p(': '), sv('SPECIFIED IN SAP'),         p(',')),
+    I(4, k('analysisSetId'), p(': '), sv('AS.SAFETY'),                p(',')),
+    I(4, k('dataset'),       p(': '), sv('ADSL'),                     p(',')),
+    I(4, k('variable'),      p(': '), sv('SEX'),                      p(',')),
+    I(4, k('methodId'),      p(': '), sv('MTH.CAT.FREQ'),             p(',')),
+  ),
+
+  // ── SECTION 8: SEX categorySubclassifications ─────────────────
+  sec('jb-sex-cats',
+    I(4, k('categorySubclassifications'), p(': [')),
+    I(5, p('{')),
+    I(6, k('id'),    p(': '), sv('CATSC.SEX'),       p(',')),
+    I(6, k('label'), p(': '), sv('Sex Categories'), p(',')),
+    I(6, k('categories'), p(': [')),
+    I(7, p('{ '), k('id'), p(': '), sv('CAT.SEX.F'), p(', '), k('label'), p(': '), sv('Female'), p(', '), k('value'), p(': '), sv('F'), p(', '), k('order'), p(': '), nv('1'), p(' },')),
+    I(7, p('{ '), k('id'), p(': '), sv('CAT.SEX.M'), p(', '), k('label'), p(': '), sv('Male'),   p(', '), k('value'), p(': '), sv('M'), p(', '), k('order'), p(': '), nv('2'), p(' }')),
+    I(6, p(']')),
+    I(5, p('}')),
+    I(4, p('],')),
+  ),
+
+  // ── SECTION 9: SEX orderedGroupings + results + close ─────────
+  sec('jb-sex-close',
+    I(4, k('orderedGroupings'), p(': [{ '), k('order'), p(': '), nv('1'), p(', '), k('groupingId'), p(': '), sv('GRP.TRT01P'), p(', '), k('resultsByGroup'), p(': '), bv('true'), p(' }],')),
+    I(4, k('results'), p(': []'), cm('populated after DB lock')),
+    I(3, p('},')),
+    `<div></div>`
+  ),
+
+  // ── SECTION 10: AN.DM.RACE complete ───────────────────────────
+  sec('jb-race',
+    I(3, p('{'), cm('── RACE ─────────────────────────────')),
+    I(4, k('id'),            p(': '), sv('AN.DM.RACE'),                p(',')),
+    I(4, k('name'),          p(': '), sv('Race – Frequency Counts'), p(',')),
+    I(4, k('reason'),        p(': '), sv('SPECIFIED IN SAP'),           p(',')),
+    I(4, k('analysisSetId'), p(': '), sv('AS.SAFETY'),                  p(',')),
+    I(4, k('dataset'),       p(': '), sv('ADSL'),                       p(',')),
+    I(4, k('variable'),      p(': '), sv('RACE'),                       p(',')),
+    I(4, k('methodId'),      p(': '), sv('MTH.CAT.FREQ'),               p(',')),
+    I(4, k('categorySubclassifications'), p(': [')),
+    I(5, p('{')),
+    I(6, k('id'),         p(': '), sv('CATSC.RACE'),         p(',')),
+    I(6, k('label'),      p(': '), sv('Race Categories'),    p(',')),
+    I(6, k('categories'), p(': [')),
+    I(7, p('{ '), k('id'), p(': '), sv('CAT.RACE.WHITE'), p(', '), k('label'), p(': '), sv('White'),                     p(', '), k('value'), p(': '), sv('WHITE'),                     p(', '), k('order'), p(': '), nv('1'), p(' },')),
+    I(7, p('{ '), k('id'), p(': '), sv('CAT.RACE.BLACK'), p(', '), k('label'), p(': '), sv('Black or African American'), p(', '), k('value'), p(': '), sv('BLACK OR AFRICAN AMERICAN'), p(', '), k('order'), p(': '), nv('2'), p(' },')),
+    I(7, p('{ '), k('id'), p(': '), sv('CAT.RACE.ASIAN'), p(', '), k('label'), p(': '), sv('Asian'),                     p(', '), k('value'), p(': '), sv('ASIAN'),                     p(', '), k('order'), p(': '), nv('3'), p(' }')),
+    I(6, p(']')),
+    I(5, p('}')),
+    I(4, p('],')),
+    I(4, k('orderedGroupings'), p(': [{ '), k('order'), p(': '), nv('1'), p(', '), k('groupingId'), p(': '), sv('GRP.TRT01P'), p(', '), k('resultsByGroup'), p(': '), bv('true'), p(' }],')),
+    I(4, k('results'), p(': []'), cm('populated after DB lock')),
+    I(3, p('},')),
+    `<div></div>`
+  ),
+
+  // ── SECTION 11: AN.DM.ETHNIC complete + close analyses[ ───────
+  sec('jb-ethnic',
+    I(3, p('{'), cm('── ETHNICITY ─────────────────────────')),
+    I(4, k('id'),            p(': '), sv('AN.DM.ETHNIC'),                   p(',')),
+    I(4, k('name'),          p(': '), sv('Ethnicity – Frequency Counts'), p(',')),
+    I(4, k('reason'),        p(': '), sv('SPECIFIED IN SAP'),                p(',')),
+    I(4, k('analysisSetId'), p(': '), sv('AS.SAFETY'),                       p(',')),
+    I(4, k('dataset'),       p(': '), sv('ADSL'),                            p(',')),
+    I(4, k('variable'),      p(': '), sv('ETHNIC'),                          p(',')),
+    I(4, k('methodId'),      p(': '), sv('MTH.CAT.FREQ'),                    p(',')),
+    I(4, k('categorySubclassifications'), p(': [')),
+    I(5, p('{')),
+    I(6, k('id'),         p(': '), sv('CATSC.ETHNIC'),         p(',')),
+    I(6, k('label'),      p(': '), sv('Ethnicity Categories'), p(',')),
+    I(6, k('categories'), p(': [')),
+    I(7, p('{ '), k('id'), p(': '), sv('CAT.ETHNIC.HISP'),  p(', '), k('label'), p(': '), sv('Hispanic or Latino'),     p(', '), k('value'), p(': '), sv('HISPANIC OR LATINO'),     p(', '), k('order'), p(': '), nv('1'), p(' },')),
+    I(7, p('{ '), k('id'), p(': '), sv('CAT.ETHNIC.NHISP'), p(', '), k('label'), p(': '), sv('Not Hispanic or Latino'), p(', '), k('value'), p(': '), sv('NOT HISPANIC OR LATINO'), p(', '), k('order'), p(': '), nv('2'), p(' }')),
+    I(6, p(']')),
+    I(5, p('}')),
+    I(4, p('],')),
+    I(4, k('orderedGroupings'), p(': [{ '), k('order'), p(': '), nv('1'), p(', '), k('groupingId'), p(': '), sv('GRP.TRT01P'), p(', '), k('resultsByGroup'), p(': '), bv('true'), p(' }],')),
+    I(4, k('results'), p(': []'), cm('populated after DB lock')),
+    I(3, p('}')),
+    I(2, p('],')),   // close analyses
+    `<div></div>`
+  ),
+
+  // ── SECTION 12: outputs ───────────────────────────────────────
+  sec('jb-outputs',
+    I(2, k('outputs'), p(': [')),
+    I(3, p('{')),
+    I(4, k('id'),    p(': '), sv('OUT.T14.1.1'),                                             p(',')),
+    I(4, k('name'),  p(': '), sv('Table 14.1.1'),                                            p(',')),
+    I(4, k('label'), p(': '), sv('Demographics and Baseline Characteristics – Safety Analysis Set'), p(',')),
+    I(4, k('fileSpecifications'), p(': [{ '), k('name'), p(': '), sv('T14-1-1'), p(', '), k('fileType'), p(': '), sv('rtf'), p(', '), k('location'), p(': '), sv('output/T14-1-1.rtf'), p(' }],')),
+    I(4, k('displays'), p(': [')),
+    I(5, p('{')),
+    I(6, k('id'),    p(': '), sv('DISP.T14.1.1'), p(',')),
+    I(6, k('name'),  p(': '), sv('Table 14.1.1 Display'), p(',')),
+    I(6, k('order'), p(': '), nv('1'), p(',')),
+    I(6, k('displaySections'), p(': [')),
+    I(7, p('{')),
+    I(8, k('sectionType'), p(': '), sv('Title'), p(',')),
+    I(8, k('text'), p(': [')),
+    I(9, sv('Table 14.1.1'), p(',')),
+    I(9, sv('Demographics and Baseline Characteristics'), p(',')),
+    I(9, sv('Safety Analysis Set')),
+    I(8, p(']')),
+    I(7, p('},')),
+    I(7, p('{')),
+    I(8, k('sectionType'), p(': '), sv('Footnote'), p(',')),
+    I(8, k('text'), p(': [')),
+    I(9, sv('Abbreviations: n = number of subjects; SD = standard deviation.'), p(',')),
+    I(9, sv('Percentages are based on n per treatment group in the Safety Analysis Set.')),
+    I(8, p(']')),
+    I(7, p('}')),
+    I(6, p('],')),
+    I(6, k('orderedSubSections'), p(': [')),
+    I(7, p('{ '), k('order'), p(': '), nv('1'), p(', '), k('subSection'), p(': { '), k('id'), p(': '), sv('SS.AGE'),    p(', '), k('analysisId'), p(': '), sv('AN.DM.AGE'),    p(', '), k('label'), p(': '), sv('Age (years)'),    p(' } },')),
+    I(7, p('{ '), k('order'), p(': '), nv('2'), p(', '), k('subSection'), p(': { '), k('id'), p(': '), sv('SS.SEX'),    p(', '), k('analysisId'), p(': '), sv('AN.DM.SEX'),    p(', '), k('label'), p(': '), sv('Sex, n (%)'),    p(' } },')),
+    I(7, p('{ '), k('order'), p(': '), nv('3'), p(', '), k('subSection'), p(': { '), k('id'), p(': '), sv('SS.RACE'),   p(', '), k('analysisId'), p(': '), sv('AN.DM.RACE'),   p(', '), k('label'), p(': '), sv('Race, n (%)'),   p(' } },')),
+    I(7, p('{ '), k('order'), p(': '), nv('4'), p(', '), k('subSection'), p(': { '), k('id'), p(': '), sv('SS.ETHNIC'), p(', '), k('analysisId'), p(': '), sv('AN.DM.ETHNIC'), p(', '), k('label'), p(': '), sv('Ethnicity, n (%)'), p(' } }')),
+    I(6, p(']')),
+    I(5, p('}')),
+    I(4, p(']')),
+    I(3, p('}')),
+    I(2, p(']')),
+    `<div></div>`,
+    I(1, p('}')),  // close reportingEvent
+    `<div>${p('}')}</div>`
+  ),
+
+].join('');
+
+// inject into DOM
+document.getElementById('jsonBody').innerHTML = JSON_HTML;
+
+// ── Step definitions ─────────────────────────────────────────────
+
+const STEPS = [
+  {
+    shell: ['sh-pop','sh-pbo','sh-ld','sh-hd'],
+    reveal: ['jb-infra'],
+    phase: 'Infrastructure — Population & Groups',
+    note: 'Shell population header + column names → ARS <span class="hb">analysisSets</span> (SAFFL=Y defines the Safety Analysis Set) and <span class="hb">analysisGroupings</span> (TRT01P with Placebo / Xanomeline Low Dose / Xanomeline High Dose groups). These are referenced by every analysis in the file.'
+  },
+  {
+    shell: ['sh-age-hdr'],
+    reveal: ['jb-mth-open','jb-age-hdr'],
+    phase: 'Age — analysis setup',
+    note: '"Age (years)" section → opens <span class="hb">methods</span> array with <span class="ht">MTH.CONT.SUMM</span>, and starts <span class="hb">analyses</span> array with <span class="ht">AN.DM.AGE</span>. Key fields: <span class="ht">variable: "AGE"</span>, <span class="ht">methodId: "MTH.CONT.SUMM"</span>. The <span class="hb">reason</span> and <span class="hb">purpose</span> fields are required by ARS v1.0.'
+  },
+  {
+    shell: ['sh-age-n'],
+    reveal: ['jb-op-n'],
+    phase: 'Age → n  [resultPattern: "xx"]',
+    note: 'Shell row "n" with placeholder <span class="fn">xx</span> → operation <span class="ht">OP.N</span> inside <span class="ht">MTH.CONT.SUMM</span>. The <span class="hb">resultPattern: <span class="rn">"xx"</span></span> matches the format placeholder exactly. This is the machine-readable equivalent of "format as integer" in a Word SAP.'
+  },
+  {
+    shell: ['sh-age-mean'],
+    reveal: ['jb-op-mean-sd'],
+    phase: 'Age → Mean + SD  [resultPattern: "xx.x"]',
+    note: '"Mean (SD)" cell with <span class="fc">xx.x (xx.x)</span> → two operations: <span class="ht">OP.MEAN</span> and <span class="ht">OP.SD</span>, both with <span class="hb">resultPattern: <span class="rc">"xx.x"</span></span>. One shell cell = two separate ARS operations. The display format (concatenation) is handled in the outputs section.'
+  },
+  {
+    shell: ['sh-age-med'],
+    reveal: ['jb-op-median'],
+    phase: 'Age → Median  [resultPattern: "xx.x"]',
+    note: '"Median" row → <span class="ht">OP.MEDIAN</span> with <span class="hb">resultPattern: <span class="rc">"xx.x"</span></span>. Each row in the shell section maps to exactly one operation. The programmer knows to compute all six statistics because the ARS lists all six operations in the method.'
+  },
+  {
+    shell: ['sh-age-mm'],
+    reveal: ['jb-op-minmax','jb-age-close'],
+    phase: 'Age → Min, Max  ✓ complete',
+    note: '"Min, Max" → <span class="ht">OP.MIN</span> + <span class="ht">OP.MAX</span>. The <span class="ht">MTH.CONT.SUMM</span> operations array is now closed. <span class="hb">AN.DM.AGE</span> closes with <span class="hb">results: []</span> — intentionally empty until programs run after database lock. Age analysis complete ✓'
+  },
+  {
+    shell: ['sh-sex-hdr'],
+    reveal: ['jb-mth-cat','jb-sex-hdr'],
+    phase: 'Sex — analysis setup',
+    note: '"Sex, n (%)" section → adds <span class="ht">MTH.CAT.FREQ</span> to the methods array (categorical frequency method, different from MTH.CONT.SUMM). Starts analysis <span class="ht">AN.DM.SEX</span> with <span class="ht">variable: "SEX"</span> and <span class="ht">methodId: "MTH.CAT.FREQ"</span>.'
+  },
+  {
+    shell: ['sh-sex-f','sh-sex-m'],
+    reveal: ['jb-sex-cats'],
+    phase: 'Sex → Categories (F, M)',
+    note: 'Row labels "Female" and "Male" → <span class="hb">categorySubclassifications</span> with CDISC CT values <span class="ht">"F"</span> and <span class="ht">"M"</span>. The <span class="hb">value</span> field holds the exact value in ADSL.SEX. The <span class="hb">order</span> field controls row sequence — the programmer does not decide the display order.'
+  },
+  {
+    shell: ['sh-sex-f','sh-sex-m'],
+    reveal: ['jb-sex-close'],
+    phase: 'Sex → n + xx.x%  ✓ complete',
+    note: 'The <span class="fn">xx</span> (<span class="fp">xx.x%</span>) placeholders → MTH.CAT.FREQ operations: <span class="ht">OP.CAT.N</span> (<span class="rn">resultPattern: "xx"</span>) and <span class="ht">OP.CAT.PCT</span> (<span class="rp">resultPattern: "xx.x%"</span>). Sex analysis block complete with <span class="hb">results: []</span> ✓'
+  },
+  {
+    shell: ['sh-race-hdr','sh-race-w','sh-race-b','sh-race-a'],
+    reveal: ['jb-race'],
+    phase: 'Race — full block  ✓',
+    note: 'Race section → <span class="ht">AN.DM.RACE</span> with three categories (<span class="ht">WHITE</span>, <span class="ht">BLACK OR AFRICAN AMERICAN</span>, <span class="ht">ASIAN</span> — SDTM controlled terminology). Same <span class="ht">MTH.CAT.FREQ</span> and same two operations as Sex. Race analysis complete ✓'
+  },
+  {
+    shell: ['sh-eth-hdr','sh-eth-h','sh-eth-nh'],
+    reveal: ['jb-ethnic'],
+    phase: 'Ethnicity — full block  ✓',
+    note: 'Ethnicity → <span class="ht">AN.DM.ETHNIC</span> with two SDTM CT values: <span class="ht">HISPANIC OR LATINO</span> and <span class="ht">NOT HISPANIC OR LATINO</span>. The <span class="hb">analyses</span> array is now closed. All four demographic analyses are fully defined in the ARS.'
+  },
+  {
+    shell: ['sh-fn'],
+    reveal: ['jb-outputs'],
+    phase: 'Outputs — title, footnote, section order',
+    note: 'Table title, footnote text, and section order → ARS <span class="hb">outputs.displays.displaySections</span> (Title + Footnote) and <span class="hb">orderedSubSections</span> (AGE→SEX→RACE→ETHNIC). The ARS JSON is now complete — a full machine-readable specification for the programmer, with <span class="hb">results: []</span> awaiting database lock.',
+    onReveal() { document.getElementById('wf4').classList.add('on'); }
+  }
+];
+
+// ── Engine ──────────────────────────────────────────────────────
+
+let cur = 0, playing = false, timer = null;
+const annEl    = document.getElementById('ann');
+const stepLbl  = document.getElementById('stepLbl');
+const progFill = document.getElementById('progFill');
+const phaseEl  = document.getElementById('phaseLbl');
+
+function ui() {
+  stepLbl.textContent = `Step ${cur} / ${STEPS.length}`;
+  progFill.style.width = `${(cur / STEPS.length) * 100}%`;
+}
+
+function clearHL() {
+  document.querySelectorAll('.hl-row').forEach(e => e.classList.remove('hl-row'));
+  document.querySelectorAll('.hl-cell').forEach(e => e.classList.remove('hl-cell'));
+  const fn = document.getElementById('sh-fn');
+  if (fn) fn.classList.remove('hl');
+}
+
+function hlShell(ids) {
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.tagName === 'TR') el.classList.add('hl-row');
+    else if (el.tagName === 'TH') el.classList.add('hl-cell');
+    else if (id === 'sh-fn') el.classList.add('hl');
+    else el.classList.add('hl-row'); // divs like sh-pop
+  });
+}
+
+function revealSecs(ids) {
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.remove('dim');
+    el.classList.add('lit');
+    el.classList.remove('flash');
+    void el.offsetWidth; // reflow
+    el.classList.add('flash');
+    setTimeout(() => el.classList.remove('flash'), 1500);
+    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
+}
+
+function runStep(idx) {
+  if (idx >= STEPS.length) { stopPlay(); return; }
+  const s = STEPS[idx];
+  clearHL();
+  hlShell(s.shell);
+  phaseEl.textContent = s.phase;
+  annEl.innerHTML = s.note;
+  annEl.classList.add('vis');
+  revealSecs(s.reveal);
+  if (s.onReveal) s.onReveal();
+}
+
+function stepFwd() {
+  if (cur >= STEPS.length) return;
+  runStep(cur); cur++; ui();
+}
+
+function togglePlay() { playing ? stopPlay() : startPlay(); }
+
+function startPlay() {
+  playing = true;
+  document.getElementById('btnPlay').textContent = '⏸ Pause';
+  const tick = () => {
+    if (cur >= STEPS.length) { stopPlay(); return; }
+    stepFwd();
+    timer = setTimeout(tick, 2800);
+  };
+  tick();
+}
+
+function stopPlay() {
+  playing = false;
+  document.getElementById('btnPlay').textContent = '▶ Play All';
+  if (timer) { clearTimeout(timer); timer = null; }
+}
+
+function reset() {
+  stopPlay(); cur = 0;
+  clearHL();
+  annEl.classList.remove('vis');
+  phaseEl.textContent = 'Ready';
+  document.querySelectorAll('.jsec').forEach(el => {
+    el.classList.remove('lit','flash');
+    el.classList.add('dim');
+  });
+  document.getElementById('wf4').classList.remove('on');
+  // scroll JSON back to top
+  document.getElementById('jsonScroll').scrollTop = 0;
+  ui();
+}
+
+ui();
+</script>
+</body>
+</html>
